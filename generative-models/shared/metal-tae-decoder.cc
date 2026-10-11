@@ -205,6 +205,7 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
       if ((co % 64) == 0) { _weight_bytes += (std::size_t)2 * co * 9 * cp; }
       c->split_hwio = split;
       c->cin = cp;
+      c->cin_file = ci;
       c->cout = co;
       c->k3 = true;
       return true;
@@ -261,6 +262,7 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
       _weight_bytes += c->b.byte_size();
     }
     c->cin = cp;
+    c->cin_file = ci;
     c->cout = co;
     c->k3 = true;
     return !c->w.empty();
@@ -271,6 +273,7 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
       if (shp.size() != 4 || shp[2] != 1 || shp[3] != 1) { return false; }
       c->cout = (int)shp[0];
       c->cin = (int)shp[1];
+      c->cin_file = c->cin;
       c->k3 = false;
       _info.params += (std::size_t)c->cout * c->cin;
       _weight_bytes += (std::size_t)2 * c->cout * c->cin;
@@ -280,6 +283,7 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
     if (shp.size() != 4 || shp[2] != 1 || shp[3] != 1) { return false; }
     c->cout = (int)shp[0];
     c->cin = (int)shp[1];
+    c->cin_file = c->cin;
     c->k3 = false;
     c->w = f16_buf_(mc, host);   // [cout, cin, 1, 1] IS [cout, cin]
     _info.params += host.size();
@@ -823,6 +827,9 @@ MetalTaeDecoder::conv3_(ComputeEncoder& enc, const Conv& c,
 {
   const int OH = H * up, OW = W * up;
   const int M = OH * OW;
+  // Counted ONCE, here, whichever route below runs it -- the concat pair
+  // is two dispatches of one conv -- at the file's input width.
+  _flops.gemm(M, c.cout, 9LL * c.cin_file);
   // BN 64 wherever the output is that wide: the FLUX.2 VAE measured it
   // ahead of BN 128 once the gather vectorized (the narrower tile's
   // smaller threadgroup footprint wins on occupancy). The head's 3-16
@@ -922,6 +929,7 @@ MetalTaeDecoder::conv1_(ComputeEncoder& enc, const Conv& c,
   // y[M, rows] = x[M, cin] @ w[w_row0 : w_row0 + rows, cin]^T. The row
   // offset is how a TGrow's sub-frame k takes its channel block without a
   // reshape: the block IS a contiguous band of the weight.
+  _flops.gemm(M, rows, c.cin_file);
   const bool wide = rows >= 64 && _fn_gemm_bm64bn64.valid();
   const int bn = wide ? 64 : 32;
   enc.set_function(wide ? _fn_gemm_bm64bn64 : _fn_gemm_bm64);
@@ -950,6 +958,7 @@ MetalTaeDecoder::dispatch_(ComputeEncoder& enc, const char* cat,
   enc.dispatch(grid, tg);
   if (_prof_cs == nullptr) { return; }
   enc.end();
+  _flops.flush(*_prof_cs);
   const auto t0 = std::chrono::steady_clock::now();
   metal_compute::CommandStream::Fence f = _prof_cs->commit();
   f.wait_ok();
@@ -1195,6 +1204,8 @@ MetalTaeDecoder::decode(const float* latent, int C, int T, int h, int w,
   }
   metal_compute::CommandStream cs = _mc->make_command_stream();
   if (!cs.valid()) { return fail("no command stream"); }
+  // A cancelled decode's count was never committed: drop it.
+  _flops.begin();
   _profile.clear();
   _prof_cs = std::getenv("VPIPE_TAE_PROFILE") != nullptr ? &cs : nullptr;
   // Cleared on EVERY way out: the stream is this call's local.
@@ -1281,6 +1292,7 @@ MetalTaeDecoder::decode(const float* latent, int C, int T, int h, int w,
       }
       enc.end();
     }
+    _flops.flush(cs);
     std::string ferr;
     if (!cs.commit().wait_ok(&ferr)) {
       return fail(fmt("latent frame {}: {}", t - 1,

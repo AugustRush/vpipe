@@ -7,7 +7,9 @@
 #include "generative-models/video-model-registry.h"
 
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
+#include "generative-models/wan/metal-wan-vae.h"
 
 #include "common/flex-data.h"
 #include "generative-models/shared/comfy-checkpoint.h"
@@ -358,7 +360,14 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
     // guessing from the directory.
     return int_field_(cfg, "in_channels", 16) > 16 ? "wan-i2v" : "wan-t2v";
   }
-  if (cls == "MiniMaxH3DiTModel") {
+  // The diffusers spelling of the same DiT. On MiniMaxAI's repository root
+  // it is the pipeline that carries BOTH partitions' DiTs (transformer/,
+  // transformer_ref/) and a manifest naming neither, so the partition
+  // stays empty there and the root is untagged -- a directory holding two
+  // models, which only a record can name, as for a checkout holding both
+  // released partitions.
+  if (cls == "MiniMaxH3DiTModel" ||
+      cls == genai::minimax_h3::kDiffusersDitClass) {
     // The two partitions ship BYTE-IDENTICAL transformer configs (same
     // 535 tensor names, same shapes), so the DiT alone cannot tell them
     // apart and the pipeline manifest has to -- and it matters, because
@@ -929,8 +938,13 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
       d.model_type  = comp;
       d.detected_by = "component-tag";
     } else if (base == "text_encoder") {
+      // The released partition's manifest carries `_minimax_h3`; the
+      // diffusers pipeline at the repository root names its class
+      // instead, over a byte-identical encoder.
       const FlexData mi2 = read_json_(root.parent_path() / "model_index.json");
-      if (has_field_(mi2, "_minimax_h3")) {
+      if (has_field_(mi2, "_minimax_h3") ||
+          genai::minimax_h3::is_diffusers_pipeline_root(
+              root.parent_path().string())) {
         d.model_type  = "minimax-h3-text-encoder";
         d.detected_by = "pipeline";
       }
@@ -1046,27 +1060,19 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
   return d;
 }
 
+namespace {
+
+// MiniMax-H3's RELEASED video VAE under `root`, "" when there is none.
+// This is the OUTER directory, not the `source/` one holding the
+// weights: the outer config.json is the one that names the class and
+// carries latents_mean / latents_std, while `source/config.json` is the
+// legacy geometry. The model loader descends the last level itself.
+// Both partition subdirectories: MiniMaxAI ships FL2VA/ and Ref2VA/ as
+// complete pipelines, and detection over a Ref2VA-only checkout that
+// probed FL2VA alone found no VAE at all.
 std::string
-resolve_vae_dir(const std::string& root)
+released_h3_video_vae_(const std::string& root)
 {
-  if (fs::exists(fs::path(root) / "vae" / "config.json")) {
-    return (fs::path(root) / "vae").string();
-  }
-  // MiniMax-H3's video VAE. This is the OUTER directory, not the
-  // `source/` one holding the weights: the outer config.json is the
-  // one that names the class and carries latents_mean / latents_std,
-  // while `source/config.json` is the legacy geometry. The model
-  // loader descends the last level itself.
-  // Both partition subdirectories: MiniMaxAI ships FL2VA/ and Ref2VA/ as
-  // complete pipelines, and detection over a Ref2VA-only checkout that
-  // probed FL2VA alone found no VAE at all.
-  // VOSR ships its autoencoder under the name of the model it was
-  // extracted from rather than under `vae/`, so a graph pointing every
-  // stage at one checkpoint root would otherwise find no VAE and open
-  // the root itself.
-  if (fs::exists(fs::path(root) / "Qwen-Image-vae-2d" / "config.json")) {
-    return (fs::path(root) / "Qwen-Image-vae-2d").string();
-  }
   for (const fs::path& p : {fs::path(root) / "video_vae",
                             fs::path(root) / "FL2VA" / "video_vae",
                             fs::path(root) / "Ref2VA" / "video_vae"}) {
@@ -1075,6 +1081,39 @@ resolve_vae_dir(const std::string& root)
       return p.string();
     }
   }
+  return {};
+}
+
+}  // namespace
+
+std::string
+resolve_vae_dir(const std::string& root)
+{
+  const std::string h3 = released_h3_video_vae_(root);
+  if (fs::exists(fs::path(root) / "vae" / "config.json")) {
+    // A MiniMax-H3 checkout carries BOTH layouts: the diffusers pipeline
+    // at its root (`vae/`, AutoencoderKLMiniMaxH3) beside the released
+    // partitions' `video_vae/`. They are the same VAE -- the same
+    // tensors under other names -- so the released one answers whenever
+    // it is there. It is what MetalMiniMaxH3VideoVae::resolve_vae_dir
+    // finds first, i.e. what video-ref-encoder and generate-video's
+    // sizing open, and two answers would load the 10 GB VAE twice.
+    if (!h3.empty() &&
+        genai::minimax_h3::is_diffusers_vae_dir(
+            (fs::path(root) / "vae").string(),
+            genai::minimax_h3::kDiffusersVideoVaeClass)) {
+      return h3;
+    }
+    return (fs::path(root) / "vae").string();
+  }
+  // VOSR ships its autoencoder under the name of the model it was
+  // extracted from rather than under `vae/`, so a graph pointing every
+  // stage at one checkpoint root would otherwise find no VAE and open
+  // the root itself.
+  if (fs::exists(fs::path(root) / "Qwen-Image-vae-2d" / "config.json")) {
+    return (fs::path(root) / "Qwen-Image-vae-2d").string();
+  }
+  if (!h3.empty()) { return h3; }
   // FlashVSR as published: its Wan 2.1 VAE is ONE torch file at the root
   // with no config beside it. Returned by FILE, the way a Comfy-Org
   // repack's component is, so the root's other checkpoints -- a 5.7 GB
@@ -1107,6 +1146,113 @@ resolve_vae_dir(const std::string& root)
     }
   }
   return root;
+}
+
+namespace {
+
+// Every VAE class a BUILT-IN decoder runs, and which one. The one table
+// both VAE stages read: they used to keep a copy each, whose last arm
+// was a default -- so a class neither knew was opened as a Qwen-Image
+// VAE and failed later, on a symptom (MiniMax-H3's diffusers VAE was
+// read as a 16-channel one: "carries 24/24 of the 16 latents_mean
+// entries"). A new class is a row here, or a registered family.
+struct VaeClass {
+  const char* cls;
+  const char* family;
+};
+constexpr VaeClass kVaeClasses[] = {
+    // Krea-2's and Qwen-Image's VAE, and its RGBA form (4 channels by
+    // `input_channels`, a scalar scaling_factor in place of per-channel
+    // stats -- both read by MetalKrea2Vae::config_from_json).
+    {"AutoencoderKLQwenImage", "krea2"},
+    // Qwen-Image-2.1's: the same implementation, generalized -- five
+    // levels instead of four, z 64, RGBA, an asymmetric decoder, all
+    // from config.json rather than from the class name.
+    {"AutoencoderKLQwenImage21", "krea2"},
+    // VOSR's image-only extraction of the Qwen-Image VAE: the same
+    // tensors with the temporal axis dropped, which MetalKrea2Vae reads
+    // by each tensor's rank.
+    {"AutoencoderKLQwenImage2D", "krea2"},
+    {"AutoencoderKLFlux2", "flux2"},
+    // The PLAIN diffusers AutoencoderKL (FLUX.1's, which Z-Image and
+    // Boogu-Image use) runs on the same code: MetalFlux2Vae is
+    // config-driven, and at patch 1 with a scalar shift/scale whitening
+    // it IS a plain AutoencoderKL.
+    {"AutoencoderKL", "flux2"},
+    // The VIDEO VAE. Same tensor names as the Qwen-Image one (it IS the
+    // general form of it), so the class name is the only thing that
+    // tells them apart -- and getting it wrong would decode a video
+    // latent as a single still.
+    {"AutoencoderKLWan", "wan"},
+    // MiniMax-H3's video VAE, released and diffusers (the same numbers;
+    // generative-models/minimax-h3/minimax-h3-diffusers-layout.h). Its
+    // own family because the DECODER is a 36-layer ViT -- one token per
+    // latent voxel, each projecting a whole 4x16x16 pixel block.
+    {"MiniMaxH3VideoVAE", "minimax-h3"},
+    {genai::minimax_h3::kDiffusersVideoVaeClass, "minimax-h3"},
+};
+
+}  // namespace
+
+std::string
+builtin_vae_family(const std::string& vae_dir, std::string* unknown_class)
+{
+  if (unknown_class != nullptr) { unknown_class->clear(); }
+  // A Comfy-Org repack ships its VAEs as bare .safetensors under `vae/`
+  // with no config.json at all; the architecture is in the file's
+  // `__metadata__` key instead, and probing for it costs one header
+  // read.
+  if (!genai::comfy::resolve_component(vae_dir, "vae", "minimax_h3_video_vae",
+                                       {"video_vae"}).empty()) {
+    return "minimax-h3";
+  }
+  std::ifstream in(fs::path(vae_dir) / "config.json");
+  if (in) {
+    FlexData fd;
+    try {
+      fd = FlexData::from_json(in);
+    } catch (...) {
+      fd = FlexData::make_null();
+    }
+    if (fd.is_object() && fd.as_object().contains("_class_name")) {
+      const FlexData c = fd.as_object().at("_class_name");  // bind the view
+      const std::string cls(c.as_string(""));
+      for (const VaeClass& v : kVaeClasses) {
+        if (cls == v.cls) { return v.family; }
+      }
+      // NAMED, and nothing here decodes it: refuse by name. Falling
+      // through to the Qwen-Image default opened it as the wrong model
+      // and failed on whatever that model checked first.
+      if (unknown_class != nullptr) { *unknown_class = cls; }
+      return {};
+    }
+  }
+  // A natively-named Wan 2.1 VAE with no config anywhere -- FlashVSR's
+  // `Wan2.1_VAE.pth`, which resolve_vae_dir() hands back by file. Its
+  // tensors say what it is. Files only, so a directory never pays for
+  // the probe.
+  std::error_code ec;
+  if (fs::is_regular_file(fs::path(vae_dir), ec) && !ec) {
+    genai::MetalWanVae::Config probe;
+    if (genai::MetalWanVae::config_for_native_checkpoint(vae_dir, probe)) {
+      return "wan";
+    }
+  }
+  // No class at all: a STANDALONE checkpoint, whose config is borrowed
+  // from the model it serves (resolve_vae_config_path). Every one of
+  // those is a Qwen-Image VAE.
+  return "krea2";
+}
+
+std::string
+builtin_vae_classes()
+{
+  std::string s;
+  for (const VaeClass& v : kVaeClasses) {
+    if (!s.empty()) { s += ", "; }
+    s += v.cls;
+  }
+  return s;
 }
 
 std::string

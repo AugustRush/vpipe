@@ -4,6 +4,14 @@
 
 #include "tests/unit-tests/metal-lm/metal-lm-test-common.h"
 #include "common/flex-bag.h"
+#include "pipeline/resource-plan.h"
+#include "stages/model-memory.h"
+
+#include <atomic>
+#include <filesystem>
+#include <thread>
+
+#include <unistd.h>
 
 // Matrix-core (M5+) prefill GEMM must be greedy token-exact with the steel
 // quantized GEMM. Loads the SAME Qwen3.5 checkpoint twice -- once with the
@@ -680,4 +688,301 @@ TEST(metal_lm_smoke, language_model_wired_as_it_loads) {
   mgr->release_warm_unclaimed();
   mgr->clear_declarations();
   EXPECT_TRUE(mgr->wired_pool_used() == pool0);
+}
+
+// A CONTEXT SAVED to disk and read back decodes as the one it was saved
+// from, token for token (greedy, the same kernels either way); and a
+// conversation PARKED with a warm model is taken back by its key, or
+// saved to its file when the hold goes. Gated on
+// VPIPE_QWEN35_TEST_MODEL_PATH (Qwen3.5: paged K/V and GDN state both).
+TEST(metal_lm_smoke, a_context_saved_reads_back_token_exact) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "f16";
+  spec.page_tokens = 16;
+  spec.max_pages = 256;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  const auto prompt = lm->tokenizer().encode(
+      "Once upon a time, in a village between two rivers, there lived an "
+      "old clockmaker who kept every clock in the village a minute fast, "
+      "so that nobody would ever be late. One morning");
+  ASSERT_TRUE(prompt.size() > 32);   // more than two pages
+  auto decode = [&](genai::LoadedLanguageModel::Context& c,
+                    std::int32_t t) {
+    std::vector<std::int32_t> out{t};
+    for (int i = 0; i < 12; ++i) {
+      t = lm->next_token_greedy(c, t);
+      out.push_back(t);
+    }
+    return out;
+  };
+  // As decoded straight on.
+  std::vector<std::int32_t> want;
+  {
+    auto c = lm->make_context();
+    const std::int32_t t = lm->prefill(c, prompt);
+    ASSERT_TRUE(t >= 0);
+    want = decode(c, t);
+  }
+  // Saved after the prefill, read back, decoded.
+  const auto dir = std::filesystem::temp_directory_path()
+      / ("vpipe-ctx-" + std::to_string(std::chrono::steady_clock::now()
+                                             .time_since_epoch().count()));
+  std::filesystem::create_directories(dir);
+  const std::string file = (dir / "a.vctx").string();
+  {
+    auto c = lm->make_context();
+    const std::int32_t t = lm->prefill(c, prompt);
+    ASSERT_TRUE(t >= 0);
+    std::string err;
+    ASSERT_TRUE(lm->save_context(c, file, "meta-bytes", &err));
+    if (!err.empty()) { std::printf("save: %s\n", err.c_str()); }
+  }
+  {
+    std::string meta, err;
+    auto back = lm->load_context(file, &meta, &err);
+    if (!back.valid()) { std::printf("load: %s\n", err.c_str()); }
+    ASSERT_TRUE(back.valid());
+    if (!back.valid()) { return; }
+    EXPECT_TRUE(meta == "meta-bytes");
+    EXPECT_TRUE(back.seq_len() == (int)prompt.size());
+    EXPECT_TRUE(back.last_predicted_id() == want[0]);
+    const auto got = decode(back, want[0]);
+    EXPECT_TRUE(got == want);
+  }
+  // A file cut short is refused, and makes nothing.
+  {
+    std::filesystem::resize_file(file, std::filesystem::file_size(file) / 2);
+    std::string meta, err;
+    auto back = lm->load_context(file, &meta, &err);
+    EXPECT_TRUE(!back.valid());
+    EXPECT_TRUE(!err.empty());
+  }
+
+  // Parked with the model kept warm: taken back by its key, as it was.
+  mgr->keep_warm(lm, path, 60.0);
+  {
+    auto c = lm->make_context();
+    ASSERT_TRUE(lm->prefill(c, prompt) == want[0]);
+    const std::string spill = (dir / "kept.vctx").string();
+    mgr->park_context("conv-a", lm, std::move(c), "held", spill);
+    genai::LoadedLanguageModel::Context none;
+    std::string meta;
+    EXPECT_TRUE(!mgr->take_context("conv-b", lm, &none, &meta));
+    genai::LoadedLanguageModel::Context taken;
+    ASSERT_TRUE(mgr->take_context("conv-a", lm, &taken, &meta));
+    EXPECT_TRUE(meta == "held");
+    EXPECT_TRUE(decode(taken, want[0]) == want);
+    // Parked again; the hold ends: saved to its file first.
+    auto c2 = lm->make_context();
+    ASSERT_TRUE(lm->prefill(c2, prompt) == want[0]);
+    mgr->park_context("conv-a", lm, std::move(c2), "held", spill);
+    EXPECT_TRUE(!std::filesystem::exists(spill));
+    mgr->keep_warm(lm, path, 0);
+    EXPECT_TRUE(std::filesystem::exists(spill));
+    std::string m2, err;
+    auto back = lm->load_context(spill, &m2, &err);
+    ASSERT_TRUE(back.valid());
+    if (back.valid()) { EXPECT_TRUE(decode(back, want[0]) == want); }
+    // Dropped: nothing to take.
+    mgr->keep_warm(lm, path, 60.0);
+    auto c3 = lm->make_context();
+    mgr->park_context("conv-c", lm, std::move(c3), "", "");
+    EXPECT_TRUE(mgr->drop_context("conv-c"));
+    EXPECT_TRUE(!mgr->drop_context("conv-c"));
+    mgr->keep_warm(lm, path, 0);
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+
+// The model manager saves and releases PARKED contexts on threads of its
+// own -- the warm hold's reaper, a launch's planner, a host ending a
+// conversation -- while another context of the same model decodes.
+// Here a second thread saves and releases contexts, and drops parked
+// ones, for the whole of a decode that also makes and frees contexts
+// of its own: the decode's greedy tokens are those it makes alone, and
+// every context saved reads back. Gated on VPIPE_QWEN35_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, contexts_go_on_another_thread_while_it_decodes) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "f16";
+  spec.page_tokens = 16;
+  spec.max_pages = 1024;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  using Ctx = genai::LoadedLanguageModel::Context;
+  const auto prompt = lm->tokenizer().encode(
+      "The lighthouse keeper wrote one line in the log every night, and "
+      "on the last night of the year he wrote");
+  const auto line = lm->tokenizer().encode("A short line, held.");
+  constexpr int kTokens = 40;
+  auto decode = [&](Ctx& c, std::int32_t t, const std::function<void()>&
+                                                 between) {
+    std::vector<std::int32_t> out{t};
+    for (int i = 1; i < kTokens; ++i) {
+      t = lm->next_token_greedy(c, t);
+      out.push_back(t);
+      between();
+    }
+    return out;
+  };
+  std::vector<std::int32_t> want;
+  {
+    Ctx c = lm->make_context();
+    const std::int32_t t = lm->prefill(c, prompt);
+    ASSERT_TRUE(t >= 0);
+    want = decode(c, t, [] {});
+  }
+
+  // Theirs: contexts the other thread saves (every second one) and
+  // releases; and contexts parked with the warm model under keys, which
+  // it drops, then lets the hold go (saving those with a file).
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path()
+      / ("vpipe-ctx-mt-" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  constexpr int kTheirs = 48, kParked = 16;
+  std::vector<Ctx> theirs;
+  for (int i = 0; i < kTheirs; ++i) {
+    theirs.push_back(lm->make_context());
+    ASSERT_TRUE(lm->prefill(theirs.back(), line) >= 0);
+  }
+  mgr->keep_warm(lm, path, 600.0);
+  auto file = [&](const char* tag, int i) {
+    return (dir / (std::string(tag) + std::to_string(i) + ".vctx"))
+        .string();
+  };
+  for (int i = 0; i < kParked; ++i) {
+    Ctx c = lm->make_context();
+    ASSERT_TRUE(lm->prefill(c, line) >= 0);
+    mgr->park_context("k" + std::to_string(i), lm, std::move(c), "m",
+                      i % 2 ? file("p", i) : std::string());
+  }
+
+  std::atomic<bool> go{false}, done{false};
+  std::atomic<int>  saved{0};
+  std::thread other([&] {
+    while (!go.load()) { std::this_thread::yield(); }
+    for (int i = 0; i < kTheirs; ++i) {
+      if (i % 2 && lm->save_context(theirs[(size_t)i], file("t", i), "")) {
+        ++saved;
+      }
+      theirs[(size_t)i] = Ctx{};
+      if (i % 4 == 0 && i / 4 < kParked / 2) {
+        (void)mgr->drop_context("k" + std::to_string(2 * (i / 4)));
+      }
+      if (!done.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+    mgr->keep_warm(lm, path, 0);   // the hold ends: the rest saved
+  });
+  std::vector<std::int32_t> got;
+  {
+    Ctx c = lm->make_context();
+    const std::int32_t t = lm->prefill(c, prompt);
+    go.store(true);
+    // A context of its own made and freed at every token: the map grows
+    // under the other thread's erases.
+    got = decode(c, t, [&] {
+      Ctx extra = lm->make_context();
+      (void)lm->prefill(extra, line);
+    });
+    done.store(true);
+  }
+  other.join();
+  EXPECT_TRUE(got == want);
+  EXPECT_TRUE(saved.load() == kTheirs / 2);
+  int read_back = 0;
+  for (int i = 1; i < kTheirs; i += 2) {
+    std::string meta, err;
+    Ctx back = lm->load_context(file("t", i), &meta, &err);
+    if (back.valid() && back.seq_len() == (int)line.size()) { ++read_back; }
+  }
+  for (int i = 1; i < kParked; i += 2) {
+    std::string meta, err;
+    Ctx back = lm->load_context(file("p", i), &meta, &err);
+    if (back.valid() && back.seq_len() == (int)line.size()
+        && meta == "m") {
+      ++read_back;
+    }
+  }
+  std::printf("[contexts on another thread] decode %s; %d of %d saved "
+              "contexts read back\n", got == want ? "exact" : "DIFFERS",
+              read_back, kTheirs / 2 + kParked / 2);
+  EXPECT_TRUE(read_back == kTheirs / 2 + kParked / 2);
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+// A model kept warm that a launch does not claim STAYS when the launch
+// fits beside it and GOES when it does not -- decided by the weights
+// planner as a launch's claims reach it. A launch claiming the model
+// keeps it whatever the box. Gated on VPIPE_QWEN35_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, a_warm_model_stays_beside_a_launch_that_fits) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "f16";
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  mgr->keep_warm(lm, path, 600.0);
+  lm.reset();
+  ASSERT_TRUE(mgr->warm_count() == 1);
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path other = fs::temp_directory_path()
+      / ("vpipe-warm-fit-" + std::to_string(::getpid()));
+  fs::create_directories(other);
+  {
+    std::ofstream f(other / "model.safetensors", std::ios::binary);
+    const std::string blob(1 << 20, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  }
+  auto launch = [&](const char* ram_mb, const std::string& dir) {
+    ::setenv("VPIPE_RAM_LIMIT_MB", ram_mb, 1);
+    pl->begin_plan(&sess);
+    pl->claim(&sess, dir, "", "", 0);
+    pl->end_plan(&sess);
+    ::unsetenv("VPIPE_RAM_LIMIT_MB");
+    return mgr->warm_count();
+  };
+  // A box with room for both: kept.
+  EXPECT_TRUE(launch("1048576", other.string()) == 1);
+  // The launch claims the warm model itself: kept, however small the box.
+  EXPECT_TRUE(launch("1024", path) == 1);
+  // A box without room for the model beside the launch: released.
+  EXPECT_TRUE(launch("1024", other.string()) == 0);
+  mgr->clear_declarations();
+  std::error_code ec;
+  fs::remove_all(other, ec);
 }

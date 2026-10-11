@@ -180,6 +180,27 @@ struct MetalFlashVsrTransformer::Streaming {
   std::vector<std::uint8_t> scratch;
 };
 
+// What an open STREAM keeps between requests: every block's retained
+// key/value windows, compacted to [heads, windows * window_tokens,
+// head_dim], and the ring state they came out of.
+//
+// THE STATE IS PER BLOCK although every block ends a request in the same
+// one. Block-outer saves block L's window before it restores block L+1's,
+// so a state kept once is already the NEW one when block L+1 reads it --
+// and its windows go back into the slots one chunk later than they left.
+// That was a rel-L2 of 1.2e-2 against one request, found by the stream
+// identity test; chunk-outer, which restores every block first, passed.
+struct MetalFlashVsrTransformer::WindowCarry {
+  std::vector<SharedBuffer> k, v;    // per block
+  std::vector<int> valid, oldest;    // per block: the ring state, in slots
+  int windows = 0;                   // the most a carry can hold
+  int cap_windows = 0;               // the ring the slots are indices of
+  int next_chunk = -1;               // -1 while a request is rewriting it
+  int height = 0, width = 0;
+  std::uint64_t seed = 0;
+  Params params;
+};
+
 namespace {
 
 // Every tensor of a block that is READ at run time, against the field it
@@ -285,6 +306,29 @@ MetalFlashVsrTransformer::kv_ring_bytes(const Config& cfg, int height,
   const std::uint64_t window = 2 * th * tw;
   return window * (std::uint64_t)windows * (std::uint64_t)cfg.hidden *
          2u /* bf16 */ * 2u /* K and V */;
+}
+
+std::uint64_t
+MetalFlashVsrTransformer::stream_window_bytes(const Config& cfg, int height,
+                                              int width, const Params& prm)
+{
+  // After a request the ring holds at most its capacity less one window:
+  // the trim drops one per chunk, so it is the kv_ratio retained once
+  // that fills, and two after an opening chunk under a ratio below that.
+  return (std::uint64_t)cfg.n_layers *
+         kv_ring_bytes(cfg, height, width, kv_windows(prm.kv_ratio) - 1);
+}
+
+int
+MetalFlashVsrTransformer::window_next_chunk() const noexcept
+{
+  return _carry ? _carry->next_chunk : -1;
+}
+
+void
+MetalFlashVsrTransformer::drop_window() noexcept
+{
+  _carry.reset();
 }
 
 bool
@@ -2373,6 +2417,100 @@ MetalFlashVsrTransformer::trim_cache_(Stream& st, int bi, const Params& prm)
   --cache.valid;
 }
 
+// THE SLOTS ARE KEPT, not just the windows. The attention reads a ring
+// as a prefix of slots, so a window restored into another slot would put
+// the keys in another order and the float accumulation would reassociate
+// -- a continuation that is close to one long request rather than equal
+// to it. Each window goes back to exactly the slot it left.
+bool
+MetalFlashVsrTransformer::carry_window_(Stream& st, int cache_idx, int bi,
+                                        bool into_ring, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  if (!_carry || cache_idx < 0 || cache_idx >= (int)st.per_block.size() ||
+      bi < 0 || bi >= _cfg.n_layers) {
+    return fail("no key/value window to carry");
+  }
+  WindowCarry& cr = *_carry;
+  Stream::Cache& cache = st.per_block[(std::size_t)cache_idx];
+  if (st.cap_windows != cr.cap_windows) {
+    return fail("the carried window is from a ring of another capacity");
+  }
+  const int NH = _cfg.n_heads, HD = _cfg.head_dim;
+  const std::size_t win_tok = (std::size_t)st.one_len * 128;
+  const std::size_t cap_tok = (std::size_t)st.cap_blocks * 128;
+  const std::size_t keep_tok = (std::size_t)cr.windows * win_tok;
+  if ((int)cr.k.size() != _cfg.n_layers) {
+    cr.k.clear();
+    cr.v.clear();
+    cr.k.resize((std::size_t)_cfg.n_layers);
+    cr.v.resize((std::size_t)_cfg.n_layers);
+    cr.valid.assign((std::size_t)_cfg.n_layers, 0);
+    cr.oldest.assign((std::size_t)_cfg.n_layers, 0);
+  }
+  SharedBuffer& ck = cr.k[(std::size_t)bi];
+  SharedBuffer& cv = cr.v[(std::size_t)bi];
+  if (into_ring) {
+    if (ck.empty() || cv.empty()) {
+      return fail("block's carried window is missing");
+    }
+    cache.valid = cr.valid[(std::size_t)bi];
+    cache.oldest = cr.oldest[(std::size_t)bi];
+  } else {
+    if (cache.valid > cr.windows) {
+      return fail("the ring holds more windows than a carry keeps");
+    }
+    if (ck.empty() || cv.empty()) {
+      ck = _mc->make_shared_buffer((std::size_t)NH * keep_tok * HD * 2);
+      cv = _mc->make_shared_buffer((std::size_t)NH * keep_tok * HD * 2);
+      if (ck.empty() || cv.empty()) {
+        return fail("key/value carry allocation failed");
+      }
+    }
+  }
+  if (cache.valid > 0) {
+    CommandStream stream = _mc->make_command_stream();
+    {
+      ComputeEncoder enc = stream.begin_compute();
+      const std::size_t n = win_tok * HD;
+      for (int i = 0; i < cache.valid; ++i) {
+        const int slot = (cache.oldest + i) % st.cap_windows;
+        for (int hh = 0; hh < NH; ++hh) {
+          const std::size_t ring_off =
+              ((std::size_t)hh * cap_tok + (std::size_t)slot * win_tok) * HD;
+          const std::size_t carry_off =
+              ((std::size_t)hh * keep_tok + (std::size_t)i * win_tok) * HD;
+          for (int kv = 0; kv < 2; ++kv) {
+            const SharedBuffer& ring = kv == 0 ? cache.k : cache.v;
+            const SharedBuffer& held = kv == 0 ? ck : cv;
+            enc.set_function(_fn_copy);
+            enc.set_buffer(0, into_ring ? held : ring,
+                           (into_ring ? carry_off : ring_off) * 2);
+            enc.set_buffer(1, into_ring ? ring : held,
+                           (into_ring ? ring_off : carry_off) * 2);
+            enc.set_constant(2, 0);
+            enc.set_constant(3, (int)n);
+            enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+          }
+        }
+      }
+    }
+    std::string ge;
+    if (!stream.commit().wait_ok(&ge)) {
+      return fail(ge.empty() ? std::string("key/value carry copy failed")
+                             : ge);
+    }
+  }
+  if (!into_ring) {
+    cr.valid[(std::size_t)bi] = cache.valid;
+    cr.oldest[(std::size_t)bi] = cache.oldest;
+  }
+  return true;
+}
+
 // Copy a contiguous [heads, seq, head_dim] block into a cache slab of a
 // different stride, at token offset `held`.
 void
@@ -2695,32 +2833,84 @@ MetalFlashVsrTransformer::generate(const Request& req,
     return fail(fmt("output {}x{} must be a multiple of {}", req.width,
                     req.height, kSizeGrid)());
   }
-  if (align_frames(req.frames) != req.frames) {
+  const bool cont = req.chunk0 > 0;
+  if (req.chunk0 < 0) { return fail("a stream's chunks count from 0"); }
+  if (cont && req.chunks <= 0) {
+    return fail("a continuing request names its chunks; it has no opening "
+                "chunk for a frame count to describe");
+  }
+  if (req.chunks <= 0 && align_frames(req.frames) != req.frames) {
     return fail("frame count must be 8k+1");
   }
   if (!ensure_kernels_(err)) { return false; }
 
-  const int C = _cfg.out_channels, D = _cfg.hidden;
+  const int C = _cfg.out_channels;
   const int h8 = req.height / 8, w8 = req.width / 8;
   const int th = h8 / 2, tw = w8 / 2;
-  const int chunks = (req.frames - 1) / 8 - 2;
+  const int chunks =
+      req.chunks > 0 ? req.chunks : (req.frames - 1) / 8 - 2;
   if (chunks <= 0) {
     return fail(fmt("a clip of {} frames is all warmup; {} are needed before "
                     "anything is restored", req.frames, 8 * 3 + 1)());
   }
-  const int T = latent_frames(req.frames);
+  // The latent frames this request holds, and where the first of them
+  // sits in the STREAM: the opening chunk is six of them, every later
+  // chunk two, so a continuation starting at chunk c begins at 4 + 2c.
+  const int T = cont ? 2 * chunks : 2 * chunks + 4;
+  const int g0 = cont ? 4 + 2 * req.chunk0 : 0;
+  // The clip-shaped frame count the memory rules are written in.
+  const int frames_eq = 8 * chunks + 17;
   const std::size_t plane = (std::size_t)h8 * w8;
+
+  // A CONTINUATION takes what the stream opened with; anything else is a
+  // different stream, which this request cannot be the rest of.
+  std::uint64_t seed = req.seed;
+  if (cont) {
+    const WindowCarry* cr = _carry.get();
+    if (cr == nullptr || cr->next_chunk != req.chunk0) {
+      return fail(fmt("continues the stream at chunk {}, but {}", req.chunk0,
+                      cr == nullptr || cr->next_chunk < 0
+                          ? std::string("no stream window is held -- the "
+                                        "request before it did not keep one, "
+                                        "or the model was released between "
+                                        "them")
+                          : fmt("the held window continues at chunk {}",
+                                cr->next_chunk)())());
+    }
+    if (cr->height != req.height || cr->width != req.width ||
+        cr->params.kv_ratio != req.params.kv_ratio ||
+        cr->params.sparse_ratio != req.params.sparse_ratio ||
+        cr->params.local_range != req.params.local_range) {
+      return fail("a continuation must keep the stream's geometry and "
+                  "params");
+    }
+    seed = cr->seed;
+  } else {
+    // A new stream: whatever an earlier one left is not its history.
+    _carry.reset();
+  }
 
   // THE NOISE IS AN INPUT when the caller supplies one. Two runtimes
   // cannot agree on a pseudo-random field, so a comparison against the
   // reference has to hold it fixed; a real run draws its own.
+  //
+  // Drawn PER LATENT FRAME OF THE STREAM, so a frame's noise does not
+  // depend on how the stream was cut into requests: one request over
+  // the whole source and the same source in pieces denoise the same
+  // field.
   std::vector<float> noise((std::size_t)C * T * plane, 0.0f);
   if (req.init_noise != nullptr) {
     std::memcpy(noise.data(), req.init_noise, noise.size() * sizeof(float));
   } else {
-    std::mt19937_64 rng(req.seed);
     std::normal_distribution<float> nd(0.0f, 1.0f);
-    for (auto& v : noise) { v = nd(rng); }
+    for (int t = 0; t < T; ++t) {
+      std::mt19937_64 rng(seed ^ (0x9e3779b97f4a7c15ull *
+                                  (std::uint64_t)(g0 + t + 1)));
+      for (int c = 0; c < C; ++c) {
+        float* d = noise.data() + ((std::size_t)c * T + t) * plane;
+        for (std::size_t i = 0; i < plane; ++i) { d[i] = nd(rng); }
+      }
+    }
   }
 
   latent->assign((std::size_t)C * T * plane, 0.0f);
@@ -2733,27 +2923,96 @@ MetalFlashVsrTransformer::generate(const Request& req,
   // source frames, as the conditioner emitted them. Slicing them is all
   // that is left here -- see the class comment for why the projection
   // moved out.
-  const std::size_t tok_per_frame = (std::size_t)th * tw;
   const int want_rf = T;
   if (req.row_frames < want_rf) {
     return fail(fmt("source rows cover {} frames; this clip needs {}",
                     req.row_frames, want_rf)());
   }
 
+  // A stream's ring is always the ratio's full capacity, because the
+  // slots a carried window goes back into are indices of it -- a one-
+  // chunk opening would otherwise size a ring of three, and the request
+  // after it would have nowhere consistent to put them.
+  const bool stream = cont || req.keep_window;
+  const int cap_windows = stream ? kv_windows(req.params.kv_ratio)
+                                 : ring_windows(req.frames,
+                                                req.params.kv_ratio);
+  if (req.keep_window && !_carry) {
+    _carry = std::make_unique<WindowCarry>();
+    _carry->windows = kv_windows(req.params.kv_ratio) - 1;
+    _carry->cap_windows = cap_windows;
+    _carry->height = req.height;
+    _carry->width = req.width;
+    _carry->seed = seed;
+    _carry->params = req.params;
+  }
+  // Until this request succeeds the carry is half rewritten, and nothing
+  // may continue from it.
+  if (_carry) { _carry->next_chunk = -1; }
+
   if (_streaming) { _streaming->slots.begin_forward(); }
-  const bool outer = blocks_outer(_cfg, req.height, req.width, req.frames,
+  const bool outer = blocks_outer(_cfg, req.height, req.width, frames_eq,
                                   req.params);
-  if (!begin_clip_(st, th, tw, 6, ring_windows(req.frames,
-                                               req.params.kv_ratio),
+  if (!begin_clip_(st, th, tw, cont ? 2 : 6, cap_windows,
                    outer ? 1 : _cfg.n_layers, req.params, err)) {
     return false;
   }
-  if (outer) { return generate_blocks_outer_(req, noise, st, latent, err); }
+  // Chunk `ci` of this request: its size, its RoPE offset in the stream,
+  // and where its latent frames start in this request's own tensors.
+  auto chunk_f = [&](int ci) { return req.chunk0 + ci == 0 ? 6 : 2; };
+  auto chunk_t = [&](int ci) {
+    const int c = req.chunk0 + ci;
+    return c == 0 ? 0 : 4 + 2 * c;
+  };
+  bool ok = false;
+  if (outer) {
+    ok = generate_blocks_outer_(req, noise, st, chunks, T, g0, chunk_f,
+                                chunk_t, latent, err);
+  } else {
+    ok = generate_chunks_outer_(req, noise, st, chunks, T, g0, chunk_f,
+                                chunk_t, latent, err);
+  }
+  if (!ok) {
+    _carry.reset();
+    return false;
+  }
+  if (req.keep_window) {
+    _carry->next_chunk = req.chunk0 + chunks;
+  } else {
+    _carry.reset();
+  }
+  return true;
+}
 
+// THE CHUNK-OUTER ORDER: every block of a chunk, then the next chunk.
+bool
+MetalFlashVsrTransformer::generate_chunks_outer_(
+    const Request& req, const std::vector<float>& noise, Stream& st,
+    int chunks, int T, int g0, const std::function<int(int)>& chunk_f,
+    const std::function<int(int)>& chunk_t, std::vector<float>* latent,
+    std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  const int C = _cfg.out_channels, D = _cfg.hidden;
+  const int h8 = req.height / 8, w8 = req.width / 8;
+  const int th = h8 / 2, tw = w8 / 2;
+  const std::size_t plane = (std::size_t)h8 * w8;
+  const std::size_t tok_per_frame = (std::size_t)th * tw;
+
+  if (req.chunk0 > 0) {
+    for (int bi = 0; bi < _cfg.n_layers; ++bi) {
+      if (!carry_window_(st, bi, bi, /*into_ring=*/true, err)) {
+        return false;
+      }
+    }
+  }
   for (int ci = 0; ci < chunks; ++ci) {
-    const int f = (ci == 0) ? 6 : 2;
-    const int t_off = (ci == 0) ? 0 : (4 + ci * 2);
-    const int t_first = t_off;
+    const int f = chunk_f(ci);
+    const int t_off = chunk_t(ci);
+    const int t_first = t_off - g0;
     const int seq = f * th * tw;
 
     // The chunk's own slice of the rows. Row frame index IS the latent
@@ -2785,8 +3044,8 @@ MetalFlashVsrTransformer::generate(const Request& req,
     }
 
     SharedBuffer pred;
-    if (!forward_chunk_(st, f, th, tw, t_off, ci, x, &lq_all, req.params,
-                        &pred, req, 0, nullptr, err)) {
+    if (!forward_chunk_(st, f, th, tw, t_off, req.chunk0 + ci, x, &lq_all,
+                        req.params, &pred, req, 0, nullptr, err)) {
       return false;
     }
 
@@ -2819,6 +3078,13 @@ MetalFlashVsrTransformer::generate(const Request& req,
       return fail("aborted");
     }
   }
+  if (req.keep_window) {
+    for (int bi = 0; bi < _cfg.n_layers; ++bi) {
+      if (!carry_window_(st, bi, bi, /*into_ring=*/false, err)) {
+        return false;
+      }
+    }
+  }
   return true;
 }
 
@@ -2838,7 +3104,9 @@ MetalFlashVsrTransformer::generate(const Request& req,
 bool
 MetalFlashVsrTransformer::generate_blocks_outer_(
     const Request& req, const std::vector<float>& noise, Stream& st,
-    std::vector<float>* latent, std::string* err)
+    int chunks, int T, int g0, const std::function<int(int)>& chunk_f,
+    const std::function<int(int)>& chunk_t, std::vector<float>* latent,
+    std::string* err)
 {
   auto fail = [&](std::string m) {
     if (err != nullptr) { *err = std::move(m); }
@@ -2847,18 +3115,14 @@ MetalFlashVsrTransformer::generate_blocks_outer_(
   const int C = _cfg.out_channels, D = _cfg.hidden;
   const int h8 = req.height / 8, w8 = req.width / 8;
   const int th = h8 / 2, tw = w8 / 2;
-  const int chunks = (req.frames - 1) / 8 - 2;
-  const int T = latent_frames(req.frames);
   const std::size_t plane = (std::size_t)h8 * w8;
   const std::size_t tok_per_frame = (std::size_t)th * tw;
-  auto chunk_f = [](int ci) { return ci == 0 ? 6 : 2; };
-  auto chunk_t = [](int ci) { return ci == 0 ? 0 : 4 + ci * 2; };
 
   // Every chunk's noise, patchified into the residual stream it starts
   // from. They are all live from here to the head.
   std::vector<SharedBuffer> xs((std::size_t)chunks);
   for (int ci = 0; ci < chunks; ++ci) {
-    const int f = chunk_f(ci), t_first = chunk_t(ci);
+    const int f = chunk_f(ci), t_first = chunk_t(ci) - g0;
     std::vector<float> slice((std::size_t)C * f * plane, 0.0f);
     for (int c = 0; c < C; ++c) {
       for (int t = 0; t < f; ++t) {
@@ -2879,9 +3143,14 @@ MetalFlashVsrTransformer::generate_blocks_outer_(
   // clip -- and its sub-unit a chunk.
   for (int bi = 0; bi < _cfg.n_layers; ++bi) {
     // A fresh window for this block: the previous block's is finished.
+    // A CONTINUATION starts it from what this block left at the end of
+    // the request before.
     Stream::Cache& cache = st.per_block[0];
     cache.valid = 0;
     cache.oldest = 0;
+    if (req.chunk0 > 0 && !carry_window_(st, 0, bi, true, err)) {
+      return false;
+    }
     // Streaming, the block is read ONCE for the whole clip, and the next
     // one -- block 0 again after the last, for the next clip -- under
     // all of this block's chunks.
@@ -2890,7 +3159,7 @@ MetalFlashVsrTransformer::generate_blocks_outer_(
       return false;
     }
     for (int ci = 0; ci < chunks; ++ci) {
-      const int f = chunk_f(ci), t_first = chunk_t(ci);
+      const int f = chunk_f(ci), t_first = chunk_t(ci) - g0;
       const std::size_t seq = (std::size_t)f * tok_per_frame;
       // The int8 split's width for shapes recorded since; no encoder is
       // open here.
@@ -2906,7 +3175,7 @@ MetalFlashVsrTransformer::generate_blocks_outer_(
                         (std::size_t)t_first * tok_per_frame * D * 2,
                     seq * D * 2);
       }
-      if (!block_(st, bi, wb, 0, f, t_first, ci, xs[(std::size_t)ci],
+      if (!block_(st, bi, wb, 0, f, chunk_t(ci), ci, xs[(std::size_t)ci],
                   bi == 0 ? &lq : nullptr, req.params, err)) {
         if (_streaming) { _streaming->slots.join(); }
         return false;
@@ -2914,6 +3183,9 @@ MetalFlashVsrTransformer::generate_blocks_outer_(
       if (req.block_progress && !req.block_progress(ci + 1, chunks)) {
         return fail("aborted");
       }
+    }
+    if (req.keep_window && !carry_window_(st, 0, bi, false, err)) {
+      return false;
     }
     if (req.progress && !req.progress(bi + 1, _cfg.n_layers)) {
       return fail("aborted");
@@ -2926,7 +3198,7 @@ MetalFlashVsrTransformer::generate_blocks_outer_(
   st.rope.clear();
 
   for (int ci = 0; ci < chunks; ++ci) {
-    const int f = chunk_f(ci), t_first = chunk_t(ci);
+    const int f = chunk_f(ci), t_first = chunk_t(ci) - g0;
     const int seq = f * th * tw;
     SharedBuffer pred;
     if (!head_(st, xs[(std::size_t)ci], seq, &pred, err)) { return false; }
@@ -3183,6 +3455,12 @@ MetalFlashVsrTransformer::resident_bytes() const noexcept
     n += (std::uint64_t)_streaming->slots.last_bytes() *
          (_streaming->slots.paired() ? 2u : 1u);
     n += _streaming->scratch.size();
+  }
+  // An open stream's windows, which outlive every request they span and
+  // are, at full HD, three times the weights.
+  if (_carry) {
+    for (const auto& b : _carry->k) { add(b); }
+    for (const auto& b : _carry->v) { add(b); }
   }
   return n;
 }

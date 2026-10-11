@@ -22,6 +22,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
+#include "common/perf-flops.h"
 #include "common/session.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
@@ -1894,4 +1895,142 @@ TEST(z_image_dit, a_quantized_checkpoint_runs_and_tracks_the_dense_one)
     EXPECT_TRUE(rel > 1e-4);
   }
   fs::remove_all(root, ec);
+}
+
+// ---- perf-flops ----------------------------------------------------
+//
+// The forward's arithmetic, as the FLOP/s meter is credited with it
+// (common/perf-flops.h, shared/dit-flops.h):
+//
+//   * EXACT against a count derived here from the structure -- the
+//     caption refiner at its padded caption rows, the noise refiner at
+//     the padded image rows, the main stack over the joint sequence,
+//     each modulated block's adaLN, the embedders and the final layer;
+//   * credited whole, from the completion handlers, once the buffers
+//     retire;
+//   * with the feed-forward's rows split onto the ANE, the rows the GPU
+//     gave up are exactly what the ANE was credited.
+//
+// Two main blocks (the refiners are always whole) at a 48x44 patch
+// grid: 2112 image rows, past the ANE tier's 2048-row chunk, which it
+// declines below. Env: VPIPE_Z_IMAGE_TEST_MODEL_PATH.
+TEST(z_image_dit, forward_credits_its_flops)
+{
+  namespace pf = vpipe::perf_flops;
+  const char* r = std::getenv("VPIPE_Z_IMAGE_TEST_MODEL_PATH");
+  if (r == nullptr || *r == '\0') { return; }
+  const std::string dir =
+      (std::filesystem::path(r) / "transformer").string();
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalZImageTransformer::Config cfg;
+  ZI_REQUIRE(MetalZImageTransformer::Config::read_dims(dir, &cfg));
+  cfg.n_layers = 2;
+
+  zimage::Layout lay;
+  std::string lerr;
+  ZI_REQUIRE(zimage::build_layout(48, 44, 40, &lay, &lerr));
+  auto rnd = [&](std::size_t n, unsigned seed) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    if (b.empty()) { return b; }
+    auto* d = static_cast<std::uint16_t*>(b.contents());
+    unsigned st = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+      st = st * 1664525u + 1013904223u;
+      const float v = ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.5f;
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      d[i] = (std::uint16_t)(u >> 16);
+    }
+    return b;
+  };
+  metal_compute::SharedBuffer lat =
+      rnd((std::size_t)lay.img_tokens * cfg.patch_dim(), 11u);
+  metal_compute::SharedBuffer cap =
+      rnd((std::size_t)lay.cap_len * cfg.cap_dim, 12u);
+  ZI_REQUIRE(!lat.empty() && !cap.empty());
+
+  // The count, from the structure.
+  const long long H = cfg.hidden, FF = cfg.ffn_inner;
+  auto block = [&](long long rows) {
+    return 4 * gemm_flops(rows, H, H) + 2 * gemm_flops(rows, FF, H) +
+           gemm_flops(rows, H, FF) +
+           attention_flops(cfg.n_heads, rows * rows, cfg.head_dim);
+  };
+  const std::uint64_t mod = gemm_flops(1, 4 * H, cfg.adaln_dim);
+  const std::uint64_t want =
+      gemm_flops(1, cfg.time_mid, cfg.time_freq) +
+      gemm_flops(1, cfg.adaln_dim, cfg.time_mid) +
+      gemm_flops(lay.img_tokens, H, cfg.patch_dim()) +
+      gemm_flops(lay.cap_len, H, cfg.cap_dim) +
+      (std::uint64_t)cfg.n_refiner * block(lay.cap_total) +
+      (std::uint64_t)cfg.n_refiner * (mod + block(lay.img_total)) +
+      (std::uint64_t)cfg.n_layers * (mod + block(lay.joint_len)) +
+      gemm_flops(1, H, cfg.adaln_dim) +
+      gemm_flops(lay.img_tokens, cfg.patch_dim(), H);
+
+  struct Run { std::uint64_t flushed, gpu, ane; double ms; bool ane_on; };
+  auto run = [&](bool ane) -> Run {
+    Run o{0, 0, 0, 0.0, false};
+    MetalZImageTransformer::Config c = cfg;
+    c.ane_ffn  = ane;
+    c.ane_rows = ane ? 1 : 0;       // pinned: the whole first chunk
+    auto m = MetalZImageTransformer::load(dir, mc, c, false);
+    if (m == nullptr) { return o; }
+    MetalZImageTransformer::Request req;
+    req.latents = &lat;
+    req.cap = &cap;
+    req.layout = &lay;
+    req.timestep = 0.75f;
+    const pf::Totals g0 = pf::totals(pf::kGpu);
+    const pf::Totals a0 = pf::totals(pf::kAne);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string ferr;
+    metal_compute::SharedBuffer out = m->forward(req, &ferr);
+    o.ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (out.empty()) {
+      std::printf("  forward failed: %s\n", ferr.c_str());
+      return o;
+    }
+    o.flushed = m->gpu_flops().flushed();
+    // The last buffer's handler may run after the wait that saw it.
+    for (int i = 0; i < 400 && pf::totals(pf::kGpu).flops - g0.flops <
+                                   o.flushed; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    o.gpu = pf::totals(pf::kGpu).flops - g0.flops;
+    o.ane = pf::totals(pf::kAne).flops - a0.flops;
+    o.ane_on = m->ane_armed() && !m->ane_gpu_only();
+    return o;
+  };
+
+  const Run a = run(false);
+  ZI_REQUIRE(a.flushed > 0);
+  std::printf("[z_image_dit] joint %d rows, %d blocks: counted %.4f TFLOP, "
+              "derived %.4f, credited %.4f; %.0f ms -> %.2f TFLOP/s\n",
+              lay.joint_len, cfg.n_blocks(), a.flushed / 1e12, want / 1e12,
+              a.gpu / 1e12, a.ms, a.gpu / 1e12 / (a.ms / 1000.0));
+  EXPECT_TRUE(a.flushed == want);
+  EXPECT_TRUE(a.gpu == a.flushed);
+  EXPECT_TRUE(a.ane == 0);
+
+  const Run b = run(true);
+  if (!b.ane_on || b.ane == 0) {
+    std::printf("[z_image_dit] no ANE split on this box; the conservation "
+                "half is skipped\n");
+    return;
+  }
+  // Whole chunks of the SwiGLU's 6*H*FF a row moved. A headroom retry is
+  // ANE work the GPU never does, so the ANE may exceed what moved -- by
+  // whole chunks too -- and never fall short.
+  const std::uint64_t chunk = gemm_flops(2048, 3 * FF, H);
+  const std::uint64_t moved = a.gpu - b.gpu;
+  std::printf("[z_image_dit] ANE split: GPU %.4f + ANE %.4f TFLOP (moved "
+              "%.4f, %llu chunks)\n", b.gpu / 1e12, b.ane / 1e12,
+              moved / 1e12, (unsigned long long)(moved / chunk));
+  EXPECT_TRUE(b.gpu == b.flushed);
+  EXPECT_TRUE(moved > 0 && moved % chunk == 0);
+  EXPECT_TRUE(b.ane >= moved && (b.ane - moved) % chunk == 0);
 }

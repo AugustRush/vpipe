@@ -15,6 +15,10 @@
 #include "stages/load-image-stage.h"
 #include "stages/model-provenance.h"
 #include "stages/save-image-stage.h"
+#ifdef VPIPE_BUILD_APPLE_SILICON
+#include "apple-silicon/media/color-tags.h"
+#include "apple-silicon/media/image-io.h"
+#endif
 
 #include <cctype>
 #include <cstdint>
@@ -778,3 +782,98 @@ TEST(save_image_stage, a_format_without_alpha_composites_over_white) {
   EXPECT_TRUE(bytes[plane] > 240);
   EXPECT_TRUE(bytes[2 * plane] > 240);
 }
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// Where FFmpeg cannot be loaded -- VPIPE_NO_FFMPEG=1, as on a Mac with
+// none -- ImageIO writes the picture: PNG, BMP and TIFF as they are, a
+// JPEG of a transparent picture composited over white. WebP alone is
+// refused, at construction, by name. (An application that ships no
+// FFmpeg had every picture's graph refused: the stage would not build.)
+TEST(save_image_stage, without_ffmpeg_imageio_writes_the_picture) {
+  struct NoFfmpeg {
+    NoFfmpeg()  { setenv("VPIPE_NO_FFMPEG", "1", 1); }
+    ~NoFfmpeg() { unsetenv("VPIPE_NO_FFMPEG"); }
+  } no_ffmpeg;
+  Session sess;
+  CerrSilencer hush;
+  auto read_back = [](const string& path) {
+    apple_media::ColorTags tags;
+    string err;
+    return apple_media::read_still(path, TensorBeat::DType::U8, false,
+                                   &tags, &err);
+  };
+  auto near = [](int a, int b) { return a - b <= 1 && b - a <= 1; };
+
+  const uint8_t R = 0x12, G = 0xAB, B = 0xF0;
+  for (const char* ext : {".png", ".bmp", ".tiff"}) {
+    const string path = tmp_path_(string("-noff") + ext);
+    remove(path.c_str());
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("path", FlexData::make_string(path));
+    {
+      SaveImageStage probe(&sess, "probe", vector<InEdge>{},
+                           FlexData::from_json(
+                               "{\"path\":\"" + path + "\"}"));
+      EXPECT_TRUE(probe.config_error().empty());
+    }
+    SolidSource* src = nullptr;
+    run_store_(sess, src, std::move(cfg), 1, R, G, B);
+    auto pic = read_back(path);
+    remove(path.c_str());
+    std::printf("[no-ffmpeg] %s: %s\n", ext, pic ? "read back" : "MISSING");
+    EXPECT_TRUE(pic != nullptr);
+    if (!pic) { continue; }
+    EXPECT_TRUE(pic->shape.size() == 3 && pic->shape[1] == 3 &&
+                pic->shape[2] == 4);
+    const auto bytes = pic->materialize_contiguous();
+    const size_t plane = 3 * 4;
+    if (bytes.size() < 3 * plane) { EXPECT_TRUE(false); continue; }
+    EXPECT_TRUE(near(bytes[0], R));
+    EXPECT_TRUE(near(bytes[plane], G));
+    EXPECT_TRUE(near(bytes[2 * plane], B));
+  }
+
+  // A transparent black picture as a JPEG: white, not black.
+  {
+    const string path = tmp_path_("-noff.jpg");
+    remove(path.c_str());
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("path", FlexData::make_string(path));
+    cfg.as_object().insert("quality", FlexData::make_int(100));
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto src_u = make_unique<SolidSource>(
+        &sess, "src", vector<InEdge>{}, FlexData::make_object());
+    src_u->r = 0; src_u->g = 0; src_u->b = 0; src_u->a = 0;
+    auto* src = static_cast<SolidSource*>(pl->insert_stage(std::move(src_u)));
+    pl->insert_stage(make_unique<SaveImageStage>(
+        &sess, "store", vector<InEdge>{{src, 0}}, std::move(cfg)));
+    {
+      PipelineRuntime rt(pl.get(), &sess);
+      EXPECT_TRUE(rt.launch());
+      rt.wait_idle();
+      rt.stop();
+    }
+    const string sig = head_bytes_(path, 2);
+    EXPECT_TRUE(sig.size() == 2 && (uint8_t)sig[0] == 0xFF &&
+                (uint8_t)sig[1] == 0xD8);
+    auto pic = read_back(path);
+    remove(path.c_str());
+    EXPECT_TRUE(pic != nullptr);
+    if (pic) {
+      const auto bytes = pic->materialize_contiguous();
+      const size_t plane = (size_t)pic->shape[1] * pic->shape[2];
+      std::printf("[no-ffmpeg] .jpg over white: %d %d %d\n",
+                  bytes.size() >= 3 * plane ? bytes[0] : -1,
+                  bytes.size() >= 3 * plane ? bytes[plane] : -1,
+                  bytes.size() >= 3 * plane ? bytes[2 * plane] : -1);
+      EXPECT_TRUE(bytes.size() >= 3 * plane && bytes[0] > 240 &&
+                  bytes[plane] > 240 && bytes[2 * plane] > 240);
+    }
+  }
+
+  // WebP: only FFmpeg writes it -- refused by name.
+  SaveImageStage webp(&sess, "webp", vector<InEdge>{},
+                      FlexData::from_json(R"({"path":"/tmp/x.webp"})"));
+  EXPECT_TRUE(webp.config_error().find("FFmpeg") != string::npos);
+}
+#endif

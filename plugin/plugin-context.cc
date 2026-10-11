@@ -68,6 +68,7 @@ host_features() noexcept
     VPIPE_FEATURE_KERNEL_CONTRACT_2,
     VPIPE_FEATURE_CONTENT_SCREEN,
     VPIPE_FEATURE_VIDEO_TURN,
+    VPIPE_FEATURE_PERF_FLOPS,
   };
   return kFeatures;
 }

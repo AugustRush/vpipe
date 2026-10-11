@@ -315,58 +315,6 @@ const StageSpec kSpec = {
   .attrs     = kAttrs,
 };
 
-#ifdef VPIPE_BUILD_APPLE_SILICON
-// VAE family from the vae config.json `_class_name` ("AutoencoderKLFlux2" ->
-// "flux2"; else "krea2"). A registered family is asked before this.
-std::string
-vae_family_(const std::string& vae_dir)
-{
-  namespace fs = std::filesystem;
-  // The same probe the vae-decode twin runs, and for the same reason: a
-  // Comfy-Org repack ships its VAEs as bare .safetensors under `vae/`
-  // with no config.json at all, so the `_class_name` read below finds
-  // nothing and falls through to the "krea2" default -- which then opens
-  // that directory as a Qwen-Image VAE and reports "no readable
-  // checkpoint". The architecture is in the file's `__metadata__` key
-  // instead, and probing for it costs one header read.
-  //
-  // Missing HERE and not there is what a self-contained MiniMax-H3 pack
-  // hits the moment a graph encodes anything: decode resolved, encode
-  // did not, so FL2VA -- whose whole input is two encoded keyframes --
-  // went inert on a checkpoint whose decoder had just loaded from the
-  // same directory.
-  if (!genai::comfy::resolve_component(vae_dir, "vae", "minimax_h3_video_vae",
-                                       {"video_vae"}).empty()) {
-    return "minimax-h3";
-  }
-  std::ifstream in(fs::path(vae_dir) / "config.json");
-  if (in) {
-    FlexData fd = FlexData::from_json(in);
-    if (fd.is_object()) {
-      auto obj = fd.as_object();
-      if (obj.contains("_class_name")) {
-        const std::string cls(obj.at("_class_name").as_string(""));
-        if (cls == "AutoencoderKLFlux2") { return "flux2"; }
-        // The PLAIN diffusers AutoencoderKL (the FLUX.1 VAE Boogu-Image uses)
-        // runs on the SAME code path -- MetalFlux2Vae is config-driven, and at
-        // patch 1 with a scalar shift/scale whitening it IS a plain
-        // AutoencoderKL. Same family string, so the branches below are shared.
-        if (cls == "AutoencoderKL") { return "flux2"; }
-        // See the note in vae-decode-stage.cc: the same implementation,
-        // generalized, so the same family string.
-        if (cls == "AutoencoderKLQwenImage21") { return "krea2"; }
-        // Krea-2's / Qwen-Image's, and the RGBA form -- named rather than
-        // left to the fall-through below (see vae-decode-stage.cc).
-        if (cls == "AutoencoderKLQwenImage") { return "krea2"; }
-        if (cls == "AutoencoderKLWan") { return "wan"; }
-        if (cls == "MiniMaxH3VideoVAE") { return "minimax-h3"; }
-      }
-    }
-  }
-  return "krea2";
-}
-
-#endif
 }  // namespace
 
 const StageSpec&
@@ -655,7 +603,18 @@ VaeEncodeStage::ensure_loaded_()
     return;
   }
 
-  _family = vae_family_(vae_dir);
+  std::string unknown_class;
+  _family = builtin_vae_family(vae_dir, &unknown_class);
+  if (_family.empty()) {
+    // Refused BY NAME. Read as the default it would have been opened as
+    // a Qwen-Image VAE and failed on whatever that model checks first.
+    session()->error(fmt(
+        "VaeEncodeStage('{}'): '{}' names the VAE class '{}', which nothing "
+        "built in reads ({}) and no registered family claims; the stage "
+        "is inert", this->id(), vae_dir, unknown_class,
+        builtin_vae_classes()));
+    return;
+  }
   // One shared, reference-counted view of this checkpoint. The peer VAE
   // stage in the same graph (encode beside decode) names the same
   // directory and gets the SAME set, so the two halves of the model are

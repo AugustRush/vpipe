@@ -2,6 +2,7 @@
 #include "stages/audio-vae-decode-stage.h"
 #include "common/beat-keys.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/weight-set.h"
 
 #include "apple-silicon/tensor-beat.h"
@@ -95,10 +96,13 @@ const StageSpec kSpec = {
 // Detect the family from the audio VAE's config.json `_class_name`.
 // Empty when the directory holds no audio VAE at all, which is the
 // common misconfiguration (an hf_dir pointing at a model that generates
-// no soundtrack) and deserves a different message than a bad one.
+// no soundtrack) and deserves a different message than a bad one -- and
+// empty with `*unknown_class` set when a config NAMES a class nothing
+// here decodes, which is a third thing again and is refused by name.
 std::string
-audio_vae_family_(const std::string& vae_dir)
+audio_vae_family_(const std::string& vae_dir, std::string* unknown_class)
 {
+  unknown_class->clear();
   // A Comfy-Org repack has no config.json anywhere: resolve_vae_dir hands
   // back the .safetensors itself and the architecture is named by that
   // file's `__metadata__` key. Checking it first is what keeps this stage
@@ -119,8 +123,15 @@ audio_vae_family_(const std::string& vae_dir)
   if (!fd.is_object()) { return {}; }
   auto obj = fd.as_object();
   if (!obj.contains("_class_name")) { return {}; }
-  const std::string cls(obj.at("_class_name").as_string(""));
-  if (cls == "MiniMaxH3AudioVAE") { return "minimax-h3"; }
+  const FlexData c = obj.at("_class_name");   // a VIEW: bind it
+  const std::string cls(c.as_string(""));
+  // Released, and the diffusers pipeline's copy of the same codec (the
+  // same tensors, the same names; minimax-h3-diffusers-layout.h).
+  if (cls == "MiniMaxH3AudioVAE" ||
+      cls == genai::minimax_h3::kDiffusersAudioVaeClass) {
+    return "minimax-h3";
+  }
+  *unknown_class = cls;
   return {};
 }
 #endif
@@ -402,7 +413,16 @@ AudioVaeDecodeStage::ensure_loaded_()
     return;                        // NOT the built-in chain below
   }
 
-  _family = audio_vae_family_(vae_dir);
+  std::string unknown_class;
+  _family = audio_vae_family_(vae_dir, &unknown_class);
+  if (_family.empty() && !unknown_class.empty()) {
+    session()->error(fmt(
+        "AudioVaeDecodeStage('{}'): '{}' names the audio VAE class '{}', "
+        "which nothing built in reads (MiniMaxH3AudioVAE, {}) and no "
+        "registered family claims; inert", this->id(), vae_dir,
+        unknown_class, genai::minimax_h3::kDiffusersAudioVaeClass));
+    return;
+  }
   if (_family.empty()) {
     session()->error(fmt(
         "AudioVaeDecodeStage('{}'): '{}' holds no audio VAE this stage "

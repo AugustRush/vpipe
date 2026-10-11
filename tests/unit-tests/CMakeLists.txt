@@ -193,6 +193,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         flashvsr-family.cc
         flashvsr-accel.cc
         flashvsr-kv.cc
+        flashvsr-stream.cc
+        perf-flops.cc
         torch-zip.cc
         wan-vae.cc
         tae-decoder.cc
@@ -204,6 +206,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-blocks.cc
         minimax-h3-lora.cc
         minimax-h3-comfy.cc
+        minimax-h3-diffusers-root.cc
+        minimax-h3-diffusers-vae.cc
         minimax-h3-layout.cc
         minimax-h3-taomate.cc
         vdn-geometry.cc
@@ -273,6 +277,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         temporal-slice-stage.cc
         vae-encode-range.cc
         vae-encode-plugin.cc
+        vae-flops.cc
         content-aware-continuation-stage.cc
         temporal-stack-stage.cc
         tensor-list-stage.cc

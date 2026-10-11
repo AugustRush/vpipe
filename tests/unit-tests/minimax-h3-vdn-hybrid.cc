@@ -18,6 +18,7 @@
 
 #include "minitest.h"
 
+#include "common/perf-flops.h"
 #include "common/session.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
@@ -31,6 +32,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace vpipe;
@@ -170,11 +172,30 @@ TEST(minimax_h3_vdn, the_hybrid_runs_and_changes_the_answer)
   step.timesteps = &uniq;
   step.row_timestep_index = &row_idx;
 
+  // perf-flops: each forward's count and what the meter was credited.
+  // The hybrid's window and its linear branch (MetalVdnBranch::
+  // set_flops) are counted into the transformer's own tally, so the
+  // branch's work must reach the meter through the same commits.
+  struct Count { std::uint64_t flushed = 0, gpu = 0, pending = 0; };
+  Count last;
   auto run = [&](const char* what, std::vector<std::uint16_t>* out) {
+    namespace pf = vpipe::perf_flops;
     std::string ferr;
+    const std::uint64_t f0 = m->gpu_flops().flushed();
+    const std::uint64_t g0 = pf::totals(pf::kGpu).flops;
     MetalMiniMaxH3Transformer::Velocity v = m->forward(step, &ferr);
     if (v.empty()) { std::printf("[h3_vdn] %s: %s\n", what, ferr.c_str()); }
     if (v.empty()) { return false; }
+    last.flushed = m->gpu_flops().flushed() - f0;
+    for (int i = 0; i < 400 && pf::totals(pf::kGpu).flops - g0 <
+                                   last.flushed; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    last.gpu = pf::totals(pf::kGpu).flops - g0;
+    last.pending = m->gpu_flops().pending();
+    std::printf("[h3_vdn] %-14s counted %.4f TFLOP, credited %.4f\n", what,
+                last.flushed / 1e12, last.gpu / 1e12);
+    EXPECT_TRUE(last.gpu == last.flushed && last.pending == 0);
     const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
     out->assign(p, p + v.video.byte_size() / 2);
     std::size_t bad = 0;
@@ -195,6 +216,7 @@ TEST(minimax_h3_vdn, the_hybrid_runs_and_changes_the_answer)
   // attached.
   std::vector<std::uint16_t> plain;
   if (!run("full attn", &plain)) { return; }
+  const Count c_plain = last;
 
   std::string aerr;
   if (!m->attach_linear_branch(vroot, &aerr)) {
@@ -210,6 +232,7 @@ TEST(minimax_h3_vdn, the_hybrid_runs_and_changes_the_answer)
   // what a checkpoint means.
   std::vector<std::uint16_t> attached;
   if (!run("attached/off", &attached)) { return; }
+  EXPECT_TRUE(last.flushed == c_plain.flushed);   // inert in FLOPs too
   const bool inert = attached.size() == plain.size()
                      && std::memcmp(attached.data(), plain.data(),
                                     plain.size() * 2) == 0;
@@ -223,6 +246,10 @@ TEST(minimax_h3_vdn, the_hybrid_runs_and_changes_the_answer)
   step.video_grid_w = gw;
   std::vector<std::uint16_t> hybrid;
   if (!run("hybrid", &hybrid)) { return; }
+  const Count c_hybrid = last;
+  // The window drops (video, video) pairs and the branch adds its own
+  // arithmetic: either way the count moves.
+  EXPECT_TRUE(c_hybrid.flushed != c_plain.flushed);
   EXPECT_TRUE(m->linear_solve_failures() == 0u);
   // Every block ran the linear half, which is the other half of the
   // full-cover test below: the count has to move with the geometry, and
@@ -250,6 +277,7 @@ TEST(minimax_h3_vdn, the_hybrid_runs_and_changes_the_answer)
   // here and nowhere else.
   std::vector<std::uint16_t> again;
   if (!run("hybrid again", &again)) { return; }
+  EXPECT_TRUE(last.flushed == c_hybrid.flushed);
   const bool same = again.size() == hybrid.size()
                     && std::memcmp(again.data(), hybrid.data(),
                                    hybrid.size() * 2) == 0;

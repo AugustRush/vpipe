@@ -219,6 +219,8 @@ namespace {
 //                              FP8 spelling -> the comfy_quant one
 //   minimax_h3::translate_diffusers
 //                              MiniMax-H3 in the diffusers naming -> H3's
+//   minimax_h3::translate_diffusers_vae
+//                              its video VAE likewise
 //
 // torchao first: the H3 layout test reads `.weight` names.
 void
@@ -228,6 +230,7 @@ translate_names_(std::optional<MetalLlamaWeights>& w, bool single_file)
   if (single_file) { (void)krea2::translate_native(*w); }
   (void)fp8::translate_torchao(*w);
   (void)minimax_h3::translate_diffusers(*w);
+  (void)minimax_h3::translate_diffusers_vae(*w);
 }
 
 }  // namespace

@@ -20,7 +20,10 @@ class BeatPayloadIntf;
 // Save-image sink: writes each planar U8 RGB TensorBeat [3, H, W]
 // (channel order R, G, B, 0..255 -- the format load-image / vae-decode
 // emit) to an image file via FFmpeg's still-image encoders. The inverse
-// of load-image.
+// of load-image. On Apple, ImageIO writes what FFmpeg would where FFmpeg
+// cannot be loaded -- every format but WebP -- so an application that
+// ships no FFmpeg still saves its pictures (VPIPE_NO_FFMPEG=1 makes a
+// process behave so).
 //
 //   iport0  TensorBeatPayload, U8 [3, H, W] planar RGB. Non-matching
 //           beats are warned + dropped. EOS ends the stage.
@@ -96,9 +99,13 @@ private:
   // The ImageIO path: a picture as deep as it is, its colour embedded.
   bool encode_apple_(const TensorBeat& pic,
                      std::vector<std::uint8_t>* bytes);
+  // Whether this stage can write its format here: with FFmpeg, or with
+  // ImageIO where FFmpeg cannot be loaded (Apple, every format but WebP).
+  bool can_write_() const noexcept;
   bool write_file_(const std::vector<std::uint8_t>& bytes,
                    const std::string& out_path);
 
+  // Null where FFmpeg cannot be loaded (ffmpeg_if_present_).
   const FFmpegLibraries* _libs = nullptr;
   // The filename index lives in the picker now (it was `_seen`), so the
   // numbering rule and the no-overwrite scan cannot drift apart.

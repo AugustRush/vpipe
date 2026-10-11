@@ -229,6 +229,7 @@ uti_for(std::string_view format)
   if (format == "exr") { return CFSTR("com.ilm.openexr-image"); }
   if (format == "jpeg" || format == "jpg") { return CFSTR("public.jpeg"); }
   if (format == "heic") { return CFSTR("public.heic"); }
+  if (format == "bmp") { return CFSTR("com.microsoft.bmp"); }
   return nullptr;
 }
 
@@ -437,6 +438,28 @@ encode_still(const TensorBeat& pic, const ColorTags& tags,
       }
       CGImageRelease(img);
       img = linear;
+    }
+    // A format without alpha (JPEG, HEIC) gets the picture COMPOSITED
+    // OVER WHITE, as every viewer shows a transparent one: left to the
+    // encoder, the colour under a transparent pixel -- black, from most
+    // models -- was what it wrote.
+    const bool opaque_format = opt.format == "jpeg" ||
+                               opt.format == "jpg" || opt.format == "heic";
+    if (img && alpha && opaque_format) {
+      CGContextRef ctx = CGBitmapContextCreate(
+          nullptr, W, H, 8, (std::size_t)W * 4, cs,
+          (uint32_t)kCGImageAlphaNoneSkipLast |
+              (uint32_t)kCGBitmapByteOrderDefault);
+      CGImageRef flat = nullptr;
+      if (ctx) {
+        CGContextSetRGBFillColor(ctx, 1, 1, 1, 1);
+        CGContextFillRect(ctx, CGRectMake(0, 0, W, H));
+        CGContextDrawImage(ctx, CGRectMake(0, 0, W, H), img);
+        flat = CGBitmapContextCreateImage(ctx);
+        CGContextRelease(ctx);
+      }
+      CGImageRelease(img);
+      img = flat;
     }
     CGColorSpaceRelease(cs);
     if (!img) {

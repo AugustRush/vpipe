@@ -10,6 +10,7 @@
 #include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/ane-ffn.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/shared/fp8-expand.h"
 #include "generative-models/shared/fp8-layout.h"
 #include "generative-models/shared/fp8.h"
@@ -318,6 +319,9 @@ class MetalKrea2Transformer {
   // the module can release the booking when it did not.
   bool ane_attempted() const noexcept { return _ane_tried; }
   bool ane_armed() const noexcept { return _ane != nullptr; }
+  // What the forwards have encoded for perf-flops, credited to the GPU
+  // as each block retires (generative-models/shared/dit-flops.h).
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
   // The qkv tier arms separately -- it has its own module and its own
   // eligibility -- so a caller revising what the plan booked has to ask
   // about both.
@@ -544,6 +548,10 @@ class MetalKrea2Transformer {
   // Sol-Attn's kernels and scratch. Null unless Config::sol.enabled and
   // the kernels validated; every use is guarded.
   std::unique_ptr<MetalSolAttention> _sol;
+  // perf-flops: GEMMs and attention counted as encoded, credited at
+  // retire; Sol's exact half at the keep ratio it realizes.
+  GpuFlopsTally _flops;
+  SolFlops _sol_flops;
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;

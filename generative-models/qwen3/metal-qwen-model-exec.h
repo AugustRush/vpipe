@@ -9,12 +9,14 @@
 // Each LoadedLanguageModel ContextId maps to one metal context.
 
 #include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/context-io.h"
 #include "generative-models/model-exec.h"
 #include "generative-models/speculative-decode.h"
 
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -25,7 +27,8 @@ namespace vpipe::metal_compute { class MetalCompute; }
 
 namespace vpipe::genai {
 
-class MetalQwenModelExec : public ModelExec, private SpecDecodeExt {
+class MetalQwenModelExec : public ModelExec, private SpecDecodeExt,
+                           private ContextIoExt {
 public:
   MetalQwenModelExec(const std::string&            model_dir,
                      metal_compute::MetalCompute*  mc,
@@ -151,10 +154,28 @@ private:
                       std::string* err) override;
   bool generate(const SpecDecodeRequest& rq, SpecDecodeResult* out) override;
 
+  // ---- ContextIoExt: a context written out and read back --------------
+  bool export_context(ContextId ctx,
+                      const ContextManager::ByteSink& out) override;
+  bool import_context(ContextId ctx,
+                      const ContextManager::ByteSource& in) override;
+
   struct CtxState { ContextId metal_cid; };
   CtxState* state_for_(ContextId ctx);
+  // The metal context behind `ctx`, or an invalid id: looked up under
+  // _ctx_mu, for a caller that only needs the id.
+  ContextId metal_cid_(ContextId ctx) const;
 
   std::unique_ptr<MetalQwenModel>             _model;
+  // _ctxmap is reached from more than the thread generating on this
+  // model: a context parked with a warm model is saved, read back and
+  // released on the model manager's threads (its reaper, a launch's
+  // planner, a host dropping a conversation) while another context of
+  // the same model decodes. Every access holds _ctx_mu. A CtxState is
+  // fixed once inserted and the map's nodes never move, so a pointer
+  // state_for_ hands out stays valid with the lock dropped; the
+  // ContextManager behind it locks its own state.
+  mutable std::mutex                          _ctx_mu;
   std::unordered_map<std::uint32_t, CtxState> _ctxmap;
   std::vector<float>                          _logits;
   // For attach_drafter: the drafter's weights go through the session's

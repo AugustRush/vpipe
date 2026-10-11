@@ -67,6 +67,44 @@ inline constexpr std::string_view kPtsUs = "pts_us";
 // Latent frames per second of an AUDIO latent. Real.
 inline constexpr std::string_view kLatentsPerSecond = "latents_per_second";
 
+// ---- one SOURCE over several beats ---------------------------------------
+//
+// A producer that restores a long source in pieces, carrying its state
+// across the cuts, says so on every beat of the stream, so a consumer
+// that keeps causal state of its own -- a video VAE's decode carries --
+// continues across the cut too rather than opening cold. Absent: the beat
+// stands alone, as every beat did before these existed.
+//
+// Bool: this beat continues the one before it on the same stream.
+inline constexpr std::string_view kStreamContinues = "stream_continues";
+// Int, on a group of frames (temporal-stack): how many of its leading
+// frames the group before already carried -- its overlap. A consumer
+// that stitches groups back into one source drops them.
+inline constexpr std::string_view kRepeated = "repeated";
+// Bool, on every beat of a stream: true on its last. A stage holding a
+// model or carries for the stream keeps them until then.
+inline constexpr std::string_view kStreamFinal = "stream_final";
+// Int: of the frames this beat decodes to, how many are real. The end of
+// a stream padded out to its producer's frame rule decodes to more, and a
+// decoder drops the rest. Absent: all of them.
+inline constexpr std::string_view kValidFrames = "valid_frames";
+// Ints, for pieces that OVERLAP rather than continue: a producer that
+// restores a long source as independent clips re-restores a few frames
+// at each cut and has the decoder cross-fade them. `blend_head`: this
+// beat's first N decoded frames are the same source frames as the last N
+// of the beat before; a decoder blends the two (a raised cosine from the
+// old to the new) instead of emitting both. `blend_tail`: this beat's
+// last N frames will be repeated by the next beat; a decoder holds them
+// back for that blend, and emits them as they are if no such beat comes.
+inline constexpr std::string_view kBlendHead = "blend_head";
+inline constexpr std::string_view kBlendTail = "blend_tail";
+// Per decoded frame, the channel statistics of the picture it restores:
+// [mean_r, mean_g, mean_b, std_r, std_g, std_b] over samples in [-1, 1].
+// A decoder rescales each channel of each frame to them (AdaIN) -- the
+// colour correction a restoration model's reference applies against its
+// own input. Absent: no correction.
+inline constexpr std::string_view kColorRef = "color_ref";
+
 // The content screen refused the prompt. Bool. Set on the conditioning
 // and carried to the latent, where a decoder emits a refusal card of
 // kRefusalWidth x kRefusalHeight (ints) instead of decoding.

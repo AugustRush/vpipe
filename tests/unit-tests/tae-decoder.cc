@@ -11,7 +11,10 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
+#include "common/perf-flops.h"
 #include "common/session.h"
+#include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/shared/metal-tae-decoder.h"
 #include "generative-models/weight-set.h"
 
@@ -24,6 +27,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace vpipe;
@@ -533,6 +537,195 @@ TEST(tae_decoder, the_fused_forward_is_the_one_that_runs)
       const int hw_n = it != pr.end() ? it->second.dispatches : 0;
       const int st_n = st != pr.end() ? st->second.dispatches : 0;
       std::printf("[tae] %s route: %d hw, %d gather\n", name, hw_n, st_n);
+    }
+  }
+}
+
+namespace {
+
+// The arithmetic of decoding `T` latent frames of `h` x `w`, read off the
+// checkpoint's tensor names and shapes alone -- the published network
+// walked slot by slot, NOT the decoder's parse. 2 * outputs * cout * 9 *
+// cin a 3x3 conv and 2 * outputs * cout * cin a 1x1 (TGrow, skip, the
+// mid-block pool), each at the resolution it runs at: a TGrow ahead of a
+// nearest upsample runs before it, at a quarter of the pixels (the two
+// commute, and the decoder takes the cheap order). And at the frames it
+// runs for: every raw frame up to the last MemBlock, which feeds the
+// memory, and past it only the ones some KEPT output frame descends from.
+std::uint64_t
+tae_flops_(const std::string& file, int T, int h, int w, Trim trim)
+{
+  auto src = MetalLlamaWeights::open_model(file);
+  if (!src) { return 0; }
+  const std::string pre =
+      src->has("decoder.layers.0.weight") ? "decoder.layers."
+      : src->has("decoder.1.weight")      ? "decoder."
+                                          : "";
+  int max_idx = -1;
+  for (const std::string& nm : src->tensor_names()) {
+    if (nm.compare(0, pre.size(), pre) != 0) { continue; }
+    std::size_t q = pre.size();
+    while (q < nm.size() && nm[q] >= '0' && nm[q] <= '9') { ++q; }
+    if (q == pre.size() || q >= nm.size() || nm[q] != '.') { continue; }
+    max_idx = std::max(max_idx, std::stoi(nm.substr(pre.size())));
+  }
+  auto mk = [&](const std::string& n) -> std::uint64_t {
+    const auto* i = src->info(n);
+    if (i == nullptr || i->shape.size() != 4) { return 0; }
+    return (std::uint64_t)i->shape[0] * (std::uint64_t)i->shape[1] *
+           (std::uint64_t)i->shape[2] * (std::uint64_t)i->shape[3];
+  };
+  // FLOPs per pixel of the op's resolution; `g` a TGrow, `u` an upsample.
+  struct L { char kind; std::uint64_t per_px; int stride; bool mem; };
+  std::vector<L> ops;
+  long long C = 0;
+  for (int i = 0; i <= max_idx; ++i) {
+    const std::string nm = pre + std::to_string(i);
+    if (src->has(nm + ".conv.0.weight")) {
+      const auto* c0 = src->info(nm + ".conv.0.weight");
+      const bool mem = c0->shape[1] == 2 * C;
+      std::uint64_t per = 2 * (mk(nm + ".conv.0.weight") +
+                               mk(nm + ".conv.2.weight") +
+                               mk(nm + ".conv.4.weight"));
+      for (const char* t : {".skip.weight", ".pool.0.weight",
+                            ".pool.3.weight"}) {
+        if (src->has(nm + t)) { per += 2 * mk(nm + t); }
+      }
+      C = src->info(nm + ".conv.4.weight")->shape[0];
+      ops.push_back({'b', per, 1, mem});
+    } else if (src->has(nm + ".conv.weight")) {
+      const auto* g = src->info(nm + ".conv.weight");
+      ops.push_back({'g', 2 * mk(nm + ".conv.weight"),
+                     (int)(g->shape[0] / C), false});
+    } else if (src->has(nm + ".weight")) {
+      C = src->info(nm + ".weight")->shape[0];
+      ops.push_back({'c', 2 * mk(nm + ".weight"), 1, false});
+    } else if (i > 0 && !ops.empty()) {
+      ops.push_back({ops.back().kind == 'c' ? 'r' : 'u', 0, 1, false});
+    }
+  }
+  for (std::size_t i = 0; i + 1 < ops.size(); ++i) {
+    if (ops[i].kind == 'u' && ops[i + 1].kind == 'g') {
+      std::swap(ops[i], ops[i + 1]);
+      ++i;
+    }
+  }
+  int tu = 1;
+  std::size_t last_mem = 0;
+  for (std::size_t i = 0; i < ops.size(); ++i) {
+    if (ops[i].kind == 'g') { tu *= ops[i].stride; }
+    if (ops[i].mem) { last_mem = i; }
+  }
+  auto kept = [&](long raw) {
+    if (tu <= 1) { return true; }
+    if (trim == Trim::kH3Chunks) { return raw % (5L * tu) >= tu - 1; }
+    return raw >= tu - 1;
+  };
+  std::uint64_t total = 0;
+  long long px = (long long)h * w;
+  long rate = 1;
+  for (std::size_t i = 0; i < ops.size(); ++i) {
+    long fan = 1;
+    for (std::size_t k = i; k < ops.size(); ++k) {
+      if (ops[k].kind == 'g') { fan *= ops[k].stride; }
+    }
+    long runs = 0;
+    for (long j = 0; j < (long)T * rate; ++j) {
+      bool any = i <= last_mem;
+      for (long q = 0; q < fan && !any; ++q) { any = kept(j * fan + q); }
+      runs += any ? 1 : 0;
+    }
+    if (ops[i].kind == 'u') { px *= 4; }
+    total += (std::uint64_t)runs * (std::uint64_t)px * ops[i].per_px;
+    if (ops[i].kind == 'g') { rate *= ops[i].stride; }
+  }
+  return total;
+}
+
+// What one decode added to the meter's GPU total, once its last buffer's
+// handler has run (it may run after the wait that saw the buffer).
+std::uint64_t
+credited_since_(std::uint64_t g0, std::uint64_t want)
+{
+  namespace pf = vpipe::perf_flops;
+  for (int i = 0; i < 400 && pf::totals(pf::kGpu).flops - g0 < want; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return pf::totals(pf::kGpu).flops - g0;
+}
+
+}  // namespace
+
+// The achieved-FLOP/s meter (common/perf-flops.h) as a preview feeds it.
+// Three things per published decoder: the count is the NETWORK's (equal
+// to tae_flops_, from the tensor headers), everything counted is flushed
+// and credited (nothing pending, the meter's GPU total grown by exactly
+// the flushed figure), and the count does not depend on the route -- the
+// profiled decode (a commit per dispatch) and, on a GPU with matrix
+// cores, the gather conv alone (VPIPE_TAE_NO_HWCONV) count the same.
+TEST(tae_decoder, a_preview_counts_its_flops)
+{
+  namespace pf = vpipe::perf_flops;
+  for (const char* name : {"taeh3_22", "kijai2d", "taew2_1", "taef1",
+                           "taef2", "taeqi2_1"}) {
+    const std::string dir = golden_(name);
+    Case c;
+    if (dir.empty() || !load_case_(dir, &c)) { continue; }
+    Session sess;
+    MetalCompute* mc = sess.metal_compute();
+    if (mc == nullptr) { return; }
+    const Trim trim = c.trim == "h3" ? Trim::kH3Chunks : Trim::kLeading;
+    std::string err;
+    auto ws = WeightSet::open(c.checkpoint, nullptr);
+    auto dec = MetalTaeDecoder::load(ws, mc, &err);
+    ASSERT_TRUE(dec != nullptr);
+    if (dec == nullptr) { continue; }
+    auto run = [&](MetalTaeDecoder& d, std::uint64_t* credited) {
+      const std::uint64_t f0 = d.gpu_flops().flushed();
+      const std::uint64_t g0 = pf::totals(pf::kGpu).flops;
+      MetalTaeDecoder::Frames f;
+      if (!d.decode(c.latent.data(), c.C, c.T, c.h, c.w, trim, 0, 1, &f,
+                    &err)) {
+        return std::uint64_t(0);
+      }
+      const std::uint64_t got = d.gpu_flops().flushed() - f0;
+      if (credited != nullptr) { *credited = credited_since_(g0, got); }
+      return got;
+    };
+    const std::uint64_t want = tae_flops_(c.checkpoint, c.T, c.h, c.w, trim);
+    std::uint64_t credited = 0;
+    const std::uint64_t counted = run(*dec, &credited);
+    std::printf("[tae] %s %dx%dx%d: counted %.4f GFLOP, derived %.4f, "
+                "credited %.4f\n", name, c.T, c.h, c.w, counted / 1e9,
+                want / 1e9, credited / 1e9);
+    EXPECT_TRUE(want > 0 && counted == want);
+    EXPECT_TRUE(credited == counted);
+    EXPECT_TRUE(dec->gpu_flops().pending() == 0);
+
+    // Profiled: a commit after every dispatch, each with its flush.
+    const char* was = std::getenv("VPIPE_TAE_PROFILE");
+    const std::string saved = was != nullptr ? was : "";
+    ::setenv("VPIPE_TAE_PROFILE", "1", 1);
+    const std::uint64_t profiled = run(*dec, nullptr);
+    if (was == nullptr) { ::unsetenv("VPIPE_TAE_PROFILE"); }
+    else { ::setenv("VPIPE_TAE_PROFILE", saved.c_str(), 1); }
+    EXPECT_TRUE(profiled == counted);
+    EXPECT_TRUE(dec->gpu_flops().pending() == 0);
+
+    // The gather conv alone, where the hardware conv would take most of
+    // the decode: the route is decided at load, so a second decoder.
+    if (mc->supports_matrix_cores() &&
+        std::getenv("VPIPE_TAE_NO_HWCONV") == nullptr) {
+      ::setenv("VPIPE_TAE_NO_HWCONV", "1", 1);
+      auto gather = MetalTaeDecoder::load(ws, mc, &err);
+      ::unsetenv("VPIPE_TAE_NO_HWCONV");
+      ASSERT_TRUE(gather != nullptr);
+      if (gather != nullptr) {
+        const std::uint64_t g = run(*gather, nullptr);
+        std::printf("[tae] %s gather-only: counted %.4f GFLOP\n", name,
+                    g / 1e9);
+        EXPECT_TRUE(g == counted);
+      }
     }
   }
 }

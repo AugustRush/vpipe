@@ -1126,6 +1126,45 @@ Session::wait_pipelines(int timeout_ms)
   return Status{0};
 }
 
+// One pipeline's wait. The impl is resolved under the map lock and
+// waited on outside it: other threads' launches, stops and unloads of
+// OTHER pipelines take that lock and leave this impl alone.
+Status
+Session::wait_one_pipeline(PipelineHandle h, int timeout_ms)
+{
+  PipelineHandleImpl* impl = resolve(h);
+  if (!impl) {
+    return Status{1};
+  }
+  return impl->wait_idle(timeout_ms) ? Status{0} : Status{4};
+}
+
+// SessionIntf's one-pipeline wait. Non-virtual, as load_pipeline(const
+// FlexData&): every SessionIntf a caller holds is a Session made here.
+Status
+SessionIntf::wait_pipeline(PipelineHandle h, int timeout_ms)
+{
+  auto* s = dynamic_cast<Session*>(this);
+  if (s == nullptr) {
+    return Status{1};
+  }
+  return s->wait_one_pipeline(h, timeout_ms);
+}
+
+// SessionIntf's conversation drop (text-chat's kept contexts, held by
+// the model manager with the models kept warm).
+Status
+SessionIntf::drop_chat_context(std::string_view key)
+{
+  auto* s = dynamic_cast<Session*>(this);
+  if (s == nullptr) {
+    return Status{1};
+  }
+  auto* mgr = s->generative_model_manager();
+  return mgr != nullptr && mgr->drop_context(std::string(key)) ? Status{0}
+                                                               : Status{1};
+}
+
 Status
 Session::store_pipeline(PipelineHandle h, string_view path_sv)
 {

@@ -60,8 +60,8 @@
       ],
       "config": {
         "mode": "video",
-        "group_size": 25,
-        "overlap": 4,
+        "group_size": 24,
+        "overlap": 0,
         "max_mb": 512
       }
     },
@@ -100,7 +100,7 @@
       "config": {
         "width": 1920,
         "height": 1152,
-        "frames": 25,
+        "frames": 41,
         "seed": 0,
         "unload_when_idle": "auto"
       }

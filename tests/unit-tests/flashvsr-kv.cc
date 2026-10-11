@@ -489,3 +489,146 @@ TEST(flashvsr_kv, streamed_blocks_are_bit_identical)
   }
   ::unsetenv("VPIPE_FVSR_NO_SLOTS");
 }
+
+// A STREAM IN PIECES IS ONE REQUEST. The same source restored as one
+// request over five chunks, and as several -- an opening of two chunks
+// that keeps its window, continuations that keep it too, and a final one
+// -- must give the same latent, bit for bit: each block's window goes
+// back into the ring slots it left, RoPE and the noise are indexed by the
+// stream's own frame, and a continuation takes the stream's seed. Both
+// orders, a routed arm (routing reads the window's block means), and two
+// cuttings, one with a two-chunk continuation.
+//
+// The noise is the SEEDED draw here, not a pinned one: drawing it per
+// latent frame of the stream is part of what is being checked.
+//
+// IT HAS CAUGHT A BUG: the carried ring state was once kept for the whole
+// stack, and block-outer -- which saves block L before restoring block
+// L+1 -- restored every block but the first a chunk late. rel-L2 1.2e-2,
+// chunk-outer identical.
+TEST(flashvsr_kv, stream_requests_equal_one_request)
+{
+  const char* root = std::getenv("VPIPE_FLASHVSR_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  FlashVsrLayout layout;
+  ASSERT_TRUE(resolve_flashvsr_layout(root, &layout));
+  MetalFlashVsrTransformer::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalFlashVsrTransformer::config_from_checkpoint(
+      layout.denoiser, &cfg, &err));
+  auto ws = WeightSet::open(layout.denoiser, nullptr);
+  auto ctx_ws = WeightSet::open(layout.context, nullptr);
+  ASSERT_TRUE(ws != nullptr && ctx_ws != nullptr);
+  if (ws == nullptr || ctx_ws == nullptr) { return; }
+  auto dit = MetalFlashVsrTransformer::load(ws, ctx_ws, layout.context_name,
+                                            mc, cfg, &err);
+  ASSERT_TRUE(dit != nullptr);
+  if (dit == nullptr) { return; }
+
+  constexpr int kSize = 384;
+  constexpr int kFrames = 57;   // five chunks: 6 + 4 x 2 latent frames
+  const int T = MetalFlashVsrTransformer::latent_frames(kFrames);
+  const int tok = (kSize / 16) * (kSize / 16);
+  const std::size_t row_frame = (std::size_t)tok * cfg.hidden;
+  std::mt19937_64 rng(0x5eedu);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<std::uint16_t> rows((std::size_t)T * row_frame);
+  for (auto& v : rows) { v = to_bf16_(0.5f * nd(rng)); }
+
+  // {chunk0, chunks}: the opening's two chunks are 8 latent frames, each
+  // later chunk 2.
+  struct Piece { int chunk0, chunks; };
+  const std::vector<std::vector<Piece>> cuttings = {
+      {{0, 2}, {2, 2}, {4, 1}},
+      {{0, 2}, {2, 1}, {3, 1}, {4, 1}}};
+
+  struct Arm { const char* name; bool chunk_outer; double sparse; int local; };
+  const Arm arms[] = {{"block-outer", false, 2.0, 11},
+                      {"chunk-outer", true, 2.0, 11},
+                      {"block-outer routed", false, 0.05, 1}};
+  for (const Arm& a : arms) {
+    if (a.chunk_outer) {
+      ::setenv("VPIPE_FVSR_CHUNK_OUTER", "1", 1);
+    } else {
+      ::unsetenv("VPIPE_FVSR_CHUNK_OUTER");
+    }
+    MetalFlashVsrTransformer::Request one;
+    one.rows = rows.data();
+    one.row_frames = T;
+    one.frames = kFrames;
+    one.height = kSize;
+    one.width = kSize;
+    one.seed = 1234;
+    one.params.sparse_ratio = a.sparse;
+    one.params.local_range = a.local;
+    std::vector<float> whole;
+    std::vector<int> shape;
+    ASSERT_TRUE(dit->generate(one, &whole, &shape, &err));
+    ASSERT_TRUE(dit->window_next_chunk() == -1);
+
+    for (const auto& pieces : cuttings) {
+      std::vector<float> joined(whole.size(), 0.0f);
+      bool ok = true;
+      int at = 0;                     // latent frame the piece starts at
+      for (std::size_t i = 0; i < pieces.size() && ok; ++i) {
+        const Piece& p = pieces[i];
+        const int pt = p.chunk0 == 0 ? 2 * p.chunks + 4 : 2 * p.chunks;
+        MetalFlashVsrTransformer::Request r = one;
+        r.rows = rows.data() + (std::size_t)at * row_frame;
+        r.row_frames = pt;
+        r.chunk0 = p.chunk0;
+        r.chunks = p.chunks;
+        r.keep_window = i + 1 < pieces.size();
+        // A continuation takes the stream's seed whatever it is handed.
+        if (p.chunk0 > 0) { r.seed = 99; }
+        std::vector<float> lat;
+        ok = dit->generate(r, &lat, &shape, &err);
+        ASSERT_TRUE(ok);
+        if (!ok) { std::printf("  %s: %s\n", a.name, err.c_str()); break; }
+        ASSERT_TRUE(shape.size() == 4 && shape[1] == pt);
+        // Channel-major latents: this piece's frames into every channel
+        // of the joined one.
+        const std::size_t plane = (std::size_t)shape[2] * shape[3];
+        for (int c = 0; c < shape[0]; ++c) {
+          std::memcpy(joined.data() + ((std::size_t)c * T + at) * plane,
+                      lat.data() + (std::size_t)c * pt * plane,
+                      (std::size_t)pt * plane * sizeof(float));
+        }
+        at += pt;
+        ASSERT_TRUE(dit->window_next_chunk() ==
+                    (r.keep_window ? p.chunk0 + p.chunks : -1));
+      }
+      if (!ok) { continue; }
+      ASSERT_TRUE(at == T);
+      const bool same = std::memcmp(joined.data(), whole.data(),
+                                    whole.size() * sizeof(float)) == 0;
+      EXPECT_TRUE(same);
+      std::printf("  %-20s %zu requests vs 1: %s (rel-L2 %.2e)\n", a.name,
+                  pieces.size(), same ? "IDENTICAL" : "DIFFERENT",
+                  rel_l2_(joined, whole));
+    }
+  }
+  ::unsetenv("VPIPE_FVSR_CHUNK_OUTER");
+
+  // A continuation with no window to continue is REFUSED, not run cold:
+  // a cold chunk-2 would be a plausible latent of the wrong function.
+  {
+    MetalFlashVsrTransformer::Request r;
+    r.rows = rows.data() + (std::size_t)8 * row_frame;
+    r.row_frames = 4;
+    r.height = kSize;
+    r.width = kSize;
+    r.chunk0 = 2;
+    r.chunks = 2;
+    std::vector<float> lat;
+    std::vector<int> shape;
+    dit->drop_window();
+    EXPECT_TRUE(!dit->generate(r, &lat, &shape, &err));
+    std::printf("  a continuation with no window: refused (%s)\n",
+                err.c_str());
+  }
+}

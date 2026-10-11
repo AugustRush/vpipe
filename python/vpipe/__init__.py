@@ -37,6 +37,7 @@ from ._vpipe import (
     SessionManager,
     StageHandle,
     Status,
+    perf_flops,
     vpipe_version,
 )
 
@@ -51,6 +52,7 @@ __all__ = [
     "create_session",
     "destroy_session",
     "manager",
+    "perf_flops",
     "session",
     "vpipe_version",
 ]

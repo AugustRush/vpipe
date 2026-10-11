@@ -21,6 +21,7 @@
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
 #include "common/job.h"
+#include "common/perf-flops.h"
 #include "common/session.h"
 #include "generative-models/context-manager.h"
 #include "generative-models/flux2/metal-flux2-calibration.h"
@@ -50,6 +51,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -3702,4 +3704,89 @@ TEST(flux2_smoke, lora_forbids_fusion_names_the_fused_projections)
   // would be a slowdown chosen for a reason that never materialized.
   EXPECT_FALSE(MetalFlux2Transformer::lora_forbids_fusion(
       (dir / "nope.safetensors").string()));
+}
+
+// ---- perf-flops ----------------------------------------------------
+//
+// The forward's arithmetic, as the FLOP/s meter is credited with it
+// (common/perf-flops.h, shared/dit-flops.h): EXACT against a count
+// derived here from the structure -- the embedders and the three
+// modulation projections, each double block's image and text halves
+// around one joint attention, each single block's fused projection,
+// attention and output, and the final layer -- and credited whole once
+// the buffers retire. The stack is the checkpoint's (it is read from
+// config.json), streamed, at a small geometry. Env:
+// VPIPE_FLUX2_TEST_MODEL_PATH (+ VPIPE_FLUX2_DIT_DIR).
+TEST(flux2_smoke, forward_credits_its_flops)
+{
+  namespace pf = vpipe::perf_flops;
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+  auto dit = MetalFlux2Transformer::load(
+      tdir, mc, MetalFlux2Transformer::Config{}, /*stream=*/true);
+  ASSERT_TRUE(dit != nullptr);
+  if (dit == nullptr) { return; }
+  dit->set_residency_reserve(0);
+  const auto& c = dit->config();
+
+  const int TS = 24, gh = 8, gw = 8, IS = gh * gw, seq = TS + IS;
+  SharedBuffer ctx = mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+  SharedBuffer lat =
+      mc->make_shared_buffer((std::size_t)IS * c.in_channels * 2);
+  ASSERT_TRUE(!ctx.empty() && !lat.empty());
+  if (ctx.empty() || lat.empty()) { return; }
+  {
+    std::mt19937 rng(20261010);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)nd(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)IS * c.in_channels; ++i) {
+      lp[i] = (_Float16)nd(rng);
+    }
+  }
+
+  // The count, from the structure. Every projection here is linear in
+  // its rows, so a double block's image and text halves sum to one
+  // projection over the joint rows.
+  const long long H = c.hidden, DFF = c.double_ff_hidden;
+  const long long INNER = DFF / 2, SMLP = c.single_mlp_in;
+  const long long OC = c.out_channels > 0 ? c.out_channels : c.in_channels;
+  const std::uint64_t attn =
+      attention_flops(c.n_heads, (long long)seq * seq, c.head_dim);
+  const std::uint64_t dbl = 4 * gemm_flops(seq, H, H) +
+                            gemm_flops(seq, DFF, H) +
+                            gemm_flops(seq, H, INNER) + attn;
+  const std::uint64_t sgl = gemm_flops(seq, 3 * H + 2 * SMLP, H) +
+                            gemm_flops(seq, H, H + SMLP) + attn;
+  const std::uint64_t want =
+      gemm_flops(1, H, c.timestep_dim) + gemm_flops(1, H, H) +
+      2 * gemm_flops(1, 6 * H, H) + gemm_flops(1, 3 * H, H) +
+      gemm_flops(IS, H, c.in_channels) + gemm_flops(TS, H, c.joint_dim) +
+      (std::uint64_t)c.n_double * dbl + (std::uint64_t)c.n_single * sgl +
+      gemm_flops(1, 2 * H, H) + gemm_flops(IS, OC, H);
+
+  const pf::Totals g0 = pf::totals(pf::kGpu);
+  const SharedBuffer vel = dit->forward_dit(ctx, TS, lat, IS, gh, gw, 0.5f);
+  ASSERT_TRUE(!vel.empty());
+  const std::uint64_t flushed = dit->gpu_flops().flushed();
+  // The last buffer's handler may run after the wait that saw it.
+  for (int i = 0; i < 400 && pf::totals(pf::kGpu).flops - g0.flops <
+                                 flushed; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  const std::uint64_t gpu = pf::totals(pf::kGpu).flops - g0.flops;
+  std::printf("[flux2_smoke] flops: %d+%d blocks over %d rows: counted "
+              "%.5f TFLOP, derived %.5f, credited %.5f\n", c.n_double,
+              c.n_single, seq, flushed / 1e12, want / 1e12, gpu / 1e12);
+  EXPECT_TRUE(flushed == want);
+  EXPECT_TRUE(gpu == flushed);
 }

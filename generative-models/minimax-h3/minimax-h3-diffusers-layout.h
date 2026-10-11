@@ -72,6 +72,85 @@ struct Part {
 std::vector<Part> assembled_parts(const MetalLlamaWeights& w,
                                   const std::string& nm);
 
+// ---- the VAEs ---------------------------------------------------------
+//
+// The diffusers pipeline at the repository's ROOT (`vae/`, `audio_vae/`,
+// beside the `FL2VA/` and `Ref2VA/` partitions) carries both VAEs too,
+// and VERIFIED byte for byte against `FL2VA/video_vae/source` and
+// `FL2VA/audio_vae` they are the same numbers:
+//
+//   video   every tensor renamed (decoder.proj_in -> decoder.x_embedder,
+//           attn.to_out.0 -> attn.to_out, ff.net.2 -> ff.w2,
+//           encoder.down_blocks.N.resnets.M -> encoder.down.N.block.M,
+//           conv_shortcut -> nin_shortcut, downsamplers.0 -> downsample)
+//           except two that are stored in pieces: to_q / to_k / to_v
+//           are attn.to_qkv split PER HEAD -- the fused tensor is
+//           [h0(q,k,v) | h1(q,k,v) | ...], each piece one head of 64
+//           rows -- and ff.net.0.proj is ff.w1 with its halves swapped
+//           (up | gate on disk, gate | up in the model). Weights and
+//           biases alike. The native file's decoder.mask_token has no
+//           counterpart, and nothing here reads it.
+//   audio   the same tensors under the same names; only the config and
+//           the file name differ.
+//
+// The video renames are applied at open (translate_diffusers_vae), and
+// the two split tensors become `<to_qkv>.q/.k/.v` and `<w1>.ug`, which
+// the VAE's loader assembles from vae_assembled_parts.
+
+// The diffusers class names, as `_class_name` in each config.json.
+inline constexpr const char* kDiffusersVideoVaeClass =
+    "AutoencoderKLMiniMaxH3";
+inline constexpr const char* kDiffusersAudioVaeClass =
+    "AutoencoderKLMiniMaxH3Audio";
+inline constexpr const char* kDiffusersDitClass =
+    "MiniMaxH3Transformer3DModel";
+
+// ---- the diffusers PIPELINE at the repository root ----------------------
+//
+// The root's model_index.json (`MiniMaxH3ModularPipeline`) is one pipeline
+// over BOTH task partitions: `transformer/` is FL2VA's DiT and
+// `transformer_ref/` Ref2VA's -- VERIFIED by their bytes against the
+// released partitions -- beside one text encoder, tokenizer, processor
+// and pair of VAEs (byte-identical to each partition's). So on such a
+// root `transformer/` is a PARTITION's DiT, not the model's, and the
+// task decides which directory answers.
+inline constexpr const char* kDiffusersPipelineClass =
+    "MiniMaxH3ModularPipeline";
+
+// Whether `dir` is that root: its model_index.json names the pipeline,
+// or it carries `transformer_ref/` (a partial checkout without the
+// manifest).
+bool is_diffusers_pipeline_root(const std::string& dir);
+
+// The DiT directory a pipeline root keeps for `partition` ("fl2va" ->
+// transformer/, "ref2va" -> transformer_ref/, empty -> the historical
+// fl2va), or "" when that directory is not present.
+std::string diffusers_pipeline_dit(const std::string& root,
+                                   const std::string& partition);
+
+// The partition a DiT directory holds BY ITS PLACE in a pipeline root
+// (transformer/ -> "fl2va", transformer_ref/ -> "ref2va"), "" when it is
+// not one of those.
+std::string diffusers_pipeline_partition(const std::string& dit_dir);
+
+// Whether `dir` is a directory whose config.json names `cls`. A file, a
+// missing config or another class answer false.
+bool is_diffusers_vae_dir(const std::string& dir, const char* cls);
+
+// Whether `w` is the H3 video VAE in the diffusers naming.
+bool is_diffusers_vae_layout(const MetalLlamaWeights& w);
+
+// Rename in place, as translate_diffusers does for the DiT: the whole
+// checkpoint or nothing. Returns the number renamed.
+std::size_t translate_diffusers_vae(MetalLlamaWeights& w);
+
+// How the video VAE's linear `nm` (e.g. "decoder.transformer_blocks.3.
+// attn.to_qkv") is assembled, in output-row order, with `head_dim`-row
+// heads. Empty when `<nm>.weight` is one tensor or the pieces are not
+// there either.
+std::vector<Part> vae_assembled_parts(const MetalLlamaWeights& w,
+                                      const std::string& nm, int head_dim);
+
 }  // namespace minimax_h3
 }  // namespace genai
 }  // namespace vpipe

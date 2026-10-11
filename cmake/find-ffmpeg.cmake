@@ -139,6 +139,36 @@ if(_vpipe_ffmpeg_cached)
   endif()
 endif()
 
+# ---- 1b. the FFmpeg a build ships ---------------------------------------
+# A build that BUNDLES an FFmpeg (VPIPE_BUNDLE_FFMPEG with
+# VPIPE_FFMPEG_BUNDLE_DIR, as the release with-ffmpeg variant and a host
+# shipping its own FFmpeg configure it) compiles against THAT FFmpeg's
+# headers, beside its libraries -- never pkg-config's or Homebrew's. vpipe
+# dlopens FFmpeg but bakes the headers' struct layouts into its objects,
+# so a library built against Homebrew's 9.0 and shipped with an LGPL 8.1
+# corrupts every call that passes a struct (see the ABI note below). No
+# headers there is an error, not a fallback: the fallback is that
+# mismatch.
+if(VPIPE_BUNDLE_FFMPEG AND VPIPE_FFMPEG_BUNDLE_DIR)
+  set(_vpipe_ffmpeg_bundle_inc "")
+  foreach(_cand "${VPIPE_FFMPEG_BUNDLE_DIR}/../include"
+                "${VPIPE_FFMPEG_BUNDLE_DIR}/include")
+    get_filename_component(_cand "${_cand}" ABSOLUTE)
+    _vpipe_ffmpeg_complete("${_cand}" "${_vpipe_ffmpeg_headers}" _ok)
+    if(_ok AND NOT _vpipe_ffmpeg_bundle_inc)
+      set(_vpipe_ffmpeg_bundle_inc "${_cand}")
+    endif()
+  endforeach()
+  if(NOT _vpipe_ffmpeg_bundle_inc)
+    message(FATAL_ERROR
+      "VPIPE_BUNDLE_FFMPEG: no FFmpeg headers beside "
+      "${VPIPE_FFMPEG_BUNDLE_DIR} (../include or include). The library "
+      "must be compiled against the FFmpeg it ships.")
+  endif()
+  set(VPIPE_FFMPEG_INCLUDE_DIRS "${_vpipe_ffmpeg_bundle_inc}")
+  message(STATUS "FFmpeg headers: the bundled build's")
+endif()
+
 # ---- 2. pkg-config -----------------------------------------------------
 find_package(PkgConfig QUIET)
 if(PKG_CONFIG_FOUND AND NOT VPIPE_FFMPEG_INCLUDE_DIRS)
@@ -297,3 +327,24 @@ endforeach()
 
 set(VPIPE_FFMPEG_ABI_TAG "${_vpipe_ffmpeg_abi}")
 message(STATUS "FFmpeg ABI: ${VPIPE_FFMPEG_ABI_TAG}")
+
+# ---- 7. what a host's release checks its FFmpeg against ---------------
+# The version and ABI the library was compiled against, installed as
+# share/vpipe/ffmpeg-headers ("version=8.1.2", "abi=<the tag above>"): an
+# application that bundles its own FFmpeg beside libvpipe compares its
+# libraries' majors to this before it ships them.
+set(VPIPE_FFMPEG_HEADERS_VERSION "")
+foreach(_d IN LISTS VPIPE_FFMPEG_INCLUDE_DIRS)
+  if(NOT VPIPE_FFMPEG_HEADERS_VERSION
+     AND EXISTS "${_d}/libavutil/ffversion.h")
+    file(STRINGS "${_d}/libavutil/ffversion.h" _l
+         REGEX "^#define[ \t]+FFMPEG_VERSION[ \t]+\"")
+    if(_l)
+      string(REGEX MATCH "\"([^\"]+)\"" _m "${_l}")
+      set(VPIPE_FFMPEG_HEADERS_VERSION "${CMAKE_MATCH_1}")
+    endif()
+  endif()
+endforeach()
+file(WRITE "${CMAKE_BINARY_DIR}/ffmpeg-headers"
+     "version=${VPIPE_FFMPEG_HEADERS_VERSION}\n"
+     "abi=${VPIPE_FFMPEG_ABI_TAG}\n")

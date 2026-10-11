@@ -1367,6 +1367,16 @@ transformer 融合后的 qkv 投影的分组方式不同——这个差异在张
 一个目录持有哪个模式，是从那个模式自己的 `model_index.json` 中读出的，而模型的
 注册键则表明你要的是哪一个。
 
+同一个仓库的根目录还带着一套 diffusers 流水线——同时覆盖两个模式：`transformer/`
+是 FL2VA 的 DiT，`transformer_ref/` 是 Ref2VA 的，旁边是共用的 `text_encoder/`、
+`tokenizer/`、`processor/`、`vae/` 和 `audio_vae/`。它们都是发布的权重，只是换成
+了 diffusers 的命名（DiT、VAE 和编码器逐个张量相同），一张图可以直接在它上面运行：
+把 `model-select` 指向仓库根目录，每个阶段都会找到自己的组件，DiT 按模式选取。如果
+检出里同时还有某个已发布模式的目录，则改用该模式下的那一份——权重相同，所以一张图
+不会同时持有两份。一张图运行哪个模式，由模型记录决定，与同时检出两个已发布模式时
+一样：用 `model-register` 注册仓库根目录，并设 `model_type: minimax-h3-ref2va`
+（或 `minimax-h3-fl2va`），再选用这条记录；直接给一个路径时按 FL2VA 处理。
+
 <a id="fewer-steps--the-turbo-lora"></a>
 ### 更少的步数——Turbo LoRA
 

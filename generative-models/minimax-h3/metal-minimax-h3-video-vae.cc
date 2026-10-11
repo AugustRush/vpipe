@@ -5,6 +5,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/shared/mma-tile.h"
 #include "generative-models/weight-set.h"
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -92,6 +94,251 @@ blk_(int i, const char* rest)
   return "decoder.transformer_blocks." + std::to_string(i) + "." + rest;
 }
 
+// A linear the checkpoint stores in pieces (the diffusers layout's split
+// attention and swapped feed-forward), assembled into the bf16 tensor
+// the released file would have converted to: the same rounding, so the
+// two layouts load bit-identical weights. `suffix` is ".weight" or
+// ".bias"; empty when a piece lacks it. Each piece is read ONCE and
+// UNCACHED -- the assembly is what the model keeps.
+SharedBuffer
+assemble_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& key,
+               const std::vector<minimax_h3::Part>& parts,
+               const char* suffix, const std::string& part)
+{
+  const MetalLlamaWeights& src = ws.src();
+  std::int64_t rows = 0, width = -1;
+  for (const minimax_h3::Part& pc : parts) {
+    const auto* ti = src.info(pc.layer + suffix);
+    if (ti == nullptr || ti->shape.empty()) { return {}; }
+    std::int64_t w = 1;
+    for (std::size_t d = 1; d < ti->shape.size(); ++d) { w *= ti->shape[d]; }
+    if (width >= 0 && w != width) { return {}; }
+    width = w;
+    rows += pc.rows;
+  }
+  return ws.derived(key, [&]() -> SharedBuffer {
+    std::map<std::string, SharedBuffer> raw;
+    for (const minimax_h3::Part& pc : parts) {
+      const std::string nm = pc.layer + suffix;
+      if (raw.count(nm) == 0) {
+        raw[nm] = ws.read(nm, mc, WeightSet::Residency::Copied);
+        if (raw[nm].empty()) { return {}; }
+      }
+    }
+    SharedBuffer out =
+        mc->make_shared_buffer((std::size_t)rows * (std::size_t)width * 2);
+    if (out.empty()) { return {}; }
+    auto* d = static_cast<std::uint16_t*>(out.contents());
+    for (const minimax_h3::Part& pc : parts) {
+      const std::string nm = pc.layer + suffix;
+      const std::string& dt = src.info(nm)->dtype;
+      const void* base = raw[nm].contents();
+      const std::size_t n = (std::size_t)pc.rows * (std::size_t)width;
+      const std::size_t at = (std::size_t)pc.row0 * (std::size_t)width;
+      for (std::size_t i = 0; i < n; ++i) {
+        if (dt == "F32") {
+          d[i] = f32_to_bf16_(static_cast<const float*>(base)[at + i]);
+        } else if (dt == "F16") {
+          d[i] = f32_to_bf16_(
+              (float)static_cast<const _Float16*>(base)[at + i]);
+        } else if (dt == "BF16") {
+          d[i] = static_cast<const std::uint16_t*>(base)[at + i];
+        } else {
+          return {};
+        }
+      }
+      d += n;
+    }
+    return out;
+  }, part);
+}
+
+// The checks a config meets once its fields are read, whichever layout
+// they came from: the derived widths, the shapes this decoder
+// implements, and a tiling that covers the image.
+bool
+finish_config_(MetalMiniMaxH3VideoVae::Config& out, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  out.dim = out.n_heads * out.head_dim;
+  // FeedForward(dim, mult=4): the diffusers default this decoder is
+  // constructed with, so the inner width is not in the config.
+  out.ffn_inner = 4 * out.dim;
+  if (out.head_dim != 64) {
+    return fail("only dim_head 64 is supported (the steel flash-attention "
+                "entry point this decoder runs on is bd64)");
+  }
+  if (out.rope_dim() % 6 != 0) {
+    return fail("int(dim_head * rope_dim_ratio) must be divisible by 6");
+  }
+  // Tile size, overridable for MEASUREMENT. The checkpoint's 256 is the
+  // reference's number, and the cost it buys is not obvious: at 960x544
+  // it lays 15 tiles whose union decodes 1.88x the pixels that exist, so
+  // 88% of the decode is overlap -- but tiles are also where attention is
+  // quadratic, so bigger tiles trade redundant GEMM for superlinear
+  // attention and the balance is an empirical question per machine.
+  //
+  // NOT a tuning knob to ship a different default behind: the tiling
+  // decides where the seams fall and what the cross-fade blends, so a
+  // different size is a different OUTPUT, not the same one computed
+  // faster. Anything found here has to clear the decode golden before it
+  // becomes a default.
+  if (const char* e = std::getenv("VPIPE_H3_VVAE_TILE")) {
+    const int t = std::atoi(e);
+    if (t >= out.patch && t % out.patch == 0) { out.tile_size = t; }
+  }
+
+  // ---- the tiling must COVER the axis exactly ------------------------
+  // `split_tiles` pays the leftover slack back in whole `ratio` steps,
+  // so the union it lays overruns the axis by `slack % ratio` -- and
+  // both tilers and `stitch_` trust the coverage. A tile that ends past
+  // the image is an out-of-bounds READ in encode_tiled_/decode_tiled_
+  // and an out-of-bounds WRITE in stitch_, which is memory corruption
+  // rather than a wrong picture.
+  //
+  // The slack is `tile_size*n - overlap*(n-1) - length` for whichever
+  // `n` the split lands on, and H/W are already multiples of `patch`,
+  // so it is a multiple of `patch` for EVERY n exactly when both the
+  // tile and the minimum overlap are. Checked here rather than in
+  // split_tiles because this is where a checkpoint's numbers arrive,
+  // and refusing a config beats silently retiling one.
+  if (out.tile_size % out.patch != 0 ||
+      out.tile_overlap_min % out.patch != 0) {
+    return fail("vae_tile_size " + std::to_string(out.tile_size) +
+                " and vae_tile_overlap_min " +
+                std::to_string(out.tile_overlap_min) +
+                " must both be multiples of the " +
+                std::to_string(out.patch) +
+                "-pixel patch, or the tiling overruns the image");
+  }
+  return true;
+}
+
+// The DIFFUSERS config (AutoencoderKLMiniMaxH3, at the repository root's
+// `vae/`): one flat file where the released layout keeps two -- the
+// wrapper's clip geometry and latent whitening, and the source net's
+// shape -- under other names. What the released config states as flags
+// (a ViT decoder, gated SiLU, causal 3D encoder, per-frame group norm)
+// the diffusers class has no other form of, so there is nothing to
+// check for them; what it states as numbers is read, and what this
+// decoder hard-codes is refused when it differs.
+bool
+diffusers_config_(const std::string& dir,
+                  MetalMiniMaxH3VideoVae::Config& out, std::string* err)
+{
+  namespace fs = std::filesystem;
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  const fs::path p = fs::path(dir) / "config.json";
+  FlexData cfg;
+  {
+    std::ifstream f(p);
+    if (!f) { return fail("cannot open " + p.string()); }
+    try {
+      cfg = FlexData::from_json(f);
+    } catch (...) {
+      return fail("cannot parse " + p.string());
+    }
+  }
+  if (!cfg.is_object()) { return fail(p.string() + " is not a JSON object"); }
+  auto o = cfg.as_object();
+  auto gi = [&](const char* k, int d) {
+    return o.contains(k) ? (int)o.at(k).as_int(d) : d;
+  };
+  auto gr = [&](const char* k, double d) {
+    return o.contains(k) ? o.at(k).as_real(d) : d;
+  };
+  auto ints = [&](const char* k, std::vector<int>& dst) {
+    if (!o.contains(k)) { return; }
+    FlexData v = o.at(k);
+    if (!v.is_array()) { return; }
+    auto a = v.as_array();
+    std::vector<int> got;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      got.push_back((int)a.at(i).as_int(0));
+    }
+    if (!got.empty()) { dst = std::move(got); }
+  };
+  out.z_channels   = gi("latent_channels", out.z_channels);
+  out.in_channels  = gi("in_channels", out.in_channels);
+  out.out_channels = gi("out_channels", out.out_channels);
+  out.res_blocks   = gi("layers_per_block", out.res_blocks);
+  out.gn_groups    = gi("norm_num_groups", out.gn_groups);
+  out.enc_norm_eps = (float)gr("norm_eps", out.enc_norm_eps);
+  out.n_layers     = gi("decoder_num_layers", out.n_layers);
+  out.n_heads      = gi("decoder_num_attention_heads", out.n_heads);
+  out.head_dim     = gi("decoder_attention_head_dim", out.head_dim);
+  out.n_register   = gi("decoder_num_register_tokens", out.n_register);
+  out.rope_theta   = gr("decoder_rope_theta", out.rope_theta);
+  out.rope_dim_ratio = gr("decoder_rope_dim_ratio", out.rope_dim_ratio);
+  out.norm_eps     = (float)gr("decoder_norm_eps", out.norm_eps);
+  out.clip_length  = gi("clip_length", out.clip_length);
+  out.token_drop   = gi("token_drop", out.token_drop);
+  // The encoder's widths as diffusers states them: one per level, where
+  // the released config gives a base and multipliers.
+  std::vector<int> widths;
+  ints("block_out_channels", widths);
+  if (!widths.empty()) {
+    out.base_ch = widths.front();
+    out.ch_mult.clear();
+    for (int w : widths) {
+      if (out.base_ch <= 0 || w % out.base_ch != 0) {
+        return fail(p.string() + ": block_out_channels are not multiples "
+                    "of the first");
+      }
+      out.ch_mult.push_back(w / out.base_ch);
+    }
+  }
+  ints("spatial_downsample_factors", out.space_down);
+  ints("temporal_downsample_factors", out.time_down);
+  if (out.ch_mult.size() != out.space_down.size() ||
+      out.ch_mult.size() != out.time_down.size()) {
+    return fail(p.string() + ": block_out_channels and the spatial and "
+                "temporal downsample factors must have one entry per level");
+  }
+  // No separate statement of the compression to hold the factors
+  // against: here they ARE the statement.
+  out.patch = 1;
+  out.patch_t = 1;
+  for (std::size_t i = 0; i < out.ch_mult.size(); ++i) {
+    out.patch *= out.space_down[i];
+    out.patch_t *= out.time_down[i];
+  }
+  if (o.contains("spatial_padding_mode")) {
+    const FlexData v = o.at("spatial_padding_mode");   // a VIEW: bind it
+    const std::string pm(v.as_string("reflect"));
+    if (pm != "reflect") {
+      return fail("encoder spatial_padding_mode '" + pm + "' is not reflect");
+    }
+  }
+  if (gi("decoder_ffn_mult", 4) != 4) {
+    return fail("decoder_ffn_mult is not 4: the feed-forward here is "
+                "4 * dim wide");
+  }
+  auto reals = [&](const char* k, std::vector<float>& dst) {
+    if (!o.contains(k)) { return; }
+    FlexData v = o.at(k);
+    if (!v.is_array()) { return; }
+    auto a = v.as_array();
+    std::vector<float> got;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      got.push_back((float)a.at(i).as_real(0.0));
+    }
+    if ((int)got.size() == out.z_channels) { dst = std::move(got); }
+  };
+  reals("latents_mean", out.latents_mean);
+  reals("latents_std", out.latents_std);
+  // vae_tile_size / vae_tile_overlap_min are not stated; the defaults
+  // are the released 256 / 64, which this class and the reference's
+  // diffusers wrapper share.
+  return true;
+}
+
 }  // namespace
 
 std::string
@@ -114,6 +361,11 @@ MetalMiniMaxH3VideoVae::resolve_vae_dir(const std::string& path)
       !fs::exists(p / "source")) {
     return p.string();                                 // already source/
   }
+  // The diffusers VAE named directly: its weights sit beside its config.
+  if (minimax_h3::is_diffusers_vae_dir(p.string(),
+                                       minimax_h3::kDiffusersVideoVaeClass)) {
+    return p.string();
+  }
   if (fs::exists(p / "source" / "model.safetensors")) {
     return (p / "source").string();                    // video_vae/
   }
@@ -126,6 +378,14 @@ MetalMiniMaxH3VideoVae::resolve_vae_dir(const std::string& path)
   for (const char* part : {"FL2VA", "Ref2VA"}) {
     const fs::path src = p / part / "video_vae" / "source";
     if (fs::exists(src / "model.safetensors")) { return src.string(); }
+  }
+  // The diffusers pipeline at the repository's root, LAST: a checkout
+  // that also holds a partition has just answered with the released
+  // copy, the one every graph already shares (the same numbers; see
+  // minimax-h3-diffusers-layout.h).
+  if (minimax_h3::is_diffusers_vae_dir((p / "vae").string(),
+                                       minimax_h3::kDiffusersVideoVaeClass)) {
+    return (p / "vae").string();
   }
   return path;
 }
@@ -140,6 +400,11 @@ MetalMiniMaxH3VideoVae::config_from_json(const std::string& vae_dir,
     return false;
   };
   fs::path p(resolve_vae_dir(vae_dir));
+  if (minimax_h3::is_diffusers_vae_dir(p.string(),
+                                       minimax_h3::kDiffusersVideoVaeClass)) {
+    return diffusers_config_(p.string(), out, err) &&
+           finish_config_(out, err);
+  }
   // `cfg` is the source net's config (diffusers `source/config.json`);
   // `wrap` is the wrapper's, which is where the clip/tile geometry and
   // the latent whitening live. The released layout keeps them in two
@@ -328,57 +593,7 @@ MetalMiniMaxH3VideoVae::config_from_json(const std::string& vae_dir,
     reals("latents_std", out.latents_std);
   }
 
-  out.dim = out.n_heads * out.head_dim;
-  // FeedForward(dim, mult=4): the diffusers default this decoder is
-  // constructed with, so the inner width is not in the config.
-  out.ffn_inner = 4 * out.dim;
-  if (out.head_dim != 64) {
-    return fail("only dim_head 64 is supported (the steel flash-attention "
-                "entry point this decoder runs on is bd64)");
-  }
-  if (out.rope_dim() % 6 != 0) {
-    return fail("int(dim_head * rope_dim_ratio) must be divisible by 6");
-  }
-  // Tile size, overridable for MEASUREMENT. The checkpoint's 256 is the
-  // reference's number, and the cost it buys is not obvious: at 960x544
-  // it lays 15 tiles whose union decodes 1.88x the pixels that exist, so
-  // 88% of the decode is overlap -- but tiles are also where attention is
-  // quadratic, so bigger tiles trade redundant GEMM for superlinear
-  // attention and the balance is an empirical question per machine.
-  //
-  // NOT a tuning knob to ship a different default behind: the tiling
-  // decides where the seams fall and what the cross-fade blends, so a
-  // different size is a different OUTPUT, not the same one computed
-  // faster. Anything found here has to clear the decode golden before it
-  // becomes a default.
-  if (const char* e = std::getenv("VPIPE_H3_VVAE_TILE")) {
-    const int t = std::atoi(e);
-    if (t >= out.patch && t % out.patch == 0) { out.tile_size = t; }
-  }
-
-  // ---- the tiling must COVER the axis exactly ------------------------
-  // `split_tiles` pays the leftover slack back in whole `ratio` steps,
-  // so the union it lays overruns the axis by `slack % ratio` -- and
-  // both tilers and `stitch_` trust the coverage. A tile that ends past
-  // the image is an out-of-bounds READ in encode_tiled_/decode_tiled_
-  // and an out-of-bounds WRITE in stitch_, which is memory corruption
-  // rather than a wrong picture.
-  //
-  // The slack is `tile_size*n - overlap*(n-1) - length` for whichever
-  // `n` the split lands on, and H/W are already multiples of `patch`,
-  // so it is a multiple of `patch` for EVERY n exactly when both the
-  // tile and the minimum overlap are. Checked here rather than in
-  // split_tiles because this is where a checkpoint's numbers arrive,
-  // and refusing a config beats silently retiling one.
-  if (out.tile_size % out.patch != 0 ||
-      out.tile_overlap_min % out.patch != 0) {
-    return fail("vae_tile_size " + std::to_string(out.tile_size) +
-                " and vae_tile_overlap_min " +
-                std::to_string(out.tile_overlap_min) +
-                " must both be multiples of the " +
-                std::to_string(out.patch) +
-                "-pixel patch, or the tiling overruns the image");
-  }
+  if (!finish_config_(out, err)) { return false; }
 
   // ---- the single-frame image capability ------------------------------
   // Read LAST, because validating the slice needs `patch_t`, and that is
@@ -439,6 +654,15 @@ MetalMiniMaxH3VideoVae::Linear
 MetalMiniMaxH3VideoVae::linear_(WeightSet& ws, const std::string& nm)
 {
   Linear l;
+  // Stored in pieces (the diffusers layout): assembled whole.
+  if (const auto parts =
+          minimax_h3::vae_assembled_parts(ws.src(), nm, _cfg.head_dim);
+      !parts.empty()) {
+    const std::string key = std::string(kKey) + "asm|" + nm;
+    l.w = assemble_bf16_(ws, _mc, key + ".weight", parts, ".weight", _part);
+    l.b = assemble_bf16_(ws, _mc, key + ".bias", parts, ".bias", _part);
+    return l;
+  }
   l.b = weight_(ws, nm + ".bias");
   const MetalLlamaWeights& src = ws.src();
   const auto* si = src.info(nm + ".scales");
@@ -802,6 +1026,18 @@ MetalMiniMaxH3VideoVae::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
                               const SharedBuffer& y, std::size_t y_off, int M,
                               int N, int K)
 {
+  _flops.gemm(M, N, K);
+  gemm_uncounted_(enc, x, x_off, l, y, y_off, M, N, K);
+}
+
+void
+MetalMiniMaxH3VideoVae::gemm_uncounted_(ComputeEncoder& enc,
+                                        const SharedBuffer& x,
+                                        std::size_t x_off, const Linear& l,
+                                        const SharedBuffer& y,
+                                        std::size_t y_off, int M, int N,
+                                        int K)
+{
   // Rows in bands narrow enough that no dispatch addresses past 2^31,
   // each rebased through the buffer offset so the kernel's own
   // arithmetic stays small. Below the line -- the decode, and every
@@ -820,8 +1056,9 @@ MetalMiniMaxH3VideoVae::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
   const int band = row_band_(std::max(N, K));
   if (M > band) {
     for (int m0 = 0; m0 < M; m0 += band) {
-      gemm_(enc, x, x_off + (std::size_t)m0 * K, l, y,
-            y_off + (std::size_t)m0 * N, std::min(band, M - m0), N, K);
+      gemm_uncounted_(enc, x, x_off + (std::size_t)m0 * K, l, y,
+                      y_off + (std::size_t)m0 * N, std::min(band, M - m0),
+                      N, K);
     }
     return;
   }
@@ -1214,6 +1451,7 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
   // The ANE feed-forward tier, armed once from the first tile's rows.
   const bool ane_on = _cfg.ane_ffn && ane_setup_(rows);
   using Clk = std::chrono::steady_clock;
+  _flops.begin();
   CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();
@@ -1251,6 +1489,7 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
         // embedding ahead of layer 0: drain it first. See
         // AneFeedForward::needs_barrier.
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         enc = stream.begin_compute();
       }
@@ -1291,6 +1530,7 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
         enc.dispatch({(unsigned)HD, (unsigned)rows, (unsigned)NH},
                      {(unsigned)HD, 1, 1});
       }
+      _flops.attention(NH, (long long)rows * (long long)rows, HD);
       if (use_steel) {
         enc.set_function(_fn_attn);
         enc.set_buffer(0, s.qh); enc.set_buffer(1, s.kh);
@@ -1340,6 +1580,7 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
       if (ane_block || ane_probe) {
         const auto t_d0 = Clk::now();
         enc.end();
+        _flops.flush(stream);
         CommandStream::Fence afence = stream.commit();
         const bool staged = ane_block && _ane->join_stage(L);
         afence.wait();
@@ -1373,6 +1614,7 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
       gpu_ff(0, g_rows);
       if (a_rows > 0) {
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         const double gpu_ms =
             _ane->timing() ? std::chrono::duration<double, std::milli>(
@@ -1386,6 +1628,7 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
       } else if (ane_probe) {
         // The GPU over every row, drained, for the on/off measurement.
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         _ane->note_probe(ane_drain_ms,
                          std::chrono::duration<double, std::milli>(
@@ -1410,6 +1653,7 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
     gemm_(enc, s.nm, 0, _proj_out, s.patches, 0, voxels, PE, D);
   }
   std::string gpu_err;
+  _flops.flush(stream);
   if (!stream.commit().wait_ok(&gpu_err)) {
     return fail(gpu_err.empty() ? std::string("MiniMax-H3 video VAE decode "
                                               "failed")
@@ -1528,15 +1772,20 @@ MetalMiniMaxH3VideoVae::enc_conv_(ComputeEncoder& enc, const Conv3d& c,
   for (int t = 0; t < To; ++t) {
     // Causal taps: output frame t reads input frames t*stride - 2 ..
     // t*stride, and anything before the start of the clip reads as zero.
-    int mask = 0;
+    int mask = 0, live = 0;
     std::size_t off[3] = {0, 0, 0};
     for (int kt = 0; kt < 3; ++kt) {
       const int si = t * stride_t + kt - 2;
       if (si >= 0 && si < Ti) {
         mask |= 1 << kt;
+        ++live;
         off[kt] = (std::size_t)si * ihw * (std::size_t)c.cin;
       }
     }
+    // The frame's arithmetic is its LIVE taps: a tap before the clip is
+    // causal zero padding, which the gather below multiplies but the
+    // model does not (the same rule as the Wan VAE's).
+    _flops.gemm((long long)ohw, c.cout, 9LL * live * c.cin);
     for (std::size_t r0 = 0; r0 < ohw; r0 += band) {
       const int mrows = (int)std::min(band, ohw - r0);
       enc.set_function(_fn_im2col_r);
@@ -1554,9 +1803,9 @@ MetalMiniMaxH3VideoVae::enc_conv_(ComputeEncoder& enc, const Conv3d& c,
       enc.set_constant(11, stride_s);
       enc.set_constant(12, pad_lo);
       enc.dispatch({(unsigned)(27 * c.cin), (unsigned)mrows, 1}, {64, 1, 1});
-      gemm_(enc, _es.col, 0, c.l, out,
-            ((std::size_t)t * ohw + r0) * (std::size_t)c.cout, mrows, c.cout,
-            27 * c.cin);
+      gemm_uncounted_(enc, _es.col, 0, c.l, out,
+                      ((std::size_t)t * ohw + r0) * (std::size_t)c.cout,
+                      mrows, c.cout, 27 * c.cin);
     }
   }
   return To;
@@ -1746,6 +1995,7 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
     }
     (void)tt;
   }
+  _flops.begin();
   CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();
@@ -1815,6 +2065,7 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
     }
   }
   std::string gpu_err;
+  _flops.flush(stream);
   if (!stream.commit().wait_ok(&gpu_err)) {
     return fail(gpu_err.empty()
                     ? std::string("MiniMax-H3 video VAE encode failed")

@@ -35,6 +35,7 @@ extern "C" {
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -137,6 +138,47 @@ lower_ext(const string& path)
 // stage.
 constexpr int kSeqPad = 6;
 
+// FFmpeg, when this process can load it; else null, never a throw. The
+// session's own loader is REQUIRED-mode -- it throws, and logs an error,
+// at every ask while FFmpeg is missing -- and this stage is built for
+// every graph that saves a picture, so the answer is probed quietly
+// (optional mode: a warning) and kept for as long as the environment
+// that decides it -- VPIPE_NO_FFMPEG, VPIPE_FFMPEG_DIR -- is unchanged.
+const FFmpegLibraries*
+ffmpeg_if_present_(const SessionContextIntf* s)
+{
+  if (s == nullptr) { return nullptr; }
+  enum class Known { No, Present, Absent };
+  static std::mutex mu;
+  static Known known = Known::No;
+  static std::string known_for;   // the environment it was found in
+  std::string env;
+  for (const char* k : {"VPIPE_NO_FFMPEG", "VPIPE_FFMPEG_DIR"}) {
+    const char* v = std::getenv(k);
+    env += std::string(v != nullptr ? v : "") + '\n';
+  }
+  Known k = Known::No;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    if (known_for == env) { k = known; }
+  }
+  if (k == Known::Absent) { return nullptr; }
+  const FFmpegLibraries* libs = nullptr;
+  try {
+    if (k == Known::Present ||
+        LibAvUtil(s, LibraryHandle::LoadMode::Optional).valid()) {
+      libs = s->services()->ffmpeg_libraries();
+    }
+  } catch (...) {
+    libs = nullptr;
+  }
+  if (libs != nullptr && !libs->valid()) { libs = nullptr; }
+  std::lock_guard<std::mutex> lk(mu);
+  known = libs != nullptr ? Known::Present : Known::Absent;
+  known_for = env;
+  return libs;
+}
+
 }   // namespace
 
 SaveImageStage::SaveImageStage(const SessionContextIntf* s,
@@ -145,7 +187,7 @@ SaveImageStage::SaveImageStage(const SessionContextIntf* s,
                                  FlexData                  config)
   : TypedStage<SaveImageStage>(s, std::move(id), std::move(iports),
                                 std::move(config))
-  , _libs(s ? s->services()->ffmpeg_libraries() : nullptr)
+  , _libs(ffmpeg_if_present_(s))
 {
   // Deferred validation (see Stage::fail_config): construct for any config
   // so a graph can be built/edited before `path` is supplied.
@@ -217,10 +259,31 @@ SaveImageStage::SaveImageStage(const SessionContextIntf* s,
                     this->id()));
   }
 #endif
-  if (!_libs || !_libs->valid()) {
+  if (_libs == nullptr) {
+#ifdef VPIPE_BUILD_APPLE_SILICON
+    // Without FFmpeg, ImageIO writes every format but WebP: a picture is
+    // still saved where no FFmpeg is installed.
+    if (_format == "webp") {
+      fail_config(fmt(
+          "SaveImageStage('{}'): webp needs FFmpeg, which this process "
+          "cannot load (ImageIO writes png, jpeg, tiff, bmp and exr)",
+          this->id()));
+    }
+#else
     fail_config(fmt(
         "SaveImageStage('{}'): FFmpegLibraries unavailable", this->id()));
+#endif
   }
+}
+
+bool
+SaveImageStage::can_write_() const noexcept
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  return _libs != nullptr || _format != "webp";
+#else
+  return _libs != nullptr;
+#endif
 }
 
 SaveImageStage::~SaveImageStage() = default;
@@ -288,8 +351,10 @@ const PortSpec kIports[] = {
 const StageSpec kSpec = {
   .type_name = "save-image",
   .doc       = "Sink: encodes each planar U8 RGB TensorBeat [3,H,W] to an "
-               "image file (PNG/JPEG/WebP/BMP/TIFF) via FFmpeg. The inverse "
-               "of load-image; quality/compression knobs control the store.",
+               "image file (PNG/JPEG/WebP/BMP/TIFF) via FFmpeg -- or, on "
+               "Apple, ImageIO where FFmpeg cannot be loaded (all but "
+               "WebP). The inverse of load-image; quality/compression "
+               "knobs control the store.",
   .display_name = "Save Image",
   .category  = StageCategory::Visual,
   .iports    = kIports,
@@ -355,8 +420,9 @@ SaveImageStage::encode_(const BeatPayloadIntf& beat, const string& out_path,
   }
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // As deep as the picture, OpenEXR, or F16: ImageIO, the colour kept.
+  // And every picture where FFmpeg cannot be loaded.
   if (_format == "exr" || _bit_depth == 16 ||
-      tbp->dtype == TensorBeat::DType::F16) {
+      tbp->dtype == TensorBeat::DType::F16 || _libs == nullptr) {
     std::vector<std::uint8_t> bytes;
     if (!encode_apple_(*tbp, &bytes)) { return false; }
     if (!exif_tiff.empty()) {
@@ -633,11 +699,12 @@ SaveImageStage::reset_run_state()
 Job
 SaveImageStage::initialize(RuntimeContext& /*ctx*/)
 {
-  if (_path.empty() || !_libs || !_libs->valid()) { co_return; }
+  if (_path.empty() || !can_write_()) { co_return; }
   session()->info(fmt(
       "SaveImageStage('{}'): writing {} to '{}' (quality {}, compression "
-      "{}{})", this->id(), _format, _path, _quality, _compression,
-      _lossless ? ", lossless" : ""));
+      "{}{}){}", this->id(), _format, _path, _quality, _compression,
+      _lossless ? ", lossless" : "",
+      _libs == nullptr ? " with ImageIO: FFmpeg cannot be loaded" : ""));
   // A template is worth ECHOING RESOLVED. Anything this file does not
   // recognise is copied verbatim into the name (see output-path.h), so
   // a mistyped token is otherwise invisible until someone goes looking
@@ -684,7 +751,7 @@ SaveImageStage::process(RuntimeContext& ctx)
           "got {}, ignoring", this->id(), mb->describe()));
     }
   }
-  if (_path.empty() || !_libs || !_libs->valid()) { co_return; }   // inert.
+  if (_path.empty() || !can_write_()) { co_return; }   // inert.
 
   // Provenance: generate-image stamps the generating model onto the latent's
   // sideband and vae-decode carries it onto the image, so a GENERATED image

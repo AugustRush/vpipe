@@ -448,6 +448,7 @@ MetalVdnBranch::gemm_act_(ComputeEncoder& enc, const SharedBuffer& a,
                           int use_bias, SharedBuffer& dst, SharedBuffer& raw,
                           int M, int N, int K, int act, int c_elt)
 {
+  count_(gemm_flops(M, N, K));
   const bool plain = use_bias == 0 && act == 0 && c_elt != 0;
   const bool mma = _mma && a_elt != 0 && lda == K && !bmat.empty()
                    && (plain || raw.byte_size()
@@ -1107,6 +1108,9 @@ MetalVdnBranch::encode(ComputeEncoder& enc, int layer, const Geometry& g,
       int run = slots > 0 ? std::min(fend - fnew, slots - slot)
                           : fend - fnew;
       run = std::min(run, fband);
+      // Depthwise K x K over the run's frames.
+      count_(2ull * (std::uint64_t)run * (std::uint64_t)spf *
+             (std::uint64_t)outC * (std::uint64_t)(K * K));
       const std::size_t src_off =
           soff + (std::size_t)(fnew - frame_base) * (std::size_t)spf
                      * qrowb;
@@ -1165,6 +1169,10 @@ MetalVdnBranch::encode(ComputeEncoder& enc, int layer, const Geometry& g,
     if (conv) { psplit(_prof.conv); }
     if (conv && have != nullptr) { *have = fend; }
     const int use_t = conv ? 1 : 0, l2i = l2 ? 1 : 0;
+    if (conv) {   // the K-tap temporal stencil, on the frames kept
+      count_(2ull * (std::uint64_t)out_frames * (std::uint64_t)spf *
+             (std::uint64_t)outC * (std::uint64_t)K);
+    }
     // With the conv on, _ta reads the SPATIAL kernel's own tight output
     // rather than the caller's tensor, so the strides revert to their
     // defaults -- and the element type becomes the BRANCH's, not the
@@ -1263,6 +1271,9 @@ MetalVdnBranch::encode(ComputeEncoder& enc, int layer, const Geometry& g,
                    const SharedBuffer& bb, std::size_t boff,
                    SharedBuffer& aa, std::size_t aoff, SharedBuffer& bo,
                    std::size_t ooff, int spf, int batch) {
+    // k^T k and k^T v, each [d, d] over the frame's tokens.
+    count_(4ull * (std::uint64_t)spf * (std::uint64_t)d * (std::uint64_t)d *
+           (std::uint64_t)batch);
     if (_mma_stats) {
       enc.set_function(_stats_mma);
       enc.set_buffer(0, kk); enc.set_buffer(1, vv);
@@ -1294,6 +1305,10 @@ MetalVdnBranch::encode(ComputeEncoder& enc, int layer, const Geometry& g,
                    const SharedBuffer& bo, SharedBuffer& ll, SharedBuffer& lli,
                    SharedBuffer& iv, SharedBuffer& trn, SharedBuffer& ij,
                    int batch) {
+    // Cholesky, its triangular inverse and their product at d^3 / 3
+    // each, then the d x d GEMM.
+    count_(3ull * (std::uint64_t)d * (std::uint64_t)d * (std::uint64_t)d *
+           (std::uint64_t)batch);
     enc.set_function(_chol);
     enc.set_buffer(0, aa); enc.set_buffer(1, ll);
     enc.set_constant(2, d);
@@ -1436,6 +1451,8 @@ MetalVdnBranch::encode(ComputeEncoder& enc, int layer, const Geometry& g,
   const std::size_t per = (std::size_t)H * d * d;
   auto scan_step = [&](const SharedBuffer& src, std::size_t soff, int f,
                        SharedBuffer& bank) {
+    count_(2ull * (std::uint64_t)d * (std::uint64_t)d * (std::uint64_t)d *
+           (std::uint64_t)H);   // transition . state, a head
     enc.set_function(_step);
     enc.set_buffer(0, src, soff);
     enc.set_buffer(1, _tr, (std::size_t)f * per * 4);
@@ -1504,6 +1521,9 @@ MetalVdnBranch::encode(ComputeEncoder& enc, int layer, const Geometry& g,
     proj_sigmoid(*in.x, xoff, w_gd, w_gu, b.g_up_b, _gate_b, n,
                  outC, d);
     psplit(_prof.gate);
+    // q . state: [tokens, d] x [d, d] a head.
+    count_(2ull * (std::uint64_t)n * (std::uint64_t)H * (std::uint64_t)d *
+           (std::uint64_t)d);
     if (_mma_readout) {
       // The contraction, then the row-wise tail. Split because the
       // RMSNorm needs a whole 128-wide row and a reduction across it,

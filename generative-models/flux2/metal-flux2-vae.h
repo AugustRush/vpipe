@@ -3,6 +3,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/shared/kernel-sets/vae-conv3x3-tune.h"
 #include "generative-models/shared/kernel-sets/vae-mid-attn-tune.h"
 
@@ -103,6 +104,12 @@ class MetalFlux2Vae {
   encode(const metal_compute::SharedBuffer& img, int H, int W);
   bool has_encoder() const { return _has_encoder; }
 
+  // The GPU arithmetic decode() and encode() have credited to the
+  // achieved-FLOP/s meter (common/perf-flops.h): every 3x3 conv, 1x1
+  // conv and the mid-block attention, counted as encoded and credited
+  // as each command buffer retires. For a test to hold against shapes.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
+
   const Config& config() const { return _cfg; }
 
  private:
@@ -179,6 +186,7 @@ class MetalFlux2Vae {
 
   // Encoder path (loaded only when with_encoder).
   bool _has_encoder = false;
+  GpuFlopsTally _flops;   // see gpu_flops()
   Conv _enc_conv_in;                // 3 -> block_out[0]
   std::vector<DownStage> _enc_down;
   ResBlock _enc_mid_res0, _enc_mid_res1;

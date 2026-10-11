@@ -14,6 +14,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
 #include "common/flex-data.h"
+#include "common/perf-flops.h"
 #include "generative-models/krea2/metal-krea2-transformer.h"
 
 #include <chrono>
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace vpipe;
@@ -1529,4 +1531,167 @@ TEST(krea2_dit, forward_dit_sage_matches_f16)
   EXPECT_TRUE(std::isfinite(r) && r < 0.10);
   // The int8 path RAN. Without this the test passes on two dense arms.
   EXPECT_TRUE(differ > v_sage.size() / 4);
+}
+
+// ---- perf-flops ----------------------------------------------------
+//
+// Both forwards' arithmetic, as the FLOP/s meter is credited with it
+// (common/perf-flops.h, shared/dit-flops.h):
+//
+//   * the text-fusion tower and a two-block DiT, each EXACT against a
+//     count derived here from the structure, and each credited whole
+//     once its buffers retire;
+//   * with Sol routing every block, the first forward counts the GEMMs
+//     at once and credits the attention Sol kept when it finishes, and
+//     the second counts its routed attention at that ratio as it
+//     encodes -- so the two forwards' attention agree.
+//
+// Grid 32 with 64 prompt tokens is 1088 joint rows, 17 routing blocks:
+// past Sol's floor of 16. Env: VPIPE_KREA2_TEST_MODEL_PATH.
+TEST(krea2_dit, forward_credits_its_flops)
+{
+  namespace pf = vpipe::perf_flops;
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config cfg;
+  cfg.n_layers = 2;
+  const int TS = 64, grid = 32, IS = grid * grid, seq = TS + IS;
+  const long long HID = cfg.hidden, IC = cfg.in_channels;
+  const long long TH = cfg.text_hidden, NL = cfg.n_text_layers;
+  const long long TFF = cfg.text_ffn, THD = cfg.text_head_dim();
+  const long long HD = cfg.head_dim, FF = cfg.ffn;
+  const long long qd = (long long)cfg.n_heads * HD;
+  const long long kd = (long long)cfg.n_kv_heads * HD;
+
+  std::uint32_t st = 0x7f10b5e1u;
+  auto f16buf = [&](std::size_t n, float amp) {
+    SharedBuffer b = mc->make_shared_buffer(n * 2);
+    if (b.empty()) { return b; }
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      st = st * 1664525u + 1013904223u;
+      d[i] = (_Float16)(((float)(st >> 9) / 4194304.0f - 1.0f) * amp);
+    }
+    return b;
+  };
+  const SharedBuffer ehs = f16buf((std::size_t)TS * NL * TH, 1.0f);
+  const SharedBuffer txt = f16buf((std::size_t)TS * HID, 1.0f);
+  const SharedBuffer lat = f16buf((std::size_t)IS * IC, 1.0f);
+  ASSERT_TRUE(!ehs.empty() && !txt.empty() && !lat.empty());
+  if (ehs.empty() || txt.empty() || lat.empty()) { return; }
+
+  // The counts, from the structure. A text-fusion block runs `batch`
+  // independent length-T sequences: the layerwise ones over the 12
+  // tapped layers of each token, the refiners over the prompt.
+  auto text_block = [&](long long batch, long long T) {
+    const long long BT = batch * T;
+    return 5 * gemm_flops(BT, TH, TH) + 2 * gemm_flops(BT, TFF, TH) +
+           gemm_flops(BT, TH, TFF) +
+           attention_flops(batch * cfg.text_heads, T * T, THD);
+  };
+  const std::uint64_t want_text =
+      (std::uint64_t)cfg.n_layerwise * text_block(TS, NL) +
+      gemm_flops(TS * TH, 1, NL) +
+      (std::uint64_t)cfg.n_refiner * text_block(1, TS) +
+      gemm_flops(TS, HID, TH) + gemm_flops(TS, HID, HID);
+  const std::uint64_t attn =
+      attention_flops(cfg.n_heads, (long long)seq * seq, HD);
+  const std::uint64_t gemms_per_block =
+      gemm_flops(seq, qd, HID) + 2 * gemm_flops(seq, kd, HID) +
+      2 * gemm_flops(seq, HID, HID) + gemm_flops(seq, 2 * FF, HID) +
+      gemm_flops(seq, HID, FF);
+  const std::uint64_t gemms =
+      gemm_flops(1, HID, cfg.timestep_dim) + gemm_flops(1, HID, HID) +
+      gemm_flops(1, 6 * HID, HID) + gemm_flops(IS, HID, IC) +
+      (std::uint64_t)cfg.n_layers * gemms_per_block +
+      gemm_flops(IS, IC, HID);
+  const std::uint64_t want_dit = gemms + (std::uint64_t)cfg.n_layers * attn;
+
+  // One call; what the tally flushed and the meter was credited.
+  struct Got { std::uint64_t flushed = 0, gpu = 0; bool ok = false; };
+  auto measure = [&](MetalKrea2Transformer& m, auto&& call) {
+    Got g;
+    const std::uint64_t f0 = m.gpu_flops().flushed();
+    const pf::Totals g0 = pf::totals(pf::kGpu);
+    g.ok = call();
+    g.flushed = m.gpu_flops().flushed() - f0;
+    // The last buffer's handler may run after the wait that saw it --
+    // and Sol's finish() credits synchronously, so reaching `flushed` is
+    // not proof that every handler has run. Let them settle.
+    for (int i = 0; i < 400 && pf::totals(pf::kGpu).flops - g0.flops <
+                                   g.flushed; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    g.gpu = pf::totals(pf::kGpu).flops - g0.flops;
+    return g;
+  };
+  auto dit = [&](MetalKrea2Transformer& m) {
+    return !m.forward_dit(txt, TS, lat, IS, grid, grid, 0.5f).empty();
+  };
+
+  {
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg, /*stream=*/true);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { return; }
+    const Got t = measure(*m, [&]() {
+      return !m->forward_text(ehs, TS).empty();
+    });
+    const Got d = measure(*m, [&]() { return dit(*m); });
+    std::printf("[krea2_dit] flops: text tower %.4f TFLOP (derived %.4f, "
+                "credited %.4f); DiT %lld rows x %d blocks %.4f TFLOP "
+                "(derived %.4f, credited %.4f)\n", t.flushed / 1e12,
+                want_text / 1e12, t.gpu / 1e12, (long long)seq,
+                cfg.n_layers, d.flushed / 1e12, want_dit / 1e12,
+                d.gpu / 1e12);
+    ASSERT_TRUE(t.ok && d.ok);
+    EXPECT_TRUE(t.flushed == want_text);
+    EXPECT_TRUE(t.gpu == t.flushed);
+    EXPECT_TRUE(d.flushed == want_dit);
+    EXPECT_TRUE(d.gpu == d.flushed);
+  }
+
+  // Sol on every block.
+  MetalKrea2Transformer::Config sc = cfg;
+  sc.sol.enabled      = true;
+  sc.sol.tau          = 1.0f;
+  sc.sol.dense_layers = 0;
+  sc.sol.key_block    = 64;
+  sc.sol.local_radius = 1;
+  auto m = MetalKrea2Transformer::load(tdir, mc, sc, /*stream=*/true);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  const Got a = measure(*m, [&]() { return dit(*m); });
+  ASSERT_TRUE(a.ok);
+  if (!a.ok) { return; }
+  // A dense count means nothing routed: no Sol kernels on this box, or
+  // a geometry it declined.
+  if (a.flushed == want_dit) {
+    std::printf("[krea2_dit] flops: Sol did not route here; its half is "
+                "skipped\n");
+    return;
+  }
+  const Got b = measure(*m, [&]() { return dit(*m); });
+  ASSERT_TRUE(b.ok);
+  // The first forward: GEMMs as encoded, the kept attention at finish.
+  const std::uint64_t kept1 = a.gpu - a.flushed;
+  // The second: the routed attention at that ratio, as encoded -- one
+  // floor per routed call, so within a FLOP a block of the first.
+  const std::uint64_t kept2 = b.flushed - gemms;
+  const std::uint64_t all = (std::uint64_t)cfg.n_layers * attn;
+  std::printf("[krea2_dit] flops with Sol: forward 1 counted %.4f + kept "
+              "%.4f at finish, forward 2 counted %.4f (kept %.4f); dense "
+              "attention %.4f TFLOP\n", a.flushed / 1e12, kept1 / 1e12,
+              b.flushed / 1e12, kept2 / 1e12, all / 1e12);
+  EXPECT_TRUE(a.flushed == gemms);
+  EXPECT_TRUE(a.gpu >= a.flushed);
+  EXPECT_TRUE(kept1 > 0 && kept1 <= all);
+  EXPECT_TRUE(b.gpu == b.flushed);
+  const std::uint64_t gap = kept1 > kept2 ? kept1 - kept2 : kept2 - kept1;
+  EXPECT_TRUE(gap <= (std::uint64_t)cfg.n_layers);
 }

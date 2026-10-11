@@ -210,6 +210,21 @@ private:
   std::unique_ptr<genai::MetalKrea2Vae> _vae;
   std::unique_ptr<genai::MetalFlux2Vae> _flux2_vae;
   std::unique_ptr<genai::MetalWanVae>   _wan_vae;
+  // A STREAM's decode carries (sideband::kStreamContinues), held from one
+  // latent beat to the next so the decode continues across the cut. Kept
+  // apart from the VAE itself, so an idle unload of the weights between
+  // beats does not end the stream; dropped at its final beat.
+  std::unique_ptr<genai::MetalWanVae::DecodeStream> _wan_stream;
+  // OVERLAPPING clips (sideband::kBlendTail / kBlendHead): a beat's last
+  // frames held back, as 0..1 planes, for the next beat to cross-fade into
+  // its first ones; emitted as they are if no such beat comes.
+  struct HeldFrame {
+    std::vector<float> unit;     // [3, H, W]
+    int                H = 0, W = 0;
+    FlexData           sb;
+  };
+  std::vector<HeldFrame> _held;
+  std::unique_ptr<TensorBeatPayload> held_beat_(const HeldFrame& h) const;
   // MiniMax-H3's video VAE. Its decoder is a ViT rather than an
   // upsampling conv stack, so it tiles STRUCTURALLY and returns the whole
   // clip at once instead of streaming chunks through a sink.

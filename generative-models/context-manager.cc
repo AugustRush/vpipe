@@ -1706,6 +1706,198 @@ ContextManager::ensure_sliding_capacity(ContextId id, int need)
   return true;
 }
 
+// ---- export / import ------------------------------------------------
+//
+// The stream: magic, the layout it fits (layer count, page size, the
+// bytes of a page, of a conv and an SSM state, and each layer's kind),
+// the context's length and its pages' valid counts, then each paged
+// layer's K pages and V pages and each linear layer's conv and SSM
+// state, and the magic again. Whole pages: the unused slots of the last
+// one cost a page at most, and a page keeps its rows where the kernels
+// address them.
+
+namespace {
+
+constexpr uint32_t kCtxMagic    = 0x31435456u;   // "VTC1"
+constexpr uint8_t  kLayerNone   = 0;
+constexpr uint8_t  kLayerPaged  = 1;
+constexpr uint8_t  kLayerLinear = 2;
+
+}  // namespace
+
+bool
+ContextManager::export_context(ContextId id, const ByteSink& out) const
+{
+  if (!out) { return false; }
+  lock_guard<mutex> lk(_impl->mu);
+  const Impl& I = *_impl;
+  if (!I.metal_enabled() || I.contig_enabled) { return false; }
+  const Impl::Context* c = I.find_locked_(id);
+  if (c == nullptr || c->gdn_ring_R != 1 || c->gdn_cur != 0) {
+    return false;
+  }
+  const int pt = I.spec.page_tokens;
+  const size_t np = c->page_list.size();
+  for (size_t i = 0; i + 1 < np; ++i) {
+    if (c->page_valid[i] != pt) { return false; }
+  }
+  for (PageId p : c->page_list) {
+    if (p.v >= I.m_pool_capacity) { return false; }
+  }
+  bool ok = true;
+  auto put = [&](const void* p, size_t n) {
+    if (ok && n > 0) { ok = out(p, n); }
+  };
+  auto pod = [&](const auto& v) { put(&v, sizeof v); };
+  auto kind = [&](int L) {
+    return I.pool_owns_(L) ? kLayerPaged
+        : (I.is_linear_(L) && I.has_ssm_layers) ? kLayerLinear
+                                                 : kLayerNone;
+  };
+  pod(kCtxMagic);
+  pod(static_cast<int32_t>(I.spec.n_layers));
+  pod(static_cast<int32_t>(pt));
+  pod(static_cast<uint64_t>(I.m_page_bytes));
+  pod(static_cast<uint64_t>(I.m_conv_bytes));
+  pod(static_cast<uint64_t>(I.m_ssm_bytes));
+  for (int L = 0; L < I.spec.n_layers; ++L) { pod(kind(L)); }
+  pod(static_cast<int32_t>(c->seq_len));
+  pod(static_cast<uint32_t>(np));
+  for (size_t i = 0; i < np; ++i) {
+    pod(static_cast<int32_t>(c->page_valid[i]));
+  }
+  const size_t pb = I.m_page_bytes;
+  for (int L = 0; L < I.spec.n_layers && ok; ++L) {
+    if (!I.pool_owns_(L)) { continue; }
+    for (const auto* pool :
+         {&I.m_kpool[(size_t)L], &I.m_vpool[(size_t)L]}) {
+      const auto* base = static_cast<const uint8_t*>(pool->contents());
+      for (PageId p : c->page_list) {
+        put(base + static_cast<size_t>(p.v) * pb, pb);
+      }
+    }
+  }
+  if (I.has_ssm_layers) {
+    for (int L = 0; L < I.spec.n_layers && ok; ++L) {
+      if (!I.is_linear_(L)) { continue; }
+      if ((size_t)L >= c->m_conv_state.size()
+          || c->m_conv_state[(size_t)L].empty()
+          || c->m_ssm_state[(size_t)L].empty()) {
+        return false;
+      }
+      put(c->m_conv_state[(size_t)L].contents(), I.m_conv_bytes);
+      put(c->m_ssm_state[(size_t)L].contents(), I.m_ssm_bytes);
+    }
+  }
+  pod(kCtxMagic);
+  return ok;
+}
+
+ContextId
+ContextManager::import_context(const ByteSource& in)
+{
+  if (!in) { return ContextId{}; }
+  Impl& I = *_impl;
+  if (!I.metal_enabled() || I.contig_enabled) { return ContextId{}; }
+  bool ok = true;
+  auto get = [&](void* p, size_t n) {
+    if (ok && n > 0) { ok = in(p, n); }
+  };
+  auto pod = [&](auto& v) { get(&v, sizeof v); };
+  auto want_kind = [&](int L) {
+    return I.pool_owns_(L) ? kLayerPaged
+        : (I.is_linear_(L) && I.has_ssm_layers) ? kLayerLinear
+                                                 : kLayerNone;
+  };
+  // The header, checked against this manager before anything is made.
+  uint32_t magic = 0;
+  int32_t  n_layers = 0, pt = 0;
+  uint64_t page_bytes = 0, conv_bytes = 0, ssm_bytes = 0;
+  pod(magic);
+  pod(n_layers);
+  pod(pt);
+  pod(page_bytes);
+  pod(conv_bytes);
+  pod(ssm_bytes);
+  if (!ok || magic != kCtxMagic || n_layers != I.spec.n_layers
+      || pt != I.spec.page_tokens || page_bytes != I.m_page_bytes
+      || conv_bytes != I.m_conv_bytes || ssm_bytes != I.m_ssm_bytes) {
+    return ContextId{};
+  }
+  for (int L = 0; L < n_layers; ++L) {
+    uint8_t kind = 0;
+    pod(kind);
+    if (!ok || kind != want_kind(L)) { return ContextId{}; }
+  }
+  int32_t  seq_len = 0;
+  uint32_t np = 0;
+  pod(seq_len);
+  pod(np);
+  if (!ok || seq_len < 0 || np > I.spec.max_pages) { return ContextId{}; }
+  vector<int> valid(np);
+  int64_t total = 0;
+  for (uint32_t i = 0; i < np && ok; ++i) {
+    int32_t v = 0;
+    pod(v);
+    if (v <= 0 || v > pt || (i + 1 < np && v != pt)) { ok = false; }
+    valid[i] = v;
+    total += v;
+  }
+  if (!ok || total != seq_len) { return ContextId{}; }
+
+  const ContextId id = acquire_root();
+  if (!id.valid()) { return ContextId{}; }
+  // Held through the reads: another context's append may grow -- and so
+  // move -- the pools these pages are written into.
+  lock_guard<mutex> lk(I.mu);
+  Impl::Context* c = I.find_locked_(id);
+  auto undo = [&] {
+    if (c != nullptr) {
+      for (PageId p : c->page_list) { I.release_page_locked_(p); }
+    }
+    I.contexts.erase(id.v);
+    return ContextId{};
+  };
+  if (c == nullptr) { return undo(); }
+  for (uint32_t i = 0; i < np; ++i) {
+    const PageId p = I.allocate_page_locked_();
+    if (!p.valid() || p.v >= I.m_pool_capacity) {
+      if (p.valid()) { I.release_page_locked_(p); }
+      if (session()) {
+        session()->warn(fmt(
+            "ContextManager::import_context: the page pool cannot hold "
+            "{} pages (max_pages={})", np, I.spec.max_pages));
+      }
+      return undo();
+    }
+    c->page_list.push_back(p);
+    c->page_valid.push_back(valid[i]);
+  }
+  c->seq_len = seq_len;
+  c->tail_frozen = false;
+  const size_t pb = I.m_page_bytes;
+  for (int L = 0; L < n_layers && ok; ++L) {
+    if (!I.pool_owns_(L)) { continue; }
+    for (auto* pool : {&I.m_kpool[(size_t)L], &I.m_vpool[(size_t)L]}) {
+      auto* base = static_cast<uint8_t*>(pool->contents());
+      for (PageId p : c->page_list) {
+        get(base + static_cast<size_t>(p.v) * pb, pb);
+      }
+    }
+  }
+  if (I.has_ssm_layers) {
+    for (int L = 0; L < n_layers && ok; ++L) {
+      if (!I.is_linear_(L)) { continue; }
+      get(c->m_conv_state[(size_t)L].contents(), I.m_conv_bytes);
+      get(c->m_ssm_state[(size_t)L].contents(), I.m_ssm_bytes);
+    }
+  }
+  uint32_t trailer = 0;
+  pod(trailer);
+  if (!ok || trailer != kCtxMagic) { return undo(); }
+  return id;
+}
+
 
 void
 ContextManager::set_eval_per_write(bool b) noexcept

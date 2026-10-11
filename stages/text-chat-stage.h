@@ -56,12 +56,66 @@ namespace vpipe {
 // loaded model does not provide (no tower / no pad token) warns and
 // drops that attachment, keeping the surrounding text.
 //
+// A CONVERSATION beat. A host that runs a graph per turn -- an agent
+// that asks the model, acts on its answer, then asks again -- sends the
+// whole conversation as a FlexData OBJECT instead of a line:
+//   messages   (array, required) -- {role: system | user | assistant |
+//                                  tool, content, name?}, oldest first;
+//                                  the last is the user's or a tool's
+//                                  (the reply comes after it). A
+//                                  `system` message first is the system
+//                                  turn; tool messages in a row are one
+//                                  tool-results turn. Media markers are
+//                                  read in the LAST user message only.
+//   tools      (array)           -- the HOST's tools, {name, description,
+//                                  parameters (JSON Schema)}, advertised
+//                                  in the system turn. Never run here: a
+//                                  reply calling them ENDS the turn, the
+//                                  calls going out on out-port 0, and the
+//                                  host sends their results as the next
+//                                  beat's tool messages.
+//   context    (string)          -- a KEY: the context the turn ends on
+//                                  is parked under it with the model
+//                                  (GenerativeModelManager::park_context)
+//                                  for the next graph naming it, which
+//                                  then prefills only the messages after
+//                                  what it holds. Without one the stage
+//                                  keeps it for its own next beat.
+//   context_dir (string)         -- where the keyed context is SAVED when
+//                                  the model goes (its warm hold ends, or
+//                                  a launch needs the room) and read back
+//                                  from by the next turn: the host's
+//                                  folder, the host's to remove.
+//   max_new_tokens (int)         -- this turn's budget, in place of the
+//                                  stage's.
+// What a kept context holds is matched message by message: an assistant
+// message matches the reply decoded here only when the host sends it
+// back exactly as out-port 0's `text` was. Messages that do not begin
+// with what it holds start a new context, and so does a beat whose
+// `tools` -- or the stage's own rendering of the system and generation
+// turns (its thinking mode, the reasoning instruction) -- differ from
+// the ones the context was made under. ChatML / Qwen families only;
+// another's chat template refuses the beat by name.
+//
 // Per assistant turn the stage emits a FlexData object on out-port 0
 // with keys:
 //   text        (string) -- the full assistant response text
 //   prefill_ms  (int)    -- prefill wall time in milliseconds
 //   decode_ms   (int)    -- decode wall time in milliseconds
+//   decoded     (int)    -- tokens decoded in it (a drafter's accepted
+//                           ones included): decode_ms's tokens a second
 //   ctx_pos     (int)    -- K/V context length after this turn
+// and, for a conversation beat:
+//   content     (string) -- the reply less its tool-call blocks
+//   tool_calls  (array)  -- {name, arguments (JSON text)}, in order
+//   finish      (string) -- tool_calls | stop | length | interrupted |
+//                           stopped | error
+//   reused      (int)    -- tokens of the kept context reused
+//   prefilled   (int)    -- tokens prefilled this turn
+//   restored    (string) -- where the context came from: memory (kept
+//                           with the model), disk (read back), stage (the
+//                           stage's own), new
+//   ctx_bytes   (int)    -- the model's K/V held now, every context's
 // The oport is unconditional; downstream consumers are optional --
 // the runtime drops writes when no cursor is attached. The intended
 // consumer is a feedback-rx + feedback-tx pair driving the input
@@ -328,6 +382,12 @@ private:
   // subsequent turns skip it because the cache already starts with
   // BOS. `/clear` flips this back to false.
   bool _seeded = false;
+  // What _chat_ctx holds as a CONVERSATION (an unkeyed conversation
+  // beat's): its setup's digest, then its messages', one by one. The
+  // next such beat reuses it when its own begin with these. False once
+  // a plain line has been added.
+  std::vector<std::uint64_t> _conv_digests;
+  bool                       _conv_valid = false;
 
   // ---- user interrupt (Ctrl-C / the web UI's Interrupt button) -----
   //

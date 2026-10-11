@@ -25,6 +25,8 @@ set(LOCAL_SOURCES
   os-sandbox.cc
   path-sandbox.cc
   perf-buffer.cc
+  perf-flops.cc
+  perf-flops-doc.cc
   compare-image-channel.cc
   mask-editor-channel.cc
   preview-channel.cc
@@ -77,6 +79,8 @@ set(LOCAL_HEADERS
   path-sandbox.h
   perf-buffer.h
   perf-event.h
+  perf-flops.h
+  perf-flops-doc.h
   compare-image-channel.h
   mask-editor-channel.h
   preview-channel.h

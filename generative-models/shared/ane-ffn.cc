@@ -8,6 +8,7 @@
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/shared/fp8.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/perf-flops.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
@@ -223,6 +224,12 @@ AneFeedForward::create(const Options& o)
   f->_matmul  = o.matmul;
   f->_gelu    = o.gelu && !o.matmul;
   f->_out_w   = o.matmul ? o.ffn : o.hidden;
+  // What one row costs the ANE, as perf-flops counts it: one projection
+  // `hidden` -> `ffn`, or two (GELU: up and down), or three (SwiGLU:
+  // gate, up and down) -- the same figure the GPU's GEMMs count for the
+  // rows it keeps, so moving rows between them moves no FLOPs.
+  f->_row_flops = 2ull * (std::uint64_t)o.hidden * (std::uint64_t)o.ffn *
+                  (o.matmul ? 1ull : (f->_gelu ? 2ull : 3ull));
   f->_chunk   = chunk;
   f->_chunks  = rows / chunk;
   f->_rows_per_block = rows;
@@ -930,7 +937,19 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
         return;
       }
       const auto tp = Clk::now();
-      bool ok = _rt->run(_in, 0, _out, 0, *_w);
+      // One predict, credited to the ANE as it returns -- every one that
+      // ran, a headroom retry included: the meter is what the unit DID.
+      auto run = [&]() {
+        const std::uint64_t t0 = perf_flops::now_ns();
+        const bool r = _rt->run(_in, 0, _out, 0, *_w);
+        if (r && perf_flops::available()) {
+          perf_flops::credit(perf_flops::kAne,
+                             (std::uint64_t)_chunk * _row_flops, t0,
+                             perf_flops::now_ns());
+        }
+        return r;
+      };
+      bool ok = run();
       std::size_t bad = ok ? non_finite() : 0;
       // fp16 overflow inside the graph: rescale and predict THIS chunk
       // again. Earlier chunks were converted out at the scale they were
@@ -940,7 +959,7 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
         _slot_scale *= 4.0f;
         _up_scale = _slot_scale;
         ++_rescales;
-        ok = _rt->run(_in, 0, _out, 0, *_w);
+        ok = run();
         bad = ok ? non_finite() : 0;
       }
       if (tm) { _t_pred += ms_since_(tp); }

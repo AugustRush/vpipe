@@ -305,9 +305,41 @@ gone_wired_bytes(Records& recs)
 
 }  // namespace
 
+namespace {
+
+// The conversations parked on a warm model that is going (park_context):
+// each saved where its host said, then let go -- before the model, which
+// `warm` still holds. A generic lambda, not a member: every method of the
+// manager is an exported symbol (see `_warm` in the header).
+const auto spill_parked = [](auto& warm, const SessionContextIntf* s) {
+  for (auto& p : warm.parked) {
+    if (p.spill.empty() || !p.ctx.valid() || !warm.lm) { continue; }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string err;
+    const int tokens = p.ctx.seq_len();
+    if (warm.lm->save_context(p.ctx, p.spill, p.meta, &err)) {
+      if (s != nullptr) {
+        s->info(fmt(
+            "GenerativeModelManager: conversation '{}' ({} tokens) saved "
+            "to {} in {} ms as its model goes", p.key, tokens, p.spill,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count()));
+      }
+    } else if (s != nullptr) {
+      s->warn(fmt(
+          "GenerativeModelManager: conversation '{}' could not be saved "
+          "({}); its next turn prefills it again", p.key, err));
+    }
+  }
+  warm.parked.clear();
+};
+
+}  // namespace
+
 GenerativeModelManager::~GenerativeModelManager()
 {
-  // The warm models first: they hold weight sets of their own.
+  // The warm models first: they hold weight sets of their own. The
+  // conversations parked on them are saved before they go.
   std::vector<Warm> warm;
   {
     lock_guard<mutex> lk(_warm_mu);
@@ -316,6 +348,7 @@ GenerativeModelManager::~GenerativeModelManager()
   }
   _warm_cv.notify_all();
   if (_warm_reaper.joinable()) { _warm_reaper.join(); }
+  for (auto& w : warm) { spill_parked(w, session()); }
   warm.clear();
   // See the declaration: the sets must be released while the registry
   // they deregister from is still alive.
@@ -1092,6 +1125,16 @@ GenerativeModelManager::accounts_for(const string& dir) const
     if (k.rfind(pfx, 0) == 0 && w != nullptr) { return true; }
   }
   return false;
+}
+
+bool
+GenerativeModelManager::declares(const string& dir) const
+{
+  if (dir.empty()) { return false; }
+  const string canon = canonicalize_(session(), dir);
+  lock_guard<mutex> lk(_ws_mu);
+  auto it = _declared.find(canon);
+  return it != _declared.end() && it->second > 0;
 }
 
 // Bytes per canonical directory: what each checkpoint costs right now,
@@ -1897,7 +1940,7 @@ GenerativeModelManager::keep_warm(const shared_ptr<LoadedLanguageModel>& lm,
 {
   if (!lm) { return; }
   const string key = canonicalize_(session(), dir);
-  shared_ptr<LoadedLanguageModel> dropped;   // freed outside the lock
+  std::vector<Warm> dropped;   // freed outside the lock
   {
     lock_guard<mutex> lk(_warm_mu);
     if (_warm_stop) { return; }
@@ -1905,7 +1948,7 @@ GenerativeModelManager::keep_warm(const shared_ptr<LoadedLanguageModel>& lm,
                            [&](const Warm& w) { return w.lm == lm; });
     if (seconds <= 0) {
       if (it != _warm.end()) {
-        dropped = std::move(it->lm);
+        dropped.push_back(std::move(*it));
         _warm.erase(it);
       }
     } else {
@@ -1915,7 +1958,7 @@ GenerativeModelManager::keep_warm(const shared_ptr<LoadedLanguageModel>& lm,
       if (it != _warm.end()) {
         it->until = std::max(it->until, until);
       } else {
-        _warm.push_back(Warm{lm, key, until});
+        _warm.push_back(Warm{lm, key, until, {}});
       }
       if (!_warm_reaper.joinable()) {
         _warm_reaper = std::thread([this] {
@@ -1937,7 +1980,8 @@ GenerativeModelManager::keep_warm(const shared_ptr<LoadedLanguageModel>& lm,
               // Freed with the lock dropped: a 16 GB model's buffers take
               // a moment, and a keep_warm must not wait on them.
               rl.unlock();
-              for (const auto& w : expired) {
+              for (auto& w : expired) {
+                spill_parked(w, session());
                 if (session()) {
                   session()->info(fmt(
                       "GenerativeModelManager: '{}' was kept warm and is "
@@ -1960,6 +2004,7 @@ GenerativeModelManager::keep_warm(const shared_ptr<LoadedLanguageModel>& lm,
     }
   }
   _warm_cv.notify_all();
+  for (auto& w : dropped) { spill_parked(w, session()); }
 }
 
 size_t
@@ -1985,7 +2030,8 @@ GenerativeModelManager::release_warm_unclaimed()
       }
     }
   }
-  for (const auto& w : gone) {
+  for (auto& w : gone) {
+    spill_parked(w, session());
     if (session()) {
       session()->info(fmt(
           "GenerativeModelManager: '{}' was kept warm; this launch does "
@@ -2006,6 +2052,117 @@ GenerativeModelManager::warm_count() const
 {
   lock_guard<mutex> lk(_warm_mu);
   return _warm.size();
+}
+
+std::vector<string>
+GenerativeModelManager::warm_dirs() const
+{
+  std::vector<string> dirs;
+  lock_guard<mutex> lk(_warm_mu);
+  for (const auto& w : _warm) { dirs.push_back(w.dir); }
+  return dirs;
+}
+
+size_t
+GenerativeModelManager::warm_kv_bytes() const
+{
+  std::vector<shared_ptr<LoadedLanguageModel>> lms;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (const auto& w : _warm) { lms.push_back(w.lm); }
+  }
+  size_t bytes = 0;
+  for (const auto& lm : lms) {
+    if (lm) { bytes += lm->kv_bytes(); }
+  }
+  return bytes;
+}
+
+void
+GenerativeModelManager::park_context(const string&                    key,
+                                     const shared_ptr<LoadedLanguageModel>& lm,
+                                     LoadedLanguageModel::Context     ctx,
+                                     string                           meta,
+                                     const string&                    spill)
+{
+  if (key.empty() || !lm || !ctx.valid()) { return; }
+  Parked p{key, std::move(ctx), std::move(meta), spill};
+  // What the key held before goes, outside the lock -- each with its
+  // model, so a reaper dropping that hold meanwhile cannot take the
+  // model from under the context.
+  std::vector<Warm> replaced;
+  bool kept = false;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (auto& w : _warm) {
+      for (auto it = w.parked.begin(); it != w.parked.end();) {
+        if (it->key != key) {
+          ++it;
+          continue;
+        }
+        Warm old{w.lm, w.dir, w.until, {}};
+        old.parked.push_back(std::move(*it));
+        replaced.push_back(std::move(old));
+        it = w.parked.erase(it);
+      }
+    }
+    auto it = std::find_if(_warm.begin(), _warm.end(),
+                           [&](const Warm& w) { return w.lm == lm; });
+    if (it != _warm.end() && !_warm_stop) {
+      it->parked.push_back(std::move(p));
+      kept = true;
+    }
+  }
+  replaced.clear();
+  if (!kept) {
+    // Not kept warm: the model may go with its last user, now.
+    Warm now{lm, string(), {}, {}};
+    now.parked.push_back(std::move(p));
+    spill_parked(now, session());
+  }
+}
+
+bool
+GenerativeModelManager::take_context(const string&                    key,
+                                     const shared_ptr<LoadedLanguageModel>& lm,
+                                     LoadedLanguageModel::Context*    ctx,
+                                     string*                          meta)
+{
+  if (key.empty() || !lm || ctx == nullptr) { return false; }
+  lock_guard<mutex> lk(_warm_mu);
+  for (auto& w : _warm) {
+    if (w.lm != lm) { continue; }
+    for (auto it = w.parked.begin(); it != w.parked.end(); ++it) {
+      if (it->key != key) { continue; }
+      *ctx = std::move(it->ctx);
+      if (meta != nullptr) { *meta = std::move(it->meta); }
+      w.parked.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool
+GenerativeModelManager::drop_context(const string& key)
+{
+  std::vector<Warm> gone;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (auto& w : _warm) {
+      for (auto it = w.parked.begin(); it != w.parked.end();) {
+        if (it->key != key) {
+          ++it;
+          continue;
+        }
+        Warm old{w.lm, w.dir, w.until, {}};
+        old.parked.push_back(std::move(*it));
+        gone.push_back(std::move(old));
+        it = w.parked.erase(it);
+      }
+    }
+  }
+  return !gone.empty();
 }
 
 size_t

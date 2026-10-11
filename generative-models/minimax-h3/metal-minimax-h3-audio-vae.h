@@ -3,6 +3,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/dit-flops.h"
 
 #include <memory>
 #include <string>
@@ -156,6 +157,12 @@ class MetalMiniMaxH3AudioVae {
 
   // Samples `frames` latent frames decode to, per channel.
   int decoded_samples(int frames) const;
+
+  // The GPU arithmetic decode() and encode() have credited to the
+  // achieved-FLOP/s meter (common/perf-flops.h): every conv and linear
+  // GEMM (a transposed conv as the GEMM it runs) and the encoder's
+  // causal attention, credited as each command buffer retires.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
 
   // Encode `[stereo, samples]` PLANAR f32 into the posterior MEAN,
   // `[stereo * frames, latent_channels]` row-major -- which is already
@@ -368,6 +375,7 @@ class MetalMiniMaxH3AudioVae {
   metal_compute::ComputeFunction _fn_dense_mma, _fn_dense_mma_deep,
       _fn_bias_add;
   bool _use_mma2 = false;
+  GpuFlopsTally _flops;   // see gpu_flops()
   // Shape gate. The win regime measured on this decoder is the trunk's
   // resblock convolutions (M 3k-9k, N 128-256, K 0.9k-2.8k), which carry
   // ~75% of the decode's GEMM FLOPs. The rest of the stack is a very

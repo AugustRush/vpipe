@@ -133,9 +133,31 @@ std::string hf_path_from_local(const std::string& dir);
 // a checkpoint: the H3 video path failing for a reason that has
 // nothing to do with H3.
 //
+// A MiniMax-H3 checkout can hold BOTH: the diffusers pipeline at its
+// root (`vae/`, AutoencoderKLMiniMaxH3) and the released partitions.
+// The released `video_vae/` answers then -- the same VAE, and the copy
+// every other H3 stage opens.
+//
 // Returns `root` unchanged when neither layout is present, so the
 // caller's existing "no checkpoint here" error still fires.
 std::string resolve_vae_dir(const std::string& root);
+
+// Which BUILT-IN decoder runs the VAE in `vae_dir` (as resolve_vae_dir
+// returns it): "krea2", "flux2", "wan" or "minimax-h3", read off its
+// config.json `_class_name` (or a Comfy-Org file's `__metadata__`).
+//
+// EMPTY when the config names a class no built-in decoder runs, with
+// that class in `*unknown_class`: a caller refuses it BY NAME. A VAE
+// with no class at all -- a standalone checkpoint whose config is
+// borrowed -- is "krea2", as it always was. Ask the plugin registry
+// (VaeModelRegistry::claim_for) first; a family it claims never gets
+// here.
+std::string builtin_vae_family(const std::string& vae_dir,
+                               std::string* unknown_class = nullptr);
+
+// The classes builtin_vae_family() knows, comma-separated, for the
+// message that refuses one it does not.
+std::string builtin_vae_classes();
 
 // WHAT TO OPEN A WeightSet ON, given a VAE directory.
 //

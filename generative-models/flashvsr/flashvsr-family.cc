@@ -1,10 +1,12 @@
 #include "generative-models/flashvsr/flashvsr-family.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/beat-keys.h"
 #include "common/vpipe-format.h"
 #include "generative-models/flashvsr/flashvsr-lq-proj.h"
 #include "generative-models/flashvsr/metal-flashvsr-transformer.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/wan/metal-wan-vae.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-memory.h"
@@ -131,8 +133,32 @@ class FlashVsrGenerator final : public VideoGenerator {
                         "divide by 8, and the grid is the frame over 16)",
                         W, H, kGrid)());
     }
+    // A STREAM's rows say which of its chunks they hold; a clip's are the
+    // whole of one, sized by the stage's frame count.
+    const FlexData sb = req.cond_sideband != nullptr ? *req.cond_sideband
+                                                     : FlexData{};
+    int chunk0 = 0, chunks = 0;
+    bool stream = false, final_beat = true;
+    if (sb.is_object()) {
+      auto o = sb.as_object();
+      if (o.contains(flashvsr_stream::kChunk0)) {
+        stream = true;
+        chunk0 = (int)o.at(flashvsr_stream::kChunk0).as_int(-1);
+        chunks = o.contains(flashvsr_stream::kChunks)
+                     ? (int)o.at(flashvsr_stream::kChunks).as_int(0)
+                     : 0;
+        final_beat = o.contains(sideband::kStreamFinal) &&
+                     o.at(sideband::kStreamFinal).as_bool(false);
+      }
+    }
+    if (stream && (chunk0 < 0 || chunks <= 0)) {
+      return refuse(fmt("stream rows name chunks {}+{}, which is no chunk "
+                        "at all", chunk0, chunks)());
+    }
     const int frames = MetalFlashVsrTransformer::align_frames(req.frames);
-    const int want_t = MetalFlashVsrTransformer::latent_frames(frames);
+    const int want_t =
+        stream ? (chunk0 == 0 ? 2 * chunks + 4 : 2 * chunks)
+               : MetalFlashVsrTransformer::latent_frames(frames);
     if (want_t <= 0) {
       return refuse(fmt("a {}-frame clip is all warmup; 25 frames is the "
                         "shortest that restores anything", req.frames)());
@@ -157,6 +183,11 @@ class FlashVsrGenerator final : public VideoGenerator {
     r.width = W;
     r.seed = req.seed;
     r.params = params_from_config_(req.model_config);
+    if (stream) {
+      r.chunk0 = chunk0;
+      r.chunks = chunks;
+      r.keep_window = !final_beat;
+    }
     // One step at a fixed timestep, so the configured step count has
     // nothing to select. The bar follows the unit of work instead: a
     // block's pass over the whole clip (block-outer, 30 of them, chunks
@@ -169,6 +200,22 @@ class FlashVsrGenerator final : public VideoGenerator {
       return refuse(err.empty() ? std::string("denoise failed") : err);
     }
     out->latents_per_second = 0.0;
+    // What the DECODE needs to know, forwarded as the encoder said it:
+    // whether this latent continues the last (so its carries do), whether
+    // the stream ends here, how many of its frames are real, the per-frame
+    // colour reference, and how it overlaps its neighbours.
+    if (sb.is_object()) {
+      FlexData fw = FlexData::make_object();
+      auto in = sb.as_object();
+      auto o = fw.as_object();
+      for (std::string_view k :
+           {sideband::kStreamContinues, sideband::kStreamFinal,
+            sideband::kValidFrames, sideband::kColorRef,
+            sideband::kBlendHead, sideband::kBlendTail}) {
+        if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
+      }
+      out->sideband = std::move(fw);
+    }
     return true;
   }
 
@@ -229,6 +276,72 @@ resolve_flashvsr_layout(const std::string& root, FlashVsrLayout* out)
   l.published = true;
   if (out != nullptr) { *out = std::move(l); }
   return true;
+}
+
+std::size_t
+flashvsr_stream_bytes(const std::string& root, int width, int height,
+                      double kv_ratio)
+{
+  if (width <= 0 || height <= 0) { return 0; }
+  FlashVsrLayout layout;
+  MetalFlashVsrTransformer::Config cfg;
+  if (!resolve_flashvsr_layout(root, &layout) ||
+      !MetalFlashVsrTransformer::config_from_checkpoint(layout.denoiser,
+                                                        &cfg)) {
+    return 0;
+  }
+  MetalFlashVsrTransformer::Params prm;
+  prm.kv_ratio = kv_ratio;
+  // The VAE is Wan 2.1's; read its config where the checkpoint has one.
+  MetalWanVae::Config vcfg;
+  if (!layout.vae.empty() &&
+      !MetalWanVae::config_from_json(layout.vae, vcfg, nullptr)) {
+    MetalWanVae::config_for_native_checkpoint(layout.vae, vcfg);
+  }
+  return (std::size_t)MetalFlashVsrTransformer::stream_window_bytes(
+             cfg, height, width, prm) +
+         MetalWanVae::decode_carry_bytes(vcfg, height / 8, width / 8);
+}
+
+bool
+flashvsr_stream_fits(const std::string& root, int width, int height,
+                     std::size_t* need)
+{
+  if (need != nullptr) { *need = 0; }
+  const std::size_t carries = flashvsr_stream_bytes(root, width, height);
+  if (carries == 0) { return false; }
+  FlashVsrLayout layout;
+  MetalFlashVsrTransformer::Config cfg;
+  if (!resolve_flashvsr_layout(root, &layout) ||
+      !MetalFlashVsrTransformer::config_from_checkpoint(layout.denoiser,
+                                                        &cfg)) {
+    return false;
+  }
+  MetalWanVae::Config vcfg;
+  if (!layout.vae.empty() &&
+      !MetalWanVae::config_from_json(layout.vae, vcfg, nullptr)) {
+    MetalWanVae::config_for_native_checkpoint(layout.vae, vcfg);
+  }
+  const int h8 = height / 8, w8 = width / 8;
+  const std::size_t peak = MetalWanVae::decode_peak_bytes(vcfg, h8, w8);
+  const std::size_t vae_carries =
+      MetalWanVae::decode_carry_bytes(vcfg, h8, w8);
+  // Beside the carries, what a stream cannot do without: the denoiser at
+  // its STREAMING floor (a tight box streams its blocks, and a stream
+  // asks nothing of their residency), the projection and its working set
+  // for a group, and the rest of a whole-plane decode -- a carried decode
+  // cannot tile -- the carries being counted already.
+  const std::size_t total =
+      carries +
+      (std::size_t)MetalFlashVsrTransformer::streaming_floor_bytes(cfg) +
+      FlashVsrLqProj::weight_bytes(layout.source, layout.source_prefix) +
+      FlashVsrLqProj::working_bytes(layout.source, layout.source_prefix,
+                                    height, width, 25) +
+      (peak > vae_carries ? peak - vae_carries : 0);
+  if (need != nullptr) { *need = total; }
+  const std::size_t ram = model_memory::phys_ram();
+  if (ram == 0) { return true; }
+  return total + model_memory::kStreamHeadroom <= ram;
 }
 
 bool
@@ -347,8 +460,20 @@ FlashVsrVideoFamily::denoise_scratch_bytes(const std::string& root, int width,
   // in its own. 901 MB at 1920x1152 x 25 that the plan did not have;
   // MEASURED 748 MB above the weights on a first clip, before any peer
   // had allocated.
+  // ...AND A STREAM'S WINDOWS, held from one clip's denoise to the next
+  // whenever the source encoder streams -- which, left to decide, it does
+  // exactly when flashvsr_stream_fits() says so, the same rule asked the
+  // same way.
+  const MetalFlashVsrTransformer::Params prm =
+      params_from_config_(model_config);
+  const std::size_t windows =
+      flashvsr_stream_fits(root, width, height)
+          ? (std::size_t)MetalFlashVsrTransformer::stream_window_bytes(
+                cfg, height, width, prm)
+          : 0;
   return (std::size_t)MetalFlashVsrTransformer::denoise_scratch_bytes(
-             cfg, height, width, frames, params_from_config_(model_config)) +
+             cfg, height, width, frames, prm) +
+         windows +
          FlashVsrLqProj::working_bytes(layout.source, layout.source_prefix,
                                        height, width, frames);
 }

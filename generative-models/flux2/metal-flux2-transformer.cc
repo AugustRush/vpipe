@@ -2429,6 +2429,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
           self->_lora.apply(*e, x, xe, lf, y, ye, M, N, K,
                             self->_mma_min_m);
         };
+        self->_flops.gemm(M, N, K);
         // Matrix-core matmul2d first (M5); false -> steel below.
         if (self->gemm_mma_(*e, x, xe, w, y, ye, M, N, K)) {
           lora_after();
@@ -2482,6 +2483,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       void swiglu_ff(const SharedBuffer& x, const QWeight& w,
                      const SharedBuffer& out, int M, int K, int Nf,
                      int out_stride = 0, int out_off = 0) {
+        self->_flops.gemm(M, Nf, K);   // gate|up, one fused GEMM
         const bool a16 = self->_ff_acc16;
         const bool strided = out_stride > 0;
         if (w.quantized) {
@@ -2628,6 +2630,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         e->set_constant(7, nh); e->set_constant(8, nh); e->set_constant(9, T);
         e->set_constant(10, T);
         e->dispatch({32, (unsigned)nh, (unsigned)T}, {32, 1, 1});
+        self->_flops.attention(nh, (long long)T * T, D);
       }
       // out[r, 0:W] = in[r*S + off : +W]  (strided column slice; block=0).
       void slice(const SharedBuffer& in, const SharedBuffer& out, int rows,
@@ -2925,8 +2928,12 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       sc.sink_start  = 0;
       sc.sink_tokens = TS;
       std::string serr;
-      if (!_sol->encode(*op.e, qt, kt, vt, atb, HED, seq, HD, scale, sc,
-                        &serr)) {
+      if (_sol->encode(*op.e, qt, kt, vt, atb, HED, seq, HD, scale, sc,
+                       &serr)) {
+        _flops.add(_sol_flops.routed(
+            attention_flops(HED, (long long)seq * seq, HD),
+            _sol->total_blocks()));
+      } else {
         // Said once per forward rather than once per block: a geometry
         // Sol cannot serve fails the same way for all of them.
         if (layer == _cfg.sol.dense_layers && _mc->session() != nullptr) {
@@ -2957,6 +2964,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       op.e->set_buffer(3, atb); op.e->set_buffer(4, _attn_params);
       if (i8_ok) { _sage->bind(*op.e); }
       op.e->dispatch({32 * a_nqb, 4 * (unsigned)HED, 1}, {32, 4, 1});
+      _flops.attention(HED, (long long)QA * KL, HD);
       if (split_attn) {
         // Group B: reference queries over reference keys ONLY. Same buffers
         // re-based on the reference band; the per-head strides stay the full
@@ -2967,6 +2975,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         op.e->set_buffer(2, vt, ro); op.e->set_buffer(3, atb, ro);
         op.e->set_buffer(4, attn_params_ref);
         op.e->dispatch({32 * a_nqb_ref, 4 * (unsigned)HED, 1}, {32, 4, 1});
+        _flops.attention(HED, (long long)IS_REF * IS_REF, HD);
       }
     } else {
       op.sdpa(qt, kt, vt, atb, scale, seq, HD, HED);
@@ -3013,6 +3022,9 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   // stack really gets is what is timed, and the single stack's noise is not.
   const bool stack_time = std::getenv("VPIPE_FLUX2_STACK_TIME") != nullptr;
   std::chrono::steady_clock::time_point t_stack0{};
+  // perf-flops: whatever an aborted forward left uncredited is dropped.
+  _flops.begin();
+  if (_sol) { _sol_flops.begin(); }
   // ===== stream 1: conditioning + embed + double blocks =====
   if (prof) { mk = tnow(); }
   {
@@ -3027,6 +3039,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     // takes a callback at all.
     auto flush_with = [&](auto&& between) {
       enc.end();
+      _flops.flush(stream);
       CommandStream::Fence f = stream.commit();
       between();
       f.wait();
@@ -3040,6 +3053,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     auto dsplit = [&](double& acc) {
       if (!prof) { return; }
       enc.end();
+      _flops.flush(stream);
       stream.commit().wait();
       acc += ms_since(mk);
       stream = _mc->make_command_stream();
@@ -3158,7 +3172,9 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       if (_stream_stop && _stream_stop()) { return {}; }
       // On the GPU's clock: the double stack commits ONCE, after the
       // loop, so reporting inline would time the encode. See
-      // shared/dit-gpu-progress.h.
+      // shared/dit-gpu-progress.h. The blocks' FLOPs ride the same
+      // checkpoint.
+      _flops.flush(stream);
       report_block(stream, _block_progress, L, c.n_double + c.n_single);
       // Resident once residency has promoted it, and read into a slot
       // until then. The vector is sized to n_double in streaming mode
@@ -3235,6 +3251,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         // embedding ahead of block 0: drain it first, so the section times
         // its own work. See AneFeedForward::needs_barrier.
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         reopen();
       }
@@ -3257,6 +3274,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       if (dq_meas) {
         const auto t_d0 = std::chrono::steady_clock::now();
         enc.end();
+        _flops.flush(stream);
         CommandStream::Fence qf = stream.commit();
         ane_prefetch();
         const bool staged = dq_split && _ane_dqkv->join_stage(L);
@@ -3285,6 +3303,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
               dl(&DoubleLora::v));
       if (dq_meas) {
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         const double g_ms = ane_ms(dq_t0);
         int lost = -1;
@@ -3359,6 +3378,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       if (df_meas) {
         const auto t_d0 = std::chrono::steady_clock::now();
         enc.end();
+        _flops.flush(stream);
         CommandStream::Fence ff_fence = stream.commit();
         ane_prefetch();
         const bool staged = df_split && _ane_dff->join_stage(L);
@@ -3403,6 +3423,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       dff_gpu(0, df_g);
       if (df_meas) {
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         const double g_ms = ane_ms(df_t0);
         int lost = -1;
@@ -3439,6 +3460,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         op.gemm(smlp, b.ff_out, ref, 0, IS, H, INNER, 0,
                 dl(&DoubleLora::ff_out));
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         reopen();
         auto f32 = [](std::uint16_t v) {
@@ -3524,6 +3546,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       }
     }
     enc.end();
+    _flops.flush(stream);
     std::string gpu_err;
     if (!stream.commit().wait_ok(&gpu_err)) {
       if (_mc->session() != nullptr) {
@@ -3632,6 +3655,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       };
       const auto t_d0 = std::chrono::steady_clock::now();
       enc.end();
+      _flops.flush(stream);
       CommandStream::Fence sf = stream.commit();
       if (streaming) {
         // The successor's read, under this block's work from here on.
@@ -3701,6 +3725,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       const auto sp_t0 = std::chrono::steady_clock::now();
       sp_gpu(0, sp_g);
       enc.end();
+      _flops.flush(stream);
       stream.commit().wait();
       const double g_ms = sms(sp_t0);
       int lost = -1;
@@ -3787,6 +3812,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
             sl(&SingleLora::o));
     gated_joint(op, joint, 2 * H, ob);                     // += gate * to_out
     enc.end();
+    _flops.flush(stream);
     std::string gpu_err;
     const auto sgl_gp0 = sp_now();
     CommandStream::Fence sgl_fence = stream.commit();
@@ -3881,6 +3907,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     op.tap("emb_proj", 0, nrm, 0, IS_GEN, H);
     op.gemm(nrm, _proj_out, velocity, 0, IS_GEN, OC, H);
     enc.end();
+    _flops.flush(stream);
     std::string gpu_err;
     if (!stream.commit().wait_ok(&gpu_err)) {
       if (_mc->session() != nullptr) {
@@ -3890,6 +3917,8 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       return {};
     }
   }
+  // Every routed layer has run, so Sol's count is this forward's whole.
+  if (_sol) { _sol_flops.finish(_sol->exact_blocks()); }
   if (prof) {
     t_final += ms_since(mk);
     if (_mc->session() != nullptr) {

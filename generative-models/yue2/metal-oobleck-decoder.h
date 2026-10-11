@@ -32,6 +32,7 @@
 
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/dit-flops.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -117,6 +118,11 @@ public:
 
   std::size_t resident_bytes() const;
 
+  // The GPU arithmetic decode() has credited to the achieved-FLOP/s
+  // meter (common/perf-flops.h): every conv's GEMM, a transposed conv
+  // as the GEMM it runs, credited as each tile's command buffer retires.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
+
 private:
   MetalOobleckDecoder() = default;
 
@@ -199,6 +205,7 @@ private:
   // the A/B.
   metal_compute::ComputeFunction _fn_mma, _fn_mma_deep, _fn_bias_rows;
   bool _use_mma = false;
+  GpuFlopsTally _flops;   // see gpu_flops()
   int _mma_min_m = 256;
   int _mma_min_n = 64;
 };

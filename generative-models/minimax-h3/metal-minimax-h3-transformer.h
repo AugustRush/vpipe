@@ -14,6 +14,7 @@
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/mma-splitk.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/dit-flops.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -701,6 +702,9 @@ class MetalMiniMaxH3Transformer {
   std::size_t window_key_blocks() const { return _vdn_kb_sparse; }
   std::size_t dense_key_blocks() const { return _vdn_kb_dense; }
   bool linear_window_covers_all() const { return _vdn_full_cover; }
+  // What the forwards have encoded for perf-flops, credited to the GPU
+  // as each block retires (generative-models/shared/dit-flops.h).
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
 
   // What the attached branch's blocks hold, plus the two per-forward
   // buffers the hybrid adds. Reported apart from resident_block_bytes()
@@ -1848,6 +1852,10 @@ class MetalMiniMaxH3Transformer {
   // Sol-Attn's kernels and scratch. Null unless Config::sol.enabled and
   // the kernels validated; see the attention dispatch.
   std::unique_ptr<MetalSolAttention> _sol;
+  // perf-flops: GEMMs and attention counted as encoded, credited at
+  // retire; Sol's exact half at the keep ratio it realizes.
+  GpuFlopsTally _flops;
+  SolFlops _sol_flops;
   // The int8 QK prologue and its operands. Null when the box has no
   // matrix cores or the config did not ask -- and every use is guarded,
   // because a box without them runs the same forward densely.

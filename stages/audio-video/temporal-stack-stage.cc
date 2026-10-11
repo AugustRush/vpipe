@@ -1,5 +1,7 @@
 #include "stages/audio-video/temporal-stack-stage.h"
 
+#include "common/beat-keys.h"
+
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
@@ -263,6 +265,7 @@ TemporalStackStage::reset_group_()
   _sample_rate  = 0;
   _fps_num      = 0.0;
   _fps_den      = 0.0;
+  _repeated     = 0;
 }
 
 int
@@ -289,6 +292,7 @@ TemporalStackStage::retain_tail_(int keep)
   _buf.erase(_buf.begin(), _buf.begin() + (std::ptrdiff_t)drop);
   _count = keep;
   _tail  = 0;   // audio never gets here; see retain_beats_
+  _repeated = keep;
 
   // The rate metadata has to describe the beats that REMAIN. Anything
   // else dates the next clip to a frame it no longer starts on, and the
@@ -457,6 +461,7 @@ TemporalStackStage::build_() const
     if (fps > 0.0) { o.insert_or_assign("fps", FlexData::make_real(fps)); }
   }
   o.insert_or_assign("stacked", FlexData::make_int(_count));
+  o.insert_or_assign(sideband::kRepeated, FlexData::make_int(_repeated));
   // Config LAST, so it overrides what was computed. A user pinning a
   // rate is correcting this stage, not asking to be corrected by it.
   if (_sideband_cfg.is_object()) {

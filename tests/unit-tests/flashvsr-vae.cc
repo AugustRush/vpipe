@@ -779,3 +779,124 @@ TEST(flashvsr_vae, hwconv_decode_matches_gather)
               g * 8, g * 8, F, r);
   EXPECT_TRUE(r < 2e-3);
 }
+
+// A DECODE STREAM IN PIECES IS ONE DECODE. The latent of a FlashVSR
+// stream arrives a beat at a time, and the decode of each must continue
+// the last one's causal carries -- or every beat's first frames are
+// decoded cold, which is the visible seam a stream exists to remove. So
+// the same latent, decoded whole and decoded as three pieces through one
+// DecodeStream, must give the same frames bit for bit, frame indices
+// continuing across the pieces. And the carries are LOAD-BEARING: the
+// second piece decoded cold differs.
+//
+// Env: VPIPE_FLASHVSR_TEST_MODEL_PATH; VPIPE_WAN_VAE_TEST_GRID=<h8>.
+TEST(flashvsr_vae, stream_pieces_equal_one_decode)
+{
+  const char* root = std::getenv("VPIPE_FLASHVSR_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  FlashVsrLayout layout;
+  ASSERT_TRUE(resolve_flashvsr_layout(root, &layout) && !layout.vae.empty());
+  if (layout.vae.empty()) { return; }
+  MetalWanVae::Config cfg;
+  std::string err;
+  const bool have_cfg =
+      MetalWanVae::config_from_json(layout.vae, cfg, &err) ||
+      MetalWanVae::config_for_native_checkpoint(layout.vae, cfg, &err);
+  ASSERT_TRUE(have_cfg);
+  if (!have_cfg) { return; }
+  auto m = MetalWanVae::load(layout.vae, mc, cfg, /*with_encoder=*/false);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  int g = 32;
+  if (const char* e = std::getenv("VPIPE_WAN_VAE_TEST_GRID")) {
+    if (std::atoi(e) > 0) { g = std::atoi(e); }
+  }
+  // A stream's shape: six latent frames open it, then two per chunk.
+  const int pieces[] = {6, 2, 2};
+  const int T = 10;
+  const int F = MetalWanVae::video_frames(T);
+  const std::size_t plane = (std::size_t)g * g;
+  std::vector<_Float16> zh((std::size_t)cfg.z_dim * T * plane);
+  {
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : zh) { v = (_Float16)nd(rng); }
+  }
+  // [z, T, h, w] -> the latent frames [t0, t0 + n) as their own tensor.
+  auto latent = [&](int t0, int n) {
+    SharedBuffer z = mc->make_shared_buffer((std::size_t)cfg.z_dim * n *
+                                            plane * 2);
+    auto* d = static_cast<_Float16*>(z.contents());
+    for (int c = 0; c < cfg.z_dim; ++c) {
+      std::memcpy(d + (std::size_t)c * n * plane,
+                  zh.data() + ((std::size_t)c * T + t0) * plane,
+                  (std::size_t)n * plane * 2);
+    }
+    return z;
+  };
+  const std::size_t hw = (std::size_t)g * 8 * g * 8;
+  // Frame-major RGB of everything a decode hands its sink, indexed by
+  // the frame number the sink is told.
+  auto sink_into = [&](std::vector<std::uint16_t>& px, int* seen) {
+    return [&px, seen, hw](const SharedBuffer& rgb, int frame0, int n) {
+      const auto* s = static_cast<const std::uint16_t*>(rgb.contents());
+      const std::size_t need = (std::size_t)(frame0 + n) * 3 * hw;
+      if (px.size() < need) { px.resize(need, 0); }
+      for (int f = 0; f < n; ++f) {
+        for (int c = 0; c < 3; ++c) {
+          std::memcpy(px.data() + ((std::size_t)(frame0 + f) * 3 + c) * hw,
+                      s + ((std::size_t)c * n + f) * hw, hw * 2);
+        }
+      }
+      *seen += n;
+      return true;
+    };
+  };
+
+  std::vector<std::uint16_t> whole, joined;
+  int n_whole = 0, n_joined = 0;
+  std::string e;
+  ASSERT_TRUE(m->decode(latent(0, T), T, g, g, sink_into(whole, &n_whole),
+                        &e));
+  MetalWanVae::DecodeStream ds;
+  int t0 = 0;
+  for (const int n : pieces) {
+    ASSERT_TRUE(m->decode(latent(t0, n), n, g, g,
+                          sink_into(joined, &n_joined), &e, &ds));
+    t0 += n;
+  }
+  ASSERT_TRUE(n_whole == F && n_joined == F);
+  ASSERT_TRUE(ds.frames == F);
+  const bool same = whole.size() == joined.size() &&
+                    std::memcmp(whole.data(), joined.data(),
+                                whole.size() * 2) == 0;
+  EXPECT_TRUE(same);
+  std::printf("  %dx%d, T=%d as 6+2+2: %s; the stream held %.1f MB of "
+              "carries (estimate %.1f MB)\n", g * 8, g * 8, T,
+              same ? "IDENTICAL" : "DIFFERENT",
+              (double)ds.bytes() / 1048576.0,
+              (double)MetalWanVae::decode_carry_bytes(cfg, g, g) /
+                  1048576.0);
+  EXPECT_TRUE(ds.bytes() == MetalWanVae::decode_carry_bytes(cfg, g, g));
+
+  // Cold, the second piece is a clip of its own: one frame for its first
+  // latent frame rather than four, and different pixels -- compared at
+  // its second latent frame, cold frame 1 against the stream's frame
+  // 1 + 4 * 6.
+  std::vector<std::uint16_t> cold;
+  int n_cold = 0;
+  ASSERT_TRUE(m->decode(latent(6, 2), 2, g, g, sink_into(cold, &n_cold),
+                        &e));
+  EXPECT_TRUE(n_cold == 5);
+  const std::size_t f2 = (std::size_t)MetalWanVae::video_frames(6);
+  const bool differs =
+      cold.size() >= 3 * hw * 5 &&
+      std::memcmp(cold.data() + 3 * hw, joined.data() + (f2 + 4) * 3 * hw,
+                  3 * hw * 2) != 0;
+  EXPECT_TRUE(differs);
+}

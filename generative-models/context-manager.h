@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -548,6 +549,27 @@ public:
   // layout / not fresh / need>max_seq. Global layers are untouched.
   bool ensure_sliding_capacity(ContextId id, int need);
 
+  // ---- a context written out and read back --------------------------
+  //
+  // A conversation's K/V can outlive the model that computed it. When the
+  // model has to make room -- a launch needs the memory -- a host coming
+  // back to the conversation would otherwise pay its whole prefill again,
+  // seconds per thousand tokens on a large model, where reading it back
+  // costs what the bytes take off the disk.
+  //
+  // export_context streams everything the METAL backend holds for `id`:
+  // the pages of every paged layer and the recurrent state of every
+  // linear layer, after a header naming the layout they fit.
+  // import_context makes a NEW root context of them, its pages fresh
+  // from the pool. Paged layout only; refused -- false / an invalid id,
+  // nothing written or made -- for the Contiguous layout, the MLX
+  // backend, a context with a partial INNER page (a branch's frozen
+  // tail) or its GDN run-ahead ring on, and bytes of another layout. The
+  // caller keeps the GPU off the context meanwhile (between turns).
+  using ByteSink   = std::function<bool(const void*, std::size_t)>;
+  using ByteSource = std::function<bool(void*, std::size_t)>;
+  bool      export_context(ContextId id, const ByteSink& out) const;
+  ContextId import_context(const ByteSource& in);
 
   // Read-only view of the spec the manager was constructed with.
   const Spec& spec() const noexcept;

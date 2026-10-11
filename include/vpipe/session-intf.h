@@ -147,8 +147,36 @@ public:
   // (Python's signal machinery; the binding releases the GIL with
   // periodic PyErr_CheckSignals), after which the caller's
   // exception path can sequentially issue stop_pipeline /
-  // unload_pipeline from the same thread that was blocked here.
+  // unload_pipeline from the same thread that was blocked here. A host
+  // with a control thread per pipeline waits with wait_pipeline (below).
   virtual Status wait_pipelines(int timeout_ms = -1) = 0;
+
+  // Block until ONE pipeline has reached data-driven idle, as
+  // wait_pipelines does for all of them -- for a host that drives
+  // several pipelines at once, each from a control thread of its own (a
+  // download beside a generation). wait_pipelines cannot serve that: it
+  // waits for every launched pipeline, so a thread never sees its own
+  // finish while another runs, and it holds raw pointers to the others,
+  // which their threads may stop and unload under it.
+  //
+  // `timeout_ms` as wait_pipelines'. Returns Status{0} once it is idle
+  // (or not launched), Status{4} on a timeout -- it still runs -- and
+  // Status{1} for an unknown handle.
+  //
+  // Thread-safety: safe while other threads launch, stop and unload
+  // OTHER pipelines of the session. Stopping or unloading THIS pipeline
+  // from another thread while the wait runs is the caller's to
+  // serialize, as for wait_pipelines. (Non-virtual, as progress() is:
+  // the interface's vtable stays as it was.)
+  Status wait_pipeline(PipelineHandle, int timeout_ms = -1);
+
+  // A CONVERSATION let go: the K/V that text-chat's conversation beats
+  // kept under `key` with its model (their `context`), dropped from
+  // memory now rather than when the model's warm hold ends -- the host's
+  // conversation is over. A context saved to the host's `context_dir`
+  // stays there: the folder is the host's. Status{0} when one was kept,
+  // Status{1} when none was. Non-virtual, as wait_pipeline.
+  Status drop_chat_context(std::string_view key);
 
   // Runtime overrides on top of the boot-time `log.*` config block.
   // All four are rejected with Status{3} while any pipeline owned

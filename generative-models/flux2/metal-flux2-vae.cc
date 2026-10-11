@@ -1700,12 +1700,15 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
   const bool vae_split = std::getenv("VPIPE_FLUX2_NO_VAE_SPLIT") == nullptr;
   const bool vprof = std::getenv("VPIPE_FLUX2_VAE_PROFILE") != nullptr;
   bool split_ok = true;
+  _flops.begin();
   {
     ComputeEncoder enc = stream.begin_compute();
     auto conv3x3 = [&](const SharedBuffer& in, int H, int W,
                        const Conv& c) -> SharedBuffer& {
       const std::size_t hw = (std::size_t)H * W;
       SharedBuffer& out = alloc(hw * c.cout);
+      // Whichever route runs it: an [H*W, 9*cin] x [9*cin, cout] product.
+      _flops.gemm((long long)hw, c.cout, 9LL * c.cin);
       // NAX hardware conv when the shape tiles; else row-tiled im2col + GEMM
       // (streams the [hw, 9*cin] im2col in bands through im2col_scratch).
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/1)) { return out; }
@@ -1721,6 +1724,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     auto conv1x1 = [&](const SharedBuffer& in, std::size_t hw,
                        const Conv& c) -> SharedBuffer& {
       SharedBuffer& out = alloc(hw * c.cout);
+      _flops.gemm((long long)hw, c.cout, c.cin);
       conv_gemm_bias_(enc, in, c.w, c.b, out, (int)hw, c.cout, c.cin);
       return out;
     };
@@ -1793,6 +1797,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
       SharedBuffer& att = alloc(hw * C);
       const float scale = 1.0f / std::sqrt((float)C);
       // The member is chosen ONCE, by measurement, in autotune_mid_attn_.
+      _flops.attention(1, (long long)hw * (long long)hw, C);
       encode_mid_attn_(enc, _attn_pick, q, k, v, att, hw, C, scale,
                        [&](std::size_t n) -> SharedBuffer& { return alloc(n); },
                        [&](const SharedBuffer& b) { release(b); });
@@ -1816,6 +1821,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     auto mark = [&](const std::string& name) {
       if (!vprof) { return; }
       enc.end();
+      _flops.flush(stream);
       std::string ge;
       if (!stream.commit().wait_ok(&ge)) { split_ok = false; }
       vmarks.emplace_back(name,
@@ -1831,6 +1837,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     auto flush = [&](const SharedBuffer*& xp) {
       if (!vae_split) { return; }
       enc.end();
+      _flops.flush(stream);
       std::string ge;
       if (!stream.commit().wait_ok(&ge)) { split_ok = false; }
       for (auto& s : pool) {
@@ -1903,6 +1910,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
   if (!split_ok) { return fail("GPU decode ran out of memory at a level "
                                "boundary (lower the resolution)"); }
   std::string gpu_err;
+  _flops.flush(stream);
   if (!stream.commit().wait_ok(&gpu_err)) {
     return fail(gpu_err.empty() ? std::string("GPU decode failed") : gpu_err);
   }
@@ -2018,11 +2026,13 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
   const bool vae_split = std::getenv("VPIPE_FLUX2_NO_VAE_SPLIT") == nullptr;
   const bool vprof = std::getenv("VPIPE_FLUX2_VAE_PROFILE") != nullptr;
   bool split_ok = true;
+  _flops.begin();
   {
     ComputeEncoder enc = stream.begin_compute();
     auto conv3x3 = [&](const SharedBuffer& in, int H, int W,
                        const Conv& c) -> SharedBuffer& {
       SharedBuffer& out = alloc((std::size_t)H * W * c.cout);
+      _flops.gemm((long long)H * W, c.cout, 9LL * c.cin);
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/1)) { return out; }
       // Small cout (the final conv to 3 / 2*latent) never satisfies the
       // hardware conv's cout % 64; a direct pass beats materializing im2col.
@@ -2036,6 +2046,7 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
     auto conv3x3_s2 = [&](const SharedBuffer& in, int H, int W,
                           const Conv& c) -> SharedBuffer& {
       SharedBuffer& out = alloc((std::size_t)(H / 2) * (W / 2) * c.cout);
+      _flops.gemm((long long)(H / 2) * (W / 2), c.cout, 9LL * c.cin);
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/2)) { return out; }
       tiled_conv3x3_(enc, in, out, H, W, c, /*stride=*/2, im2col_scratch,
                      im2col_cap);
@@ -2044,6 +2055,7 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
     auto conv1x1 = [&](const SharedBuffer& in, std::size_t hw,
                        const Conv& c) -> SharedBuffer& {
       SharedBuffer& out = alloc(hw * c.cout);
+      _flops.gemm((long long)hw, c.cout, c.cin);
       conv_gemm_bias_(enc, in, c.w, c.b, out, (int)hw, c.cout, c.cin);
       return out;
     };
@@ -2102,6 +2114,7 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
       SharedBuffer& att = alloc(hw * C);
       const float scale = 1.0f / std::sqrt((float)C);
       // The member is chosen ONCE, by measurement, in autotune_mid_attn_.
+      _flops.attention(1, (long long)hw * (long long)hw, C);
       encode_mid_attn_(enc, _attn_pick, q, k, v, att, hw, C, scale,
                        [&](std::size_t n) -> SharedBuffer& { return alloc(n); },
                        [&](const SharedBuffer& b) { release(b); });
@@ -2116,6 +2129,7 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
     auto flush = [&](const SharedBuffer*& xp) {
       if (!vae_split) { return; }
       enc.end();
+      _flops.flush(stream);
       std::string ge;
       if (!stream.commit().wait_ok(&ge)) { split_ok = false; }
       for (auto& s : pool) {
@@ -2134,6 +2148,7 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
     auto mark = [&](const std::string& name) {
       if (!vprof) { return; }
       enc.end();
+      _flops.flush(stream);
       std::string ge;
       if (!stream.commit().wait_ok(&ge)) { split_ok = false; }
       vmarks.emplace_back(name,
@@ -2195,6 +2210,7 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
   }
   if (!alloc_ok || !split_ok) { return {}; }
   std::string gpu_err;
+  _flops.flush(stream);
   if (!stream.commit().wait_ok(&gpu_err)) { return {}; }
 
   // Take the mode (first L channels of the 2L moments), patchify [2,2], apply

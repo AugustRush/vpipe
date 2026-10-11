@@ -80,6 +80,8 @@ public:
   Status store_pipeline(PipelineHandle,
                         std::string_view path) override;
   Status wait_pipelines(int timeout_ms = -1) override;
+  // SessionIntf::wait_pipeline: one pipeline's wait.
+  Status wait_one_pipeline(PipelineHandle, int timeout_ms);
 
   Status debug_level(unsigned) override;
   Status debug_level(std::string_view) override;

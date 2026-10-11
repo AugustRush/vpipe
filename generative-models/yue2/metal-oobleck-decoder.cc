@@ -498,6 +498,7 @@ MetalOobleckDecoder::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
                            const SharedBuffer& y, std::size_t ye, int M,
                            int N, int K)
 {
+  _flops.gemm(M, N, K);
   if (gemm_mma_(enc, x, w, bias, y, ye, M, N, K)) { return; }
   enc.set_function(_fn_gemm);
   enc.set_buffer(0, x);
@@ -583,6 +584,7 @@ MetalOobleckDecoder::decode_tile_(const float* z, int frames, int f0, int f1,
       }
     }
   }
+  _flops.begin();
   CommandStream s = _mc->make_command_stream();
   int L = T;
   {
@@ -628,6 +630,7 @@ MetalOobleckDecoder::decode_tile_(const float* z, int frames, int f0, int f1,
     conv_run_(enc, _conv_out, _b, _c, L);
   }
   std::string gerr;
+  _flops.flush(s);
   if (!s.commit().wait_ok(&gerr)) {
     if (err != nullptr) {
       *err = gerr.empty() ? "VAE decode failed" : gerr;

@@ -80,7 +80,8 @@ read_still(const std::string& path, TensorBeat::DType dtype,
 //              ImageIO stores Rec.709 primaries: wider primaries are
 //              converted (linear, unclamped), so the colours survive
 //              and read back tagged BT.709 linear
-//   jpeg, heic 8 bits, lossy
+//   jpeg, heic 8 bits, lossy; a picture with alpha composited over white
+//   bmp        8 bits
 bool still_format_known(std::string_view format);
 
 struct StillWriteOptions {

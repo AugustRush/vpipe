@@ -3,6 +3,7 @@
 // __init__.py decide what high-level conveniences to layer on top
 // (default-session creation, config resolution, etc.).
 
+#include "common/perf-flops-doc.h"
 #include "vpipe/pipeline-handle.h"
 #include "vpipe/session-intf.h"
 #include "vpipe/session-manager.h"
@@ -299,6 +300,19 @@ NB_MODULE(_vpipe, m)
             "for the user-facing API.";
 
   m.def("vpipe_version", &vpipe_version);
+
+  // The achieved-FLOP/s meter (common/perf-flops.h): process-wide, always
+  // on, so a module function rather than a session method. Returns the
+  // document common/perf-flops-doc.h describes, as a dict.
+  m.def("perf_flops",
+        [](std::uint64_t bin_ms, std::size_t bins, std::uint64_t lag_ms) {
+          return from_json_(
+              perf_flops_document(bin_ms, bins, lag_ms).to_json());
+        },
+        nb::arg("bin_ms") = 1000, nb::arg("bins") = 60,
+        nb::arg("lag_ms") = 0,
+        "Achieved TFLOP/s of the GPU and the ANE per bin, oldest first, "
+        "over the last `bins` bins of `bin_ms` (ending `lag_ms` ago).");
 
   nb::class_<Status>(m, "Status")
     .def(nb::init<>())

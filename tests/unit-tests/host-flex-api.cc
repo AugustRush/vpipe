@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace std;
@@ -54,7 +55,7 @@ stage_(string_view id, string_view type, FlexData iports, FlexData config)
 
 // in (external-input) -> tap (external-tap, pass), built in code.
 FlexData
-graph_()
+graph_(string_view id = "host-flex")
 {
   FlexData stages = FlexData::make_array();
   auto a = stages.as_array();
@@ -66,7 +67,7 @@ graph_()
                      FlexData::make_object()));
   FlexData g = FlexData::make_object();
   auto o = g.as_object();
-  o.insert("id", str_("host-flex"));
+  o.insert("id", str_(id));
   o.insert("stages", std::move(stages));
   o.insert("subpipelines", FlexData::make_array());
   return g;
@@ -163,6 +164,51 @@ TEST(host_flex_api, pipeline_and_commands_without_json_text)
 
   (void)s->wait_pipelines(3000);
   EXPECT_TRUE(s->unload_pipeline(p).code == 0);
+  SessionManager::get().destroy_session(s);
+}
+
+// Two pipelines, each driven by a control thread of its own -- a download
+// beside a generation: one is waited for while the other runs on, and the
+// other is unloaded by its own thread while the first is waited for.
+TEST(host_flex_api, one_pipeline_waited_for_while_another_runs)
+{
+  auto* s = const_cast<SessionIntf*>(SessionManager::get().create_session());
+  ASSERT_TRUE(s != nullptr);
+  if (s == nullptr) { return; }
+  PipelineHandle a = s->load_pipeline(graph_("first"));
+  PipelineHandle b = s->load_pipeline(graph_("second"));
+  ASSERT_TRUE(a.valid() && b.valid());
+  if (!a.valid() || !b.valid()) {
+    SessionManager::get().destroy_session(s);
+    return;
+  }
+  ASSERT_TRUE(s->launch_pipeline(a).code == 0);
+  ASSERT_TRUE(s->launch_pipeline(b).code == 0);
+
+  // The first finished, the second still taking beats: the first's own
+  // wait sees it end, where waiting for every pipeline cannot.
+  CommandHandle fin = a.stage("in").command("finish", FlexData());
+  EXPECT_TRUE(fin.wait(3000) == CommandState::Replied);
+  EXPECT_TRUE(s->wait_pipeline(a, 3000).code == 0);
+  EXPECT_TRUE(s->wait_pipeline(b, 50).code == 4);
+  EXPECT_TRUE(s->wait_pipelines(50).code == 4);
+
+  // The second waited for on another thread while this one unloads the
+  // first; then the second is finished, and that wait ends.
+  int waited = -1;
+  std::thread t([&] { waited = s->wait_pipeline(b, 5000).code; });
+  EXPECT_TRUE(s->unload_pipeline(a).code == 0);
+  CommandHandle fin2 = b.stage("in").command("finish", FlexData());
+  EXPECT_TRUE(fin2.wait(3000) == CommandState::Replied);
+  t.join();
+  EXPECT_TRUE(waited == 0);
+
+  // A handle the session no longer holds; one never launched is idle.
+  EXPECT_TRUE(s->wait_pipeline(a, 0).code == 1);
+  PipelineHandle c = s->load_pipeline(graph_("third"));
+  EXPECT_TRUE(c.valid() && s->wait_pipeline(c, 0).code == 0);
+  EXPECT_TRUE(s->unload_pipeline(b).code == 0);
+  EXPECT_TRUE(s->unload_pipeline(c).code == 0);
   SessionManager::get().destroy_session(s);
 }
 

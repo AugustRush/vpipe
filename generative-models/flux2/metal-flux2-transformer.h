@@ -11,6 +11,7 @@
 #include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/ane-ffn.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/dit-flops.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
@@ -172,6 +173,9 @@ class MetalFlux2Transformer {
   static bool read_dims(const std::string& model_dir, Config* cfg);
   static int ane_chunk_rows() noexcept;
   bool ane_attempted() const noexcept { return _ane_tried; }
+  // What the forwards have encoded for perf-flops, credited to the GPU
+  // as each block retires (generative-models/shared/dit-flops.h).
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
   bool ane_armed() const noexcept
   {
     return _ane_dff != nullptr || _ane_dqkv != nullptr ||
@@ -817,6 +821,10 @@ class MetalFlux2Transformer {
   // Sol-Attn's kernels and scratch. Null unless Config::sol.enabled and
   // the kernels validated; every use is guarded.
   std::unique_ptr<MetalSolAttention> _sol;
+  // perf-flops: GEMMs and attention counted as encoded, credited at
+  // retire; Sol's exact half at the keep ratio it realizes.
+  GpuFlopsTally _flops;
+  SolFlops _sol_flops;
   bool _use_mma2 = false;
   int  _mma_min_m = 64;   // matmul2d only wins once M amortizes the 128 tile
   metal_compute::SharedBuffer _w_deq;   // reusable [N,K] f16 dequant scratch

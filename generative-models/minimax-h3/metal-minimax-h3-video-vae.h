@@ -6,6 +6,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/shared/mma-splitk.h"
 
 #include <cstddef>
@@ -338,6 +339,13 @@ class MetalMiniMaxH3VideoVae {
   // Whether the tier tried to arm, and whether it did.
   bool ane_attempted() const noexcept { return _ane_tried; }
   bool ane_armed() const noexcept { return _ane != nullptr; }
+
+  // The GPU arithmetic decode() and encode() have credited to the
+  // achieved-FLOP/s meter (common/perf-flops.h): every projection and
+  // conv GEMM and the decoder's attention, counted as encoded and
+  // credited as each command buffer retires. Rows the ANE tier takes
+  // are credited by the tier itself, to the ANE. For a test.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
   // Whether a tier LOST rows on some block and has stayed on the GPU
   // since (AneFeedForward::gpu_only): the rows were recomputed on
   // the GPU, and no later block split.
@@ -420,6 +428,13 @@ class MetalMiniMaxH3VideoVae {
              const metal_compute::SharedBuffer& x, std::size_t x_off,
              const Linear& l, const metal_compute::SharedBuffer& y,
              std::size_t y_off, int M, int N, int K);
+  // gemm_ without counting it toward gpu_flops(): for a caller that
+  // counts its own arithmetic (a causal conv, by its live taps).
+  void gemm_uncounted_(metal_compute::ComputeEncoder& enc,
+                       const metal_compute::SharedBuffer& x,
+                       std::size_t x_off, const Linear& l,
+                       const metal_compute::SharedBuffer& y,
+                       std::size_t y_off, int M, int N, int K);
   // Rows one dispatch may write into an N-wide destination.
   //
   // Two limits, and the tighter one is the same number. The mma tiles
@@ -572,6 +587,7 @@ class MetalMiniMaxH3VideoVae {
   int _prog_done = 0;
   int _prog_total = 0;
   bool _use_mma2 = false;
+  GpuFlopsTally _flops;   // see gpu_flops()
   int _mma_min_m = 64;
   bool _attn_nax = false;
   metal_compute::ComputeFunction _fn_gemm, _fn_rms, _fn_rms_heads, _fn_trope,

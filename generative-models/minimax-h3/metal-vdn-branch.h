@@ -38,6 +38,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/minimax-h3/vdn-config.h"
 #include "generative-models/minimax-h3/vdn-geometry.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/weight-set.h"
 
 #include <cstddef>
@@ -408,6 +409,21 @@ public:
   const Profile& profile() const { return _prof; }
   void clear_profile() { _prof = Profile{}; }
 
+  // The achieved-FLOP/s tally the branch counts its arithmetic into: the
+  // host transformer's, since the branch encodes on that model's encoder
+  // and commits nothing of its own, so its work is credited at the
+  // commits the transformer flushes. Null: nothing is counted.
+  //
+  // What counts: the feature and gate projections (2MNK), the
+  // depthwise spatial and temporal convs (2 * outputs * taps), the
+  // per-frame statistics (k^T k and k^T v, 4 * tokens * d^2 a head), the
+  // solve (3 * d^3 a frame and head: Cholesky, triangular inverse and
+  // their product at d^3/3 each, then a d^3 GEMM's 2 * d^3), the scan's
+  // d x d state steps (2 * d^3 each, both directions) and the readout
+  // (2 * tokens * d^2 a head). Not counted: elementwise passes, the
+  // gather and bridge's blends, and the per-frame decay MLP.
+  void set_flops(GpuFlopsTally* t) noexcept { _flops = t; }
+
   // Non-zero after a forward if any I + A was not positive definite --
   // which is a statement about the PRECISION of the statistics upstream,
   // not about the solve. Read it; a silent NaN reaches the residual
@@ -430,6 +446,12 @@ public:
   }
 
 private:
+  GpuFlopsTally* _flops = nullptr;   // see set_flops()
+  void count_(std::uint64_t f) noexcept
+  {
+    if (_flops != nullptr) { _flops->add(f); }
+  }
+
   struct Block {
     metal_compute::SharedBuffer k_sp, k_tm, v_sp, v_tm;
     metal_compute::SharedBuffer beta_proj;

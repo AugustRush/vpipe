@@ -21,6 +21,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
+#include "common/perf-flops.h"
 #include "common/session.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
@@ -40,6 +41,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <thread>
 
 using namespace vpipe;
 using namespace vpipe::genai;
@@ -276,6 +278,150 @@ TEST(qwen_image_21_dit, forward_runs_and_is_finite)
               lay.joint_len, lay.target_len, cfg.out_channels, rms);
   EXPECT_TRUE(finite);
   EXPECT_TRUE(rms > 1e-4);
+}
+
+// ---- perf-flops ----------------------------------------------------
+//
+// The forward's arithmetic, as the FLOP/s meter is credited with it
+// (common/perf-flops.h, shared/dit-flops.h). Three things:
+//
+//   * EXACT against a count derived here from the model's structure: every
+//     projection at 2*M*N*K and the block-causal attention at its pairs --
+//     a GEMM counted twice or missed is a wrong figure on every plot;
+//   * the meter is credited with all of it, from the completion handlers,
+//     once the buffers retire;
+//   * with the feed-forward's rows split onto the ANE, GPU + ANE is the
+//     same count -- moving rows moves no FLOPs.
+//
+// The ANE half needs a sequence past one 2048-row chunk (the tier
+// declines below it), hence 2112 image rows. Streams, like the smoke
+// test above. Env: VPIPE_QWEN_IMAGE21_TEST_MODEL_PATH.
+TEST(qwen_image_21_dit, forward_credits_its_flops)
+{
+  namespace pf = vpipe::perf_flops;
+  const std::string dir = dit_dir_();
+  if (dir.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalQwenImage21Transformer::Config cfg;
+  Q21D_REQUIRE(MetalQwenImage21Transformer::Config::read_dims(dir, &cfg));
+
+  // 20 prompt tokens, then a 48x44 target (528 slots of four rows).
+  std::vector<std::uint8_t> slot(20, 0);
+  slot.resize(20 + 528, 1);
+  const std::vector<qi21::ImgBlock> blocks = {{1, 48, 44}};
+  qi21::Layout lay;
+  std::string lerr;
+  Q21D_REQUIRE(qi21::build_layout(slot, {}, blocks, &lay, &lerr));
+  auto rnd = [&](std::size_t n, unsigned seed) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    if (b.empty()) { return b; }
+    auto* d = static_cast<std::uint16_t*>(b.contents());
+    unsigned st = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+      st = st * 1664525u + 1013904223u;
+      const float v = ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.5f;
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      d[i] = (std::uint16_t)(u >> 16);
+    }
+    return b;
+  };
+  metal_compute::SharedBuffer lat =
+      rnd((std::size_t)lay.image_len * cfg.in_channels, 11u);
+  metal_compute::SharedBuffer txt =
+      rnd((std::size_t)slot.size() * cfg.txt_dim, 22u);
+  Q21D_REQUIRE(!lat.empty() && !txt.empty());
+
+  // The count, from the structure.
+  const long long H = cfg.hidden, FF = (long long)cfg.hidden * cfg.mlp_ratio;
+  const long long J = lay.joint_len, IMG = lay.image_len;
+  const long long E = (long long)slot.size();
+  const long long MR = cfg.causal_condition ? 2 : 1;
+  std::uint64_t attn = 0;
+  for (const qi21::Segment& sg : lay.segments) {
+    const long long q = sg.end - sg.start;
+    attn += attention_flops(cfg.n_heads,
+                            sg.is_text ? causal_pairs(q, sg.start)
+                                       : q * sg.end,
+                            cfg.head_dim);
+  }
+  const std::uint64_t per_block =
+      4 * gemm_flops(J, H, H) + 3 * gemm_flops(J, FF, H) + attn;
+  const std::uint64_t model =
+      gemm_flops(MR, H, cfg.time_proj) + gemm_flops(MR, H, H) +
+      gemm_flops(MR, 4 * H, H) + gemm_flops(MR, H, H) +
+      gemm_flops(IMG, H, cfg.in_channels) +
+      gemm_flops(E, H, cfg.txt_dim) + gemm_flops(E, H, H) +
+      gemm_flops(J, cfg.out_channels, H);
+  const std::uint64_t want =
+      model + (std::uint64_t)cfg.n_layers * per_block;
+
+  // One forward on a fresh model; GPU and ANE credited during it.
+  struct Run { std::uint64_t flushed, gpu, ane; double ms; bool ane_on; };
+  auto run = [&](bool ane) -> Run {
+    Run r{0, 0, 0, 0.0, false};
+    MetalQwenImage21Transformer::Config c = cfg;
+    c.ane_ffn = ane;
+    c.ane_rows = ane ? 1 : 0;       // pinned: the whole first chunk
+    auto m = MetalQwenImage21Transformer::load(dir, mc, c, true);
+    if (m == nullptr) { return r; }
+    MetalQwenImage21Transformer::Request req;
+    req.latents = &lat;
+    req.txt = &txt;
+    req.layout = &lay;
+    req.timestep = 0.75f;
+    const pf::Totals g0 = pf::totals(pf::kGpu);
+    const pf::Totals a0 = pf::totals(pf::kAne);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string ferr;
+    metal_compute::SharedBuffer out = m->forward(req, &ferr);
+    r.ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (out.empty()) {
+      std::printf("  forward failed: %s\n", ferr.c_str());
+      return r;
+    }
+    r.flushed = m->gpu_flops().flushed();
+    // The last buffer's handler may run after the wait that saw it.
+    for (int i = 0; i < 400 && pf::totals(pf::kGpu).flops - g0.flops <
+                                   r.flushed; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    r.gpu = pf::totals(pf::kGpu).flops - g0.flops;
+    r.ane = pf::totals(pf::kAne).flops - a0.flops;
+    r.ane_on = m->ane_armed() && !m->ane_gpu_only();
+    return r;
+  };
+
+  const Run a = run(false);
+  Q21D_REQUIRE(a.flushed > 0);
+  std::printf("  joint %lld rows, %d blocks: counted %.4f TFLOP, derived "
+              "%.4f, credited %.4f; %.0f ms -> %.2f TFLOP/s\n", J,
+              cfg.n_layers, a.flushed / 1e12, want / 1e12, a.gpu / 1e12,
+              a.ms, a.gpu / 1e12 / (a.ms / 1000.0));
+  EXPECT_TRUE(a.flushed == want);
+  EXPECT_TRUE(a.gpu == a.flushed);
+  EXPECT_TRUE(a.ane == 0);
+
+  const Run b = run(true);
+  if (!b.ane_on || b.ane == 0) {
+    std::printf("  no ANE split on this box; the conservation half is "
+                "skipped\n");
+    return;
+  }
+  // The rows moved are whole chunks of the SwiGLU's 6*H*FF a row. A
+  // headroom retry is ANE work the GPU never does, so the ANE may exceed
+  // what moved -- by whole chunks too -- and never fall short.
+  const std::uint64_t chunk = gemm_flops(2048, 3 * FF, H);
+  const std::uint64_t moved = a.gpu - b.gpu;
+  std::printf("  ANE split: GPU %.4f + ANE %.4f TFLOP (moved %.4f, %llu "
+              "chunks)\n", b.gpu / 1e12, b.ane / 1e12, moved / 1e12,
+              (unsigned long long)(moved / chunk));
+  EXPECT_TRUE(b.gpu == b.flushed);
+  EXPECT_TRUE(moved > 0 && moved % chunk == 0);
+  EXPECT_TRUE(b.ane >= moved && (b.ane - moved) % chunk == 0);
 }
 
 // ---- against the reference, at a size that fits anywhere -----------

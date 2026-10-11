@@ -86,9 +86,15 @@
 //                      content screen, run by diffusion-conditioner
 //   video-turn         generative-models/video-turn.h: a vision-language
 //                      model a stage drives -- frames, a timed video turn
+//   perf-flops         common/perf-flops.h: the achieved-FLOP/s meter a
+//                      family credits (generative-models/shared/
+//                      dit-flops.h does it on the GPU's clock). WEAKLY
+//                      imported: a plugin using it still loads on a
+//                      host without it -- never list it as required
 #define VPIPE_FEATURE_KERNEL_CONTRACT_2 "kernel-contract/2"
 #define VPIPE_FEATURE_CONTENT_SCREEN    "content-screen/1"
 #define VPIPE_FEATURE_VIDEO_TURN        "video-turn/1"
+#define VPIPE_FEATURE_PERF_FLOPS        "perf-flops/1"
 
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }

@@ -289,6 +289,13 @@ MetalMiniMaxH3Transformer::partition_of(const std::string& path,
       }
     }
   }
+  // The diffusers pipeline at the repository root says it by PLACE:
+  // `transformer/` is FL2VA's DiT and `transformer_ref/` Ref2VA's. Its
+  // manifest names no partition, because it is both.
+  if (!dit.empty()) {
+    const std::string pp = minimax_h3::diffusers_pipeline_partition(dit);
+    if (!pp.empty()) { return pp; }
+  }
   // A diffusers checkout says it in the pipeline manifest, which sits
   // beside the transformer directory (the partition root).
   fs::path base(dit.empty() ? path : dit);
@@ -372,7 +379,15 @@ MetalMiniMaxH3Transformer::resolve_dit_dir(const std::string& path,
   if (fs::exists(p / "config.json") && !fs::exists(p / "transformer")) {
     return p.string();                       // already the transformer dir
   }
-  if (fs::exists(p / "transformer" / "config.json")) {
+  // The diffusers pipeline at the repository root holds BOTH DiTs
+  // (minimax-h3-diffusers-layout.h), so its `transformer/` is FL2VA's and
+  // not the answer for every partition: taken as "a partition root" it
+  // handed a Ref2VA graph the FL2VA weights, which load, run at full
+  // cost and condition on nothing. Such a root is answered below, after
+  // the released partitions.
+  const bool pipeline_root =
+      minimax_h3::is_diffusers_pipeline_root(p.string());
+  if (!pipeline_root && fs::exists(p / "transformer" / "config.json")) {
     return (p / "transformer").string();     // a partition root
   }
   // A repository root: the pipeline lives one level down in a partition
@@ -401,6 +416,15 @@ MetalMiniMaxH3Transformer::resolve_dit_dir(const std::string& path,
     // back to Ref2VA -- "whatever this checkout is" -- which is what the
     // repack path does with the same question, and what keeps a graph
     // written before Ref2VA existed resolving as it did.
+  }
+  // The diffusers pipeline's own DiTs, LAST: a checkout that also holds
+  // the released partition has just answered with it (the same weights,
+  // under the names every other layout here was verified against). Told,
+  // the partition's directory only; untold, FL2VA's, as above.
+  if (pipeline_root) {
+    const std::string d = minimax_h3::diffusers_pipeline_dit(p.string(),
+                                                             partition);
+    if (!d.empty()) { return d; }
   }
   return path;
 }
@@ -1440,6 +1464,7 @@ MetalMiniMaxH3Transformer::lora_gemm_a_(ComputeEncoder& enc,
                                         float scale, std::size_t lora_off)
 {
   const int r = lf.rank;
+  _flops.gemm(M, r, K);
   const bool mma = _use_mma2 && M >= _mma_min_m;
   const metal_compute::ComputeFunction* fa = mma ? lora_route_a_(r) : nullptr;
   // The strength rides HERE on the matrix-core route and on the second
@@ -1483,6 +1508,7 @@ MetalMiniMaxH3Transformer::lora_gemm_b_(ComputeEncoder& enc,
   // reading its window of the [M, lf.rank] t -- see Factors::banded.
   const bool band = lf.banded();
   const int r = lf.b_rank();
+  _flops.gemm(M, N, r);   // a banded B reads its group's share of rank
   const bool mma = _use_mma2 && M >= _mma_min_m;
   // The accumulating tiles have no scale of their own, so this route is
   // legal only once the FIRST GEMM applied the strength.
@@ -3565,6 +3591,7 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
   Linear fv;
   const Linear* wl = fp8_dense_(enc, l, fv, N, K);
   if (wl == nullptr) { return; }
+  _flops.gemm(M, N, K);
   // Whether an adapter can run at all was settled in lora_stack_, so an
   // empty stack here simply means none is attached.
   const int nl = lora != nullptr ? lora->n : 0;
@@ -4435,6 +4462,7 @@ MetalMiniMaxH3Transformer::bake_adaln(
         ComputeEncoder enc = st.begin_compute();
         gemm_(enc, temb, 0, *ada, tab, 0, T, D, c.time_dim);
       }
+      _flops.flush(st);
       // CHECKED, because a discarded status here is the worst kind of
       // silence this model can produce. The table is a FRESH allocation:
       // if the GEMM's command buffer fails -- out of memory is the way,
@@ -4491,6 +4519,7 @@ MetalMiniMaxH3Transformer::bake_adaln(
       ComputeEncoder enc = st.begin_compute();
       gemm_(enc, temb, 0, *fada, _final_adaln_tab, 0, T, FD, c.time_dim);
     }
+    _flops.flush(st);
     // Same reasoning as the per-block tables above: unwritten here is
     // silent, and it reaches the output layer of every step.
     std::string bake_err;
@@ -5267,6 +5296,7 @@ MetalMiniMaxH3Transformer::attach_linear_branch(const std::string& dir,
   // per-block commit the DiT's are. A resident stack keeps both.
   br->set_stream_blocks(_stream_blocks);
   _vdn = std::move(br);
+  _vdn->set_flops(&_flops);   // credited at this model's commits
   if (_mc->session() != nullptr) {
     _mc->session()->log_debug(fmt(
         "MetalMiniMaxH3Transformer: VDN hybrid attention attached ({} "
@@ -6272,6 +6302,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     }
     _sol->reset_counts();
   }
+  if (_sol) { _sol_flops.begin(); }
   _vdn_blocks_run = 0;
   bool use_steel = _steel_ok;
   // Without the block-sparse kernel the window falls to sdpa_spans_f16,
@@ -6611,12 +6642,16 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         p_ms(p_resid, p_tune), p_ms(p_tune, p_end)));
   }
 
+  // perf-flops: what an aborted forward added and never flushed is
+  // dropped.
+  _flops.begin();
   CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();
     auto psplit = [&](double& acc) {
       if (!prof) { return; }
       enc.end();
+      _flops.flush(stream);
       stream.commit().wait();
       acc += std::chrono::duration<double, std::milli>(
                  std::chrono::steady_clock::now() - mark).count();
@@ -6632,6 +6667,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     auto xdump = [&](const char* where) {
       if (!xprobe) { return; }
       enc.end();
+      _flops.flush(stream);
       stream.commit().wait();
       const auto* p = static_cast<const std::uint16_t*>(s.x.contents());
       auto band = [&](int r0, int n) {
@@ -6670,6 +6706,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     auto bdump = [&](const char* where, const SharedBuffer& buf, int width) {
       if (!bprobe || _mc->session() == nullptr) { return; }
       enc.end();
+      _flops.flush(stream);
       stream.commit().wait();
       const auto* p = static_cast<const std::uint16_t*>(buf.contents());
       auto band = [&](int r0, int n) {
@@ -6819,9 +6856,24 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // stream is least redundant, and the published profile keeps one of
     // 48 exact for that reason.
     auto attn = [&](int rows, bool main, int layer) {
+      // perf-flops: every arm below counts the (query, key) pairs it
+      // attends -- the window's share of them on the windowed arms.
+      const long long dense = (long long)rows * rows;
+      auto windowed = [&]() {
+        return _vdn_kb_dense > 0
+                   ? (long long)((double)dense * (double)_vdn_kb_sparse /
+                                 (double)_vdn_kb_dense)
+                   : dense;
+      };
       // TaoMate-H3's split, on the main blocks. The refiner below is text
       // alone either way.
       if (sattn && main) {
+        // Text over the text, the media over the cache and the whole
+        // sequence.
+        _flops.attention(NH,
+                         (long long)n_text * n_text +
+                             (long long)s_media * (s_rows + seq),
+                         HD);
         skv->encode_gather(enc, _fn_copy_rect, layer, s.kh, s.vh, rows);
         const std::size_t kv_text = (std::size_t)s_rows * HD * 2;
         const std::size_t q_media = (std::size_t)n_text * HD * 2;
@@ -6899,6 +6951,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         if (!_sol->encode(enc, s.qh, s.kh, s.vh, s.oh, NH, rows, HD, scale,
                           sc, &serr)) {
           sol_err = "sol_attn: " + serr;
+        } else {
+          _flops.add(_sol_flops.routed(attention_flops(NH, dense, HD),
+                                       _sol->total_blocks()));
         }
         return;
       }
@@ -6930,6 +6985,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         enc.set_buffer(11, _vdn_sp_bounds);
         enc.dispatch({32 * (unsigned)((rows + A_BQ - 1) / A_BQ),
                       4 * (unsigned)NH, 1}, {32, 4, 1});
+        _flops.attention(NH, windowed(), HD);
         return;
       }
       if (vdn_linear && main) {
@@ -6947,6 +7003,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         enc.set_constant(15, _vdn_tpf);
         enc.set_constant(16, _vdn_frames);
         enc.dispatch({32, (unsigned)NH, (unsigned)rows}, {32, 1, 1});
+        _flops.attention(NH, windowed(), HD);
         return;
       }
       if (use_steel) {
@@ -7016,6 +7073,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         const unsigned wm = use_wide ? 8u : 4u;
         enc.dispatch({32 * (unsigned)(((unsigned)rows + bq - 1) / bq),
                       wm * (unsigned)NH, 1}, {32, wm, 1});
+        _flops.attention(NH, dense, HD);
         return;
       }
       enc.set_function(_fn_sdpa);
@@ -7026,6 +7084,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       enc.set_constant(8, NH); enc.set_constant(9, rows);
       enc.set_constant(10, rows);
       enc.dispatch({32, (unsigned)NH, (unsigned)rows}, {32, 1, 1});
+      _flops.attention(NH, dense, HD);
     };
 
     // One block. `modulated` selects the 50 main blocks (per-row AdaLN
@@ -7072,6 +7131,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // sample ran ~25% long and flipped an M5 Pro run off the split. See
         // AneFeedForward::needs_barrier.
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         stream = _mc->make_command_stream();
         enc = stream.begin_compute();
@@ -7090,6 +7150,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       if ((qkv_block || qkv_probe) &&
           (lora_layer == 0 || _ane_qkv->needs_barrier())) {
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         stream = _mc->make_command_stream();
         enc = stream.begin_compute();
@@ -7116,6 +7177,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       if (qkv_block || qkv_probe) {
         const auto t_q0 = std::chrono::steady_clock::now();
         enc.end();
+        _flops.flush(stream);
         metal_compute::CommandStream::Fence qfence = stream.commit();
         const bool staged = qkv_block && _ane_qkv->join_stage(lora_layer);
         qfence.wait();
@@ -7137,6 +7199,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             &lo_qkv);
       if (q_rows > 0 || qkv_probe) {
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         const double qg_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_qg0).count();
@@ -7354,6 +7417,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       if (ane_block || ane_probe) {
         const auto t_d0 = std::chrono::steady_clock::now();
         enc.end();
+        _flops.flush(stream);
         metal_compute::CommandStream::Fence afence = stream.commit();
         // A streamed block issues its successor's read here, under this
         // block's attention and both halves of its feed-forward -- at the
@@ -7436,6 +7500,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       if (a_rows > 0) {
         // The GPU's half, drained, then the ANE joined behind it.
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         const double t_gpu =
             _ane->timing()
@@ -7453,6 +7518,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       } else if (ane_probe) {
         // The GPU over every row, drained, for the on/off measurement.
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         _ane->note_probe(ane_drain_ms,
                          std::chrono::duration<double, std::milli>(
@@ -7592,6 +7658,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // milliseconds and then runs for a minute, so an inline report
       // would race to 100% and sit there. See
       // shared/dit-gpu-progress.h.
+      // The blocks before this one, credited when the buffer now open
+      // retires -- the checkpoint the progress report rides too.
+      _flops.flush(stream);
       report_block(stream, _block_progress, Lx, c.n_layers);
       // Pinned prefix (Lx < _pinned) is resident in _blocks; the tail is
       // read from the retained weight set into a loop-local Block and
@@ -7827,6 +7896,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // is coming from the numbers, not from the addressing.
       if (xprobe && Lx == 0 && _mc->session() != nullptr) {
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         const auto* m = static_cast<const std::uint16_t*>(s.mod.contents());
         for (int tag = 0; tag < h3::kModalityNum; ++tag) {
@@ -7953,6 +8023,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // anything relied on.
       if (streaming || kv_io) {
         enc.end();
+        // This block's FLOPs ride the buffer committed below, which it
+        // waits on: flushed at the next block's start they would land on
+        // the next block's buffer and be credited a block late.
+        _flops.flush(stream);
         std::string blk_err;
         // Taken unconditionally: the query-tile probe charges this block's
         // wall time to whichever tile it ran, and one clock read per block is
@@ -8187,10 +8261,14 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   std::string gpu_err;
   const bool trip_on = !_nan_report.empty() &&
                        std::getenv("VPIPE_H3_NAN_TRIP") != nullptr;
+  _flops.flush(stream);
   if (!stream.commit().wait_ok(&gpu_err)) {
     return fail(gpu_err.empty() ? std::string("MiniMax-H3 DiT forward failed")
                                 : gpu_err);
   }
+  // Every routed layer has run, so Sol's count is this forward's whole.
+  // (The log at the next forward's start reads the same count.)
+  if (_sol) { _sol_flops.finish(_sol->exact_blocks()); }
   // An FP8 weight that could not be widened left its projection
   // unwritten: the forward ran and its output is not the model's.
   if (_fp8_failed) {

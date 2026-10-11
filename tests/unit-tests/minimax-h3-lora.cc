@@ -26,12 +26,14 @@
 #include "minitest.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
+#include "common/perf-flops.h"
 #include "common/session.h"
 #include "generative-models/lora-fusion.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-denoise.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/shared/runtime-lora.h"
 
 #include <algorithm>
@@ -44,6 +46,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace vpipe;
@@ -852,6 +855,107 @@ TEST(minimax_h3_lora, kohya_spelling_is_the_same_adapter)
 // the property the design is built around.
 //
 // Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH + VPIPE_MINIMAX_H3_TURBO_LORA.
+// perf-flops: a runtime adapter's two GEMMs are the forward's arithmetic
+// too -- TaoMate-H3's chunked LoRA and HyperFlow's flow-map adapter run
+// every step through them. A rank-R adapter on each block's out_proj
+// adds exactly 2*S*R*inner + 2*S*hidden*R a block to the count, and the
+// meter is credited all of it.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (the adapter is synthetic).
+TEST(minimax_h3_lora, an_adapter_counts_its_flops)
+{
+  namespace pf = vpipe::perf_flops;
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_lora] config: %s\n", cerr.c_str());
+    return;
+  }
+  cfg.n_layers = 2;
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, 0.3125f, 0.5f, 1.0f, &uniq, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  const metal_compute::SharedBuffer vb = to_bf16_buf_(
+      mc, ramp_((std::size_t)n_video * cfg.video_patch_elems(), 0.017f,
+                0.5f));
+  const metal_compute::SharedBuffer ab = to_bf16_buf_(
+      mc, ramp_((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f,
+                0.5f));
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp_((std::size_t)tags.size() * cfg.text_dim, 0.005f, 0.5f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  const int R = 8, HH = cfg.hidden, II = cfg.inner();
+  const fs::path dir = fs::temp_directory_path() / "vpipe-h3-lora-flops";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir, ec);
+  const fs::path syn = dir / "out.safetensors";
+  {
+    std::vector<Tensor> ts;
+    for (int i = 0; i < cfg.n_layers; ++i) {
+      const std::string p = "blocks." + std::to_string(i) + ".attn.out_proj";
+      ts.push_back({p + ".lora_A.weight", {R, II},
+                    ramp_((std::size_t)R * II, 0.013f, 0.30f)});
+      ts.push_back({p + ".lora_B.weight", {HH, R},
+                    ramp_((std::size_t)HH * R, 0.021f, 0.30f)});
+    }
+    ASSERT_TRUE(write_st_(syn, ts, ""));
+  }
+  using Specs = std::vector<MetalMiniMaxH3Transformer::LoraSpec>;
+  struct Run { std::uint64_t flushed = 0, gpu = 0; int mods = 0; };
+  auto run = [&](const Specs& specs) {
+    Run r;
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, specs);
+    if (m == nullptr) { return r; }
+    r.mods = m->lora_modules();
+    MetalMiniMaxH3Transformer::Step step;
+    step.video = &vb;  step.audio = &ab;  step.text = &tb;
+    step.layout = &L;  step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    const pf::Totals g0 = pf::totals(pf::kGpu);
+    std::string ferr;
+    if (m->forward(step, &ferr).empty()) {
+      std::printf("[minimax_h3_lora] forward: %s\n", ferr.c_str());
+      return r;
+    }
+    r.flushed = m->gpu_flops().flushed();
+    for (int i = 0; i < 400 && pf::totals(pf::kGpu).flops - g0.flops <
+                                   r.flushed; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    r.gpu = pf::totals(pf::kGpu).flops - g0.flops;
+    return r;
+  };
+  const Run base = run({});
+  const Run lora = run({MetalMiniMaxH3Transformer::LoraSpec{syn.string(),
+                                                            1.0f}});
+  fs::remove_all(dir, ec);
+  ASSERT_TRUE(base.flushed > 0 && lora.mods == cfg.n_layers);
+  const long long S = L.seq_len;
+  const std::uint64_t want =
+      (std::uint64_t)cfg.n_layers *
+      (gemm_flops(S, R, II) + gemm_flops(S, HH, R));
+  std::printf("[minimax_h3_lora] %lld rows, rank %d on %d out_proj: the "
+              "adapter added %.6f TFLOP, derived %.6f; credited %.4f / "
+              "%.4f\n", S, R, lora.mods,
+              (lora.flushed - base.flushed) / 1e12, want / 1e12,
+              base.gpu / 1e12, lora.gpu / 1e12);
+  EXPECT_TRUE(lora.flushed - base.flushed == want);
+  EXPECT_TRUE(base.gpu == base.flushed && lora.gpu == lora.flushed);
+}
+
 TEST(minimax_h3_lora, two_adapters_add_and_are_dialled_apart)
 {
   const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");

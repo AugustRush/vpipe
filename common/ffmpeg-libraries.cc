@@ -240,12 +240,25 @@ preferred_candidates_(string_view lib_name)
   return out;
 }
 
+// VPIPE_NO_FFMPEG=1: load no FFmpeg at all, as on a machine without one
+// -- what a host (or a test) checks its fallbacks against. The loader
+// is handed a name nothing has, so it fails as an absent FFmpeg does.
+bool
+ffmpeg_refused_()
+{
+  const char* v = ::getenv("VPIPE_NO_FFMPEG");
+  return v != nullptr && *v != '\0' && string_view(v) != "0";
+}
+
 template <size_t N>
 string
 find_first_loadable_(const LogSinkIntf*  session,
                      const char* const   (&candidates)[N],
                      string_view         lib_name)
 {
+  if (ffmpeg_refused_()) {
+    return "VPIPE_NO_FFMPEG";
+  }
   for (const string& c : preferred_candidates_(lib_name)) {
     void* h = ::dlopen(c.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (h) {

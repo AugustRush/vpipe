@@ -3,7 +3,9 @@
 
 #include "generative-models/video-model-registry.h"
 
+#include <cstddef>
 #include <string>
+#include <string_view>
 
 namespace vpipe {
 namespace genai {
@@ -75,6 +77,42 @@ struct FlashVsrLayout {
 };
 
 bool resolve_flashvsr_layout(const std::string& root, FlashVsrLayout* out);
+
+// ---- ONE SOURCE, ONE PASS ----------------------------------------------
+//
+// FlashVSR restores a video as a stream: a causal projection over the
+// source, and a denoiser whose blocks attend a key/value window over the
+// chunks before. Cutting the source into independent clips restarts all
+// of it -- and the VAE decode after it -- at every cut, which is a visible
+// change of texture there. A STREAM carries the state across instead:
+// the source encoder keeps its projection's carries, the denoiser each
+// block's window, the VAE decode its causal carries, and the result is
+// what one pass over the whole source makes.
+//
+// The source encoder's rows say where in the stream they sit, beside the
+// generic keys of common/beat-keys.h (sideband::kStreamContinues,
+// kStreamFinal, kValidFrames, kColorRef), which the family forwards onto
+// the latent for the decode.
+namespace flashvsr_stream {
+// Ints, on the rows: the stream's index of the first chunk they hold
+// (0 = the opening one), and how many they hold.
+inline constexpr std::string_view kChunk0 = "flashvsr_chunk0";
+inline constexpr std::string_view kChunks = "flashvsr_chunks";
+}  // namespace flashvsr_stream
+
+// What a stream HOLDS between beats at this output geometry: every
+// denoiser block's retained key/value windows, and the VAE decode's
+// causal carries over the whole plane (a carried decode does not tile).
+// 0 when the checkpoint cannot be read.
+std::size_t flashvsr_stream_bytes(const std::string& root, int width,
+                                  int height, double kv_ratio = 3.0);
+// Whether this box can restore a stream at this geometry: the stream's
+// carries, the denoiser at its streaming floor, the projection, and a
+// whole-plane decode's working set, with kStreamHeadroom to spare,
+// against TOTAL RAM (VPIPE_RAM_LIMIT_MB), so every stage that asks
+// answers alike. `need` gets the figure. True when RAM is unknown.
+bool flashvsr_stream_fits(const std::string& root, int width, int height,
+                          std::size_t* need = nullptr);
 
 class FlashVsrVideoFamily final : public VideoModelFamily {
  public:

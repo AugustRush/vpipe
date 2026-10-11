@@ -1022,6 +1022,17 @@ MetalWanVae::conv_frame_(Ctx& cx, const Conv& c,
   const int OW = (stride == 2) ? W / 2 : W;
   const std::size_t ohw = (std::size_t)OH * OW;
 
+  // The frame's arithmetic, counted here whichever route runs it: the
+  // LIVE temporal taps only. A tap before the sequence is causal zero
+  // padding -- the hardware route skips it, the gather multiplies its
+  // zeros -- so the count does not depend on which route the GPU has.
+  int live = 1;
+  if (c.kt == 3) {
+    live = 0;
+    for (int t = 0; t < 3; ++t) { live += taps[t] != nullptr ? 1 : 0; }
+  }
+  _flops.gemm((long long)ohw, c.cout, (long long)live * c.ks * c.cin);
+
   // 1x1: no gather at all, the activation IS the GEMM input.
   if (c.ks == 1 && c.kt == 1) {
     gemm_bias_(cx, *taps[0], c.w, c.b, out, (int)ohw, c.cout, c.cin,
@@ -1213,6 +1224,7 @@ MetalWanVae::conv_chunk_(Ctx& cx, const Conv& c, const SharedBuffer& in,
   // A 1x1 with no temporal extent is the same GEMM for every frame, so run
   // the whole chunk as one tall GEMM instead of t of them.
   if (c.kt == 1 && c.ks == 1) {
+    _flops.gemm((long long)t_in * (long long)ohw, c.cout, c.cin);
     gemm_bias_(cx, in, c.w, c.b, out, (int)((std::size_t)t_in * ohw), c.cout,
                c.cin);
     return out;
@@ -1370,6 +1382,7 @@ MetalWanVae::attention_(Ctx& cx, const Attn& a, const SharedBuffer& x, int t,
   SharedBuffer& q = cx.alloc(_mc, rows * C);
   SharedBuffer& k = cx.alloc(_mc, rows * C);
   SharedBuffer& v = cx.alloc(_mc, rows * C);
+  _flops.gemm((long long)rows, 3LL * C, C);   // q, k, v
   gemm_bias_(cx, n, a.q.w, a.q.b, q, (int)rows, C, C);
   gemm_bias_(cx, n, a.k.w, a.k.b, k, (int)rows, C, C);
   gemm_bias_(cx, n, a.v.w, a.v.b, v, (int)rows, C, C);
@@ -1378,6 +1391,7 @@ MetalWanVae::attention_(Ctx& cx, const Attn& a, const SharedBuffer& x, int t,
   const float scale = 1.0f / std::sqrt((float)C);
   // The attention is per FRAME (the reference folds time into the batch),
   // so each frame is its own hw-long sequence.
+  _flops.attention(t, (long long)hw * (long long)hw, C);
   for (int f = 0; f < t; ++f) {
     // A frame view of each of q/k/v/att. The attention kernels take whole
     // buffers, so bind the slices through the encoder's byte offset.
@@ -1419,6 +1433,7 @@ MetalWanVae::attention_(Ctx& cx, const Attn& a, const SharedBuffer& x, int t,
   }
   cx.release(q); cx.release(k); cx.release(v);
   SharedBuffer& p = cx.alloc(_mc, rows * C);
+  _flops.gemm((long long)rows, C, C);
   gemm_bias_(cx, att, a.proj.w, a.proj.b, p, (int)rows, C, C);
   cx.release(att);
   SharedBuffer& out = resadd_(cx, p, x, rows * (std::size_t)C);
@@ -1968,6 +1983,7 @@ MetalWanVae::mid_chunk_(Ctx& cx, const SharedBuffer& z, int T, int f, int h8,
   }
   // post_quant_conv (1x1), then the decoder proper.
   SharedBuffer& pq = cx.alloc(mc, hw0 * Cz);
+  _flops.gemm((long long)hw0, Cz, Cz);
   gemm_bias_(cx, x0, _post_quant.w, _post_quant.b, pq, (int)hw0, Cz, Cz);
   cx.release(x0);
 
@@ -2248,6 +2264,7 @@ MetalWanVae::decode_tile_outer_(const SharedBuffer& z, int T, int h8, int w8,
         cx.release(*x);
       }
       std::string gpu_err;
+      _flops.flush(stream);
       if (!stream.commit().wait_ok(&gpu_err)) {
         return fail(gpu_err.empty() ? std::string("GPU video decode failed")
                                     : gpu_err);
@@ -2497,6 +2514,7 @@ MetalWanVae::decode_tile_outer_(const SharedBuffer& z, int T, int h8, int w8,
                     "memory)");
       }
       std::string gpu_err;
+      _flops.flush(stream);
       if (!stream.commit().wait_ok(&gpu_err)) {
         return fail(gpu_err.empty() ? std::string("GPU video decode failed")
                                     : gpu_err);
@@ -2549,8 +2567,29 @@ bool
 MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
                     const FrameSink& on_frame, std::string* err)
 {
+  return decode(z, T, h8, w8, on_frame, err, nullptr);
+}
+
+std::size_t
+MetalWanVae::decode_carry_bytes(const Config& cfg, int h8, int w8,
+                                bool frame_split) noexcept
+{
+  const DecodeTerms r = decode_terms_(cfg, h8, w8, frame_split, 1.0, 0);
+  std::size_t n = 0;
+  for (int k = 0; k < 3; ++k) { n += r.carries[k]; }
+  return n;
+}
+
+bool
+MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
+                    const FrameSink& on_frame, std::string* err,
+                    DecodeStream* ds)
+{
+  // A failed piece leaves a stream nothing to continue from: the carries
+  // it half-advanced are not the end of any frame.
   auto fail = [&](std::string m) {
     if (err != nullptr) { *err = std::move(m); }
+    if (ds != nullptr) { *ds = DecodeStream{}; }
     return false;
   };
   const int Cz = _cfg.z_dim;
@@ -2560,6 +2599,15 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
     return fail("input latent smaller than [z_dim, T, h8, w8]");
   }
   if (!on_frame) { return fail("no frame sink"); }
+  _flops.begin();
+  if (ds != nullptr && ds->frames > 0 &&
+      (ds->h8 != h8 || ds->w8 != w8)) {
+    return fail(fmt("a decode stream is {}x{} latent; this piece is {}x{}",
+                    ds->w8, ds->h8, w8, h8)());
+  }
+  // What a stream already holds -- its carries, allocated by the piece
+  // before -- is not part of what this one still needs.
+  const std::size_t held = ds != nullptr ? ds->bytes() : 0;
   MetalCompute* mc = _mc;
   const int Hout = h8 * 8, Wout = w8 * 8;
   const int base = _cfg.base_dim;
@@ -2587,7 +2635,8 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
     // "d" / "s" alone: tiled at that depth, the tiles PLANNED a band at a
     // time from what is free (with VPIPE_WAN_VAE_TILE_ROOM_MB, from what it
     // says is free).
-    const char* e = std::getenv("VPIPE_WAN_VAE_TILE");
+    const char* e =
+        ds == nullptr ? std::getenv("VPIPE_WAN_VAE_TILE") : nullptr;
     int ty = 0, tx = 0;
     const bool deep = e != nullptr && *e == 'd';
     if (e != nullptr && (std::string(e) == "d" || std::string(e) == "s")) {
@@ -2607,6 +2656,7 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
       headroom = std::min(headroom, mb.available_physical);
     }
     std::size_t need = decode_peak_bytes(h8, w8);
+    need = need > held ? need - held : 0;
     // NO MARGIN on top. fits_physical's default 10% is for a guess, and
     // this is not one: the carries are exact and the pool term is
     // calibrated 3-4% ABOVE a measured peak, so a margin counts the same
@@ -2658,7 +2708,9 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
     for (int i = 0; i < kWaitSteps && have != 0 && need > have; ++i) {
       bool fits = false;
       const TailTiles t =
-          choose_tail_tiles_(h8, w8, have, frame_split_on, T, &fits);
+          ds != nullptr
+              ? TailTiles{}
+              : choose_tail_tiles_(h8, w8, have, frame_split_on, T, &fits);
       if (fits && (t.ty > 1 || t.tx > 1)) {
         tiles = t;
         need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac, T,
@@ -2676,9 +2728,11 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
                  : 0;
       // The whole plane may be affordable again now, and it is both faster
       // and simpler than any tiling.
-      if (decode_peak_bytes(_cfg, h8, w8, frame_split_on, 1.0) <= have) {
+      if (decode_peak_bytes(_cfg, h8, w8, frame_split_on, 1.0) <=
+          have + held) {
         tiles = TailTiles{};
         need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, 1.0);
+        need = need > held ? need - held : 0;
       }
     }
     if (waited > 0 && need <= have && mc->session() != nullptr) {
@@ -2692,7 +2746,9 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
       // is too small for this geometry reads differently from a moment
       // that was.
       const TailTiles finest =
-          choose_tail_tiles_(h8, w8, have, frame_split_on, T);
+          ds != nullptr
+              ? TailTiles{}
+              : choose_tail_tiles_(h8, w8, have, frame_split_on, T);
       if (finest.ty > 1 || finest.tx > 1) {
         tiles = finest;
         need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, finest.frac, T,
@@ -2742,9 +2798,10 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
     // What the decode itself will hold -- the TILED figure when the
     // preflight chose tiles, or the band is sized against a reserve this
     // decode is not going to take and starves for room that is free.
-    const std::size_t reserve =
+    const std::size_t peak =
         decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac, T,
                              tiles.deep);
+    const std::size_t reserve = peak > held ? peak - held : 0;
     const std::size_t avail = headroom > reserve ? (headroom - reserve) / 2 : 0;
     col_cap = std::min(full_band, std::max(floor_band, avail));
   }
@@ -2777,9 +2834,15 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
 
   // Per-conv carries, in traversal order. The count is fixed by the
   // topology, so index them by a counter reset at each chunk exactly as
-  // the reference resets feat_idx.
-  std::vector<Carry> carry(256);
+  // the reference resets feat_idx. A stream's are the ones the piece
+  // before left: the first chunk's one-frame pass-through and the causal
+  // zero padding are both decided by a carry's own state, so a carried
+  // piece's first latent frame is simply the next four frames.
+  std::vector<Carry> local;
+  std::vector<Carry>& carry = ds != nullptr ? ds->carry : local;
+  if (carry.empty()) { carry.resize(256); }
   std::size_t ci = 0;
+  long long done = ds != nullptr ? ds->frames : 0;
 
   for (int f = 0; f < T; ++f) {
     ci = 0;
@@ -2809,6 +2872,7 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
                   "memory)");
     }
     std::string gpu_err;
+    _flops.flush(stream);
     if (!stream.commit().wait_ok(&gpu_err)) {
       return fail(gpu_err.empty() ? std::string("GPU video decode failed")
                                   : gpu_err);
@@ -2830,7 +2894,13 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
         }
       }
     }
-    const int frame0 = (f == 0) ? 0 : (1 + 4 * (f - 1));
+    const int frame0 = (int)done;
+    done += t;
+    if (ds != nullptr) {
+      ds->frames = done;
+      ds->h8 = h8;
+      ds->w8 = w8;
+    }
     if (!on_frame(frames, frame0, t)) { return true; }   // sink stopped
   }
   return true;
@@ -2877,6 +2947,7 @@ MetalWanVae::encode(const SharedBuffer& video, int F, int H, int W,
   if (video.byte_size() < (std::size_t)3 * F * hw * 2) {
     return fail("input video smaller than [3, F, H, W]");
   }
+  _flops.begin();
   MetalCompute* mc = _mc;
   const int base = _cfg.base_dim;
   const int Cz = _cfg.z_dim;
@@ -2984,6 +3055,7 @@ MetalWanVae::encode(const SharedBuffer& video, int F, int H, int W,
       cx.release(xn);
       // quant_conv (1x1) over the chunk's latent frames.
       SharedBuffer& q = cx.alloc(mc, rows * (std::size_t)(2 * Cz));
+      _flops.gemm((long long)rows, 2LL * Cz, 2LL * Cz);
       gemm_bias_(cx, h, _quant_conv.w, _quant_conv.b, q, (int)rows, 2 * Cz,
                  2 * Cz);
       cx.release(h);
@@ -2992,6 +3064,7 @@ MetalWanVae::encode(const SharedBuffer& video, int F, int H, int W,
     }
     if (!cx.alloc_ok) { return fail("an encode allocation failed"); }
     std::string gpu_err;
+    _flops.flush(stream);
     if (!stream.commit().wait_ok(&gpu_err)) {
       return fail(gpu_err.empty() ? std::string("GPU video encode failed")
                                   : gpu_err);

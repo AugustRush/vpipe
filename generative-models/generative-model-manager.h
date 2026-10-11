@@ -3,6 +3,7 @@
 
 #include "common/flex-data.h"
 #include "common/session-member.h"
+#include "generative-models/loaded-language-model.h"
 #include "generative-models/weight-registry.h"
 
 #include <atomic>
@@ -176,6 +177,46 @@ public:
   // those compete for nothing a model holds. Returns how many went.
   std::size_t release_warm_unclaimed();
   std::size_t warm_count() const;
+  // The directories of the models kept warm now, and the bytes of K/V
+  // they hold -- their parked conversations' too. The weights planner
+  // (stages/model-memory.cc) weighs the directories against a launch.
+  std::vector<std::string> warm_dirs() const;
+  std::size_t warm_kv_bytes() const;
+
+  // ---- a CONVERSATION kept by key ------------------------------------
+  //
+  // A host that runs a graph per turn of a conversation -- an agent that
+  // asks, acts on the answer, then asks again -- would prefill the whole
+  // conversation each turn: seconds per thousand tokens on a large
+  // model, and the conversation only grows. The context it ended on is
+  // PARKED here instead, under the host's key, with the model while it is
+  // kept warm: the next graph naming the key takes it back and prefills
+  // only what is new (text-chat's `context`).
+  //
+  // It lives as long as the warm hold. When the hold goes -- its time
+  // out, a launch that needs the room (release_warm_unclaimed), the
+  // manager's end -- a context parked with a `spill_path` is SAVED there
+  // first (LoadedLanguageModel::save_context), and the next turn reads it
+  // back rather than prefilling it again; without one it is let go.
+  // Parked on a model not kept warm, it is saved (or let go) at once.
+  // One context a key: parking another replaces it. `meta` is the
+  // caller's own -- what the context covers.
+  //
+  // PLUGIN ABI 8: ADDITIONS, as the hold's three above.
+  void park_context(const std::string&                          key,
+                    const std::shared_ptr<LoadedLanguageModel>& lm,
+                    LoadedLanguageModel::Context                ctx,
+                    std::string                                 meta,
+                    const std::string&                          spill_path);
+  // Taken back: the context parked under `key` on `lm`, with its meta;
+  // false when there is none (another model's under the key stays).
+  bool take_context(const std::string&                          key,
+                    const std::shared_ptr<LoadedLanguageModel>& lm,
+                    LoadedLanguageModel::Context*               ctx,
+                    std::string*                                meta);
+  // Let go, unsaved: the conversation is over. A file saved for it
+  // before is the caller's to remove. False when none was parked.
+  bool drop_context(const std::string& key);
 
   // ---- shared non-LM models ----------------------------------------
   //
@@ -365,6 +406,11 @@ public:
   // question a footprint calculation asks before adding a directory's
   // on-disk size, so it does not count the same checkpoint twice.
   bool accounts_for(const std::string& dir) const;
+  // True when THIS launch has declared `dir` (declare_weights) -- unlike
+  // accounts_for(), which a checkpoint merely open also satisfies. What
+  // tells a model kept warm that the launch uses it apart from one it
+  // only sits beside.
+  bool declares(const std::string& dir) const;
 
   // ---- the streaming signal ------------------------------------------
   //
@@ -1060,10 +1106,21 @@ private:
   // too -- is a libvpipe symbol the ABI snapshot records, and once
   // recorded it could not be removed within ABI 8. (It briefly was one,
   // reap_warm_(), before any ABI 8 build with it was published.)
+  // A conversation parked on a warm model (park_context): its key, its
+  // context, the caller's meta, where it is saved when the hold goes.
+  struct Parked {
+    std::string                  key;
+    LoadedLanguageModel::Context ctx;
+    std::string                  meta;
+    std::string                  spill;
+  };
+  // `parked` after `lm`: members go in reverse, so the contexts are
+  // released while the model they live in is still there.
   struct Warm {
     std::shared_ptr<LoadedLanguageModel>  lm;
     std::string                           dir;
     std::chrono::steady_clock::time_point until;
+    std::vector<Parked>                   parked;
   };
   // Models loaded with load_spec::kWireWeights and the bytes their load
   // left wired, charged to the pool; given back once the model is gone

@@ -449,7 +449,13 @@ TEST(flashvsr_family, generates_from_projected_rows)
               mean, sd);
   EXPECT_TRUE(sd > 0.5 && sd < 3.0);
   EXPECT_TRUE(std::fabs(mean) < 1.5);
-  EXPECT_TRUE(rel_l2_(res.video, want) > 0.05);
+  // ...and it must NOT be the golden's: pinned to the reference's noise
+  // the latent matches at ~0.011, and a drawn field lands near 0.05 --
+  // close, because a one-step restorer depends on its noise only weakly,
+  // so the bar sits between the two rather than at either.
+  const double to_golden = rel_l2_(res.video, want);
+  std::printf("  rel-L2 to the golden: %.4f\n", to_golden);
+  EXPECT_TRUE(to_golden > 0.025);
 }
 
 // The source encoder's PORT SURFACE and its category.

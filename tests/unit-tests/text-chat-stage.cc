@@ -22,6 +22,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/text-chat-stage.h"
+#include "generative-models/generative-model-manager.h"
 
 #include "common/media-line.h"
 
@@ -1511,6 +1512,251 @@ TEST(text_chat_stage, metal_chat_media_gemma_image_audio_turn) {
     if (lower_(t).find("red") != std::string::npos) { has_red = true; }
   }
   EXPECT_TRUE(has_red);
+}
+
+// ---- CONVERSATION beats -------------------------------------------
+//
+// A host that runs a graph per turn sends the whole conversation as an
+// object beat; the context the turn ends on is kept under its key with
+// the model (kept warm), taken back by the next graph and only the new
+// messages prefilled; saved to the host's folder when the model must go
+// and read back from there. The host's tools are called back, not run.
+
+namespace {
+
+// Emits one FlexData object beat, then signals done.
+class ObjectBeatSource : public TypedStage<ObjectBeatSource> {
+public:
+  static constexpr const char* kTypeName = "ut-chat-object-source";
+  using TypedStage::TypedStage;
+
+  FlexData beat;
+
+  Job process(RuntimeContext& ctx) override
+  {
+    if (_sent) { ctx.signal_done(); co_return; }
+    _sent = true;
+    co_await ctx.write(0, make_payload<FlexDataPayload>(beat));
+  }
+
+private:
+  bool _sent = false;
+};
+
+// One graph -- source, text-chat, sink -- on `sess`, as a host runs a
+// turn: the turn record, or null.
+FlexData
+run_conversation_turn_(Session& sess, const char* path, const string& beat)
+{
+  Pipeline pl("chat-conversation", &sess);
+  auto src = make_unique<ObjectBeatSource>(
+      &sess, "beat", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  src->beat = FlexData::from_json(beat);
+  auto* bsrc = static_cast<ObjectBeatSource*>(pl.insert_stage(std::move(src)));
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype", FlexData::make_string("f16"));
+    o.insert("max_new_tokens", FlexData::make_int(96));
+    o.insert("page_tokens", FlexData::make_int(16));
+    o.insert("max_pages", FlexData::make_int(512));
+    o.insert("keep_loaded", FlexData::make_real(60.0));
+    o.insert("disable_thinking", FlexData::make_bool(true));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { bsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(pl.insert_stage(std::move(ch)));
+  auto sk = make_unique<TurnSink>(
+      &sess, "sink", vector<InEdge>{ { chat, 0 } }, FlexData::make_object());
+  auto* sink = static_cast<TurnSink*>(pl.insert_stage(std::move(sk)));
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  PipelineRuntime rt(&pl, &sess);
+  const bool launched = rt.launch();
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  if (!launched) { return FlexData(); }
+  rt.wait_idle();
+  rt.stop();
+  auto turns = sink->take();
+  return turns.empty() ? FlexData() : turns.back();
+}
+
+string
+field_(const FlexData& t, const char* key)
+{
+  if (!t.is_object() || !t.as_object().contains(key)) { return {}; }
+  const FlexData v = t.as_object().at(key);
+  return v.is_string() ? string(v.as_string()) : v.to_json();
+}
+
+int64_t
+int_field_(const FlexData& t, const char* key)
+{
+  if (!t.is_object() || !t.as_object().contains(key)) { return -1; }
+  return t.as_object().at(key).as_int(-1);
+}
+
+// A message as JSON.
+string
+msg_(const string& role, const string& content)
+{
+  FlexData m = FlexData::make_object();
+  {
+    auto o = m.as_object();
+    o.insert("role", FlexData::make_string(role));
+    o.insert("content", FlexData::make_string(content));
+  }
+  return m.to_json();
+}
+
+string
+conv_beat_(const vector<string>& msgs, const string& key,
+           const string& dir, const string& tools = "")
+{
+  string s = "{\"messages\":[";
+  for (size_t i = 0; i < msgs.size(); ++i) {
+    s += (i ? "," : "") + msgs[i];
+  }
+  s += "],\"context\":\"" + key + "\"";
+  if (!dir.empty()) { s += ",\"context_dir\":\"" + dir + "\""; }
+  if (!tools.empty()) { s += ",\"tools\":" + tools; }
+  return s + "}";
+}
+
+}  // namespace
+
+TEST(text_chat_stage, metal_chat_conversation_kept_saved_read_back) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  Session sess;
+  sess.set_ui_delegate(std::make_unique<SilentUi>());
+  const auto dir = std::filesystem::temp_directory_path()
+      / ("vpipe-conv-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(dir);
+  const string d = dir.string();
+
+  vector<string> msgs = {
+      msg_("system", "You are a terse assistant. Answer in a few words."),
+      msg_("user", "My name is Ada. Reply with just: OK")};
+  const FlexData r1 = run_conversation_turn_(sess, path,
+                                             conv_beat_(msgs, "conv", d));
+  std::printf("[conversation] 1: '%s' restored=%s prefilled=%lld\n",
+              field_(r1, "text").c_str(), field_(r1, "restored").c_str(),
+              (long long)int_field_(r1, "prefilled"));
+  ASSERT_TRUE(!field_(r1, "text").empty());
+  EXPECT_TRUE(field_(r1, "restored") == "new");
+  EXPECT_TRUE(field_(r1, "finish") == "stop");
+  // Its speed, as a host shows it: the tokens decoded beside the time.
+  EXPECT_TRUE(int_field_(r1, "decoded") >= 1);
+  EXPECT_TRUE(int_field_(r1, "prefilled") > 0);
+
+  // The next turn: what it held is reused, the new message prefilled.
+  msgs.push_back(msg_("assistant", field_(r1, "text")));
+  msgs.push_back(msg_("user", "What is my name? One word."));
+  const FlexData r2 = run_conversation_turn_(sess, path,
+                                             conv_beat_(msgs, "conv", d));
+  std::printf("[conversation] 2: '%s' restored=%s reused=%lld "
+              "prefilled=%lld\n", field_(r2, "text").c_str(),
+              field_(r2, "restored").c_str(),
+              (long long)int_field_(r2, "reused"),
+              (long long)int_field_(r2, "prefilled"));
+  EXPECT_TRUE(field_(r2, "restored") == "memory");
+  EXPECT_TRUE(int_field_(r2, "reused") > int_field_(r1, "prefilled"));
+  EXPECT_TRUE(int_field_(r2, "prefilled") < int_field_(r1, "prefilled"));
+  EXPECT_TRUE(field_(r2, "text").find("Ada") != string::npos);
+  // What the kept context holds is what the conversation rendered again
+  // reads: a fresh context of the same messages prefills as many tokens
+  // as the kept one reused and prefilled.
+  const FlexData r2f = run_conversation_turn_(
+      sess, path, conv_beat_(msgs, "conv-fresh", ""));
+  std::printf("[conversation] 2 fresh: '%s' prefilled=%lld\n",
+              field_(r2f, "text").c_str(),
+              (long long)int_field_(r2f, "prefilled"));
+  EXPECT_TRUE(field_(r2f, "restored") == "new");
+  EXPECT_TRUE(int_field_(r2f, "prefilled")
+              == int_field_(r2, "reused") + int_field_(r2, "prefilled"));
+  EXPECT_TRUE(sess.drop_chat_context("conv-fresh").code == 0);
+
+  // The model must go (a launch claims other weights and does not fit
+  // beside it): the conversation is saved to its folder first ...
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  mgr->clear_declarations();
+  mgr->declare_weights("/nonexistent/another-model", 1 << 20);
+  EXPECT_TRUE(mgr->release_warm_unclaimed() == 1);
+  mgr->clear_declarations();
+  const auto file = dir / "conv.vctx";
+  EXPECT_TRUE(std::filesystem::exists(file));
+  // ... and the next turn, the model loaded again, reads it back.
+  msgs.push_back(msg_("assistant", field_(r2, "text")));
+  msgs.push_back(msg_("user", "Spell my name backwards."));
+  const FlexData r3 = run_conversation_turn_(sess, path,
+                                             conv_beat_(msgs, "conv", d));
+  std::printf("[conversation] 3: '%s' restored=%s reused=%lld "
+              "prefilled=%lld\n", field_(r3, "text").c_str(),
+              field_(r3, "restored").c_str(),
+              (long long)int_field_(r3, "reused"),
+              (long long)int_field_(r3, "prefilled"));
+  EXPECT_TRUE(field_(r3, "restored") == "disk");
+  EXPECT_TRUE(int_field_(r3, "reused") > int_field_(r2, "reused"));
+  EXPECT_TRUE(!std::filesystem::exists(file));
+
+  // Messages that do not begin with what it holds: a new context.
+  vector<string> other = {msg_("user", "Say hello.")};
+  const FlexData r4 = run_conversation_turn_(sess, path,
+                                             conv_beat_(other, "conv", d));
+  EXPECT_TRUE(field_(r4, "restored") == "new");
+  EXPECT_TRUE(sess.drop_chat_context("conv").code == 0);
+  EXPECT_TRUE(sess.drop_chat_context("conv").code != 0);
+  std::filesystem::remove_all(dir);
+}
+
+TEST(text_chat_stage, metal_chat_conversation_calls_the_host_tools) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  Session sess;
+  sess.set_ui_delegate(std::make_unique<SilentUi>());
+  const string tools = R"([{"name":"set_title",
+      "description":"Sets the title of the current slide.",
+      "parameters":{"type":"object",
+        "properties":{"title":{"type":"string"}},"required":["title"]}}])";
+  vector<string> msgs = {
+      msg_("system", "You edit slides with the tools you are given."),
+      msg_("user", "Set the slide's title to Water.")};
+  const FlexData r1 = run_conversation_turn_(
+      sess, path, conv_beat_(msgs, "tools", "", tools));
+  std::printf("[conversation.tools] 1: '%s' finish=%s calls=%s\n",
+              field_(r1, "text").c_str(), field_(r1, "finish").c_str(),
+              field_(r1, "tool_calls").c_str());
+  EXPECT_TRUE(field_(r1, "finish") == "tool_calls");
+  const string calls = field_(r1, "tool_calls");
+  EXPECT_TRUE(calls.find("set_title") != string::npos);
+  EXPECT_TRUE(calls.find("Water") != string::npos);
+  // Its result back as a tool message: the reply continues from it.
+  msgs.push_back(msg_("assistant", field_(r1, "text")));
+  msgs.push_back(msg_("tool", R"({"ok":true,"title":"Water"})"));
+  const FlexData r2 = run_conversation_turn_(
+      sess, path, conv_beat_(msgs, "tools", "", tools));
+  std::printf("[conversation.tools] 2: '%s' finish=%s restored=%s\n",
+              field_(r2, "text").c_str(), field_(r2, "finish").c_str(),
+              field_(r2, "restored").c_str());
+  EXPECT_TRUE(field_(r2, "restored") == "memory");
+  EXPECT_TRUE(field_(r2, "finish") == "stop");
+  // The host's tools change: the kept context advertises the old ones,
+  // so the conversation starts again in a new one.
+  const string tools2 = tools.substr(0, tools.size() - 1)
+      + R"(,{"name":"set_color","description":"Sets the text color.",
+      "parameters":{"type":"object",
+        "properties":{"color":{"type":"string"}}}}])";
+  msgs.push_back(msg_("assistant", field_(r2, "text")));
+  msgs.push_back(msg_("user", "Thanks."));
+  const FlexData r3 = run_conversation_turn_(
+      sess, path, conv_beat_(msgs, "tools", "", tools2));
+  std::printf("[conversation.tools] 3 (tools changed): restored=%s\n",
+              field_(r3, "restored").c_str());
+  EXPECT_TRUE(field_(r3, "restored") == "new");
+  EXPECT_TRUE(sess.drop_chat_context("tools").code == 0);
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON

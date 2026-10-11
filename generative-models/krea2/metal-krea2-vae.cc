@@ -1721,12 +1721,14 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
   // the block that fills it. See the note at `dmark`.
   const bool dprof = std::getenv("VPIPE_VAE_DECODE_PROFILE") != nullptr;
   std::vector<std::pair<std::string, double>> dlevels;
+  _flops.begin();
   {
     ComputeEncoder enc = stream.begin_compute();
 
     auto gemm_bias = [&](const SharedBuffer& x, const SharedBuffer& w,
                          const SharedBuffer& b, const SharedBuffer& y, int M,
                          int N, int K) {
+      _flops.gemm(M, N, K);
       conv_gemm_bias_(enc, x, w, b, y, M, N, K);
     };
     // 3x3 conv2d: im2col (into the shared scratch, or a held buffer if it
@@ -1734,6 +1736,8 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
     auto conv3x3 = [&](const SharedBuffer& in, int H, int W,
                        const Conv& c) -> SharedBuffer& {
       SharedBuffer& out = alloc((std::size_t)H * W * c.cout);
+      // Whichever route runs it: an [H*W, 9*cin] x [9*cin, cout] product.
+      _flops.gemm((long long)H * W, c.cout, 9LL * c.cin);
       // NAX hardware conv first; then the (opt-in) fused tgmem conv; else the
       // row-tiled im2col + gemm_bias (bands through im2col_scratch).
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/1)) { return out; }
@@ -1843,6 +1847,7 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
       SharedBuffer& att = alloc(hw * C);
       const float scale = 1.0f / std::sqrt((float)C);
       // The member is chosen ONCE, by measurement, in autotune_mid_attn_.
+      _flops.attention(1, (long long)hw * (long long)hw, C);
       encode_mid_attn_(enc, _attn_pick, q, k, v, att, hw, C, scale);
       release(q); release(k); release(v);  // consumed by the sdpa
       SharedBuffer& p = conv1x1(att, hw, a.proj);
@@ -1885,6 +1890,7 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
     auto flush = [&](const SharedBuffer*& xp) {
       if (!vae_split) { return; }
       enc.end();
+      _flops.flush(stream);
       std::string ge;
       if (!stream.commit().wait_ok(&ge)) { split_ok = false; }
       for (auto& s : pool) {
@@ -1959,6 +1965,7 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
                 "(lower the resolution)");
   }
   std::string gpu_err;
+  _flops.flush(stream);
   if (!stream.commit().wait_ok(&gpu_err)) {
     return fail(gpu_err.empty() ? std::string("GPU decode failed") : gpu_err);
   }
@@ -2218,17 +2225,20 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
   SharedBuffer carry;
   const bool vae_split = std::getenv("VPIPE_KREA2_NO_VAE_SPLIT") == nullptr;
   bool split_ok = true;
+  _flops.begin();
   {
     ComputeEncoder enc = stream.begin_compute();
     auto gemm_bias = [&](const SharedBuffer& x, const SharedBuffer& w,
                          const SharedBuffer& b, const SharedBuffer& y, int M,
                          int N, int K) {
+      _flops.gemm(M, N, K);
       conv_gemm_bias_(enc, x, w, b, y, M, N, K);
     };
     auto conv3x3g = [&](const SharedBuffer& in, int H, int W, const Conv& c,
                         bool stride2) -> SharedBuffer& {
       const int OH = stride2 ? H / 2 : H, OW = stride2 ? W / 2 : W;
       SharedBuffer& out = alloc((std::size_t)OH * OW * c.cout);
+      _flops.gemm((long long)OH * OW, c.cout, 9LL * c.cin);
       if (conv3x3_hw_(enc, in, c, out, H, W, stride2 ? 2 : 1)) {
         return out;
       }
@@ -2308,6 +2318,7 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
       // hwv, NOT hw: the encoder's enclosing scope has its own `hw` (the
       // full-resolution pixel count) and passing that here compiles cleanly
       // while running the attention over a sequence ~64x too long.
+      _flops.attention(1, (long long)hwv * (long long)hwv, C);
       encode_mid_attn_(enc, _attn_pick, q, k, v, att, hwv, C, scale);
       release(q); release(k); release(v);  // consumed by the sdpa
       SharedBuffer& p = conv1x1(att, hwv, a.proj);
@@ -2333,6 +2344,7 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
     auto flush = [&](const SharedBuffer*& xp) {
       if (!vae_split) { return; }
       enc.end();
+      _flops.flush(stream);
       std::string ge;
       if (!stream.commit().wait_ok(&ge)) { split_ok = false; }
       for (auto& s : pool) {
@@ -2400,6 +2412,7 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
     last_ch = _cfg.z_dim * 2;
   }
   if (!alloc_ok || !split_ok) { return {}; }
+  _flops.flush(stream);
   stream.commit().wait();
 
   // Posterior MODE = first z_dim channels; whiten (x-mean)/std; transpose

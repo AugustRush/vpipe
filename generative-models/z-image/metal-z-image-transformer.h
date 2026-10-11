@@ -8,6 +8,7 @@
 #include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/shared/dit-gpu-progress.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/runtime-lora.h"
@@ -213,6 +214,9 @@ class MetalZImageTransformer {
   bool uses_sage_attn() const { return (bool)_sage; }
   bool uses_i8_gemm() const { return (bool)_i8; }
   bool uses_sol_attn() const { return (bool)_sol; }
+  // What the forwards have encoded for perf-flops, credited to the GPU
+  // as each block retires (generative-models/shared/dit-flops.h).
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
   bool ane_armed() const noexcept { return _ane != nullptr; }
   bool ane_attempted() const noexcept { return _ane_tried; }
   bool ane_qkv_armed() const noexcept { return _ane_qkv != nullptr; }
@@ -429,6 +433,10 @@ class MetalZImageTransformer {
   mutable metal_compute::SharedBuffer _w_deq;
   std::unique_ptr<MetalSageAttention> _sage;
   std::unique_ptr<MetalSolAttention> _sol;
+  // perf-flops: GEMMs and attention counted as encoded, credited at
+  // retire; Sol's exact half at the keep ratio it realizes.
+  GpuFlopsTally _flops;
+  SolFlops _sol_flops;
   std::unique_ptr<AneFeedForward> _ane;
   bool _ane_tried = false;
   std::unique_ptr<AneFeedForward> _ane_qkv;

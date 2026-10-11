@@ -16,6 +16,11 @@ namespace vpipe::webui {
 // capture and retrieve the captured timeline. start accepts optional
 // {max_events}; data returns the dump_profiling document (live while
 // capturing, else the snapshot taken at stop).
+//
+// flops is the other half and needs no capture: the achieved TFLOP/s of
+// the GPU and the ANE, per bin, for a plot that polls every second or
+// ten (common/perf-flops-doc.h). ?bin_ms= (default 1000), ?bins= (60),
+// ?lag_ms= (0).
 class ProfilerApi {
 public:
   explicit ProfilerApi(ApiContext& ctx) : _ctx(ctx) {}
@@ -28,6 +33,7 @@ private:
   HttpResponse h_reset_ (const HttpRequest&);
   HttpResponse h_status_(const HttpRequest&);
   HttpResponse h_data_  (const HttpRequest&);
+  HttpResponse h_flops_ (const HttpRequest&);
 
   // Snapshot the live profiling buffers to a JSON string. There is no
   // in-memory dump API, so this dumps to a temp file (dump_profiling)

@@ -51,6 +51,246 @@ using namespace std;
 
 namespace vpipe {
 
+namespace {
+
+// ---- a CONVERSATION beat (see the header) -------------------------------
+
+struct ConvMessage {
+  string role;      // system | user | assistant | tool
+  string content;
+  string name;      // a tool message's tool, when given
+};
+
+struct Conversation {
+  bool                on = false;
+  vector<ConvMessage> messages;
+  string              tools_json;   // one function spec a line; "" none
+  string              key;          // the context's key; "" the stage's
+  string              dir;          // where it is saved; "" nowhere
+  int                 max_new_tokens = 0;
+};
+
+// What a message is, for matching a kept context against the messages a
+// beat brings: FNV-1a over its role, name and text. An assistant
+// message matches the reply the stage decoded only when the host hands
+// it back exactly as out-port 0's `text` gave it.
+uint64_t
+message_digest(const ConvMessage& m)
+{
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](string_view s) {
+    for (unsigned char c : s) {
+      h ^= c;
+      h *= 1099511628211ull;
+    }
+    h ^= 0xff;
+    h *= 1099511628211ull;
+  };
+  mix(m.role);
+  mix(m.name);
+  mix(m.content);
+  return h;
+}
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// What frames a conversation without being one of its messages: the
+// tools its system turn advertises, and the family's own system and
+// generation turns as this stage renders them (the reasoning
+// instruction; the empty thinking block of a template with thinking
+// off). It LEADS the digests a kept context holds, so a context made
+// under another frame -- the host changed its tools, the stage's
+// thinking mode was toggled -- is not reused for this one.
+uint64_t
+setup_digest(const genai::ChatTemplate& tpl, const string& tools_json)
+{
+  vector<int32_t> ids;
+  (void)tpl.render_system_message(string_view(), tools_json,
+                                  /*is_first_turn=*/true, &ids);
+  (void)tpl.render_generation_prompt(&ids);
+  ConvMessage m;
+  m.role = "setup";
+  m.name = string(tpl.family_name());
+  m.content.assign(reinterpret_cast<const char*>(ids.data()),
+                   ids.size() * sizeof(int32_t));
+  return message_digest(m);
+}
+#endif
+
+// A kept context's meta: the setup's digest (setup_digest), then the
+// digests of the messages it holds.
+constexpr string_view kConvMetaHead = "conversation/2";
+
+string
+digests_meta(const vector<uint64_t>& d)
+{
+  string s(kConvMetaHead);
+  char buf[24];
+  for (uint64_t x : d) {
+    std::snprintf(buf, sizeof buf, "\n%016llx",
+                  static_cast<unsigned long long>(x));
+    s += buf;
+  }
+  return s;
+}
+
+bool
+parse_digests_meta(string_view meta, vector<uint64_t>* out)
+{
+  out->clear();
+  if (meta.substr(0, kConvMetaHead.size()) != kConvMetaHead) {
+    return false;
+  }
+  size_t p = kConvMetaHead.size();
+  while (p < meta.size()) {
+    if (meta[p] != '\n' || p + 17 > meta.size()) { return false; }
+    uint64_t v = 0;
+    for (size_t i = p + 1; i < p + 17; ++i) {
+      const char c = meta[i];
+      v <<= 4;
+      if (c >= '0' && c <= '9') {
+        v |= (uint64_t)(c - '0');
+      } else if (c >= 'a' && c <= 'f') {
+        v |= (uint64_t)(c - 'a' + 10);
+      } else {
+        return false;
+      }
+    }
+    out->push_back(v);
+    p += 17;
+  }
+  return true;
+}
+
+// Where a keyed context is saved in its host's folder: the key, kept to
+// characters any file system takes.
+string
+context_file(const string& dir, const string& key)
+{
+  string name;
+  for (char c : key) {
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+        || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+    name += ok ? c : '_';
+  }
+  if (name.empty() || name.front() == '.') { name = "context" + name; }
+  return (std::filesystem::path(dir) / (name + ".vctx")).string();
+}
+
+// The beat's object read: false (with *why) when it is not a
+// conversation this stage can take.
+bool
+parse_conversation(const FlexData& d, Conversation* c, string* why)
+{
+  const auto o = d.as_object();
+  if (!o.contains("messages")) {
+    *why = "an object beat needs \"messages\"";
+    return false;
+  }
+  const FlexData msgs = o.at("messages");
+  if (!msgs.is_array() || msgs.as_array().empty()) {
+    *why = "\"messages\" must be a non-empty array";
+    return false;
+  }
+  const auto ma = msgs.as_array();
+  for (size_t i = 0; i < ma.size(); ++i) {
+    const FlexData m = ma[i];
+    if (!m.is_object()) {
+      *why = "each message must be an object";
+      return false;
+    }
+    const auto mo = m.as_object();
+    ConvMessage cm;
+    if (mo.contains("role")) { cm.role = string(mo.at("role").as_string()); }
+    if (mo.contains("content")) {
+      cm.content = string(mo.at("content").as_string());
+    }
+    if (mo.contains("name")) { cm.name = string(mo.at("name").as_string()); }
+    if (cm.role != "system" && cm.role != "user" && cm.role != "assistant"
+        && cm.role != "tool") {
+      *why = "a message's role must be system, user, assistant or tool, "
+             "not '" + cm.role + "'";
+      return false;
+    }
+    c->messages.push_back(std::move(cm));
+  }
+  const string& last = c->messages.back().role;
+  if (last != "user" && last != "tool") {
+    *why = "the last message must be the user's or a tool's: the reply "
+           "comes after it";
+    return false;
+  }
+  if (o.contains("tools")) {
+    const FlexData tools = o.at("tools");
+    if (!tools.is_array()) {
+      *why = "\"tools\" must be an array";
+      return false;
+    }
+    const auto ta = tools.as_array();
+    for (size_t i = 0; i < ta.size(); ++i) {
+      const FlexData t = ta[i];
+      if (!t.is_object() || !t.as_object().contains("name")) {
+        *why = "each tool must be an object with a \"name\"";
+        return false;
+      }
+      // The OpenAI / Hermes function shape Qwen was trained on.
+      const auto to = t.as_object();
+      FlexData fn = FlexData::make_object();
+      {
+        auto f = fn.as_object();
+        f.insert("name", to.at("name"));
+        if (to.contains("description")) {
+          f.insert("description", to.at("description"));
+        }
+        f.insert("parameters", to.contains("parameters")
+                                   ? to.at("parameters")
+                                   : FlexData::make_object());
+      }
+      FlexData spec = FlexData::make_object();
+      {
+        auto so = spec.as_object();
+        so.insert("type", FlexData::make_string("function"));
+        so.insert("function", std::move(fn));
+      }
+      if (!c->tools_json.empty()) { c->tools_json += "\n"; }
+      c->tools_json += spec.to_json();
+    }
+  }
+  if (o.contains("context")) { c->key = string(o.at("context").as_string()); }
+  if (o.contains("context_dir")) {
+    c->dir = string(o.at("context_dir").as_string());
+  }
+  if (o.contains("max_new_tokens")) {
+    c->max_new_tokens = (int)o.at("max_new_tokens").as_int(0);
+  }
+  c->on = true;
+  return true;
+}
+
+// The reply less its tool-call blocks: what it says in words.
+string
+reply_words(const string& text, string_view open, string_view close)
+{
+  string out;
+  size_t p = 0;
+  while (p < text.size()) {
+    const size_t a = open.empty() ? string::npos : text.find(open, p);
+    if (a == string::npos) {
+      out += text.substr(p);
+      break;
+    }
+    out += text.substr(p, a - p);
+    const size_t b = text.find(close, a + open.size());
+    if (b == string::npos) { break; }
+    p = b + close.size();
+  }
+  const size_t s = out.find_first_not_of(" \t\r\n");
+  if (s == string::npos) { return {}; }
+  const size_t e = out.find_last_not_of(" \t\r\n");
+  return out.substr(s, e - s + 1);
+}
+
+}  // namespace
+
 #ifdef VPIPE_BUILD_APPLE_SILICON
 namespace {
 
@@ -448,8 +688,8 @@ const PortSpec kIports[] = {
 };
 const PortSpec kOports[] = {
   {.name = "assistant",
-   .doc = "FlexData {text,prefill_ms,decode_ms,ctx_pos} per turn "
-          "(downstream optional)",
+   .doc = "FlexData {text,prefill_ms,decode_ms,decoded,ctx_pos} per "
+          "turn (downstream optional)",
    .type = &typeid(FlexDataPayload),
    .tags = "text", .clock_group = 0},
   {.name = "stream",
@@ -856,6 +1096,7 @@ TextChatStage::process(RuntimeContext& ctx)
         root.insert("text", FlexData::make_string(text));
         root.insert("prefill_ms", FlexData::make_int(prefill_ms));
         root.insert("decode_ms", FlexData::make_int(decode_ms));
+        root.insert("decoded", FlexData::make_int(0));
         root.insert("ctx_pos", FlexData::make_int(ctx_pos));
         return make_payload<FlexDataPayload>(std::move(fd));
       };
@@ -892,7 +1133,20 @@ TextChatStage::process(RuntimeContext& ctx)
         build_turn_payload("", 0, 0, current_ctx_pos()));
     co_return;
   }
-  if (!fdp->data.is_string()) {
+  // An OBJECT beat is a CONVERSATION (see the header): every message
+  // of it, each turn -- the context kept from the last one reused for
+  // what it already holds.
+  Conversation conv;
+  if (fdp->data.is_object()) {
+    string why;
+    if (!parse_conversation(fdp->data, &conv, &why)) {
+      session()->warn(fmt(
+          "TextChatStage('{}'): not a conversation: {}", this->id(), why));
+      co_await ctx.write(0,
+          build_turn_payload("", 0, 0, current_ctx_pos()));
+      co_return;
+    }
+  } else if (!fdp->data.is_string()) {
     session()->warn(fmt(
         "TextChatStage('{}'): FlexData payload is not a string "
         "(type-discriminator-mismatch)", this->id()));
@@ -900,8 +1154,9 @@ TextChatStage::process(RuntimeContext& ctx)
         build_turn_payload("", 0, 0, current_ctx_pos()));
     co_return;
   }
-  const string user_text = string(fdp->data.as_string(""));
-  if (user_text.empty()) {
+  string user_text = conv.on ? conv.messages.back().content
+                             : string(fdp->data.as_string(""));
+  if (!conv.on && user_text.empty()) {
     co_await ctx.write(0,
         build_turn_payload("", 0, 0, current_ctx_pos()));
     co_return;
@@ -913,9 +1168,10 @@ TextChatStage::process(RuntimeContext& ctx)
   // BOS) re-emit it on the next turn; ChatML treats _seeded as a
   // no-op anyway. We still emit a turn beat so any feedback loop
   // sees the cleared ctx_pos and the next iteration fires.
-  if (user_text == "/clear") {
+  if (!conv.on && user_text == "/clear") {
     _chat_ctx = _lm->make_context();
     _seeded = false;
+    _conv_valid = false;
     session()->info(fmt("[chat cleared]"));
     co_await ctx.write(0,
         build_turn_payload("", 0, 0, current_ctx_pos()));
@@ -940,6 +1196,162 @@ TextChatStage::process(RuntimeContext& ctx)
         build_turn_payload("", 0, 0, current_ctx_pos()));
     co_return;
   }
+
+  // ---- a CONVERSATION: its context, and the messages still to render --
+  // The context kept under the beat's key -- the model manager holds it
+  // while the model is warm -- else the one saved in the beat's folder
+  // when the model went, else (or when the messages do not begin with
+  // what it holds) a new one. What it holds is matched message by
+  // message (message_digest); the messages after that render ahead of
+  // the turn (`conv_ids`), the first system turn advertising the host's
+  // tools. The beat's last user message is the turn's own line, below,
+  // as a plain beat's is (media markers too); a beat ending in tool
+  // results renders them and the generation prompt here.
+  vector<int32_t>  conv_ids;
+  vector<uint64_t> conv_digests;
+  bool             conv_tail_tool = false;
+  string           conv_restored;
+  int              conv_reused = 0;
+  if (!conv.on) {
+    // A plain line continues the stage's own context, which then holds
+    // no conversation a later beat could match.
+    if (!_chat_ctx.valid()) {
+      _chat_ctx = _lm->make_context();
+      _seeded = false;
+    }
+    _conv_valid = false;
+  } else {
+    auto refuse = [&](const string& why) {
+      session()->warn(fmt("TextChatStage('{}'): {}", this->id(), why));
+    };
+    vector<int32_t> probe;
+    if (!tpl->render_generation_prompt(&probe)) {
+      refuse(fmt("the '{}' chat template cannot render a conversation",
+                 tpl->family_name())());
+      co_await ctx.write(0,
+          build_turn_payload("", 0, 0, current_ctx_pos()));
+      co_return;
+    }
+    conv_digests.push_back(setup_digest(*tpl, conv.tools_json));
+    for (const auto& m : conv.messages) {
+      conv_digests.push_back(message_digest(m));
+    }
+    vector<uint64_t> held;
+    bool have = false;
+    auto* mgr = session()->services()->generative_model_manager();
+    if (!conv.key.empty()) {
+      genai::LoadedLanguageModel::Context kept;
+      string meta;
+      if (mgr != nullptr && mgr->take_context(conv.key, _lm, &kept, &meta)
+          && parse_digests_meta(meta, &held)) {
+        _chat_ctx = std::move(kept);
+        have = true;
+        conv_restored = "memory";
+      } else if (!conv.dir.empty()) {
+        const string file = context_file(conv.dir, conv.key);
+        std::error_code ec;
+        if (std::filesystem::exists(file, ec)) {
+          const auto t0 = std::chrono::steady_clock::now();
+          string err;
+          auto back = _lm->load_context(file, &meta, &err);
+          if (back.valid() && parse_digests_meta(meta, &held)) {
+            _chat_ctx = std::move(back);
+            have = true;
+            conv_restored = "disk";
+            session()->info(fmt(
+                "TextChatStage('{}'): conversation '{}' read back from "
+                "disk ({} tokens, {} ms)", this->id(), conv.key,
+                _chat_ctx.seq_len(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count()));
+          } else {
+            refuse(fmt("the saved conversation '{}' could not be read "
+                       "back ({}); it is prefilled again", conv.key,
+                       err)());
+          }
+          // Read back, or unreadable: the file has had its use.
+          std::filesystem::remove(file, ec);
+        }
+      }
+    } else if (_conv_valid && _chat_ctx.valid()) {
+      held = _conv_digests;
+      have = true;
+      conv_restored = "stage";
+    }
+    // Reused when it holds the same setup and at least one message, all
+    // of them the beat's first ones, and the beat brings more.
+    if (have && (held.size() < 2 || held.size() >= conv_digests.size()
+                 || !std::equal(held.begin(), held.end(),
+                                conv_digests.begin()))) {
+      have = false;
+    }
+    size_t k = 0;   // the messages the context holds
+    if (have) {
+      k = held.size() - 1;
+      _seeded = _chat_ctx.seq_len() > 0;
+    } else {
+      _chat_ctx = _lm->make_context();
+      _seeded = false;
+      conv_restored = "new";
+      if (!_chat_ctx.valid()) {
+        refuse("no context could be made for the conversation");
+        co_await ctx.write(0,
+            build_turn_payload("", 0, 0, current_ctx_pos()));
+        co_return;
+      }
+    }
+    _conv_valid = false;
+    conv_reused = _chat_ctx.seq_len();
+    const size_t n = conv.messages.size();
+    conv_tail_tool = conv.messages.back().role == "tool";
+    const size_t end = conv_tail_tool ? n : n - 1;
+    size_t i = k;
+    bool ok = true;
+    if (k == 0) {
+      const bool sys = conv.messages[0].role == "system";
+      if (sys || !conv.tools_json.empty()) {
+        ok = tpl->render_system_message(
+            sys ? string_view(conv.messages[0].content) : string_view(),
+            conv.tools_json, /*is_first_turn=*/true, &conv_ids);
+        if (sys) { i = 1; }
+      }
+    }
+    while (ok && i < end) {
+      const auto& m = conv.messages[i];
+      if (m.role == "tool") {
+        vector<string> results;
+        while (i < end && conv.messages[i].role == "tool") {
+          results.push_back(conv.messages[i++].content);
+        }
+        ok = tpl->render_tool_results_message(
+            span<const string>(results.data(), results.size()), &conv_ids);
+        continue;
+      }
+      ok = tpl->render_message(m.role, m.content,
+                               !_seeded && conv_ids.empty(), &conv_ids);
+      ++i;
+    }
+    if (ok && conv_tail_tool) {
+      ok = tpl->render_generation_prompt(&conv_ids);
+    }
+    if (!ok) {
+      refuse(fmt("the '{}' chat template could not render the "
+                 "conversation", tpl->family_name())());
+      co_await ctx.write(0,
+          build_turn_payload("", 0, 0, current_ctx_pos()));
+      co_return;
+    }
+  }
+  // A conversation may ask for its own reply budget.
+  struct BudgetGuard {
+    int* at;
+    int  was;
+    ~BudgetGuard() { *at = was; }
+  } budget_guard{&_max_new_tokens, _max_new_tokens};
+  if (conv.on && conv.max_new_tokens > 0) {
+    _max_new_tokens = conv.max_new_tokens;
+  }
+
   // ---- media-line markers: processed BEFORE the tokenizer ----------
   // A marker-bearing line decomposes into ordered chunks (text runs +
   // attachments). Each attachment is decoded with FFmpeg to the
@@ -950,7 +1362,7 @@ TextChatStage::process(RuntimeContext& ctx)
   // and is dropped, keeping the surrounding text.
   vector<genai::MediaChunk> chunks;
   vector<MediaItem>         items;   // encoded media, in chunk order
-  if (media_line::has_media_marker(user_text)) {
+  if (!conv_tail_tool && media_line::has_media_marker(user_text)) {
     vector<string> perrs;
     auto segs = media_line::parse(user_text, &perrs);
     for (const auto& e : perrs) {
@@ -1027,7 +1439,7 @@ TextChatStage::process(RuntimeContext& ctx)
       chunks.push_back(std::move(c));
       items.push_back(std::move(*item));
     }
-  } else {
+  } else if (!conv_tail_tool) {
     genai::MediaChunk c;
     c.kind = genai::MediaChunk::Kind::Text;
     c.text = user_text;
@@ -1039,9 +1451,12 @@ TextChatStage::process(RuntimeContext& ctx)
   // <bos>), so the user turn that follows must NOT emit it again -- pass
   // is_first_turn=false to the user render when a tools system turn will
   // precede it. A no-op for ChatML/Qwen (no session-start token).
-  const bool tools_active = !_tools.empty() && tpl->supports_tools();
+  // A conversation's tools are the HOST's: advertised in its system turn
+  // above and called back, never run here (see the header).
+  const bool tools_active =
+      !conv.on && !_tools.empty() && tpl->supports_tools();
   const bool tools_seed   = tools_active && !_seeded;
-  const bool user_is_first = !_seeded && !tools_seed;
+  const bool user_is_first = !_seeded && !tools_seed && conv_ids.empty();
 
   vector<int32_t> ids;
   bool have_media = !items.empty();
@@ -1059,7 +1474,7 @@ TextChatStage::process(RuntimeContext& ctx)
     items.clear();
     ids.clear();
   }
-  if (!have_media && ids.empty()) {
+  if (!conv_tail_tool && !have_media && ids.empty()) {
     // Text-only turn (no markers, or every attachment dropped).
     string text_only;
     for (const auto& c : chunks) {
@@ -1083,7 +1498,10 @@ TextChatStage::process(RuntimeContext& ctx)
   // declaration already lives in the K/V cache. After decode we scan
   // the reply for tool-call blocks, run them, and feed the results
   // back for another round (see the tool loop below).
-  if (tools_seed) {
+  if (conv.on) {
+    // The conversation's messages before the turn's own line.
+    ids.insert(ids.begin(), conv_ids.begin(), conv_ids.end());
+  } else if (tools_seed) {
     vector<int32_t> sys;
     // The tools turn CARRIES the reasoning-effort instruction when one
     // is set (the template merges them into one system turn, as the
@@ -1766,6 +2184,78 @@ TextChatStage::process(RuntimeContext& ctx)
     break;
   }
 
+  // ---- a CONVERSATION's turn ends: its context kept for the next ------
+  // Closed as the conversation rendered again reads (ChatML's "\n" after
+  // <|im_end|>), so the next beat's messages follow it exactly; then
+  // parked under its key with the model -- saved to its folder when the
+  // model goes -- or kept by the stage. The reply's tool calls go back
+  // to the host, which runs them and sends their results as the next
+  // beat's tool messages.
+  FlexData conv_calls = FlexData::make_array();
+  string   conv_finish;
+  int64_t  conv_ctx_pos = current_ctx_pos();
+  if (conv.on) {
+    if (reason != StopReason::DecodeError && _chat_ctx.valid()) {
+      vector<int32_t> sep;
+      tpl->render_turn_separator(&sep);
+      for (int32_t id : sep) { (void)_lm->next_token(_chat_ctx, id); }
+    }
+    conv_ctx_pos = current_ctx_pos();
+    vector<McpToolCall> calls;
+    if (!conv.tools_json.empty()) {
+      calls = tpl->parse_tool_calls(assistant_text);
+    }
+    {
+      auto arr = conv_calls.as_array();
+      for (const auto& c : calls) {
+        FlexData o = FlexData::make_object();
+        {
+          auto oo = o.as_object();
+          oo.insert("name", FlexData::make_string(c.name));
+          oo.insert("arguments", FlexData::make_string(c.arguments_json));
+        }
+        arr.push_back(std::move(o));
+      }
+    }
+    switch (reason) {
+    case StopReason::StopToken:       conv_finish = "stop"; break;
+    case StopReason::MaxNewTokens:    conv_finish = "length"; break;
+    case StopReason::UserInterrupted: conv_finish = "interrupted"; break;
+    case StopReason::PipelineStopped: conv_finish = "stopped"; break;
+    case StopReason::DecodeError:     conv_finish = "error"; break;
+    }
+    if (!calls.empty()) { conv_finish = "tool_calls"; }
+    vector<uint64_t> held = conv_digests;
+    held.push_back(message_digest(ConvMessage{"assistant", assistant_text,
+                                              string()}));
+    if (reason == StopReason::DecodeError || !_chat_ctx.valid()) {
+      // A context a decode broke off in is not kept: the next beat
+      // starts again from its messages.
+      _chat_ctx = _lm->make_context();
+      _seeded = false;
+    } else if (!conv.key.empty()) {
+      string spill;
+      if (!conv.dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(conv.dir, ec);
+        spill = context_file(conv.dir, conv.key);
+      }
+      // The warm hold renewed FIRST: it runs from the last reply's end,
+      // so the host's pause plus this turn may have outlasted it, and a
+      // context parked with no hold is saved now, or let go.
+      renew_warm_();
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        mgr->park_context(conv.key, _lm, std::move(_chat_ctx),
+                          digests_meta(held), spill);
+      }
+      _chat_ctx = genai::LoadedLanguageModel::Context{};
+      _seeded = false;
+    } else {
+      _conv_digests = std::move(held);
+      _conv_valid = true;
+    }
+  }
+
   // Close the streaming out-port for this turn: the tail text goes out
   // as the final {text, end_of_response=true} beat (before the complete
   // per-turn record on out-port 0, so a consumer sees the reply end).
@@ -1787,9 +2277,20 @@ TextChatStage::process(RuntimeContext& ctx)
     root.insert("decode_ms",
         FlexData::make_int(
             static_cast<int64_t>(decode_s * 1000.0)));
-    root.insert("ctx_pos",
-        FlexData::make_int(
-            static_cast<int64_t>(_chat_ctx.seq_len())));
+    root.insert("decoded", FlexData::make_int(decode_calls_total));
+    root.insert("ctx_pos", FlexData::make_int(conv_ctx_pos));
+    if (conv.on) {
+      root.insert("content", FlexData::make_string(reply_words(
+          assistant_text, tpl->tool_call_open_marker(),
+          tpl->tool_call_close_marker())));
+      root.insert("tool_calls", std::move(conv_calls));
+      root.insert("finish", FlexData::make_string(conv_finish));
+      root.insert("reused", FlexData::make_int(conv_reused));
+      root.insert("prefilled", FlexData::make_int(prefill_n_total));
+      root.insert("restored", FlexData::make_string(conv_restored));
+      root.insert("ctx_bytes", FlexData::make_int(
+          static_cast<int64_t>(_lm->kv_bytes())));
+    }
   }
   co_await ctx.write(0,
       make_payload<FlexDataPayload>(std::move(fd)));

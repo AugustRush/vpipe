@@ -3,6 +3,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/dit-flops.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -170,6 +171,13 @@ public:
     return _profile;
   }
 
+  // The GPU arithmetic decode() has credited to the achieved-FLOP/s
+  // meter (common/perf-flops.h): every 3x3 conv (one count for a
+  // MemBlock's concat pair), every 1x1 (TGrow, skip, pool), counted as
+  // encoded -- so a raw frame nobody keeps counts only the ops it ran --
+  // and credited as each command buffer retires.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
+
 private:
   struct Conv {
     // 3x3: [cout, 9 * cin] with K ordered (ky, kx, ci) -- the layout the
@@ -192,6 +200,10 @@ private:
     // hardware convs, one per half.
     bool split_hwio = false;
     int  cin  = 0;
+    // The checkpoint's own input width. `cin` is the first conv's rounded
+    // up to the gather's 32, and those zero columns are the kernel's
+    // padding, not the network's arithmetic: gpu_flops() counts this.
+    int  cin_file = 0;
     int  cout = 0;
     bool k3   = true;
   };
@@ -349,6 +361,7 @@ private:
   // VPIPE_TAE_PROFILE: the decode's stream while it runs, else null.
   metal_compute::CommandStream* _prof_cs = nullptr;
   std::map<std::string, ProfileRow> _profile;
+  GpuFlopsTally _flops;   // see gpu_flops()
 };
 
 }  // namespace genai

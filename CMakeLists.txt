@@ -596,6 +596,9 @@ install(FILES
     # without hard-coding the numbers.
     ${CMAKE_CURRENT_SOURCE_DIR}/common/perf-event.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/perf-scope.h
+    # The achieved-FLOP/s meter (perf-flops/1): a plugin family credits
+    # its arithmetic here, through dit-flops.h below.
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/perf-flops.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/session-member.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/vertex.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/vpipe-format.h
@@ -802,6 +805,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/stream-sizing.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/dit-block-progress.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/dit-gpu-progress.h
+        # The same retire-time hook, carrying FLOPs to perf-flops.h.
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/dit-flops.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/streamed-refill.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/wired-pool.h
         # streamed-refill.h widens FP8 codes, so these two are part of its
@@ -872,6 +877,11 @@ endif()
 
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE
     DESTINATION share/doc/vpipe
+)
+# The FFmpeg the library was compiled against (cmake/find-ffmpeg.cmake,
+# step 7): what an application bundling its own FFmpeg checks it with.
+install(FILES ${CMAKE_BINARY_DIR}/ffmpeg-headers
+    DESTINATION share/vpipe
 )
 # Apache-2.0 section 4(d): a redistributed libvpipe carries the NOTICE
 # too -- an app bundling it copies this directory into its licences.

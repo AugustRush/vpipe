@@ -1567,6 +1567,20 @@ Which partition a directory holds is read from that partition's own
 `model_index.json`, and the model's registration key is what says which one
 you asked for.
 
+The same repository also carries a diffusers pipeline at its root — one
+pipeline over both partitions: `transformer/` is FL2VA's DiT and
+`transformer_ref/` Ref2VA's, beside one `text_encoder/`, `tokenizer/`,
+`processor/`, `vae/` and `audio_vae/`. Every one of them is the released
+weights under diffusers names (the DiTs, VAEs and encoder tensor for
+tensor), and a graph runs on it as it is: point `model-select` at the
+repository root and each stage finds its component, the DiT chosen by
+partition. When the checkout also holds a released partition, that
+partition's copies are used instead — the same weights, so a graph never
+holds two of them. Which partition a graph runs is the model record's to
+say, as for a checkout of both released partitions: register the root
+with `model-register` and `model_type: minimax-h3-ref2va` (or
+`minimax-h3-fl2va`) and select that record; a bare path is taken as FL2VA.
+
 ### Fewer steps — the Turbo LoRA
 
 Steps are the bulk of what this model costs, and good quality from the raw

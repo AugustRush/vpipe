@@ -226,6 +226,27 @@ class MetalFlashVsrTransformer {
     // this null and the seed decides. f32 [out_channels, T, H/8, W/8].
     const float* init_noise = nullptr;
     Params params;
+
+    // ONE SOURCE OVER SEVERAL REQUESTS, restored as the reference
+    // restores it: in one pass. `chunk0` is the stream's index of this
+    // request's first chunk. 0 opens the stream -- the opening chunk is
+    // this request's first, and `frames` (or `chunks`) says how many
+    // follow. Above 0 the request CONTINUES the one before it: its rows
+    // hold its own chunks only, two row frames each, `chunks` says how
+    // many, and every block attends the key/value window the previous
+    // request left. `keep_window` is what leaves one: each block's
+    // window survives the call, for a request starting at the chunk this
+    // one ended before.
+    //
+    // The result is the latent one request over the whole source would
+    // have produced, bit for bit -- the window keeps its ring slots, the
+    // noise is drawn per latent frame of the STREAM, and a continuation
+    // takes the seed, geometry and params the stream opened with (a
+    // mismatch is refused, not reconciled). Without this, every request
+    // opens cold, which is a visible change of texture at every seam.
+    int  chunk0 = 0;
+    int  chunks = 0;           // 0 = from `frames` (an opening request)
+    bool keep_window = false;
   };
 
   // Returns the whitened latent [16, T, H/8, W/8] that vae-decode takes,
@@ -263,6 +284,17 @@ class MetalFlashVsrTransformer {
   // `windows` temporal windows, bf16. 425 MB at 1920x1152 and 4 windows.
   static std::uint64_t kv_ring_bytes(const Config& cfg, int height,
                                      int width, int windows);
+
+  // What a STREAM holds between requests (Request::keep_window): every
+  // block's retained windows, the ring's capacity less the slot the next
+  // chunk writes. 9.6 GB at 1920x1152 and kv_ratio 3 -- the price of a
+  // seamless stream, and why a box that cannot hold it restores clips.
+  static std::uint64_t stream_window_bytes(const Config& cfg, int height,
+                                           int width, const Params& params);
+  // The chunk a held window continues into, or -1 when none is held.
+  int  window_next_chunk() const noexcept;
+  // Let a held window go (the stream ended, or will not continue here).
+  void drop_window() noexcept;
 
   // What one clip's key/value windows ALLOCATE: one ring, or one per
   // block, as blocks_outer() decides. Was the largest term a denoise
@@ -347,6 +379,14 @@ class MetalFlashVsrTransformer {
   struct Block;
   struct Stream;   // the per-block KV window, live for one generate()
   struct Streaming;   // the slot pair a streaming load reads blocks into
+  struct WindowCarry;   // every block's window between stream requests
+
+  // Copy block `bi`'s retained windows between the ring `cache_idx` and
+  // the carry: INTO the ring before a continuing request runs the block,
+  // OUT of it after a request that keeps its window. Slots are kept, so
+  // the attention reads the keys in the order one request would have.
+  bool carry_window_(Stream& st, int cache_idx, int bi, bool into_ring,
+                     std::string* err);
 
   bool fold_constants_(WeightSet& w, std::string* err);
   // The three-axis RoPE tables for one chunk, built in WINDOW-PERMUTED
@@ -380,6 +420,7 @@ class MetalFlashVsrTransformer {
   std::string                  _ctx_name = "posi_context";
   std::vector<Block>           _blocks;
   std::unique_ptr<Streaming>   _streaming;   // set when stream_blocks
+  std::unique_ptr<WindowCarry> _carry;       // set while a stream is open
 
   // ---- folded at load, because the timestep and the context are both
   // constants of this checkpoint. See the class comment.
@@ -432,8 +473,20 @@ class MetalFlashVsrTransformer {
              metal_compute::SharedBuffer* noise_out, std::string* err);
   void report_prof_(Stream& st, const char* what, int n_blocks);
   // The block-outer clip loop; see blocks_outer().
+  // The two orders over one request's `chunks`: `T` latent frames from
+  // stream frame `g0`, chunk `ci`'s size and stream offset from the two
+  // functions. generate() has already settled all of that.
   bool generate_blocks_outer_(const Request& req,
                               const std::vector<float>& noise, Stream& st,
+                              int chunks, int T, int g0,
+                              const std::function<int(int)>& chunk_f,
+                              const std::function<int(int)>& chunk_t,
+                              std::vector<float>* latent, std::string* err);
+  bool generate_chunks_outer_(const Request& req,
+                              const std::vector<float>& noise, Stream& st,
+                              int chunks, int T, int g0,
+                              const std::function<int(int)>& chunk_f,
+                              const std::function<int(int)>& chunk_t,
                               std::vector<float>* latent, std::string* err);
   bool ensure_kernels_(std::string* err);
 

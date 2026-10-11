@@ -44,6 +44,7 @@ MetalQwenModelExec::state_for_(ContextId ctx)
   if (_model == nullptr) {
     return nullptr;
   }
+  std::lock_guard<std::mutex> lk(_ctx_mu);
   auto it = _ctxmap.find(ctx.v);
   if (it != _ctxmap.end()) {
     return &it->second;
@@ -65,11 +66,19 @@ MetalQwenModelExec::context_seq_len(ContextId ctx) const
   }
   // Read-only: an unmapped context has no KV yet -- do NOT lazily
   // materialize one just to report its length.
-  auto it = _ctxmap.find(ctx.v);
-  if (it == _ctxmap.end()) {
+  const ContextId cid = metal_cid_(ctx);
+  if (!cid.valid()) {
     return 0;
   }
-  return _model->context_manager()->seq_len_of(it->second.metal_cid);
+  return _model->context_manager()->seq_len_of(cid);
+}
+
+ContextId
+MetalQwenModelExec::metal_cid_(ContextId ctx) const
+{
+  std::lock_guard<std::mutex> lk(_ctx_mu);
+  auto it = _ctxmap.find(ctx.v);
+  return it != _ctxmap.end() ? it->second.metal_cid : ContextId{};
 }
 
 std::int32_t
@@ -368,17 +377,17 @@ MetalQwenModelExec::branch_context(ContextId parent, ContextId child)
   if (_model == nullptr) {
     return false;
   }
-  auto it = _ctxmap.find(parent.v);
-  if (it == _ctxmap.end()) {
+  const ContextId metal_parent = metal_cid_(parent);
+  if (!metal_parent.valid()) {
     return false;
   }
-  ContextId metal_child =
-      _model->context_manager()->branch(it->second.metal_cid);
+  ContextId metal_child = _model->context_manager()->branch(metal_parent);
   if (!metal_child.valid()) {
     return false;
   }
   CtxState st;
   st.metal_cid = metal_child;
+  std::lock_guard<std::mutex> lk(_ctx_mu);
   _ctxmap[child.v] = st;
   return true;
 }
@@ -387,13 +396,18 @@ void
 MetalQwenModelExec::release_context(ContextId ctx)
 {
   if (_model == nullptr) { return; }
-  auto it = _ctxmap.find(ctx.v);
-  if (it == _ctxmap.end()) { return; }
+  ContextId cid;
+  {
+    std::lock_guard<std::mutex> lk(_ctx_mu);
+    auto it = _ctxmap.find(ctx.v);
+    if (it == _ctxmap.end()) { return; }
+    cid = it->second.metal_cid;
+    _ctxmap.erase(it);
+  }
   // Return this context's KV pages to the pool (refcount drop; shared
-  // prefix pages survive until the last brancher releases) and drop the
-  // bookkeeping entry so a recycled ContextId re-acquires a fresh root.
-  _model->context_manager()->release(it->second.metal_cid);
-  _ctxmap.erase(it);
+  // prefix pages survive until the last brancher releases); the entry
+  // is gone already, so a recycled ContextId re-acquires a fresh root.
+  _model->context_manager()->release(cid);
 }
 
 bool
@@ -415,6 +429,7 @@ MetalQwenModelExec::reserve_branch_context(ContextId child, int max_tokens)
   if (ids.empty() || !ids[0].valid()) { return false; }
   CtxState st;
   st.metal_cid = ids[0];
+  std::lock_guard<std::mutex> lk(_ctx_mu);
   _ctxmap[child.v] = st;
   return true;
 }
@@ -423,20 +438,19 @@ bool
 MetalQwenModelExec::rebranch_context(ContextId parent, ContextId child)
 {
   if (_model == nullptr) { return false; }
-  auto pit = _ctxmap.find(parent.v);
-  auto cit = _ctxmap.find(child.v);
-  if (pit == _ctxmap.end() || cit == _ctxmap.end()) { return false; }
-  return _model->context_manager()->rebranch(cit->second.metal_cid,
-                                             pit->second.metal_cid);
+  const ContextId p = metal_cid_(parent);
+  const ContextId c = metal_cid_(child);
+  if (!p.valid() || !c.valid()) { return false; }
+  return _model->context_manager()->rebranch(c, p);
 }
 
 bool
 MetalQwenModelExec::detach_branch_context(ContextId child)
 {
   if (_model == nullptr) { return false; }
-  auto cit = _ctxmap.find(child.v);
-  if (cit == _ctxmap.end()) { return false; }
-  _model->context_manager()->detach_branch(cit->second.metal_cid);
+  const ContextId c = metal_cid_(child);
+  if (!c.valid()) { return false; }
+  _model->context_manager()->detach_branch(c);
   return true;
 }
 
@@ -453,7 +467,32 @@ MetalQwenModelExec::query_extension(std::string_view id) noexcept
   if (id == spec_decode::kExtensionId) {
     return static_cast<SpecDecodeExt*>(this);
   }
+  if (id == context_io::kExtensionId) {
+    return static_cast<ContextIoExt*>(this);
+  }
   return ModelExec::query_extension(id);
+}
+
+bool
+MetalQwenModelExec::export_context(ContextId ctx,
+                                   const ContextManager::ByteSink& out)
+{
+  if (_model == nullptr) { return false; }
+  const ContextId cid = metal_cid_(ctx);
+  if (!cid.valid()) { return false; }
+  return _model->context_manager()->export_context(cid, out);
+}
+
+bool
+MetalQwenModelExec::import_context(ContextId ctx,
+                                   const ContextManager::ByteSource& in)
+{
+  if (_model == nullptr || metal_cid_(ctx).valid()) { return false; }
+  const ContextId cid = _model->context_manager()->import_context(in);
+  if (!cid.valid()) { return false; }
+  std::lock_guard<std::mutex> lk(_ctx_mu);
+  _ctxmap[ctx.v] = CtxState{cid};
+  return true;
 }
 
 std::string_view

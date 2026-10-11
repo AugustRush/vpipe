@@ -3,6 +3,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/shared/kernel-sets/vae-mid-attn-tune.h"
 
 #include <functional>
@@ -157,6 +158,26 @@ class MetalWanVae {
   bool decode(const metal_compute::SharedBuffer& z, int T, int h8, int w8,
               const FrameSink& on_frame, std::string* err = nullptr);
 
+  // A decode that CONTINUES across calls. The causal carries one call
+  // leaves are where the next one starts, so a latent cut into pieces
+  // decodes to exactly the frames the whole latent does: the first
+  // piece's first latent frame is one frame, every later latent frame
+  // four, and `frame0` keeps counting. Owned by the caller; a fresh one
+  // starts a stream, and the geometry may not change inside one.
+  //
+  // A continued decode runs WHOLE-PLANE. A tiled one keeps only a tile's
+  // carries, and the next piece would need all of them -- so a stream
+  // holds the plane's carries between calls (~10 GB at 1920x1152; see
+  // decode_carry_bytes) and a box that cannot hold them must not stream.
+  struct DecodeStream;
+  bool decode(const metal_compute::SharedBuffer& z, int T, int h8, int w8,
+              const FrameSink& on_frame, std::string* err,
+              DecodeStream* stream);
+  // What a whole-plane decode's causal carries weigh at this latent size:
+  // what a DecodeStream holds between calls.
+  static std::size_t decode_carry_bytes(const Config& cfg, int h8, int w8,
+                                        bool frame_split = true) noexcept;
+
   // Single-frame convenience: decode a [z_dim, 1, h8, w8] latent to one
   // RGB frame [3, h8*8, w8*8]. This is the call that reduces to exactly
   // what MetalKrea2Vae::decode does, and the test that holds the two to
@@ -174,6 +195,15 @@ class MetalWanVae {
          std::string* err = nullptr);
 
   bool has_encoder() const { return _has_encoder; }
+
+  // The GPU arithmetic decode() and encode() have credited to the
+  // achieved-FLOP/s meter (common/perf-flops.h): every conv, 1x1 and
+  // the per-frame mid attention, counted as encoded and credited as
+  // each command buffer retires. A causal conv counts its LIVE temporal
+  // taps -- a tap before the sequence is zero padding, which only the
+  // gather route multiplies -- so the figure is the same on every GPU.
+  // For a test to hold against shapes.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
 
   // In-place per-channel un-whiten of a channel-first latent video
   // [z_dim, T, h8, w8]: z[c] = z[c]*latents_std[c] + latents_mean[c].
@@ -424,6 +454,7 @@ class MetalWanVae {
 
   // ---- encoder (loaded only when with_encoder) ------------------------
   bool _has_encoder = false;
+  GpuFlopsTally _flops;   // see gpu_flops()
   Conv _enc_conv_in;                // causal 3x3x3 3 -> base
   std::vector<DownStage> _enc_down; // 4 stages (3 with a downsample)
   ResBlock _enc_mid_res0, _enc_mid_res1;
@@ -599,6 +630,21 @@ class MetalWanVae {
   static unsigned attn_threads_(int bq)
   {
     return (bq == 16 ? 4u : bq == 32 ? 8u : 16u) * 32u;
+  }
+};
+
+// Defined here because it holds the class's own carries; a nested class
+// may name them.
+struct MetalWanVae::DecodeStream {
+  std::vector<Carry> carry;
+  long long          frames = 0;   // frames this stream has decoded
+  int                h8 = 0, w8 = 0;
+  std::size_t
+  bytes() const noexcept
+  {
+    std::size_t n = 0;
+    for (const Carry& c : carry) { n += c.buf.byte_size(); }
+    return n;
   }
 };
 

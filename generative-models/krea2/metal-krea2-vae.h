@@ -4,6 +4,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/shared/kernel-sets/vae-conv3x3-tune.h"
 #include "generative-models/shared/kernel-sets/vae-mid-attn-tune.h"
 
@@ -144,6 +145,12 @@ class MetalKrea2Vae {
   metal_compute::SharedBuffer
   encode(const metal_compute::SharedBuffer& img, int H, int W);
   bool has_encoder() const { return _has_encoder; }
+
+  // The GPU arithmetic decode() and encode() have credited to the
+  // achieved-FLOP/s meter (common/perf-flops.h): every 3x3 conv, 1x1
+  // conv and the mid-block attention, counted as encoded and credited
+  // as each command buffer retires. For a test to hold against shapes.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
 
   // In-place per-channel un-whiten of a channel-first latent [z_dim, h8, w8]:
   // z[c] = z[c] * latents_std[c] + latents_mean[c]. Returns a fresh buffer.
@@ -480,6 +487,7 @@ class MetalKrea2Vae {
   metal_compute::ComputeLibrary _lib_dense_mma;
   metal_compute::ComputeFunction _fn_dense_mma, _fn_dense_mma_deep, _fn_bias_add;
   bool _use_mma2 = false;
+  GpuFlopsTally _flops;   // see gpu_flops()
   int  _mma_min_m = 64;   // matmul2d only wins once M amortizes the 128-row tile
   // Min output cols for the matmul2d path: a tiny N (e.g. the 3-channel
   // conv_out) wastes the 128/256-wide tile, so route N < _mma_min_n to steel.

@@ -1,6 +1,7 @@
 #ifndef VPIPE_STAGES_TEXT_PROMPT_STAGE_H
 #define VPIPE_STAGES_TEXT_PROMPT_STAGE_H
 
+#include "common/flex-data.h"
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
@@ -21,7 +22,10 @@ namespace vpipe {
 // to re-run generation on the same prompt paced by a chrono/feedback source.
 //
 // Configuration (FlexData object on the 4th constructor parameter):
-//   text  (string, required) -- the prompt text to emit.
+//   text  (string) -- the prompt text to emit.
+//   value (any)    -- a FlexData value emitted AS IT IS in place of `text`:
+//                     what a stage takes as an object beat (text-chat's
+//                     conversation). One of the two is required.
 class TextPromptStage final : public TypedStage<TextPromptStage> {
 public:
   static constexpr const char* kTypeName = "text-prompt";
@@ -41,6 +45,8 @@ public:
 
 private:
   std::string _text;
+  // `value`, when configured (null otherwise): emitted in place of _text.
+  FlexData    _value;
   bool        _done = false;   // no-iport one-shot guard
 };
 

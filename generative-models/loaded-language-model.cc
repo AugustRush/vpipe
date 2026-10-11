@@ -1,6 +1,7 @@
 #include "generative-models/loaded-language-model.h"
 
 #include "generative-models/chat-template.h"
+#include "generative-models/context-io.h"
 #include "generative-models/qwen3/metal-audio-encoder.h"
 #include "generative-models/gemma4/metal-gemma-model-exec.h"
 #include "generative-models/llama3/metal-llama-model-exec.h"
@@ -30,7 +31,9 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -86,6 +89,8 @@ struct LoadedLanguageModel::Impl {
   MlxRuntime*                       runtime = nullptr;
   const SessionContextIntf*         session = nullptr;
   bool                              valid   = false;
+  // The checkpoint's directory, as loaded: what a saved context names.
+  std::string                       model_dir;
   // Selected via VPIPE_LLM_BACKEND=metal: route prefill/next_token
   // through the metal-compute exec's token-id path instead of the
   // MLX muxer + forward_chunk path.
@@ -329,6 +334,7 @@ LoadedLanguageModel::LoadedLanguageModel(
   _impl->weights   = std::move(weights);
   _impl->tokenizer = std::move(tokenizer);
   _impl->runtime   = runtime;
+  _impl->model_dir = model_dir;
   _impl->session   = session;
 
   if (!_impl->tokenizer) {
@@ -1047,6 +1053,185 @@ LoadedLanguageModel::make_context()
   c._id = dispatch_(_impl->runtime, [this] {
     return _impl->ctx_mgr->acquire_root();
   });
+  return c;
+}
+
+namespace {
+
+// A saved context's file: this magic, the FINGERPRINT of the model that
+// made it, where the context stands (its length, its next rope position,
+// its last predicted token), the caller's meta, then the exec's stream
+// (ContextIoExt). Strings are a u32 length and their bytes.
+constexpr char kSavedContextMagic[8] = {'V', 'P', 'C', 'T', 'X', 0, 0, '1'};
+constexpr std::uint32_t kMaxFingerprint = 1u << 20;
+constexpr std::uint32_t kMaxMeta = 64u << 20;
+
+// What a saved context was made by: the architecture, the checkpoint's
+// directory, and its weight and config files by name, size and time --
+// weights replaced in place are another model, whose K/V would read back
+// silently wrong.
+std::string
+context_fingerprint_(const std::string& arch, const std::string& dir)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  std::string fp = arch + "\n" + fs::weakly_canonical(dir, ec).string();
+  std::vector<std::string> files;
+  auto note = [&](const fs::path& p) {
+    std::error_code e;
+    const auto ext = p.extension().string();
+    if (ext != ".safetensors" && ext != ".json" && ext != ".gguf") {
+      return;
+    }
+    const auto size = fs::file_size(p, e);
+    const auto when = fs::last_write_time(p, e).time_since_epoch().count();
+    files.push_back(fmt("{}:{}:{}", p.filename().string(), size,
+                        static_cast<long long>(when))());
+  };
+  if (fs::is_regular_file(dir, ec)) {
+    note(dir);
+  } else {
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+      std::error_code fe;
+      if (e.is_regular_file(fe)) { note(e.path()); }
+    }
+  }
+  std::sort(files.begin(), files.end());
+  for (const auto& f : files) { fp += "\n" + f; }
+  return fp;
+}
+
+ContextIoExt*
+context_io_(ModelExec* exec)
+{
+  return exec != nullptr ? static_cast<ContextIoExt*>(
+                               exec->query_extension(
+                                   context_io::kExtensionId))
+                         : nullptr;
+}
+
+}  // namespace
+
+bool
+LoadedLanguageModel::save_context(const Context& ctx, const std::string& path,
+                                  std::string_view meta, std::string* err)
+{
+  auto fail = [&](std::string why) {
+    if (err != nullptr) { *err = std::move(why); }
+    return false;
+  };
+  if (!valid() || !ctx.valid() || ctx._lm != this) {
+    return fail("no context to save");
+  }
+  ContextIoExt* io = context_io_(_impl->exec.get());
+  if (io == nullptr) {
+    return fail("this model's backend cannot save a context");
+  }
+  const std::string part = path + ".part";
+  std::FILE* f = std::fopen(part.c_str(), "wb");
+  if (f == nullptr) { return fail(fmt("cannot write {}", part)()); }
+  bool ok = true;
+  auto put = [&](const void* p, std::size_t n) {
+    if (ok && n > 0) { ok = std::fwrite(p, 1, n, f) == n; }
+    return ok;
+  };
+  auto put_str = [&](std::string_view sv) {
+    const auto n = static_cast<std::uint32_t>(sv.size());
+    put(&n, sizeof n);
+    put(sv.data(), sv.size());
+  };
+  put(kSavedContextMagic, sizeof kSavedContextMagic);
+  put_str(context_fingerprint_(_impl->weights.config.architecture,
+                               _impl->model_dir));
+  const std::int32_t where[3] = {ctx.seq_len(), ctx._rope_next_position,
+                                 ctx._last_predicted};
+  put(where, sizeof where);
+  put_str(meta);
+  if (ok) {
+    ok = dispatch_(_impl->runtime, [&] {
+      return io->export_context(
+          ctx._id, [&](const void* p, std::size_t n) { return put(p, n); });
+    });
+  }
+  if (std::fclose(f) != 0) { ok = false; }
+  std::error_code ec;
+  if (!ok) {
+    std::filesystem::remove(part, ec);
+    return fail(fmt("could not write the context to {}", path)());
+  }
+  std::filesystem::rename(part, path, ec);
+  if (ec) {
+    std::filesystem::remove(part, ec);
+    return fail(fmt("could not move the context to {}", path)());
+  }
+  return true;
+}
+
+LoadedLanguageModel::Context
+LoadedLanguageModel::load_context(const std::string& path, std::string* meta,
+                                  std::string* err)
+{
+  auto fail = [&](std::string why) {
+    if (err != nullptr) { *err = std::move(why); }
+    return Context{};
+  };
+  if (!valid()) { return fail("no model"); }
+  ContextIoExt* io = context_io_(_impl->exec.get());
+  if (io == nullptr) {
+    return fail("this model's backend cannot read a context back");
+  }
+  std::FILE* f = std::fopen(path.c_str(), "rb");
+  if (f == nullptr) { return fail(fmt("no context at {}", path)()); }
+  struct Closer {
+    std::FILE* f;
+    ~Closer() { std::fclose(f); }
+  } closer{f};
+  bool ok = true;
+  auto get = [&](void* p, std::size_t n) {
+    if (ok && n > 0) { ok = std::fread(p, 1, n, f) == n; }
+    return ok;
+  };
+  auto get_str = [&](std::string& out, std::uint32_t cap) {
+    std::uint32_t n = 0;
+    get(&n, sizeof n);
+    if (!ok || n > cap) {
+      ok = false;
+      return;
+    }
+    out.resize(n);
+    get(out.data(), n);
+  };
+  char magic[sizeof kSavedContextMagic] = {};
+  get(magic, sizeof magic);
+  if (!ok || std::memcmp(magic, kSavedContextMagic, sizeof magic) != 0) {
+    return fail(fmt("{} is not a saved context", path)());
+  }
+  std::string fp;
+  get_str(fp, kMaxFingerprint);
+  if (!ok || fp != context_fingerprint_(_impl->weights.config.architecture,
+                                        _impl->model_dir)) {
+    return fail("the saved context was made by another model");
+  }
+  std::int32_t where[3] = {};
+  get(where, sizeof where);
+  std::string m;
+  get_str(m, kMaxMeta);
+  if (!ok) { return fail(fmt("{} is cut short", path)()); }
+  Context c = make_context();
+  if (!c.valid()) { return fail("no context could be made"); }
+  ok = dispatch_(_impl->runtime, [&] {
+    return io->import_context(
+        c._id, [&](void* p, std::size_t n) { return get(p, n); });
+  });
+  if (!ok) {
+    return fail(fmt("{} does not fit this model's context", path)());
+  }
+  c._rope_next_position = where[1];
+  c._last_predicted     = where[2];
+  if (c.seq_len() != where[0]) {
+    return fail(fmt("{} read back at another length", path)());
+  }
+  if (meta != nullptr) { *meta = std::move(m); }
   return c;
 }
 

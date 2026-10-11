@@ -3,6 +3,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/shared/mma-tile.h"
 #include "generative-models/weight-set.h"
@@ -107,6 +108,91 @@ MetalMiniMaxH3AudioVae::decode_cost(int latent_frames, std::size_t* pcm,
   *arena = 2 * width * lf * sizeof(float);
 }
 
+namespace {
+
+// The DIFFUSERS config (AutoencoderKLMiniMaxH3Audio, at the repository
+// root's `audio_vae/`). One file, where the released layout splits the
+// latent statistics (config.json) from the decoder's shape
+// (metadata.json); the weights are the released ones under the same
+// names. Every shape this class takes from its Config is stated here,
+// so each is read rather than left to a default.
+bool
+diffusers_config_(const FlexData::ConstObjectView& o, const std::string& dir,
+                  MetalMiniMaxH3AudioVae::Config& out, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = dir + "/config.json: " + std::move(m); }
+    return false;
+  };
+  auto geti = [&](const char* k, int dflt) {
+    return o.contains(k) ? (int)o.at(k).as_int(dflt) : dflt;
+  };
+  auto ints = [&](const FlexData& v, std::vector<int>* dst) {
+    if (!v.is_array()) { return false; }
+    std::vector<int> got;
+    for (auto x : v.as_array()) { got.push_back((int)x.as_int(0)); }
+    if (got.empty()) { return false; }
+    *dst = std::move(got);
+    return true;
+  };
+  auto reals = [&](const char* k, std::vector<float>* dst) {
+    if (!o.contains(k)) { return; }
+    FlexData v = o.at(k);
+    if (!v.is_array()) { return; }
+    for (auto x : v.as_real_span()) { dst->push_back((float)x); }
+  };
+  out.latent_channels = geti("latent_channels", out.latent_channels);
+  out.sample_rate     = geti("sampling_rate", out.sample_rate);
+  out.latent_dim      = geti("latent_dim", out.latent_dim);
+  out.decoder_dim     = geti("decoder_dim", out.decoder_dim);
+  out.encoder_dim     = geti("encoder_dim", out.encoder_dim);
+  out.enc_attn_heads  = geti("num_attention_heads", out.enc_attn_heads);
+  if (o.contains("decoder_rates") &&
+      !ints(o.at("decoder_rates"), &out.up_rates)) {
+    return fail("decoder_rates is not a list of integers");
+  }
+  if (o.contains("encoder_rates") &&
+      !ints(o.at("encoder_rates"), &out.down_rates)) {
+    return fail("encoder_rates is not a list of integers");
+  }
+  if (o.contains("resblock_kernel_sizes") &&
+      !ints(o.at("resblock_kernel_sizes"), &out.res_kernels)) {
+    return fail("resblock_kernel_sizes is not a list of integers");
+  }
+  if (o.contains("resblock_dilation_sizes")) {
+    FlexData v = o.at("resblock_dilation_sizes");
+    if (!v.is_array()) { return fail("resblock_dilation_sizes is not a list"); }
+    std::vector<std::vector<int>> got;
+    for (auto row : v.as_array()) {
+      std::vector<int> r;
+      if (!ints(row, &r)) {
+        return fail("resblock_dilation_sizes is not a list of lists");
+      }
+      got.push_back(std::move(r));
+    }
+    out.res_dilations = std::move(got);
+  }
+  if (out.res_dilations.size() != out.res_kernels.size()) {
+    return fail("one dilation list per resblock kernel size");
+  }
+  reals("latents_mean", &out.latents_mean);
+  reals("latents_std", &out.latents_std);
+  // No `output_channel`: the class is stereo, as the released config's 2.
+  if (out.latent_channels <= 0 || out.latent_dim <= 0 ||
+      out.decoder_dim <= 0 || out.stereo_channels <= 0 ||
+      out.encoder_dim <= 0 || out.enc_attn_heads <= 0) {
+    return fail("non-positive geometry");
+  }
+  for (int r : out.up_rates) {
+    if (r <= 0) { return fail("non-positive decoder rate"); }
+  }
+  // As the released path: the kernels are read off the weights at load.
+  out.up_kernels.assign(out.up_rates.size(), 0);
+  return true;
+}
+
+}  // namespace
+
 std::string
 MetalMiniMaxH3AudioVae::resolve_vae_dir(const std::string& path)
 {
@@ -125,6 +211,11 @@ MetalMiniMaxH3AudioVae::resolve_vae_dir(const std::string& path)
       !fs::exists(p / "audio_vae")) {
     return p.string();                                   // already audio_vae/
   }
+  // The diffusers codec named directly (see below).
+  if (minimax_h3::is_diffusers_vae_dir(p.string(),
+                                       minimax_h3::kDiffusersAudioVaeClass)) {
+    return p.string();
+  }
   if (fs::exists(p / "audio_vae" / "model.safetensors")) {
     return (p / "audio_vae").string();                   // a partition root
   }
@@ -135,6 +226,15 @@ MetalMiniMaxH3AudioVae::resolve_vae_dir(const std::string& path)
     if (fs::exists(p / part / "audio_vae" / "model.safetensors")) {
       return (p / part / "audio_vae").string();
     }
+  }
+  // The diffusers pipeline at the repository's root keeps the same
+  // tensors under the same names in `audio_vae/`, with a diffusers
+  // config (minimax-h3-diffusers-layout.h). LAST, so a checkout that
+  // also holds a partition answers with the released copy every graph
+  // already shares.
+  if (minimax_h3::is_diffusers_vae_dir((p / "audio_vae").string(),
+                                       minimax_h3::kDiffusersAudioVaeClass)) {
+    return (p / "audio_vae").string();
   }
   return path;
 }
@@ -172,6 +272,10 @@ MetalMiniMaxH3AudioVae::config_from_json(const std::string& vae_dir,
   }
   if (!fd.is_object()) { return fail("the audio VAE config is not an object"); }
   auto o = fd.as_object();
+  if (!is_comfy && minimax_h3::is_diffusers_vae_dir(
+                       dir.string(), minimax_h3::kDiffusersAudioVaeClass)) {
+    return diffusers_config_(o, dir.string(), out, err);
+  }
   auto geti = [&](const char* k, int dflt) {
     return o.contains(k) ? (int)o.at(k).as_int(dflt) : dflt;
   };
@@ -647,6 +751,7 @@ MetalMiniMaxH3AudioVae::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
                               std::size_t y_off, int M, int N, int K,
                               bool bias)
 {
+  _flops.gemm(M, N, K);
   if (gemm_mma_(enc, x, c, y, y_off, M, N, K)) {
     // The matmul2d kernel has no bias slot, so the fold is its own pass.
     if (bias) {
@@ -792,6 +897,7 @@ MetalMiniMaxH3AudioVae::linear_(ComputeEncoder& enc, const SharedBuffer& x,
                                 const SharedBuffer& y, std::size_t y_off,
                                 int M, int N, int K)
 {
+  _flops.gemm(M, N, K);
   enc.set_function(_fn_gemm);
   enc.set_buffer(0, x);
   enc.set_buffer(1, w);
@@ -1117,6 +1223,7 @@ MetalMiniMaxH3AudioVae::encode(const float* pcm, int stereo, int samples,
     enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
   };
 
+  _flops.begin();
   CommandStream stream = _mc->make_command_stream();
   int L = S;
   int W = c.encoder_dim;
@@ -1216,6 +1323,7 @@ MetalMiniMaxH3AudioVae::encode(const float* pcm, int stereo, int samples,
     }
 
     const float scale = 1.0f / std::sqrt((float)HD);
+    _flops.attention((long long)B * NH, causal_pairs(T, 0), HD);
     for (int b = 0; b < B; ++b) {
       const std::size_t off = (std::size_t)b * T * LD * 2;
       enc.set_function(_fn_sdpa_causal);
@@ -1271,6 +1379,7 @@ MetalMiniMaxH3AudioVae::encode(const float* pcm, int stereo, int samples,
   }
 
   std::string serr;
+  _flops.flush(stream);
   if (!stream.commit().wait_ok(&serr)) {
     return fail("audio encode failed: " + serr);
   }
@@ -1368,6 +1477,7 @@ MetalMiniMaxH3AudioVae::decode(const float* z, int stereo, int frames,
     tap_buf.push_back(std::move(dst));
   };
 
+  _flops.begin();
   CommandStream stream = _mc->make_command_stream();
   int L = T;
   int C = c.decoder_dim;
@@ -1448,6 +1558,7 @@ MetalMiniMaxH3AudioVae::decode(const float* z, int stereo, int frames,
     }
   }
   std::string gpu_err;
+  _flops.flush(stream);
   if (!stream.commit().wait_ok(&gpu_err)) {
     return fail(gpu_err.empty()
                     ? std::string("MiniMax-H3 audio VAE decode failed")

@@ -470,6 +470,71 @@ public:
     return vpipe::parse_tool_calls(assistant_text);
   }
 
+  // ---- a CONVERSATION, message by message ----------------------------
+  //
+  // A host that hands the chat stage a whole conversation (text-chat's
+  // conversation beats) has each message rendered as a COMPLETE turn --
+  // no generation prompt after it -- then the generation prompt once,
+  // after the last. Families with the Hermes/Qwen scaffold render them;
+  // the rest return false with nothing appended, and the stage refuses
+  // the conversation by name.
+  //
+  // The system turn: `text`, with the tools (`tools_json`, one function
+  // spec per line as tools_json() writes them; empty: none) advertised
+  // in it -- one turn, as the family's published template merges them,
+  // the reasoning instruction too (render_reasoning_system_turn).
+  virtual bool
+  render_system_message(std::string_view           text,
+                        std::string_view           tools_json,
+                        bool                       is_first_turn,
+                        std::vector<std::int32_t>* dst) const
+  {
+    (void)text; (void)tools_json; (void)is_first_turn; (void)dst;
+    return false;
+  }
+
+  // A user or assistant turn, complete. An ASSISTANT turn is rendered as
+  // the stage leaves one in the context it decoded it into: its
+  // generation prompt's extras (Qwen3's empty thinking block), its text,
+  // its close -- so a conversation rendered again reads as it was had.
+  virtual bool
+  render_message(std::string_view           role,
+                 std::string_view           content,
+                 bool                       is_first_turn,
+                 std::vector<std::int32_t>* dst) const
+  {
+    (void)role; (void)content; (void)is_first_turn; (void)dst;
+    return false;
+  }
+
+  // The results of a turn's tool calls (consecutive tool messages, in
+  // call order), complete: no assistant header after them.
+  virtual bool
+  render_tool_results_message(std::span<const std::string>  results,
+                              std::vector<std::int32_t>*    dst) const
+  {
+    (void)results; (void)dst;
+    return false;
+  }
+
+  // The generation prompt: the assistant's header and the family's
+  // extras. Rendered once, after the conversation's last message.
+  virtual bool
+  render_generation_prompt(std::vector<std::int32_t>* dst) const
+  {
+    (void)dst;
+    return false;
+  }
+
+  // What follows an assistant turn's close before the next turn opens
+  // (ChatML's "\n"), committed after a decoded turn so the context reads
+  // exactly as the conversation rendered again would. Nothing by default.
+  virtual void
+  render_turn_separator(std::vector<std::int32_t>* dst) const
+  {
+    (void)dst;
+  }
+
   // The literal opening marker of a tool-call block in this family's
   // DECODED text, used only for diagnostics (counting attempted calls
   // when none parse). Hermes/Qwen: `<tool_call>`; Gemma-4:

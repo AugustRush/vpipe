@@ -1296,6 +1296,14 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
   if (!enc.valid()) {
     return fail("qwen-image-2.1 forward: no compute encoder");
   }
+  // perf-flops. Whatever an aborted forward left uncredited is dropped,
+  // and Sol's GPU counter starts this forward at zero so finish() reads
+  // this forward's keep alone.
+  _flops.begin();
+  if (_sol) {
+    _sol->reset_counts();
+    _sol_flops.begin();
+  }
 
   // Per-stage TRACE, for locating a numeric gap against the reference.
   // VPIPE_QWEN_IMAGE21_TRACE names a directory; each call commits what
@@ -1307,6 +1315,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
   auto trace = [&](const char* tag, const SharedBuffer& b, std::size_t n) {
     if (trace_dir == nullptr || *trace_dir == '\0' || !trace_ok) { return; }
     enc.end();
+    _flops.flush(stream);
     std::string ge;
     if (!stream.commit().wait_ok(&ge)) { trace_ok = false; return; }
     std::error_code ec;
@@ -1343,6 +1352,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
   auto mark = [&](const char* bucket) {
     if (!prof) { return; }
     enc.end();
+    _flops.flush(stream);
     std::string ge;
     (void)stream.commit().wait_ok(&ge);
     const double ms = std::chrono::duration<double, std::milli>(
@@ -1670,6 +1680,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       // defers its commits the split point's drain would wait for every
       // such block queued before it. Drain what is queued FIRST.
       enc.end();
+      _flops.flush(stream);
       std::string ge2;
       if (!stream.commit().wait_ok(&ge2)) {
         return fail("qwen-image-2.1 forward: " + ge2);
@@ -1688,6 +1699,9 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       ane_stage_(L, *b);
     }
 
+    // The blocks before this one, credited when the buffer now open
+    // retires -- the same checkpoint the progress report below rides.
+    _flops.flush(stream);
     if (_block_progress) {
       // `done` of `total`, so L -- the blocks finished BEFORE this one.
       // Every other DiT here reports L, and the helper's contract wants
@@ -1731,6 +1745,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     double q_drain_ms = 0.0;
     if (qkv_split || qkv_probe) {
       enc.end();
+      _flops.flush(stream);
       const auto t_d0 = std::chrono::steady_clock::now();
       std::string ge2;
       if (!stream.commit().wait_ok(&ge2)) {
@@ -1762,6 +1777,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     mark("gemm.qkv");
     if (qkv_split || qkv_probe) {
       enc.end();
+      _flops.flush(stream);
       std::string ge2;
       if (!stream.commit().wait_ok(&ge2)) {
         if (q_rows > 0) {
@@ -1950,6 +1966,9 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
           std::string serr;
           if (_sol->encode(enc, qh, kuse, vuse, ao, NH, NH, band, Hd,
                            ascale, _cfg.sol, &serr)) {
+            _flops.add(_sol_flops.routed(
+                attention_flops(NH, (long long)qL * kL, Hd),
+                _sol->total_blocks()));
             continue;
           }
           if (_mc->session() != nullptr) {
@@ -2014,6 +2033,11 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       if (i8_ok) { _sage->bind(enc); }
       enc.dispatch({(unsigned)(32 * ((qL + A_BQ - 1) / A_BQ)),
                     (unsigned)(4 * NH), 1}, {32, 4, 1});
+      // A text run's triangle, an image block's rectangle.
+      _flops.attention(NH,
+                       sg.causal ? causal_pairs(qL, sg.koff)
+                                 : (long long)qL * kL,
+                       Hd);
     }
     mark("attn");
     // Back to token-major, then the output projection.
@@ -2056,6 +2080,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     double ane_drain_ms = 0.0;
     if (ane_split || ane_probe) {
       enc.end();
+      _flops.flush(stream);
       const auto t_d0 = std::chrono::steady_clock::now();
       std::string ge2;
       if (!stream.commit().wait_ok(&ge2)) {
@@ -2124,6 +2149,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     // is the join and its time is the GPU's share for the balancer.
     if (ane_split || ane_probe) {
       enc.end();
+      _flops.flush(stream);
       std::string ge2;
       if (!stream.commit().wait_ok(&ge2)) {
         if (a_rows > 0) { (void)_ane->finish(L, ROWS, 0.0, ane_drain_ms); }
@@ -2162,6 +2188,10 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     // and it buys the window the prefetch needs.
     if (streaming) {
       enc.end();
+      // This block's FLOPs ride the buffer committed and waited on here;
+      // flushed at the next block's start they would be credited a block
+      // late, on that block's buffer.
+      _flops.flush(stream);
       std::string ge;
       {
         CommandStream::Fence bf = stream.commit();
@@ -2217,6 +2247,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       // commit. Draining on a cadence is what lets a request arriving
       // mid-forward be seen at all.
       enc.end();
+      _flops.flush(stream);
       std::string ge;
       if (!stream.commit().wait_ok(&ge)) {
         if (kv_fill && req.kv != nullptr) { req.kv->clear(); }
@@ -2273,12 +2304,15 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
             _cfg.out_channels);
 
   mark("head");
+  _flops.flush(stream);
   enc.end();
   std::string ge;
   if (!stream.commit().wait_ok(&ge)) {
     if (kv_fill && req.kv != nullptr) { req.kv->clear(); }
     return fail("qwen-image-2.1 forward: " + ge);
   }
+  // Every routed layer has run, so Sol's count is this forward's whole.
+  if (_sol) { _sol_flops.finish(_sol->exact_blocks()); }
   // An FP8 weight that could not be widened left its projection
   // unwritten: the forward ran and its output is not the model's.
   if (_fp8_failed) {
@@ -2334,6 +2368,7 @@ MetalQwenImage21Transformer::lin_(ComputeEncoder& enc,
   const QWeight* wp = fp8_dense_(enc, w_in, fv, N, K);
   if (wp == nullptr) { return; }
   const QWeight& w = *wp;
+  _flops.gemm(M, N, K);
   // Matrix cores first; a decline encodes nothing and falls through.
   if (gemm_mma_(enc, x, xe, w, y, ye, M, N, K)) { lora_after(); return; }
   if (!w.quantized) {

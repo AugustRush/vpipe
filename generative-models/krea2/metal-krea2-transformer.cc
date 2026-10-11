@@ -2252,6 +2252,7 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
   SharedBuffer y2 = buf((std::size_t)TS * HID), y3 = buf((std::size_t)TS * HID);
 
   CommandStream stream = _mc->make_command_stream();
+  _flops.begin();
   {
     ComputeEncoder enc = stream.begin_compute();
     // y[M,N] = x[M,K] @ W[N,K]^T. dense_gemm_t (f16 W) or affine_qmm_steel
@@ -2265,6 +2266,7 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
       const QWeight* wp = fp8_dense_(enc, w_in, fv, N, K);
       if (wp == nullptr) { return; }
       const QWeight& w = *wp;
+      _flops.gemm(M, N, K);
       if (gemm_mma_(enc, xin, w, y, ye, M, N, K)) { return; }
       if (w.quantized) {
         enc.set_function(w.bits == 8 ? _fn_qmm8 : _fn_qmm4);
@@ -2306,14 +2308,16 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
       if (wp == nullptr) { return; }
       const QWeight& w = *wp;
       if (gemm_mma_(enc, xin, w, y, 0, M, N, K)) {   // dense OR quant on M5
+        _flops.gemm(M, N, K);
         bias_add(bs, y, M, N);
         return;
       }
       if (w.quantized) {
-        gemm_off(xin, w, y, 0, M, N, K);
+        gemm_off(xin, w, y, 0, M, N, K);   // counts itself
         bias_add(bs, y, M, N);
         return;
       }
+      _flops.gemm(M, N, K);
       enc.set_function(_fn_gemm_bias);
       enc.set_buffer(0, xin); enc.set_buffer(1, w.w); enc.set_buffer(2, bs);
       enc.set_buffer(3, y);
@@ -2349,6 +2353,7 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
       enc.set_constant(7, Hq); enc.set_constant(8, Hkv); enc.set_constant(9, nq);
       enc.set_constant(10, kvstride);
       enc.dispatch({32, (unsigned)Hq, (unsigned)nq}, {32, 1, 1});
+      _flops.attention(Hq, (long long)nq * T, D);
     };
     auto elt3 = [&](const metal_compute::ComputeFunction& fn,
                     const SharedBuffer& a, const SharedBuffer& b2,
@@ -2436,6 +2441,7 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
     gelu(y2, y2, TS * HID);
     gemm_bias(y2, _txt_l2w, _txt_l2b, y3, TS, HID, HID);
   }
+  _flops.flush(stream);
   stream.commit().wait();
   if (_fp8_failed) {
     if (_mc->session() != nullptr) {
@@ -2610,6 +2616,9 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
   if (_i8) { _i8->tune_pending(_mc); }
 
   CommandStream stream = _mc->make_command_stream();
+  // perf-flops: whatever an aborted forward left uncredited is dropped.
+  _flops.begin();
+  if (_sol) { _sol_flops.begin(); }
   {
     ComputeEncoder enc = stream.begin_compute();
     // Streaming-blocks mode commits the stream at block boundaries so each
@@ -2618,6 +2627,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     // data deps via the persistent `joint`); only used when _stream_blocks.
     auto flush = [&]() {
       enc.end();
+      _flops.flush(stream);
       stream.commit().wait();
       stream = _mc->make_command_stream();
       enc = stream.begin_compute();
@@ -2627,6 +2637,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     auto psplit = [&](double& acc) {
       if (!prof) { return; }
       enc.end();
+      _flops.flush(stream);
       stream.commit().wait();
       acc += std::chrono::duration<double, std::milli>(
                  std::chrono::steady_clock::now() - mark).count();
@@ -2651,6 +2662,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       const QWeight* wp = fp8_dense_(enc, w_in, fv, N, K);
       if (wp == nullptr) { return; }
       const QWeight& w = *wp;
+      _flops.gemm(M, N, K);
       if (gemm_mma_(enc, xin, w, y, ye, M, N, K)) { lora_after(); return; }
       int bm = 32, bn = 32;               // steel tile
       if (w.quantized) {
@@ -2703,6 +2715,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       if (wp == nullptr) { return; }
       const QWeight& w = *wp;
       if (gemm_mma_(enc, xin, w, y, ye, M, N, K)) {   // dense OR quant on M5
+        _flops.gemm(M, N, K);
         enc.set_function(_fn_bias_add);
         enc.set_buffer(0, y, ye * 2); enc.set_buffer(1, bs);
         enc.set_constant(2, N); enc.set_constant(3, M * N);
@@ -2710,13 +2723,14 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
         return;
       }
       if (w.quantized) {
-        gemm(xin, w, y, ye, M, N, K);
+        gemm(xin, w, y, ye, M, N, K);   // counts itself
         enc.set_function(_fn_bias_add);
         enc.set_buffer(0, y, ye * 2); enc.set_buffer(1, bs);
         enc.set_constant(2, N); enc.set_constant(3, M * N);
         enc.dispatch({(unsigned)(M * N), 1, 1}, {256, 1, 1});
         return;
       }
+      _flops.gemm(M, N, K);
       enc.set_function(_fn_gemm_bias);
       enc.set_buffer(0, xin); enc.set_buffer(1, w.w); enc.set_buffer(2, bs);
       enc.set_buffer(3, y, ye * 2);
@@ -2757,6 +2771,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       enc.set_constant(7, Hq); enc.set_constant(8, Hkv); enc.set_constant(9, nq);
       enc.set_constant(10, kvstride);
       enc.dispatch({32, (unsigned)Hq, (unsigned)nq}, {32, 1, 1});
+      _flops.attention(Hq, (long long)nq * T, D);
     };
     auto elt3 = [&](const metal_compute::ComputeFunction& fn,
                     const SharedBuffer& a, const SharedBuffer& b2,
@@ -3031,7 +3046,9 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       if (_stream_stop && _stream_stop()) { return {}; }
       // On the GPU's clock: this stack commits ONCE at the end of the
       // forward, so reporting inline would time the encode. See
-      // shared/dit-gpu-progress.h.
+      // shared/dit-gpu-progress.h. The blocks' FLOPs ride the same
+      // checkpoint.
+      _flops.flush(stream);
       report_block(stream, _block_progress, L, c.n_layers);
       // Resident in _blocks once residency has promoted it, and
       // streamed until then. An unfilled slot reads as empty.
@@ -3068,6 +3085,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
         // embedding and text fusion ahead of block 0: drain it first. See
         // AneFeedForward::needs_barrier.
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         enc = stream.begin_compute();
       }
@@ -3085,6 +3103,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       if ((qkv_block || qkv_probe) &&
           (L == 0 || _ane_qkv->needs_barrier())) {
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         enc = stream.begin_compute();
       }
@@ -3109,6 +3128,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       if (qkv_block || qkv_probe) {
         const auto t_q0 = std::chrono::steady_clock::now();
         enc.end();
+        _flops.flush(stream);
         metal_compute::CommandStream::Fence qfence = stream.commit();
         const bool staged = qkv_block && _ane_qkv->join_stage(L);
         qfence.wait();
@@ -3134,6 +3154,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       gemm(nm, b.gate, gate, 0, qg_rows, HID, HID, lb(&BlockLora::gate));
       if (q_rows > 0 || qkv_probe) {
         enc.end();
+        _flops.flush(stream);
         stream.commit().wait();
         const double qg_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_qg0).count();
@@ -3187,8 +3208,12 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
         sc.sink_start  = 0;
         sc.sink_tokens = TS;
         std::string serr;
-        if (!_sol->encode(enc, qt, kt, vt, atb, HED, KVH, seq, HD, scale,
-                          sc, &serr)) {
+        if (_sol->encode(enc, qt, kt, vt, atb, HED, KVH, seq, HD, scale,
+                         sc, &serr)) {
+          _flops.add(_sol_flops.routed(
+              attention_flops(HED, (long long)seq * seq, HD),
+              _sol->total_blocks()));
+        } else {
           // Said once per forward, not once per block: a geometry Sol
           // cannot serve fails the same way for all 28 of them.
           if (L == _cfg.sol.dense_layers && _mc->session() != nullptr) {
@@ -3218,6 +3243,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
         enc.set_buffer(3, atb); enc.set_buffer(4, _attn_params);
         if (i8_ok) { _sage->bind(enc); }
         enc.dispatch({32 * a_nqb, 4 * (unsigned)HED, 1}, {32, 4, 1});
+        _flops.attention(HED, (long long)seq * seq, HD);
       } else {
         sdpa(qt, kt, vt, atb, scale, seq, HD, HED, KVH, seq, seq);
       }
@@ -3244,6 +3270,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       // row), into `o` from element `ye`.
       auto fused_ff = [&](const SharedBuffer& x, int rows, std::size_t ye) {
         if (rows <= 0) { return; }
+        _flops.gemm(rows, 2 * FF, HID);   // the fused gate|up
         if (!_dit.gu.empty() &&
             gemm_mma_(enc, x, b.ff_gu, _dit.gu, 0, rows, 2 * FF, HID)) {
           psplit(t_ffup);
@@ -3309,6 +3336,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
           // the weights, and `nm` is readable once both are done.
           const auto t_d0 = std::chrono::steady_clock::now();
           enc.end();
+          _flops.flush(stream);
           metal_compute::CommandStream::Fence afence = stream.commit();
           // A STREAMED block issues its successor's read here too, not only
           // at its end. The end-of-block prefetch hides the read under the
@@ -3390,6 +3418,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
           const auto t_p0 = std::chrono::steady_clock::now();
           gpu_ff(0, seq);
           enc.end();
+          _flops.flush(stream);
           stream.commit().wait();
           _ane->note_probe(ane_drain_ms,
                            std::chrono::duration<double, std::milli>(
@@ -3410,6 +3439,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
           const auto t_g0 = std::chrono::steady_clock::now();
           gpu_ff(0, g_rows);
           enc.end();
+          _flops.flush(stream);
           stream.commit().wait();
           const double t_gpu =
               _ane->timing()
@@ -3432,6 +3462,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
         // the two the GPU is busy with block L and this thread has
         // nothing to do, which is the whole opportunity.
         enc.end();
+        _flops.flush(stream);
         {
           metal_compute::CommandStream::Fence bf = stream.commit();
           int nxt = -1;
@@ -3531,6 +3562,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     // fail the step instead of returning a half-written velocity, which the
     // caller (generate_) would otherwise feed back into the sampler as noise.
     std::string gpu_err;
+    _flops.flush(stream);
     if (!stream.commit().wait_ok(&gpu_err)) {
       if (_mc->session() != nullptr) {
         _mc->session()->warn(fmt(
@@ -3540,6 +3572,8 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       return {};
     }
   }
+  // Every routed layer has run, so Sol's count is this forward's whole.
+  if (_sol) { _sol_flops.finish(_sol->exact_blocks()); }
   // A GEMM whose FP8 weight had no scratch to expand into was skipped,
   // so the velocity is missing a term -- a failed step, not an answer.
   if (_fp8_failed) {

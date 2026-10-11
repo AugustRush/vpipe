@@ -23,18 +23,25 @@ TextPromptStage::TextPromptStage(const SessionContextIntf* s,
   // construct for any config so a graph can be built/edited before the text is
   // supplied.
   _text = attr_str("text");
-  if (_text.empty()) {
+  if (this->config().is_object()
+      && this->config().as_object().contains("value")) {
+    _value = this->config().as_object().at("value");
+  }
+  if (_text.empty() && _value.is_null()) {
     fail_config(fmt(
-        "TextPromptStage('{}'): config.text is required (non-empty string)",
-        this->id()));
+        "TextPromptStage('{}'): config.text (a non-empty string) or "
+        "config.value is required", this->id()));
   }
   allocate_oports(spec().oports.size());
 }
 
 namespace {
 constexpr ConfigKey kAttrs[] = {
-  {.key = "text", .type = ConfigType::Text, .required = true,
+  {.key = "text", .type = ConfigType::Text,
    .doc = "the prompt text to emit as a FlexData string"},
+  {.key = "value", .type = ConfigType::Any,
+   .doc = "a FlexData value emitted as it is in place of `text` -- an "
+          "object beat a stage takes (text-chat's conversation)"},
 };
 const PortSpec kIports[] = {
   {.name = "trigger", .doc = "optional beat that gates re-emitting the text "
@@ -108,7 +115,9 @@ TextPromptStage::process(RuntimeContext& ctx)
   _done = true;
 
   co_await ctx.write(
-      0, make_payload<FlexDataPayload>(FlexData::make_string(_text)));
+      0, make_payload<FlexDataPayload>(_value.is_null()
+                                           ? FlexData::make_string(_text)
+                                           : _value));
 
   if (!has_trigger) {
     ctx.signal_done();

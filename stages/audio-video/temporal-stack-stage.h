@@ -110,6 +110,11 @@ private:
   // `chunk_overlap_s`, which works in samples and owns the chunking.
   int    _overlap  = 0;
   bool   _overlap_audio_warned = false;
+  // Beats at the head of the open group that the group before already
+  // carried -- what a retention kept. Said on the emitted group
+  // (sideband::kRepeated), so a consumer that stitches groups back into
+  // one source can drop them rather than take them twice.
+  int    _repeated = 0;
 
   // The last `_overlap` beats' rate metadata, kept only when an overlap
   // is configured. The group's `timestamp_us` and its derived fps come

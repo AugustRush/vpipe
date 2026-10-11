@@ -2304,12 +2304,14 @@ vpipe::RuntimeContext::write(unsigned int, std::__1::unique_ptr<vpipe::BeatPaylo
 vpipe::RuntimeContext::write_sync(unsigned int, std::__1::unique_ptr<vpipe::BeatPayloadIntf, std::__1::default_delete<vpipe::BeatPayloadIntf>>)
 vpipe::RuntimeContext::~RuntimeContext()
 vpipe::SessionContextIntf::services() const
+vpipe::SessionIntf::drop_chat_context(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
 vpipe::SessionIntf::load_pipeline(vpipe::FlexData const&)
 vpipe::SessionIntf::progress() const
 vpipe::SessionIntf::progress_version() const
 vpipe::SessionIntf::reports() const
 vpipe::SessionIntf::reports_version() const
 vpipe::SessionIntf::set_log_listener(std::__1::function<void (int, std::__1::basic_string_view<char, std::__1::char_traits<char>>)>)
+vpipe::SessionIntf::wait_pipeline(vpipe::PipelineHandle, int)
 vpipe::SessionManager::create_session(vpipe::FlexData const&)
 vpipe::SessionManager::get()
 vpipe::SessionMember::SessionMember(vpipe::SessionContextIntf const*)
@@ -2486,6 +2488,7 @@ vpipe::genai::ContextManager::conv_state(vpipe::genai::ContextId, int) const
 vpipe::genai::ContextManager::conv_write(vpipe::genai::ContextId, int) const
 vpipe::genai::ContextManager::detach_branch(vpipe::genai::ContextId)
 vpipe::genai::ContextManager::ensure_sliding_capacity(vpipe::genai::ContextId, int)
+vpipe::genai::ContextManager::export_context(vpipe::genai::ContextId, std::__1::function<bool (void const*, unsigned long)> const&) const
 vpipe::genai::ContextManager::fill_page_table(vpipe::genai::ContextId, int*) const
 vpipe::genai::ContextManager::free_page_count() const
 vpipe::genai::ContextManager::full_layers_paged() const
@@ -2493,6 +2496,7 @@ vpipe::genai::ContextManager::gdn_ring_advance(vpipe::genai::ContextId)
 vpipe::genai::ContextManager::gdn_ring_begin(vpipe::genai::ContextId, int)
 vpipe::genai::ContextManager::gdn_ring_end(vpipe::genai::ContextId)
 vpipe::genai::ContextManager::gdn_ring_rollback(vpipe::genai::ContextId, int)
+vpipe::genai::ContextManager::import_context(std::__1::function<bool (void*, unsigned long)> const&)
 vpipe::genai::ContextManager::is_linear_layer(int) const
 vpipe::genai::ContextManager::kpool(int) const
 vpipe::genai::ContextManager::kv_append(vpipe::genai::ContextId, int)
@@ -2539,6 +2543,7 @@ vpipe::genai::GenerativeModelManager::clear_declarations()
 vpipe::genai::GenerativeModelManager::clear_scratch()
 vpipe::genai::GenerativeModelManager::declare_scratch(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, unsigned long, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::declare_weights(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, unsigned long, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, unsigned long)
+vpipe::genai::GenerativeModelManager::drop_context(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::drop_weights(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::enforce_memory_cap()
 vpipe::genai::GenerativeModelManager::holds_weights(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
@@ -2548,6 +2553,7 @@ vpipe::genai::GenerativeModelManager::memory_cap() const
 vpipe::genai::GenerativeModelManager::note_phase_released(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::note_streaming(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::note_wired_pool_refused()
+vpipe::genai::GenerativeModelManager::park_context(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::shared_ptr<vpipe::genai::LoadedLanguageModel> const&, vpipe::genai::LoadedLanguageModel::Context, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::park_if_unborrowed_(std::__1::shared_ptr<vpipe::genai::WeightSet> const&, long)
 vpipe::genai::GenerativeModelManager::park_weights(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::per_dir_bytes_(bool) const
@@ -2583,7 +2589,10 @@ vpipe::genai::GenerativeModelManager::store_shared_(std::__1::basic_string<char,
 vpipe::genai::GenerativeModelManager::swap_allowance_bytes() const
 vpipe::genai::GenerativeModelManager::swap_supply()
 vpipe::genai::GenerativeModelManager::swappable_other_bytes()
+vpipe::genai::GenerativeModelManager::take_context(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::shared_ptr<vpipe::genai::LoadedLanguageModel> const&, vpipe::genai::LoadedLanguageModel::Context*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>*)
 vpipe::genai::GenerativeModelManager::unwire_from_pool(vpipe::metal_compute::SharedBuffer&)
+vpipe::genai::GenerativeModelManager::warm_dirs() const
+vpipe::genai::GenerativeModelManager::warm_kv_bytes() const
 vpipe::genai::GenerativeModelManager::weight_report() const
 vpipe::genai::GenerativeModelManager::weight_set(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::weight_set_count() const
@@ -2625,6 +2634,7 @@ vpipe::genai::LoadedLanguageModel::config() const
 vpipe::genai::LoadedLanguageModel::gemma4_unified_embedder() const
 vpipe::genai::LoadedLanguageModel::kv_bytes() const
 vpipe::genai::LoadedLanguageModel::last_logits_host() const
+vpipe::genai::LoadedLanguageModel::load_context(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>*)
 vpipe::genai::LoadedLanguageModel::m_batched_decode_step(std::__1::span<vpipe::genai::LoadedLanguageModel::Context*, 18446744073709551615ul>, std::__1::span<int const, 18446744073709551615ul>, std::__1::vector<float, std::__1::allocator<float>>&)
 vpipe::genai::LoadedLanguageModel::m_batched_decode_supported() const
 vpipe::genai::LoadedLanguageModel::m_bdecode_begin(std::__1::span<vpipe::genai::LoadedLanguageModel::Context*, 18446744073709551615ul>, std::__1::span<int const, 18446744073709551615ul>, vpipe::genai::SamplerParams const&, int)
@@ -2658,6 +2668,7 @@ vpipe::genai::LoadedLanguageModel::prefill_multimodal(vpipe::genai::LoadedLangua
 vpipe::genai::LoadedLanguageModel::prefill_multimodal_metal(vpipe::genai::LoadedLanguageModel::Context&, std::__1::span<vpipe::genai::TokenRef const, 18446744073709551615ul>, std::__1::span<std::__1::pair<int, int> const, 18446744073709551615ul>)
 vpipe::genai::LoadedLanguageModel::profile_reset()
 vpipe::genai::LoadedLanguageModel::profile_totals() const
+vpipe::genai::LoadedLanguageModel::save_context(vpipe::genai::LoadedLanguageModel::Context const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>*)
 vpipe::genai::LoadedLanguageModel::set_i8_prefill(bool)
 vpipe::genai::LoadedLanguageModel::set_mtp_prefix_seed(bool)
 vpipe::genai::LoadedLanguageModel::set_profile(bool)

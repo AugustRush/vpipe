@@ -1,4 +1,5 @@
 #include "stages/diffusion-conditioner-stage.h"
+#include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/gen-input.h"
 #include "common/beat-keys.h"
 #include <chrono>
@@ -783,6 +784,12 @@ std::string family_(const std::string& transformer_dir)
         // the DiT on a tensor 14 layers further along than the one it
         // was trained against.
         if (cls == "MiniMaxH3DiTModel") { return "minimax-h3"; }
+        // The same DiT in the diffusers naming, as MiniMaxAI's repository
+        // root ships it. The H3 probe below would also find it; named here
+        // so the family is not first read as the "krea2" default.
+        if (cls == genai::minimax_h3::kDiffusersDitClass) {
+          return "minimax-h3";
+        }
       }
     }
   }
@@ -1362,9 +1369,15 @@ DiffusionConditionerStage::resolve_component_dirs_(std::string* enc_out,
         genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
     if (!e.empty() && e != root) { enc = e; }
   }
-  if (!fs::exists(dit, ec)) {
-    const std::string d =
-        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root);
+  // And on MiniMaxAI's repository root `transformer/` is one PARTITION's
+  // DiT in the diffusers naming, beside the released partitions whose
+  // copy generate-video loads -- so it is named through the same resolver
+  // and partition, or the plan carries a second 63 GB DiT nothing loads.
+  if (!fs::exists(dit, ec) ||
+      genai::minimax_h3::is_diffusers_pipeline_root(root)) {
+    const std::string d = genai::MetalMiniMaxH3Transformer::resolve_dit_dir(
+        root, genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+                  resolve_model(session(), _hf_dir).model_type));
     if (!d.empty() && d != root) { dit = d; }
   }
   // VOSR is the family whose ENCODER is not under `root` at all: DINOv2
@@ -1847,10 +1860,14 @@ DiffusionConditionerStage::ensure_loaded_()
   // there is room.
   std::string dit = (std::filesystem::path(root) / "transformer").string();
   {
+    // As resolve_component_dirs_ names it, for the same reason.
     std::error_code ec;
-    if (!std::filesystem::exists(dit, ec)) {
+    if (!std::filesystem::exists(dit, ec) ||
+        genai::minimax_h3::is_diffusers_pipeline_root(root)) {
       const std::string d =
-          genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root);
+          genai::MetalMiniMaxH3Transformer::resolve_dit_dir(
+              root, genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+                        _model_type));
       if (!d.empty() && d != root) { dit = d; }
     }
   }

@@ -1,11 +1,14 @@
 #include "apps/web-ui/profiler-api.h"
 #include "apps/web-ui/api-common.h"
 
+#include "common/perf-flops-doc.h"
 #include "common/temp-root.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "vpipe/session-intf.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <unistd.h>
 #include <fstream>
@@ -146,6 +149,27 @@ ProfilerApi::h_data_(const HttpRequest&)
   return HttpResponse::json(200, o.to_json());
 }
 
+HttpResponse
+ProfilerApi::h_flops_(const HttpRequest& req)
+{
+  // No lock: the meter is lock-free and process-wide, and a poll must
+  // not queue behind a profiling dump.
+  auto num = [&](const char* key, long dflt, long lo, long hi) {
+    const std::string v = query_param(req.query, key);
+    if (v.empty()) { return dflt; }
+    char* e = nullptr;
+    const long n = std::strtol(v.c_str(), &e, 10);
+    if (e == v.c_str()) { return dflt; }
+    return std::clamp(n, lo, hi);
+  };
+  const long bin_ms = num("bin_ms", 1000, 10, 3600000);
+  const long bins   = num("bins", 60, 1, 3600);
+  const long lag_ms = num("lag_ms", 0, 0, 3600000);
+  return HttpResponse::json(
+      200, perf_flops_document((std::uint64_t)bin_ms, (std::size_t)bins,
+                               (std::uint64_t)lag_ms).to_json());
+}
+
 void
 ProfilerApi::register_routes(HttpServer& s)
 {
@@ -159,6 +183,8 @@ ProfilerApi::register_routes(HttpServer& s)
           [this](const HttpRequest& r) { return h_status_(r); });
   s.route("GET", "/api/profiler/data",
           [this](const HttpRequest& r) { return h_data_(r); });
+  s.route("GET", "/api/profiler/flops",
+          [this](const HttpRequest& r) { return h_flops_(r); });
 }
 
 }

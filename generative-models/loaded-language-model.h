@@ -12,6 +12,8 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -280,6 +282,24 @@ public:
 
   // Mint a fresh root context.
   Context make_context();
+
+  // ---- a context SPILLED to disk and read back ------------------------
+  //
+  // What `ctx` holds -- its K/V, its recurrent state, where it stands --
+  // written to `path` with `meta` (the caller's own bytes: what the
+  // context covers), so a conversation outlives this model being
+  // unloaded: read back by the same checkpoint it is the context it was,
+  // and the next turn prefills only what is new. False (with *err) where
+  // the backend cannot (the metal Qwen family can) or the write fails;
+  // nothing is left at `path` then. Written whole, then renamed in.
+  bool save_context(const Context& ctx, const std::string& path,
+                    std::string_view meta, std::string* err = nullptr);
+  // A context read back from `path`. The file names the model that made
+  // it -- its architecture, its checkpoint and that checkpoint's files --
+  // and the layout of its K/V; another's is refused. Its meta into
+  // *meta. Invalid (with *err) when it cannot be.
+  Context load_context(const std::string& path, std::string* meta,
+                       std::string* err = nullptr);
 
   // Branch a parent context into an independent sibling. The
   // parent's partial tail page (if any) is frozen and shared by

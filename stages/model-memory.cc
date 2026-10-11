@@ -359,12 +359,14 @@ vae_decode_scratch_bytes(const std::string& root, int width, int height)
 {
   namespace fs = std::filesystem;
   if (root.empty() || width <= 0 || height <= 0) { return 0; }
-  std::ifstream in(fs::path(root) / "vae" / "config.json");
   // WHERE THE DECODER FINDS ITS VAE, not only `vae/`: VOSR ships its
   // autoencoder as `Qwen-Image-vae-2d/` under the model's root, and read
   // from `vae/` alone its decode was declared as nothing -- a picture
-  // decoded at 2K and more that the plan never heard of.
-  if (!in) {
+  // decoded at 2K and more that the plan never heard of. And a
+  // MiniMax-H3 checkout holding both layouts decodes its released copy,
+  // not the `vae/` beside it, so that is the config to size.
+  std::ifstream in;
+  {
     const fs::path dir = resolve_vae_dir(root);
     std::error_code ec;
     if (!dir.empty() && fs::is_directory(dir, ec)) {
@@ -724,6 +726,55 @@ weight_claims_in_phase(std::vector<std::string> dirs,
 
 namespace {
 
+// A language model kept warm (text-chat's `keep_loaded`) -- and the
+// conversations parked on it -- that a launch has not claimed: released
+// when the launch does not FIT beside it, kept when it does.
+//
+// Releasing unconditionally cost the next turn of a conversation its
+// model's whole load and its context's read back (or prefill) after
+// every picture, on a box that held both with tens of GB to spare. Kept
+// unconditionally, a graph that needs the room would size itself
+// against a box already full of a model it is not using. So the test
+// every irreversible decision here makes, against TOTAL RAM
+// (VPIPE_RAM_LIMIT_MB simulates a smaller box): what the box is asked
+// to hold besides the warm models --
+//   * every open checkpoint and every claim so far, once each, at the
+//     box's peak phase (phase_footprint), which counts other running
+//     graphs' cached weights and a claimed warm model at its full size;
+//   * the activation scratch declared so far (its widest phase);
+//   * the K/V of every live language model, the warm ones' included --
+// plus the warm models' weights where none of that counts them (a warm
+// model this launch does not claim: its set holds little in cache, an
+// LM reading its weights into its own buffers), plus the headroom.
+// Asked at each claim, so the claim that tips it releases -- still
+// before any stage's decide_resources() sizes the box -- and again at
+// the end, when the scratch and every claim are in.
+void
+release_warm_unless_it_fits_(const SessionContextIntf* session,
+                             genai::GenerativeModelManager* mgr)
+{
+  if (mgr == nullptr) { return; }
+  const std::vector<std::string> dirs = mgr->warm_dirs();
+  if (dirs.empty()) { return; }
+  const std::size_t held = mgr->phase_footprint(std::string())
+      + mgr->scratch_bytes(std::string()) + mgr->resident_kv_bytes();
+  std::size_t warm = 0;
+  for (const auto& d : dirs) {
+    if (!mgr->declares(d)) { warm += dir_weights_bytes(d); }
+  }
+  const std::size_t ram = phys_ram();
+  if (ram != 0 && held + warm + kHeadroom <= ram) {
+    if (session != nullptr) {
+      session->log_debug(fmt(
+          "resource-plan: kept warm beside this launch: {} MB warm + {} MB "
+          "held or declared + {} MB headroom within {} MB RAM", warm >> 20,
+          held >> 20, kHeadroom >> 20, ram >> 20));
+    }
+    return;
+  }
+  mgr->release_warm_unclaimed();
+}
+
 // The planner behind kWeightsKind: every checkpoint the graph is about
 // to open, on the manager's books before the first stage loads one.
 //
@@ -859,12 +910,13 @@ public:
     }
     _declared.fetch_add(b, std::memory_order_relaxed);
     // A language model kept warm (text-chat's `keep_loaded`) that this
-    // launch has not claimed goes NOW, at the first claim that is not it:
-    // before any stage's decide_resources() sizes the box with it still
-    // counted -- a DiT's streaming, an encoder's release -- and before
-    // anything of this launch loads. A graph that claims it as well as
-    // others keeps it if it claims it first; else it is loaded again.
-    mgr->release_warm_unclaimed();
+    // launch has not claimed goes NOW, at the claim that leaves no room
+    // for it (release_warm_unless_it_fits_): before any stage's
+    // decide_resources() sizes the box with it still counted -- a DiT's
+    // streaming, an encoder's release -- and before anything of this
+    // launch loads. A graph that claims it as well as others keeps it if
+    // it claims it first; else it is loaded again.
+    release_warm_unless_it_fits_(session, mgr);
   }
 
   void
@@ -905,9 +957,9 @@ public:
   end_plan(const SessionContextIntf* session) override
   {
     auto* mgr = manager(session);
-    // (A language model kept warm was released at this launch's claims;
+    // (A language model kept warm was weighed at this launch's claims;
     // again here for one that claimed nothing the planner weighed.)
-    if (mgr != nullptr) { mgr->release_warm_unclaimed(); }
+    release_warm_unless_it_fits_(session, mgr);
     // Apply the buffered refinements, now that every stage has both
     // declared and decided against the same complete picture.
     std::size_t phased = 0;

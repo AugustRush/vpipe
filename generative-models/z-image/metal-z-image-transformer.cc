@@ -1072,6 +1072,14 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
   CommandStream stream = mc->make_command_stream();
   ComputeEncoder enc = stream.begin_compute();
   if (!enc.valid()) { return fail("z-image forward: no compute encoder"); }
+  // perf-flops. Whatever an aborted forward left uncredited is dropped,
+  // and Sol's GPU counter starts this forward at zero so finish() reads
+  // this forward's keep alone.
+  _flops.begin();
+  if (_sol) {
+    _sol->reset_counts();
+    _sol_flops.begin();
+  }
 
   // Per-stage TRACE, for locating a numeric gap against the reference.
   // It COMMITS, so a traced run is not a timing run.
@@ -1080,6 +1088,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
   auto trace = [&](const char* tag, const SharedBuffer& b, std::size_t n) {
     if (trace_dir == nullptr || *trace_dir == '\0' || !trace_ok) { return; }
     enc.end();
+    _flops.flush(stream);
     std::string ge;
     if (!stream.commit().wait_ok(&ge)) { trace_ok = false; return; }
     std::error_code ec;
@@ -1138,6 +1147,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
   auto mark = [&](const char* bucket) {
     if (!prof) { return; }
     enc.end();
+    _flops.flush(stream);
     std::string ge;
     (void)stream.commit().wait_ok(&ge);
     const double ms = std::chrono::duration<double, std::milli>(
@@ -1166,6 +1176,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
         _lora.apply(enc, x, xe, lf, y, ye, M, N, K, _mma_min_m);
       }
     };
+    _flops.gemm(M, N, K);
     if (gemm_mma_(enc, x, xe, w, y, ye, M, N, K)) { lora_after(); return; }
     if (!w.quantized) {
       int bm = 32, bn = 32;
@@ -1400,6 +1411,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
         std::string serr;
         if (_sol->encode(enc, qh, kh, vh, ao, NH, NH, band, Hd, ascale,
                          _cfg.sol, &serr)) {
+          _flops.add(_sol_flops.routed(
+              attention_flops(NH, (long long)rows * rows, Hd),
+              _sol->total_blocks()));
           return;
         }
         if (_mc->session() != nullptr) {
@@ -1427,6 +1441,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     if (i8_ok) { _sage->bind(enc); }
     enc.dispatch({(unsigned)(32 * ((rows + A_BQ - 1) / A_BQ)),
                   (unsigned)(4 * NH), 1}, {32, 4, 1});
+    _flops.attention(NH, (long long)rows * rows, Hd);
   };
 
   // ---- one block ----------------------------------------------------
@@ -1463,6 +1478,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     double q_drain_ms = 0.0;
     if (qkv_split || qkv_probe) {
       enc.end();
+      _flops.flush(stream);
       const auto t_d0 = std::chrono::steady_clock::now();
       std::string ge2;
       if (!stream.commit().wait_ok(&ge2)) { return false; }
@@ -1492,6 +1508,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     mark("gemm.qkv");
     if (qkv_split || qkv_probe) {
       enc.end();
+      _flops.flush(stream);
       std::string ge2;
       if (!stream.commit().wait_ok(&ge2)) {
         if (q_rows > 0) { (void)_ane_qkv->finish(L, rows, 0.0, q_drain_ms); }
@@ -1562,6 +1579,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     double ane_drain_ms = 0.0;
     if (ane_split || ane_probe) {
       enc.end();
+      _flops.flush(stream);
       const auto t_d0 = std::chrono::steady_clock::now();
       std::string ge2;
       if (!stream.commit().wait_ok(&ge2)) { return false; }
@@ -1602,6 +1620,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     // the join and its time is the GPU's share for the balancer.
     if (ane_split || ane_probe) {
       enc.end();
+      _flops.flush(stream);
       std::string ge2;
       if (!stream.commit().wait_ok(&ge2)) {
         if (a_rows > 0) { (void)_ane->finish(L, rows, 0.0, ane_drain_ms); }
@@ -1770,6 +1789,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
   // prefetch want. UNMODULATED: no timestep enters the caption stream.
   for (int i = 0; i < _cfg.n_refiner; ++i) {
     if (_stream_stop && _stream_stop()) { return SharedBuffer{}; }
+    // The blocks before this one, credited when the buffer now open
+    // retires -- the checkpoint the progress report rides.
+    _flops.flush(stream);
     if (_block_progress) {
       report_block(stream, _block_progress, done, TOTAL_BLOCKS);
     }
@@ -1842,6 +1864,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       // defers its commits the split point's drain would wait for every
       // such block queued before it. Drain what is queued FIRST.
       enc.end();
+      _flops.flush(stream);
       std::string ge2;
       if (!stream.commit().wait_ok(&ge2)) {
         return fail("z-image forward: " + ge2);
@@ -1859,6 +1882,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       ane_stage_(L, *b);
     }
 
+    _flops.flush(stream);
     if (_block_progress) {
       // `done` of `total`: the blocks finished BEFORE this one. The
       // helper's contract wants a report that lags the truth and never
@@ -1885,6 +1909,10 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     if (streaming) {
       const auto gp0 = sp_now();
       enc.end();
+      // This block's FLOPs ride the buffer committed and waited on here;
+      // flushed at the next block's start they would be credited a block
+      // late, on that block's buffer.
+      _flops.flush(stream);
       std::string ge;
       {
         CommandStream::Fence bf = stream.commit();
@@ -1940,6 +1968,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       // arriving mid-forward be seen at all. Only when a stop is
       // wired: a run nobody can interrupt pays nothing.
       enc.end();
+      _flops.flush(stream);
       std::string ge;
       if (!stream.commit().wait_ok(&ge)) {
         return fail("z-image forward: " + ge);
@@ -1969,12 +1998,15 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
   lin(nrm, 0, _final_lin, vel, 0, IMG, PD, H);
   bias(_final_lin_b, vel, 0, IMG, PD);
   enc.end();
+  _flops.flush(stream);
   {
     std::string ge;
     if (!stream.commit().wait_ok(&ge)) {
       return fail("z-image forward: " + (ge.empty() ? "GPU failed" : ge));
     }
   }
+  // Every routed layer has run, so Sol's count is this forward's whole.
+  if (_sol) { _sol_flops.finish(_sol->exact_blocks()); }
   if (prof && mc->session() != nullptr) {
     double tot = 0.0;
     for (const auto& b : pbuckets) { tot += b.ms; }

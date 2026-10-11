@@ -18,6 +18,7 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/metal-vdn-branch.h"
 #include "generative-models/minimax-h3/vdn-config.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/weight-set.h"
 
 #include <cmath>
@@ -358,6 +359,110 @@ TEST(metal_vdn_branch, tile_size_does_not_change_the_answer)
   if (ran == 4) {
     std::printf("[vdn_component] worst over tiles 1..4: %.3e\n", worst);
   }
+}
+
+// perf-flops: the branch's arithmetic, as the FLOP/s meter counts it
+// (MetalVdnBranch::set_flops), equals what the geometry derives -- and
+// does not move with the frame tile. The tile decides how often the
+// per-token half is dispatched, not how much it computes: a frame's
+// spatial conv runs once whatever tile asks for it (the ring), its
+// temporal stencil, statistics and readout once per frame kept.
+TEST(metal_vdn_branch, counts_its_arithmetic_whatever_the_tile)
+{
+  const std::string stage = stage_(), gdir = golden_();
+  std::ifstream mi(gdir + "/meta.json");
+  if (!mi) { return; }
+  FlexData meta = FlexData::from_json(mi);
+  if (!meta.is_object()) { return; }
+  auto m = meta.as_object();
+  const int F = (int)m.at("frames").as_int(0);
+  const int gh = (int)m.at("grid_h").as_int(0);
+  const int gw = (int)m.at("grid_w").as_int(0);
+  const int H = (int)m.at("heads").as_int(0);
+  const int d = (int)m.at("head_dim").as_int(0);
+  const int hidden = (int)m.at("hidden").as_int(0);
+  const int Lt = (int)m.at("text_len").as_int(0);
+  const int S = gh * gw, C = H * d;
+
+  Session s;
+  MetalCompute* mc = s.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  vdn::Config cfg;
+  std::string err;
+  if (!vdn::load_config(stage, &cfg, &err)) { return; }
+  std::shared_ptr<WeightSet> ws =
+      WeightSet::open(stage + "/linear_branch", nullptr);
+  if (!ws) { return; }
+  std::vector<float> xv, qr, kr, vr, tx, tk, tv;
+  auto load = [&](const char* n, std::vector<float>* v) {
+    return read_bin_(gdir + "/" + n + ".bin", v);
+  };
+  ASSERT_TRUE(load("xv", &xv) && load("q_raw", &qr) && load("k_raw", &kr)
+              && load("v_raw", &vr) && load("text_x", &tx)
+              && load("text_k_raw", &tk) && load("text_v_raw", &tv));
+  auto buf = [&](const std::vector<float>& v) {
+    SharedBuffer b = mc->make_shared_buffer(v.size() * 4);
+    if (!b.empty()) { std::memcpy(b.contents(), v.data(), v.size() * 4); }
+    return b;
+  };
+  SharedBuffer xb = buf(xv), qb = buf(qr), kb = buf(kr), vb = buf(vr);
+  SharedBuffer txb = buf(tx), tkb = buf(tk), tvb = buf(tv);
+  MetalVdnBranch::Geometry geo;
+  geo.frames = F; geo.grid_h = gh; geo.grid_w = gw; geo.text_len = Lt;
+  const std::vector<vdn::Bound> bounds =
+      vdn::window_bounds(F, (int)m.at("radius").as_int(0),
+                         (int)m.at("chunk").as_int(0));
+  MetalVdnBranch::Inputs in;
+  in.x = &xb; in.q_raw = &qb; in.k_raw = &kb; in.v_raw = &vb;
+  in.text_x = &txb; in.text_k = &tkb; in.text_v = &tvb;
+
+  // The derivation. K is the short conv's width, spatial K x K and
+  // temporal K taps, on k and v (q is never convolved).
+  using U = std::uint64_t;
+  const int K = 5;
+  const int Fi = cfg.anchors == vdn::AnchorFrames::kBoth ? F - 2 : F;
+  const U tokens = (U)Fi * (U)S;
+  const U d3 = (U)d * (U)d * (U)d;
+  const U conv = 2 * tokens * (U)C * (U)(K * K + K);
+  U want = gemm_flops((long long)tokens, H, hidden)          // beta
+         + (cfg.conv_k ? conv : 0) + (cfg.conv_v ? conv : 0)
+         + 4 * tokens * (U)d * (U)d * (U)H                    // statistics
+         + 3 * d3 * (U)Fi * (U)H                              // solve
+         + 2 * (U)Fi * 2 * d3 * (U)H                          // scan, both
+         + gemm_flops((long long)tokens, d, hidden)            // gate down
+         + gemm_flops((long long)tokens, C, d)                 // gate up
+         + 2 * tokens * (U)H * (U)d * (U)d;                    // readout
+  if (cfg.enable_text_state && Lt > 0) {
+    want += gemm_flops(Lt, H, hidden) + 4 * (U)Lt * (U)d * (U)d * (U)H +
+            3 * d3 * (U)H;
+  }
+
+  int ran = 0;
+  for (int t : {1, 4}) {
+    MetalVdnBranch::Dims dims;
+    dims.heads = H; dims.head_dim = d; dims.hidden = hidden;
+    dims.n_layers = 50; dims.frame_tile = t;
+    dims.bf16_features = false;
+    std::unique_ptr<MetalVdnBranch> br =
+        MetalVdnBranch::load(ws, mc, cfg, dims, &err);
+    if (!br || !br->ensure_block(0, &err)) { return; }
+    GpuFlopsTally tally;
+    br->set_flops(&tally);
+    SharedBuffer ob = mc->make_shared_buffer((std::size_t)F * S * C * 4);
+    ASSERT_TRUE(!ob.empty());
+    CommandStream stream = mc->make_command_stream();
+    ComputeEncoder enc = stream.begin_compute();
+    EXPECT_TRUE(br->encode(enc, 0, geo, bounds, in, ob, &err));
+    enc.end();
+    const std::uint64_t got = tally.pending();
+    std::string gerr;
+    ASSERT_TRUE(stream.commit().wait_ok(&gerr));
+    std::printf("[vdn_component] tile %d: counted %.4f GFLOP, derived "
+                "%.4f\n", t, got / 1e9, want / 1e9);
+    EXPECT_TRUE(got == want);
+    ++ran;
+  }
+  EXPECT_TRUE(ran == 2);
 }
 
 TEST(metal_vdn_branch, a_carved_scratch_is_bit_identical)

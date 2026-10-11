@@ -3962,7 +3962,24 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // rather than parking under a live reader. That diagnostic is the
     // point: a family whose release_idle() keeps its borrow now hears
     // about it instead of being silently ineffective.
-    if (_unload_idle) {
+    // A STREAM THE FAMILY IS STILL IN holds the generator: it carries the
+    // stream's state into the next request (FlashVSR's key/value
+    // windows), and releasing it would cut the stream there -- the next
+    // beat would find nothing to continue. It is released after the
+    // stream's final beat, by the same policy as any other.
+    bool stream_open = false;
+    if (res.sideband.is_object()) {
+      FlexData rsb = res.sideband;          // as_object() is a view: keep it
+      auto ro = rsb.as_object();
+      stream_open = ro.contains(sideband::kStreamFinal) &&
+                    !ro.at(sideband::kStreamFinal).as_bool(true);
+    }
+    if (_unload_idle && stream_open) {
+      session()->log_debug(fmt(
+          "GenerateVideoStage('{}'): '{}' is mid-stream; keeping it for the "
+          "next beat", this->id(), _family));
+    }
+    if (_unload_idle && !stream_open) {
       // The family's own release, then the generator itself: a family
       // with nothing to release (FlashVSR's holds one DiT and no cache)
       // would otherwise keep its WeightSet borrowed, and the drop below
@@ -3999,7 +4016,11 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     std::memcpy(vout->as_f32(), res.video.data(),
                 res.video.size() * sizeof(float));
     {
-      FlexData sb = FlexData::make_object();
+      // What the family said back first, then the stage's own keys over
+      // it. VideoGenResult::sideband promised this forwarding and the
+      // plugin arm never did it.
+      FlexData sb = res.sideband.is_object() ? res.sideband
+                                             : FlexData::make_object();
       sb.as_object().insert_or_assign(sideband::kFps,
                                       FlexData::make_real(_fps));
       sb.as_object().insert_or_assign(

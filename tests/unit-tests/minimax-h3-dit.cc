@@ -41,6 +41,7 @@
 #include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
+#include "common/perf-flops.h"
 #include "common/session.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "stages/model-quantize-stage.h"
@@ -62,6 +63,7 @@
 #include <memory>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace vpipe;
@@ -813,6 +815,251 @@ TEST(minimax_h3_dit, scratch_estimate_matches_allocation)
     // And the geometry scratch is unchanged -- the route decides which
     // kernel runs, never how much room the forward needs.
     EXPECT_TRUE(m2->scratch_resident_bytes() == act_geo);
+  }
+}
+
+// perf-flops: the forward's arithmetic as the FLOP/s meter is credited
+// with it (common/perf-flops.h, shared/dit-flops.h).
+//
+// The same step through a 2-block and a 3-block stack: the difference is
+// exactly ONE main block, which is derived here from its shapes -- the
+// fused qkv, the output projection, fc1 (gate and up) and fc2, the
+// per-forward AdaLN projection (this test never bakes the table), and
+// dense attention over the packed sequence. A GEMM counted twice or
+// missed changes that difference. Each forward's count must also reach
+// the meter whole, from the completion handlers.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_dit, forward_credits_its_flops)
+{
+  namespace pf = vpipe::perf_flops;
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  std::vector<float> vin((std::size_t)n_video * cfg.video_patch_elems(),
+                         0.01f);
+  std::vector<float> ain((std::size_t)L.num_audio_rows * cfg.audio_channels,
+                         0.01f);
+  std::vector<float> tin((std::size_t)tags.size() * cfg.text_dim, 0.01f);
+  const SharedBuffer vb = to_bf16_buf_(mc, vin);
+  const SharedBuffer ab = to_bf16_buf_(mc, ain);
+  const SharedBuffer tb = to_bf16_buf_(mc, tin);
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+  MetalMiniMaxH3Transformer::Step step;
+  step.video = &vb;  step.audio = &ab;  step.text = &tb;
+  step.layout = &L;  step.timesteps = &uniq;
+  step.row_timestep_index = &row_idx;
+
+  struct Run { std::uint64_t flushed = 0, gpu = 0; };
+  auto run = [&](int layers) -> Run {
+    Run r;
+    MetalMiniMaxH3Transformer::Config c = cfg;
+    c.n_layers = layers;
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, c);
+    if (m == nullptr) { return r; }
+    const pf::Totals g0 = pf::totals(pf::kGpu);
+    std::string ferr;
+    const auto v = m->forward(step, &ferr);
+    if (v.empty()) {
+      std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+      return r;
+    }
+    r.flushed = m->gpu_flops().flushed();
+    // The last buffer's handler may run after the wait that saw it.
+    for (int i = 0; i < 400 && pf::totals(pf::kGpu).flops - g0.flops <
+                                   r.flushed; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    r.gpu = pf::totals(pf::kGpu).flops - g0.flops;
+    return r;
+  };
+  const Run two = run(2);
+  const Run three = run(3);
+  ASSERT_TRUE(two.flushed > 0 && three.flushed > two.flushed);
+
+  const long long S = L.seq_len, H = cfg.hidden, I = cfg.inner();
+  const long long FF = cfg.ffn;
+  const std::uint64_t block =
+      gemm_flops(S, 3 * I, H) + gemm_flops(S, H, I) +
+      gemm_flops(S, 2 * FF, H) + gemm_flops(S, H, FF) +
+      gemm_flops((long long)uniq.size(), cfg.adaln_out(), cfg.time_dim) +
+      attention_flops(cfg.n_heads, S * S, cfg.head_dim);
+  std::printf("[minimax_h3_dit] %lld rows: 2 blocks %.4f TFLOP, 3 blocks "
+              "%.4f; one block %.5f, derived %.5f; credited %.4f / %.4f\n",
+              S, two.flushed / 1e12, three.flushed / 1e12,
+              (three.flushed - two.flushed) / 1e12, block / 1e12,
+              two.gpu / 1e12, three.gpu / 1e12);
+  EXPECT_TRUE(three.flushed - two.flushed == block);
+  EXPECT_TRUE(two.gpu == two.flushed);
+  EXPECT_TRUE(three.gpu == three.flushed);
+}
+
+// perf-flops on every accelerated route. i8_gemm and Sage change HOW the
+// arithmetic is done, not how much of it the model does, so their counts
+// are the dense one exactly -- and each must still be credited whole. A
+// route that engaged is told apart from one that declined by its answer
+// (both are lossy), so an arm that cannot run on this GPU says so rather
+// than passing as the dense one. Sol keeps a share of the key blocks: on
+// a model's first forward the routed attention is counted at finish(),
+// with the share it realized, so the forward's own tally is the dense one
+// less every routed block's attention, and what finish() credits is a
+// part of that.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_dit, every_route_counts_its_flops)
+{
+  namespace pf = vpipe::perf_flops;
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  cfg.n_layers = 2;
+  // Past every route's floor: i8_gemm wants 1024 rows, Sol 16 key blocks.
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 5, 24, 40, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  ASSERT_TRUE(L.seq_len >= 1024);
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k) * 0.5f;
+    }
+    return v;
+  };
+  const SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  struct Run {
+    std::uint64_t flushed = 0, gpu = 0;
+    std::vector<float> out;
+  };
+  auto run = [&](const MetalMiniMaxH3Transformer::Config& c) {
+    Run r;
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, c);
+    if (m == nullptr) { return r; }
+    MetalMiniMaxH3Transformer::Step step;
+    step.video = &vb;  step.audio = &ab;  step.text = &tb;
+    step.layout = &L;  step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    const pf::Totals g0 = pf::totals(pf::kGpu);
+    std::string ferr;
+    const auto v = m->forward(step, &ferr);
+    if (v.empty()) {
+      std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+      return r;
+    }
+    r.flushed = m->gpu_flops().flushed();
+    for (int i = 0; i < 400 && pf::totals(pf::kGpu).flops - g0.flops <
+                                   r.flushed; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    // Sol credits its first forward synchronously at finish(), so the
+    // total can pass the flushed count while a handler is still due.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    r.gpu = pf::totals(pf::kGpu).flops - g0.flops;
+    const std::size_t n = (std::size_t)n_video * c.video_patch_elems();
+    r.out.resize(n);
+    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+    for (std::size_t i = 0; i < n; ++i) { r.out[i] = bf16_to_f32_(p[i]); }
+    return r;
+  };
+  auto moved = [](const Run& a, const Run& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.out.size() && i < b.out.size(); ++i) {
+      const double e = (double)a.out[i] - (double)b.out[i];
+      num += e * e;
+      den += (double)b.out[i] * (double)b.out[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : 0.0;
+  };
+
+  const Run dense = run(cfg);
+  ASSERT_TRUE(dense.flushed > 0 && dense.gpu == dense.flushed);
+  std::printf("[minimax_h3_dit] %d rows, dense: %.4f TFLOP\n", L.seq_len,
+              dense.flushed / 1e12);
+
+  auto same_as_dense = [&](const char* name,
+                           MetalMiniMaxH3Transformer::Config c) {
+    const Run r = run(c);
+    const double e = moved(r, dense);
+    if (r.flushed == 0 || e < 1e-6) {
+      std::printf("[minimax_h3_dit] %s did not engage on this GPU (moved "
+                  "%.2e); its arm is skipped\n", name, e);
+      return;
+    }
+    std::printf("[minimax_h3_dit] %s: counted %.4f TFLOP, credited %.4f; "
+                "answer moved %.2e from dense\n", name, r.flushed / 1e12,
+                r.gpu / 1e12, e);
+    EXPECT_TRUE(r.flushed == dense.flushed);
+    EXPECT_TRUE(r.gpu == r.flushed);
+  };
+  {
+    MetalMiniMaxH3Transformer::Config c = cfg;
+    c.i8_gemm = true;
+    same_as_dense("i8_gemm", c);
+  }
+  {
+    MetalMiniMaxH3Transformer::Config c = cfg;
+    c.sage.enabled = true;
+    c.sage.dense_layers = 0;
+    same_as_dense("sage_attn", c);
+  }
+  {
+    MetalMiniMaxH3Transformer::Config c = cfg;
+    c.sol.enabled = true;
+    c.sol.dense_layers = 0;
+    const Run r = run(c);
+    const std::uint64_t routed =
+        (std::uint64_t)c.n_layers *
+        attention_flops(c.n_heads, (long long)L.seq_len * L.seq_len,
+                        c.head_dim);
+    if (r.flushed == 0 || r.flushed == dense.flushed) {
+      std::printf("[minimax_h3_dit] sol_attn did not route on this GPU; "
+                  "its arm is skipped\n");
+    } else {
+      const std::uint64_t kept = r.gpu - r.flushed;
+      std::printf("[minimax_h3_dit] sol_attn: counted %.4f TFLOP + %.4f "
+                  "kept at finish of %.4f routed (%.1f%%)\n",
+                  r.flushed / 1e12, kept / 1e12, routed / 1e12,
+                  routed > 0 ? 100.0 * (double)kept / (double)routed : 0.0);
+      EXPECT_TRUE(r.flushed == dense.flushed - routed);
+      EXPECT_TRUE(r.gpu > r.flushed && kept <= routed);
+    }
   }
 }
 

@@ -26,6 +26,7 @@
 #include "apple-silicon/coreml/ane-emitter.h"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #include "interfaces/session-services-intf.h"
+#include "common/perf-flops.h"
 #include "common/session.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -3410,6 +3411,83 @@ TEST(ane_tier, gelu_ffn_matches_the_feed_forward_it_wraps)
   EXPECT_TRUE(std::memcmp(static_cast<const char*>(y1.contents()) + r0,
                           static_cast<const char*>(y2.contents()) + r0,
                           (std::size_t)a1 * H * 2) == 0);
+}
+
+// perf-flops: every predict the tier runs is credited to the ANE, at the
+// FLOPs the same rows would cost the GPU -- three projections a row for a
+// SwiGLU feed-forward, two for a GELU one, one for a matmul tier -- so a
+// family moving rows between the two moves no FLOPs.
+TEST(ane_tier, credits_its_predicts_to_the_flops_meter)
+{
+  namespace pf = vpipe::perf_flops;
+  using vpipe::genai::AneFeedForward;
+  using vpipe::genai::AneFfnSource;
+  vpipe::Session sess;
+  vpipe::metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  constexpr int H = 256, F = 512, seq = 768, chunk = 256;
+  std::mt19937 rng(5);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto bf16 = [&](std::size_t n, float sc) {
+    vpipe::metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      const float f = nd(rng) * sc;
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &f, sizeof(bits));
+      p[i] = (std::uint16_t)(bits >> 16);
+    }
+    return b;
+  };
+  const float su = 1.0f / std::sqrt((float)H);
+  const float sd = 1.0f / std::sqrt((float)F);
+  const auto wg = bf16((std::size_t)F * H, su);
+  const auto wu = bf16((std::size_t)F * H, su);
+  const auto wd = bf16((std::size_t)H * F, sd);
+  const auto x  = bf16((std::size_t)seq * H, 0.5f);
+  auto y = mc->make_shared_buffer((std::size_t)seq * F * 2);
+
+  enum Kind { kSwiglu, kGelu, kMatmul };
+  for (Kind k : {kSwiglu, kGelu, kMatmul}) {
+    AneFeedForward::Options o;
+    o.session = &sess;
+    o.mc      = mc;
+    o.tag     = "flops";
+    o.hidden  = H;
+    o.ffn     = F;
+    o.seq     = seq;
+    o.rows    = 1.0f;
+    o.chunk   = chunk;
+    o.gelu    = k == kGelu;
+    o.matmul  = k == kMatmul;
+    auto ff = AneFeedForward::create(o);
+    if (ff == nullptr) { return; }               // no ANE on this box
+    AneFfnSource g, u, d;
+    g.w = &wg;
+    u.w = &wu;
+    d.w = &wd;
+    if (k == kSwiglu) {
+      ff->stage(0, g, u, d, 0);
+    } else if (k == kGelu) {
+      ff->stage(0, std::vector<AneFfnSource>{u, d}, 0);
+    } else {
+      ff->stage(0, u, 0);
+    }
+    ASSERT_TRUE(ff->join_stage(0));
+    const pf::Totals t0 = pf::totals(pf::kAne);
+    const int a = ff->begin(x, y, seq);
+    ASSERT_TRUE(ff->finish(0, seq, 0.0, 0.0) && a > 0);
+    const std::uint64_t per_row =
+        2ull * H * F * (k == kMatmul ? 1 : (k == kGelu ? 2 : 3));
+    const pf::Totals t1 = pf::totals(pf::kAne);
+    std::printf("  %s: %d rows on the ANE, %llu FLOPs credited in %llu "
+                "predicts\n",
+                k == kSwiglu ? "swiglu" : (k == kGelu ? "gelu" : "matmul"),
+                a, (unsigned long long)(t1.flops - t0.flops),
+                (unsigned long long)(t1.records - t0.records));
+    EXPECT_TRUE(t1.flops - t0.flops == (std::uint64_t)a * per_row);
+    EXPECT_TRUE(t1.records - t0.records == (std::uint64_t)(a / chunk));
+  }
 }
 
 // THE GPU FALLBACK'S CONTRACT, through the described surface a plugin

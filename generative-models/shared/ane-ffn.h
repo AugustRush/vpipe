@@ -21,6 +21,7 @@
 #include "generative-models/shared/ane-module.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -276,6 +277,7 @@ class AneFeedForward {
   bool _matmul = false;
   bool _gelu   = false;      // {up, down}: the headroom rides slot 1 = down
   int  _out_w  = 0;          // output row width: hidden, or ffn for matmul
+  std::uint64_t _row_flops = 0;  // one row's predict, for perf-flops
   std::unique_ptr<AneModule>      _rt;
   std::unique_ptr<AneWeightSlots> _w;
   int  _rows_per_block = 0;

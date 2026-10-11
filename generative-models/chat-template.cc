@@ -956,6 +956,114 @@ public:
     return true;
   }
 
+  // ---- a conversation, message by message (Qwen's own template) -----
+  bool
+  render_system_message(std::string_view           text,
+                        std::string_view           tools_json,
+                        bool                       is_first_turn,
+                        std::vector<std::int32_t>* dst) const override
+  {
+    // The family's own system turn first -- the tools advertised (with
+    // Qwen3.8's reasoning instruction spliced in), or that instruction
+    // alone -- then the host's text spliced in after its header, as the
+    // published template puts the system message's content first.
+    std::vector<std::int32_t> base;
+    const bool have = !tools_json.empty()
+        ? render_tools_system_turn(tools_json, is_first_turn, &base)
+        : render_reasoning_system_turn(&base);
+    if (!have || base.empty()) {
+      if (!text.empty()) { render_system_turn_(text, dst); }
+      return true;
+    }
+    if (text.empty()) {
+      dst->insert(dst->end(), base.begin(), base.end());
+      return true;
+    }
+    std::vector<std::int32_t> head;
+    (void)push_sp_(_im_start, &head);
+    append_text_(_tok, "system\n", &head);
+    if (base.size() < head.size()
+        || !std::equal(head.begin(), head.end(), base.begin())) {
+      render_system_turn_(text, dst);
+      dst->insert(dst->end(), base.begin(), base.end());
+      return true;
+    }
+    dst->insert(dst->end(), head.begin(), head.end());
+    append_text_(_tok, text, dst);
+    append_text_(_tok, "\n\n", dst);
+    dst->insert(dst->end(), base.begin() + head.size(), base.end());
+    return true;
+  }
+
+  bool
+  render_message(std::string_view           role,
+                 std::string_view           content,
+                 bool                       is_first_turn,
+                 std::vector<std::int32_t>* dst) const override
+  {
+    (void)is_first_turn;   // ChatML has no session-start token
+    if (role == "system") {
+      render_system_turn_(content, dst);
+      return true;
+    }
+    if (role != "user" && role != "assistant") { return false; }
+    (void)push_sp_(_im_start, dst);
+    append_text_(_tok, role == "user" ? "user\n" : "assistant\n", dst);
+    if (role == "assistant") {
+      append_assistant_extras_(dst);
+      // A reply decoded with thinking on carries the stage's unified
+      // markers: the opening one stood for the extras' <think> (already
+      // rendered), the closing one for </think>.
+      std::string text(content);
+      for (std::size_t p = text.find(media_line::kThinkStart);
+           p != std::string::npos; p = text.find(media_line::kThinkStart)) {
+        text.erase(p, media_line::kThinkStart.size());
+      }
+      for (std::size_t p = text.find(media_line::kThinkEnd);
+           p != std::string::npos; p = text.find(media_line::kThinkEnd)) {
+        text.replace(p, media_line::kThinkEnd.size(), "</think>");
+      }
+      append_text_(_tok, text, dst);
+    } else {
+      append_text_(_tok, content, dst);
+    }
+    (void)push_sp_(_im_end, dst);
+    append_text_(_tok, "\n", dst);
+    return true;
+  }
+
+  bool
+  render_tool_results_message(std::span<const std::string>  results,
+                              std::vector<std::int32_t>*    dst) const override
+  {
+    if (results.empty()) { return false; }
+    (void)push_sp_(_im_start, dst);
+    append_text_(_tok, "user", dst);
+    for (const auto& r : results) {
+      append_text_(_tok, "\n<tool_response>\n", dst);
+      append_text_(_tok, r, dst);
+      append_text_(_tok, "\n</tool_response>", dst);
+    }
+    (void)push_sp_(_im_end, dst);
+    append_text_(_tok, "\n", dst);
+    return true;
+  }
+
+  bool
+  render_generation_prompt(std::vector<std::int32_t>* dst) const override
+  {
+    (void)push_sp_(_im_start, dst);
+    append_text_(_tok, "assistant\n", dst);
+    append_assistant_extras_(dst);
+    return true;
+  }
+
+  void
+  render_turn_separator(std::vector<std::int32_t>* dst) const override
+  {
+    append_text_(_tok, "\n", dst);
+  }
+
 protected:
   const Tokenizer& tok_() const noexcept { return _tok; }
   std::int32_t im_start_() const noexcept { return _im_start; }

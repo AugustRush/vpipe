@@ -442,6 +442,88 @@ the leading-frame trim (T latent frames give `t_upscale * T - t_upscale +
 A family that never calls `output` works as before, and its preview port
 simply stays silent.
 
+The host's TAE decode reports its own arithmetic to the FLOP/s meter
+(below), so your family counts only its own forwards.
+
+### Reporting achieved FLOP/s
+
+The host keeps a process-wide meter of the arithmetic the GPU and the ANE
+actually did (`common/perf-flops.h`, feature `perf-flops/1`). A UI reads it
+as TFLOP/s per bin, polled every second or ten:
+`GET /api/profiler/flops?bin_ms=1000&bins=60` in the web UI, or
+`vpipe.perf_flops(bin_ms=1000, bins=60)` from Python. Producers pay one
+lock-free ring write per credit, and the meter is always on.
+
+**It is optional, so do not require it.** A plugin imports the meter's
+functions WEAKLY: built against an SDK that has the meter, it still loads
+on a host that does not, where `perf_flops::available()` is false and
+nothing is credited. The toolkit's helpers below check this for you; code
+that calls `perf_flops::credit()` itself must check `available()` first.
+Never list `perf-flops/1` in `required_features` for this: that would
+refuse a host the plugin runs on perfectly well.
+
+Credit a DiT -- or a VAE, an audio codec, any GPU stage -- on the GPU's
+clock with the toolkit's `GpuFlopsTally`
+(`generative-models/shared/dit-flops.h`). Count as you encode, and flush
+where you commit:
+
+```cpp
+// in your GEMM helper, once per projection, at the rows the GPU computes
+_flops.gemm(M, N, K);                         // 2*M*N*K
+// at each attention dispatch: the (query, key) pairs it attends
+_flops.attention(heads, q_len * k_len, head_dim);
+// per forward
+_flops.begin();                               // before encoding anything
+_flops.flush(stream);                         // at each block's start
+_flops.flush(stream);                         // before EVERY commit
+```
+
+A flush hangs the batch on the command buffer open at that moment, and the
+meter is credited when that buffer **retires**. A forward that encodes its
+whole stack in a millisecond is therefore still reported over the seconds
+the GPU spends on it. Flush before every commit -- a streamed block's,
+an ANE split's drain, a stop drain, the final one -- and at each block's
+start for a stack that commits nothing between blocks. A batch left
+unflushed at a commit rides the next buffer and is credited late (never
+lost, never twice).
+
+Count where the work is ENCODED, so a skipped stage costs nothing: a
+cached caption that bypasses its refiner adds no FLOPs because nothing
+was encoded. If your dispatch helpers live in one ops object, keep the
+tally there (a `mutable` member, so `const` helpers can count) and flush
+it wherever anything commits.
+
+Count what executes, not what it stands in for. A causal run counts its
+triangle (`causal_pairs`). A windowed or masked attention counts the pairs
+it attends -- when the mask is host-visible, count it exactly. Sol-Attn
+counts the key blocks it kept: use `SolFlops`, which counts each forward at
+the keep ratio of the forward before it, and call `finish(exact_blocks())`
+after the final wait (reset the GPU counter at the forward's start).
+A convolution counts `2 * outputs * cout * taps * cin` whichever route runs
+it (an im2col GEMM, a hardware conv, a direct kernel): count it once, where
+the conv is asked for, not inside each route. A causal conv's taps before
+the start of the sequence are padding, not arithmetic -- one route skips
+them and another multiplies their zeros, so count the live taps and the
+figure is the same on every GPU. Padding a kernel adds for its own sake --
+input channels rounded up to a tile's width -- is not arithmetic either:
+count the model's width. A runtime adapter's two GEMMs are work like
+any other (`2*M*r*K` and `2*M*N*r`). Elementwise passes are not counted.
+The ANE needs nothing from you: the ANE
+tier credits every predict itself, at the same per-row FLOPs the GPU's
+GEMMs would have counted, so moving rows between the two units moves no
+FLOPs.
+
+To test it, derive the count from your model's shapes and hold the
+tally's `flushed()` to it EXACTLY; then hold the meter's
+`perf_flops::totals(kGpu)` delta over the forward to `flushed()`, and the
+tally's `pending()` to zero after it (a commit with no flush in front of
+it leaves its batch pending). The last buffer's completion handler can run
+just after the wait that saw it retire, so poll the totals briefly before
+comparing. A route that changes how the arithmetic is done -- a quantized
+GEMM, an int8 attention -- must count what the dense route counts: hold
+the two equal, and tell an arm that engaged from one that declined by its
+answer, or the equality is vacuous.
+
 ### Where new things go, and why they do not go in a field
 
 The ABI is a strict-equality cookie, so anything that moves a layout

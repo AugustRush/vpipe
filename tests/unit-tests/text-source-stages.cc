@@ -101,6 +101,41 @@ TEST(text_prompt_stage, emits_one_beat) {
   }
 }
 
+// A configured `value` goes out as it is -- an object beat (text-chat's
+// conversation) -- in place of a text, which it makes unnecessary.
+TEST(text_prompt_stage, emits_a_value_as_it_is) {
+  Session sess;
+  CerrSilencer hush;
+  auto pl = make_unique<Pipeline>("p", &sess);
+
+  FlexData cfg = FlexData::from_json(
+      R"({"value":{"messages":[{"role":"user","content":"hi"}]}})");
+  auto tp_u = make_unique<TextPromptStage>(
+      &sess, "tp", vector<InEdge>{}, std::move(cfg));
+  EXPECT_TRUE(tp_u->config_error().empty());
+  auto* tp = static_cast<TextPromptStage*>(pl->insert_stage(std::move(tp_u)));
+
+  auto sink_u = make_unique<SinkCapture>(
+      &sess, "sink", vector<InEdge>{{tp, 0}}, FlexData::make_object());
+  auto* sink = static_cast<SinkCapture*>(pl->insert_stage(std::move(sink_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  EXPECT_TRUE(sink->captured.size() == 1);
+  if (!sink->captured.empty()) {
+    const auto* fd =
+        dynamic_cast<const FlexDataPayload*>(sink->captured[0].get());
+    EXPECT_TRUE(fd != nullptr && fd->data.is_object());
+    if (fd != nullptr && fd->data.is_object()) {
+      const FlexData msgs = fd->data.as_object().at("messages");
+      EXPECT_TRUE(msgs.is_array() && msgs.as_array().size() == 1);
+    }
+  }
+}
+
 // Trigger iport: each chrono tick re-emits the same text (3 ticks -> 3 beats).
 TEST(text_prompt_stage, chrono_paced_reemits) {
   Session sess;
