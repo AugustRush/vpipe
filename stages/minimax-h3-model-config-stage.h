@@ -2,8 +2,10 @@
 #define VPIPE_STAGES_MINIMAX_H3_MODEL_CONFIG_STAGE_H
 
 #include "stages/latent-preview.h"
+#include "stages/lora-slots.h"
 #include "stages/model-config-source.h"
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -47,11 +49,11 @@ namespace vpipe {
 //                              block's attention into the hybrid. A
 //                              SECOND checkpoint beside the DiT, not a
 //                              replacement for it
-//   lora / lora2 (+ _scale, _qkv_layout) -- TWO runtime LoRA slots,
-//                              applied together: the usual pairing is a
-//                              few-step Turbo distillation and a style
-//                              or identity adapter, with independent,
-//                              live strengths
+//   lora / lora2 .. lora8 (+ _scale, _qkv_layout) -- EIGHT runtime
+//                              LoRA slots, applied together: the usual
+//                              pairing is a few-step Turbo distillation
+//                              and style or identity adapters, with
+//                              independent, live strengths
 //   preview_vae (+ preview_every, preview_max_edge, preview_frames) --
 //                              a tiny autoencoder for LIVE previews on
 //                              generate-video's `preview` oport; see
@@ -83,15 +85,16 @@ private:
   double _audio_seconds = 0.0;
   // The VDN-H3 release root, or empty for the stock attention.
   std::string _linear_branch;
-  std::string _lora;
-  double _lora_scale = 1.0;
-  std::string _lora2;
-  double _lora2_scale = 1.0;
-  std::string _lora2_qkv;
-  // "auto" | "flat" | "per_head"; empty keeps the beat silent. See the
-  // key's doc -- it decides whether a FUSED qkv adapter's rows are
-  // permuted into a per-head DiT's order.
-  std::string _lora_qkv;
+  // The runtime-LoRA slots, `lora` .. `lora8` (stages/lora-slots.h).
+  struct LoraSlot {
+    std::string path;
+    double      scale = 1.0;
+    // "auto" | "flat" | "per_head"; empty keeps the beat silent. See the
+    // key's doc -- it decides whether a FUSED qkv adapter's rows are
+    // permuted into a per-head DiT's order.
+    std::string qkv;
+  };
+  std::array<LoraSlot, lora_slots::kSlots> _lora;
   // TaoMate-H3's streaming method: "auto" (run it when an adapter slot
   // holds the TaoMate adapter), "on", "off".
   std::string _taomate;

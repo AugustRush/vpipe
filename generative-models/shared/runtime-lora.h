@@ -330,6 +330,11 @@ private:
 // s2 A2], B = [B1 | B2]) and would be free in the forward, but it folds
 // both strengths into A and so turns the live knob back into a rebuild.
 //
+// EIGHT at most -- a distillation, an identity adapter and a few styles
+// is already a crowded projection, and each costs its own pair of GEMMs
+// -- which is the slot count every family's loader and the stages'
+// `lora` .. `lora8` keys agree on (stages/lora-slots.h).
+//
 // `base` is the slot's own region of the [rows, rank] scratch. Whether
 // that is a CORRECTNESS requirement depends on the caller. Applier's own
 // loop runs each slot's pair back to back, so sharing one region would
@@ -338,7 +343,7 @@ private:
 // them disjoint regions or the last writer's intermediate is what every
 // B factor multiplies.
 struct Stack {
-  static constexpr int kMax = 2;
+  static constexpr int kMax = 8;
   struct Use {
     const Factors* f     = nullptr;
     float          scale = 0.0f;

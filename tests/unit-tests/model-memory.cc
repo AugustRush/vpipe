@@ -1937,6 +1937,186 @@ TEST(model_memory, a_pooled_checkpoint_survives_its_last_model)
   fs::remove_all(root, ec);
 }
 
+namespace {
+
+// A checkpoint of one F32 tensor `w`, written at <tmp>/<name>, for the
+// parking tests below. 128 KB ON PURPOSE: under MetalCompute's 64 KB
+// threshold a buffer is a heap sub-allocation, which parks nothing --
+// and the set's `parked` flag is set all the same, so a small tensor
+// passes every flag check while proving nothing. The bytes the registry
+// holds parked are the evidence.
+constexpr std::size_t kParkTestElems = 32768;
+constexpr std::size_t kParkTestBytes = kParkTestElems * sizeof(float);
+
+std::filesystem::path
+write_park_test_checkpoint_(const char* name)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path root = fs::temp_directory_path() / name;
+  fs::remove_all(root, ec);
+  fs::create_directories(root, ec);
+  std::string hdr = "{\"w\":{\"dtype\":\"F32\",\"shape\":[" +
+                    std::to_string(kParkTestElems) +
+                    "],\"data_offsets\":[0," +
+                    std::to_string(kParkTestBytes) + "]}}";
+  while (((8 + hdr.size()) % 16) != 0) { hdr.push_back(' '); }
+  std::ofstream f(root / "model.safetensors", std::ios::binary);
+  const std::uint64_t n = hdr.size();
+  f.write(reinterpret_cast<const char*>(&n), 8);
+  f.write(hdr.data(), (std::streamsize)hdr.size());
+  const std::vector<float> v(kParkTestElems, 1.0f);
+  f.write(reinterpret_cast<const char*>(v.data()),
+          (std::streamsize)kParkTestBytes);
+  return root;
+}
+
+// The weight report's row for the checkpoint whose directory contains
+// `name`; none once the manager no longer holds it.
+std::optional<genai::GenerativeModelManager::WeightUsage>
+usage_of_(const genai::GenerativeModelManager* mgr, const char* name)
+{
+  for (const auto& u : mgr->weight_report()) {
+    if (u.dir.find(name) != std::string::npos) { return u; }
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
+// What a pipeline's unload does with the checkpoints its graph let go,
+// and what a host that wants the memory back asks for: an idle checkpoint
+// SETTLED by the unload -- parked, not left resident -- and then
+// RELEASED, its bytes given back (release_idle_models). One a model
+// still borrows is left alone by both. (A finished graph's DiT and VAE
+// stayed resident and unparked: nothing settled them once the pipeline
+// was gone.)
+TEST(model_memory, idle_checkpoints_are_settled_and_released)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  auto* mc  = s.metal_compute();
+  if (mgr == nullptr || mc == nullptr || !mc->valid()) { return; }
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path idle_root =
+      write_park_test_checkpoint_("vpipe-idle-released");
+  const fs::path busy_root =
+      write_park_test_checkpoint_("vpipe-idle-borrowed");
+  // The graph whose unload settles them. It has no stages, so all its
+  // unload does here is reach the settle.
+  PipelineHandle h = s.create_pipeline("idle-settle");
+  ASSERT_TRUE(h.valid());
+  auto idle = mgr->weight_set(idle_root.string());
+  auto busy = mgr->weight_set(busy_root.string());
+  ASSERT_TRUE(idle != nullptr && busy != nullptr);
+  ASSERT_TRUE(!idle->tensor("w", mc, genai::WeightSet::Residency::Copied)
+                   .empty());
+  ASSERT_TRUE(!busy->tensor("w", mc, genai::WeightSet::Residency::Copied)
+                   .empty());
+  idle.reset();   // its model gone; `busy` is still borrowed
+
+  // Let go and not yet settled: nothing parks a set on its own.
+  const std::size_t parked0 = mgr->weights().stats().parked_bytes;
+  auto u = usage_of_(mgr, "vpipe-idle-released");
+  ASSERT_TRUE(u.has_value());
+  EXPECT_TRUE(!u->parked);
+
+  // Settled by the unload: the idle one parked, its bytes purgeable;
+  // the borrowed one as it was.
+  EXPECT_TRUE(s.unload_pipeline(h).code == 0u);
+  EXPECT_TRUE(mgr->weights().stats().parked_bytes >=
+              parked0 + kParkTestBytes);
+  u = usage_of_(mgr, "vpipe-idle-released");
+  ASSERT_TRUE(u.has_value());
+  EXPECT_TRUE(u->parked);
+  EXPECT_TRUE(u->holders == 0);
+  u = usage_of_(mgr, "vpipe-idle-borrowed");
+  ASSERT_TRUE(u.has_value());
+  EXPECT_TRUE(!u->parked);
+  // Nothing left to settle.
+  EXPECT_TRUE(mgr->settle_unborrowed() == 0u);
+
+  // Released: the idle one dropped, its bytes given back; the borrowed
+  // one kept.
+  SessionIntf& host = s;
+  EXPECT_TRUE(host.release_idle_models() >= kParkTestBytes);
+  EXPECT_TRUE(!usage_of_(mgr, "vpipe-idle-released").has_value());
+  EXPECT_TRUE(!mgr->holds_weights(idle_root.string()));
+  EXPECT_TRUE(usage_of_(mgr, "vpipe-idle-borrowed").has_value());
+  EXPECT_TRUE(mgr->holds_weights(busy_root.string()));
+  // Nothing idle left: a second ask gives nothing back.
+  EXPECT_TRUE(host.release_idle_models() == 0u);
+
+  busy.reset();
+  fs::remove_all(idle_root, ec);
+  fs::remove_all(busy_root, ec);
+}
+
+// THE PARK/BORROW RACE. A settle chooses what to park under the
+// manager's lock and parks after letting go of it, so a weight_set() in
+// between can hand a chosen set to a model that reads its tensors before
+// the park lands -- and the park then made that model's buffers
+// purgeable, under a model that never asks the set again. The hook runs
+// in exactly that window, and takes one of the two chosen sets. The
+// other, which nobody takes, is the control: it IS parked, so the settle
+// did reach its parks and stood down for the taken one alone.
+TEST(model_memory, a_set_handed_out_mid_settle_is_not_parked)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  auto* mc  = s.metal_compute();
+  if (mgr == nullptr || mc == nullptr || !mc->valid()) { return; }
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path taken_root =
+      write_park_test_checkpoint_("vpipe-park-race-taken");
+  const fs::path spare_root =
+      write_park_test_checkpoint_("vpipe-park-race-spare");
+  {
+    // Both read once and let go: idle and unparked, what a settle parks.
+    auto a = mgr->weight_set(taken_root.string());
+    auto b = mgr->weight_set(spare_root.string());
+    ASSERT_TRUE(a != nullptr && b != nullptr);
+    ASSERT_TRUE(!a->tensor("w", mc, genai::WeightSet::Residency::Copied)
+                     .empty());
+    ASSERT_TRUE(!b->tensor("w", mc, genai::WeightSet::Residency::Copied)
+                     .empty());
+  }
+  const std::size_t parked0 = mgr->weights().stats().parked_bytes;
+
+  // A model borrowing the set mid-settle and reading its tensor, as a
+  // concurrent stage's load would.
+  std::shared_ptr<genai::WeightSet> held;
+  metal_compute::SharedBuffer       alias;
+  bool                              ran = false;
+  mgr->set_before_park_for_test([&] {
+    ran  = true;
+    held = mgr->weight_set(taken_root.string());
+    if (held != nullptr) {
+      alias = held->tensor("w", mc, genai::WeightSet::Residency::Copied);
+    }
+  });
+  (void)mgr->settle_unborrowed();
+  ASSERT_TRUE(ran);
+  ASSERT_TRUE(held != nullptr && !alias.empty());
+
+  // The taken one is left alone -- the model's buffers stay resident;
+  // the spare one is parked. One set's bytes, not two.
+  EXPECT_TRUE(!held->parked());
+  const auto spare = usage_of_(mgr, "vpipe-park-race-spare");
+  ASSERT_TRUE(spare.has_value());
+  EXPECT_TRUE(spare->parked);
+  const std::size_t parked = mgr->weights().stats().parked_bytes - parked0;
+  EXPECT_TRUE(parked >= kParkTestBytes);
+  EXPECT_TRUE(parked < 2 * kParkTestBytes);
+
+  alias = {};
+  held.reset();
+  fs::remove_all(taken_root, ec);
+  fs::remove_all(spare_root, ec);
+}
+
 // A set specialised to a run's parameters is DROPPED rather than pooled:
 // handing it to a launch that does not share them would give that launch
 // weights which are silently wrong for it.

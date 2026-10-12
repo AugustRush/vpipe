@@ -19,6 +19,7 @@
 
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/shared/ane-module.h"
+#include "generative-models/shared/runtime-lora.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -96,7 +97,11 @@ struct AneFfnSource {
     int group = 0;
     int parts = 1;
   };
-  static constexpr int kMaxDeltas = 2;
+  // One per runtime-LoRA slot: a family folds a projection's whole
+  // lora::Stack, and its stagers stop at this bound without a word, so a
+  // smaller one would leave the ANE's rows short of adapters the GPU's
+  // rows apply.
+  static constexpr int kMaxDeltas = lora::Stack::kMax;
   Delta delta[kMaxDeltas];
   int   deltas = 0;
 

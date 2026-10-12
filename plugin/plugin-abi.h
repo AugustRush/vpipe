@@ -91,10 +91,15 @@
 //                      dit-flops.h does it on the GPU's clock). WEAKLY
 //                      imported: a plugin using it still loads on a
 //                      host without it -- never list it as required
+//   ane-adapters       generative-models/shared/ane-tier.h: the ANE tier
+//                      stages up to ane::kMaxAdapters (8) adapters a
+//                      projection, lora0 .. lora7; a host without it
+//                      takes lora0 and lora1 and refuses the rest
 #define VPIPE_FEATURE_KERNEL_CONTRACT_2 "kernel-contract/2"
 #define VPIPE_FEATURE_CONTENT_SCREEN    "content-screen/1"
 #define VPIPE_FEATURE_VIDEO_TURN        "video-turn/1"
 #define VPIPE_FEATURE_PERF_FLOPS        "perf-flops/1"
+#define VPIPE_FEATURE_ANE_ADAPTERS      "ane-adapters/1"
 
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }

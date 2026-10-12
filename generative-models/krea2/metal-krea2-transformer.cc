@@ -1265,7 +1265,10 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     std::string lerr;
     if (!m->bind_lora_(sp, slot, &lerr)) {
       if (mc->session() != nullptr) { mc->session()->warn(fmt("{}", lerr)); }
-      continue;
+      // An EMPTY slot rather than none, so every later adapter keeps the
+      // index the caller gave it: a live strength is addressed by that
+      // index, and closing the gap would send it to the next adapter.
+      slot = LoraSlot{};
     }
     // Each slot owns its own rows of the [rows, rank] scratch, so two
     // adapters' first GEMMs are not ordered against each other's second.

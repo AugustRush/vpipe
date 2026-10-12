@@ -1610,8 +1610,11 @@ be here.
 Features added within ABI 8, after it first shipped:
 `"kernel-contract/2"` (the contract's revision-2 entries; a host with it
 still serves revision 1), `"content-screen/1"`
-(`generative-models/content-screen.h`) and `"video-turn/1"`
-(`generative-models/video-turn.h`).
+(`generative-models/content-screen.h`), `"video-turn/1"`
+(`generative-models/video-turn.h`) and `"ane-adapters/1"` (the ANE tier
+stages up to `ane::kMaxAdapters`, eight, runtime adapters a projection,
+`lora0` .. `lora7`; a host without it takes `lora0` and `lora1` and
+refuses the rest by name, so ask `has_feature()` before binding a third).
 
 ## Where your stages show up
 

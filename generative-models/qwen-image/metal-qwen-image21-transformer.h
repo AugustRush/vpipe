@@ -201,8 +201,9 @@ class MetalQwenImage21Transformer {
     std::string path;          // one .safetensors of adapter factors
     float       scale = 1.0f;  // 1.0 = as trained; 0 = exactly off
   };
-  // Two adapters at once -- a few-step distillation beside a style one
-  // -- each in its own slot so its strength stays a live knob.
+  // Up to eight adapters at once -- a few-step distillation beside style
+  // or identity ones -- each in its own slot so its strength stays a
+  // live knob.
   static constexpr int kMaxLoraSlots = genai::lora::Stack::kMax;
 
   static std::unique_ptr<MetalQwenImage21Transformer>
@@ -222,6 +223,10 @@ class MetalQwenImage21Transformer {
   // How many projections each slot bound. 0 is what a test must refuse:
   // an adapter for another model binds nothing and says so only here.
   int lora_modules(int slot) const;
+  // The slots in use, in the order the adapters were given -- one that
+  // could not be applied included, EMPTY, so the indices stay the
+  // caller's.
+  int lora_slots() const { return _lora_slots; }
 
   // A TRAINER's adapter in `slot`: for every projection this family can
   // adapt, `fn(module, n, k, &factors)` fills the factors the forward is to
@@ -527,9 +532,9 @@ class MetalQwenImage21Transformer {
   lora::Applier _lora;
   std::vector<BlockLora> _lora_blk[kMaxLoraSlots];
   FixedLora _lora_fix[kMaxLoraSlots];
-  float _lora_scale[kMaxLoraSlots] = {0.0f, 0.0f};
-  int _lora_bound[kMaxLoraSlots] = {0, 0};
-  int _lora_rank_prefix[kMaxLoraSlots] = {0, 0};
+  float _lora_scale[kMaxLoraSlots] = {};
+  int _lora_bound[kMaxLoraSlots] = {};
+  int _lora_rank_prefix[kMaxLoraSlots] = {};
   int _lora_rank_total = 0;
   int _lora_slots = 0;
   // Rows the [rows, rank] intermediate is sized for THIS forward -- the

@@ -168,6 +168,19 @@ const ConfigKey kAttrs[] = {
           "`lora_scale` -- which is the point of a second slot: the "
           "distillation stays where it was trained while this one is "
           "swept. 0 skips its two GEMMs", .def_real = 1.0},
+  // Slots 3..8, which read exactly as `lora2` does.
+  lora_slots::path_key(2, "minimax-h3-lora"),
+  lora_slots::qkv_layout_key(2), lora_slots::scale_key(2),
+  lora_slots::path_key(3, "minimax-h3-lora"),
+  lora_slots::qkv_layout_key(3), lora_slots::scale_key(3),
+  lora_slots::path_key(4, "minimax-h3-lora"),
+  lora_slots::qkv_layout_key(4), lora_slots::scale_key(4),
+  lora_slots::path_key(5, "minimax-h3-lora"),
+  lora_slots::qkv_layout_key(5), lora_slots::scale_key(5),
+  lora_slots::path_key(6, "minimax-h3-lora"),
+  lora_slots::qkv_layout_key(6), lora_slots::scale_key(6),
+  lora_slots::path_key(7, "minimax-h3-lora"),
+  lora_slots::qkv_layout_key(7), lora_slots::scale_key(7),
   // The live-preview keys every family's config source shares; see
   // stages/latent-preview.h. For H3 the TAE is madebyollin's `taeh3`
   // (temporal, 4x in time) or Kijai's 2D one (a frame per latent frame).
@@ -197,7 +210,7 @@ const PortSpec kOports[] = {
    .doc = "MiniMax-H3 generation parameters as one FlexData object "
           "{model_family: minimax-h3, video_shift, audio_shift, "
           "condition_timestep, condition_audio_timestep, audio_seconds, "
-          "+lora, +lora2 and their scales, +taomate, +preview_vae and its "
+          "+lora .. +lora8 and their scales, +taomate, +preview_vae and its "
           "three knobs}, for a generate-video model_config iport",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
@@ -235,12 +248,12 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   _cond_audio_timestep = attr_real("condition_audio_timestep");
   _audio_seconds = attr_real("audio_seconds");
   _linear_branch = attr_str("linear_branch");
-  _lora          = attr_str("lora");
-  _lora_scale    = attr_real("lora_scale");
-  _lora_qkv      = attr_str("lora_qkv_layout");
-  _lora2         = attr_str("lora2");
-  _lora2_scale   = attr_real("lora2_scale");
-  _lora2_qkv     = attr_str("lora2_qkv_layout");
+  for (int i = 0; i < lora_slots::kSlots; ++i) {
+    LoraSlot& sl = _lora[(std::size_t)i];
+    sl.path  = attr_str(lora_slots::kPath[i]);
+    sl.scale = attr_real(lora_slots::kScale[i]);
+    sl.qkv   = attr_str(lora_slots::kQkvLayout[i]);
+  }
   _taomate       = attr_str("taomate");
   if (_taomate.empty()) { _taomate = "auto"; }
   if (_taomate != "auto" && _taomate != "on" && _taomate != "off") {
@@ -322,23 +335,18 @@ MiniMaxH3ModelConfigStage::resolved_config() const
   // asked for no adapter", which is indistinguishable from "the graph
   // said nothing" at the consumer -- and the consumer's default is
   // already no adapter.
-  if (!_lora.empty()) {
-    o.insert_or_assign("lora", FlexData::make_string(_lora));
-    o.insert_or_assign("lora_scale", FlexData::make_real(_lora_scale));
-    if (!_lora_qkv.empty()) {
-      o.insert_or_assign("lora_qkv_layout",
-                         FlexData::make_string(_lora_qkv));
-    }
-  }
-  // The second slot is independent of the first: `lora2` with no `lora`
-  // is a graph with one style adapter and no distillation, which is a
+  //
+  // Each slot is independent of the others: `lora2` with no `lora` is a
+  // graph with one style adapter and no distillation, which is a
   // perfectly ordinary request and not a hole to be filled.
-  if (!_lora2.empty()) {
-    o.insert_or_assign("lora2", FlexData::make_string(_lora2));
-    o.insert_or_assign("lora2_scale", FlexData::make_real(_lora2_scale));
-    if (!_lora2_qkv.empty()) {
-      o.insert_or_assign("lora2_qkv_layout",
-                         FlexData::make_string(_lora2_qkv));
+  for (int i = 0; i < lora_slots::kSlots; ++i) {
+    const LoraSlot& sl = _lora[(std::size_t)i];
+    if (sl.path.empty()) { continue; }
+    o.insert_or_assign(lora_slots::kPath[i], FlexData::make_string(sl.path));
+    o.insert_or_assign(lora_slots::kScale[i], FlexData::make_real(sl.scale));
+    if (!sl.qkv.empty()) {
+      o.insert_or_assign(lora_slots::kQkvLayout[i],
+                         FlexData::make_string(sl.qkv));
     }
   }
   // Emitted only off its default, which the consumer applies anyway.
@@ -357,6 +365,14 @@ void
 MiniMaxH3ModelConfigStage::report_config(const FlexData& fd) const
 {
   (void)fd;
+  // Every named slot, by its key and strength.
+  std::string adapters;
+  for (int i = 0; i < lora_slots::kSlots; ++i) {
+    const LoraSlot& sl = _lora[(std::size_t)i];
+    if (sl.path.empty()) { continue; }
+    adapters += fmt("{} {} at {:.2f}", adapters.empty() ? ", runtime" : ",",
+                    lora_slots::kPath[i], sl.scale)();
+  }
   session()->info(fmt(
       "MiniMaxH3ModelConfigStage('{}'): shifts {:.1f}/{:.1f}, condition "
       "t {:.3f}/{:.3f}, audio {}{}{}{}", this->id(), _video_shift,
@@ -364,10 +380,7 @@ MiniMaxH3ModelConfigStage::report_config(const FlexData& fd) const
       _cond_timestep, _cond_audio_timestep,
       _audio_seconds > 0.0 ? fmt("{:.3f} s", _audio_seconds)()
                            : std::string("as long as the video"),
-      _lora.empty() ? std::string()
-                    : fmt(", runtime LoRA at {:.2f}", _lora_scale)(),
-      _lora2.empty() ? std::string()
-                     : fmt(", second at {:.2f}", _lora2_scale)(),
+      adapters,
       _preview.enabled()
           ? fmt(", previews every {} step(s)", _preview.every)()
           : std::string()));

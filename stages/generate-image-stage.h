@@ -23,6 +23,7 @@
 #include "generative-models/vosr/metal-vosr-transformer.h"
 #include "stages/generation-input.h"
 #include "stages/latent-preview.h"
+#include "stages/lora-slots.h"
 #endif
 
 #include <array>
@@ -408,19 +409,20 @@ private:
   // `lora_scale` config and overridden by a model_config beat that
   // names them.
   // The runtime LoRA SLOTS, off this stage's own config and any
-  // model_config beat, in the order the DiT binds them. Two, so a
-  // distillation or identity adapter and a style one can ride together
-  // -- see kMaxLoraSlots on the transformers. The PATH is load-time; the
-  // STRENGTH is not, and each slot's moves on its own.
+  // model_config beat, in the order the DiT binds them. Eight (`lora` ..
+  // `lora8`, stages/lora-slots.h), so a distillation or identity adapter
+  // and style ones can ride together -- see kMaxLoraSlots on the
+  // transformers. The PATH is load-time; the STRENGTH is not, and each
+  // slot's moves on its own.
   struct LoraSlot {
     std::string path;
     double      scale = 1.0;
   };
-  static constexpr int kLoraSlots = 2;
+  static constexpr int kLoraSlots = lora_slots::kSlots;
   std::array<LoraSlot, kLoraSlots> _lora;
   // Config slot -> the model's adapter slot, as lora_specs_() packed them
   // (-1: not loaded). Mutable: recorded by the const builder.
-  mutable std::array<int, kLoraSlots> _lora_model_slot{{0, 1}};
+  mutable std::array<int, kLoraSlots> _lora_model_slot;
   int         _vae_base       = 128;     // VAE base ch (decode-peak est.)
   bool        _dit_unloaded   = false;   // freed after a gen; reload next beat
 

@@ -93,7 +93,8 @@ inline constexpr std::string_view kTag = "tag";            // the log prefix
 //   <p>.w                       dense bf16, [out][in]
 //   <p>.codes <p>.scales <p>.qbias   affine 4/8-bit, bf16 scales/biases
 //   <p>.bias                    bf16 [out]
-//   <p>.lora<i>.a <p>.lora<i>.b  adapter i (0, 1): A [rank][in], B [out][rank]
+//   <p>.lora<i>.a <p>.lora<i>.b  adapter i (0 .. kMaxAdapters - 1): A
+//                               [rank][in], B [out][rank]
 // and reads these params (defaults in brackets):
 //   group                       the quantization group [0]
 //   <p>.bits                    4 or 8; 0 means dense [0]
@@ -103,6 +104,12 @@ inline constexpr std::string_view kTag = "tag";            // the log prefix
 //   <p>.lora<i>.b_stride <p>.lora<i>.b_offset   [1, 0]
 // A binding name the kind does not know is REFUSED: a typo would otherwise
 // stage zeros and render.
+//
+// kMaxAdapters is what a host with the ane-adapters feature
+// (VPIPE_FEATURE_ANE_ADAPTERS, plugin/plugin-abi.h) stages. One without
+// it knows lora0 and lora1 only and refuses the rest by name, so a
+// plugin that binds more asks has_feature() first.
+inline constexpr int kMaxAdapters = 8;
 inline constexpr std::string_view kGroup = "group";
 inline constexpr std::string_view kProjGate = "gate";
 inline constexpr std::string_view kProjUp = "up";

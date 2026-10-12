@@ -7910,6 +7910,56 @@ const STRINGS = {
       '平面 RGB TensorBeat [3,H,W]（F32 或 U8）'],
 };
 
+// The runtime-LoRA slots past the second (`lora3` .. `lora8`, with their
+// `_scale` and, on MiniMax-H3, `_qkv_layout` keys) read exactly as
+// `lora2` does and share one doc on the server (stages/lora-slots.h),
+// so their strings are made from one template here rather than written
+// out six times per stage.
+(() => {
+  const path = [
+    '又一个运行时 LoRA 槽位，用法与 `lora2` 完全相同：与其他槽位同时生效'
+    + '（每个被适配的投影按槽位各加一项 s B (A x)），可接受的写法相同，加载'
+    + '时生效，强度由对应的 `_scale` 键单独实时调节。最多可同时运行八个适配'
+    + '器；每多一个就多一对细长 GEMM，基础权重仍然只读一次',
+    '又一個執行階段 LoRA 槽位，用法與 `lora2` 完全相同：與其他槽位同時生效'
+    + '（每個被套用的投影按槽位各加一項 s B (A x)），可接受的寫法相同，載入'
+    + '時生效，強度由對應的 `_scale` 鍵單獨即時調整。最多可同時執行八個轉接'
+    + '器；每多一個就多一對細長 GEMM，基礎權重仍然只讀一次',
+  ];
+  // generate-image only: a family's model-config beat wins over it.
+  const overrides = [
+    '。模型族 model-config 节拍上的同名键会覆盖这里的设置',
+    '。模型族 model-config 節拍上的同名鍵會覆寫這裡的設定',
+  ];
+  const scale = [
+    '该槽位的强度，按每次前向生效，与其他每个槽位相互独立。填 0 会跳过它的'
+    + '两个 GEMM',
+    '該槽位的強度，按每次前向生效，與其他每個槽位相互獨立。填 0 會跳過它的'
+    + '兩個 GEMM',
+  ];
+  const qkv = [
+    '该槽位那个融合 attn.qkv_proj 的行顺序，含义与 `lora` 的 '
+    + '`lora_qkv_layout` 完全相同。之所以逐槽位设置，是因为行顺序是文件的属性',
+    '該槽位那個融合 attn.qkv_proj 的列順序，含義與 `lora` 的 '
+    + '`lora_qkv_layout` 完全相同。之所以逐槽位設定，是因為列順序是檔案的屬性',
+  ];
+  const stages = [
+    ['generate-image', true, false],
+    ['krea2-model-config', false, false],
+    ['flux2-model-config', false, false],
+    ['qwen-image-21-model-config', false, false],
+    ['minimax-h3-model-config', false, true],
+  ];
+  for (const [stage, over, h3] of stages) {
+    for (let n = 3; n <= 8; ++n) {
+      const k = `cfg.${stage}.lora${n}`;
+      STRINGS[k] = ['', ...path.map((p, i) => over ? p + overrides[i] : p)];
+      STRINGS[`${k}_scale`] = ['', ...scale];
+      if (h3) { STRINGS[`${k}_qkv_layout`] = ['', ...qkv]; }
+    }
+  }
+})();
+
 const TAGS = LOCALES.map((l) => l.tag);
 const listeners = new Set();
 let current = readInitial();

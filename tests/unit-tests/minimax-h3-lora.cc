@@ -1171,6 +1171,229 @@ TEST(minimax_h3_lora, two_adapters_add_and_are_dialled_apart)
   fs::remove_all(syn_dir, sec);
 }
 
+// EIGHT different adapters at once -- every slot the DiT has.
+//
+// The two-slot arms above prove the slots are apart; this proves it at
+// the full count, through the path that is H3's own: gemm_ issues every
+// slot's t = x A^T BEFORE the base projection, lets the base tile absorb
+// ONE of them, and dispatches the rest. Synthetic adapters (out_proj on
+// every one, mlp.fc2 as well on the odd ones), so nothing but the
+// checkpoint is needed:
+//
+//   ENGAGEMENT  all eight bind, in the order given (the module counts
+//               alternate, so a shifted slot shows).
+//   ORDER       reversed is the same function -- and a different
+//               adapter is the one folded into the base tile.
+//   SUM         the eight stacked on the rank axis in ONE slot is the
+//               same arithmetic up to rounding.
+//   DIAL        slots 1..7 at strength 0 is adapter 0 alone, exactly.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_lora, eight_adapters_add_in_any_order)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_lora] config: %s\n", cerr.c_str());
+    return;
+  }
+  cfg.n_layers = 4;
+  constexpr int kSlots = MetalMiniMaxH3Transformer::kMaxLoraSlots;
+  EXPECT_TRUE(kSlots == 8);
+
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, 0.3125f, 0.5f, 1.0f, &uniq, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k) * 0.5f;
+    }
+    return v;
+  };
+  const metal_compute::SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const metal_compute::SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  // The factors. Adapter i's frequencies are its own, so no two slots
+  // hold the same numbers.
+  const int R = 8, HH = cfg.hidden;
+  struct Mod { const char* leaf; int k; };
+  const Mod mods_of[2] = {{"attn.out_proj", cfg.inner()},
+                          {"mlp.fc2", cfg.ffn}};
+  auto adapts = [](int i, int m) { return m == 0 || (i % 2) == 1; };
+  auto a_of = [&](int i, int m) {
+    return ramp_((std::size_t)R * mods_of[m].k,
+                 0.013f + 0.0017f * (float)i + 0.0005f * (float)m, 0.30f);
+  };
+  auto b_of = [&](int i, int m) {
+    return ramp_((std::size_t)HH * R,
+                 0.021f + 0.0023f * (float)i + 0.0007f * (float)m, 0.30f);
+  };
+  const fs::path dir = fs::temp_directory_path() / "vpipe-h3-8-loras";
+  std::error_code sec;
+  fs::remove_all(dir, sec);
+  fs::create_directories(dir, sec);
+  auto name = [](int blk, int m, const char* f) {
+    static const char* const kLeaf[2] = {"attn.out_proj", "mlp.fc2"};
+    return "blocks." + std::to_string(blk) + "." + kLeaf[m] + f;
+  };
+  std::vector<std::string> files;
+  for (int i = 0; i < kSlots; ++i) {
+    std::vector<Tensor> ts;
+    for (int blk = 0; blk < cfg.n_layers; ++blk) {
+      for (int m = 0; m < 2; ++m) {
+        if (!adapts(i, m)) { continue; }
+        ts.push_back({name(blk, m, ".lora_A.weight"),
+                      {R, mods_of[m].k}, a_of(i, m)});
+        ts.push_back({name(blk, m, ".lora_B.weight"), {HH, R}, b_of(i, m)});
+      }
+    }
+    files.push_back(
+        (dir / ("a" + std::to_string(i) + ".safetensors")).string());
+    ASSERT_TRUE(write_st_(files.back(), ts, ""));
+  }
+  // The same factors stacked on the rank axis: A rows and B columns
+  // slot-major, one module at a time.
+  const std::string cat = (dir / "stacked.safetensors").string();
+  {
+    std::vector<Tensor> ts;
+    for (int blk = 0; blk < cfg.n_layers; ++blk) {
+      for (int m = 0; m < 2; ++m) {
+        std::vector<float> a;
+        std::vector<std::vector<float>> bs;
+        for (int i = 0; i < kSlots; ++i) {
+          if (!adapts(i, m)) { continue; }
+          const std::vector<float> ai = a_of(i, m);
+          a.insert(a.end(), ai.begin(), ai.end());
+          bs.push_back(b_of(i, m));
+        }
+        const int rk = R * (int)bs.size();
+        std::vector<float> b((std::size_t)HH * rk);
+        for (int n = 0; n < HH; ++n) {
+          for (std::size_t j = 0; j < bs.size(); ++j) {
+            for (int r = 0; r < R; ++r) {
+              b[(std::size_t)n * rk + j * R + r] =
+                  bs[j][(std::size_t)n * R + r];
+            }
+          }
+        }
+        ts.push_back({name(blk, m, ".lora_A.weight"), {rk, mods_of[m].k},
+                      std::move(a)});
+        ts.push_back({name(blk, m, ".lora_B.weight"), {HH, rk},
+                      std::move(b)});
+      }
+    }
+    ASSERT_TRUE(write_st_(cat, ts, ""));
+  }
+
+  // Pinned route and split FF, as two_adapters_add_and_are_dialled_apart
+  // pins them: with those fixed the adapters are the only variable.
+  const auto kPin = MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32;
+  ::setenv("VPIPE_H3_NO_FUSED_FF", "1", 1);
+  using Specs = std::vector<MetalMiniMaxH3Transformer::LoraSpec>;
+  std::vector<int> mods;
+  int slots = 0;
+  auto arm = [&](const Specs& specs, const std::vector<float>& turn,
+                 std::vector<float>* out) {
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, specs);
+    if (m == nullptr) { return false; }
+    m->set_gemm_route(kPin);
+    for (std::size_t i = 0; i < turn.size(); ++i) {
+      m->set_lora_scale((int)i, turn[i]);
+    }
+    slots = m->lora_slots();
+    mods.assign((std::size_t)kSlots, 0);
+    for (int i = 0; i < kSlots; ++i) {
+      mods[(std::size_t)i] = m->lora_modules(i);
+    }
+    MetalMiniMaxH3Transformer::Step step;
+    step.video = &vb;  step.audio = &ab;  step.text = &tb;
+    step.layout = &L;  step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    std::string ferr;
+    const auto v = m->forward(step, &ferr);
+    if (v.empty()) {
+      std::printf("[minimax_h3_lora] forward: %s\n", ferr.c_str());
+      return false;
+    }
+    const std::size_t n = (std::size_t)n_video * cfg.video_patch_elems();
+    out->resize(n);
+    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = from_bf16_(p[i]); }
+    return true;
+  };
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      num += d * d;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+
+  Specs all, rev;
+  for (int i = 0; i < kSlots; ++i) {
+    all.push_back({files[(std::size_t)i], 1.0f});
+    rev.push_back({files[(std::size_t)(kSlots - 1 - i)], 1.0f});
+  }
+  std::vector<float> v_base, v_all, v_rev, v_cat, v_first, v_dial;
+  bool ok = arm({}, {}, &v_base) && arm(all, {}, &v_all);
+  ASSERT_TRUE(ok);
+  if (ok) {
+    EXPECT_TRUE(slots == kSlots);
+    bool order_ok = true;
+    for (int i = 0; i < kSlots; ++i) {
+      const int per = mods[(std::size_t)i] / cfg.n_layers;
+      order_ok = order_ok && per == 1 + i % 2 &&
+                 mods[(std::size_t)i] % cfg.n_layers == 0;
+    }
+    EXPECT_TRUE(order_ok);
+    std::vector<float> turn((std::size_t)kSlots, 0.0f);
+    turn[0] = 1.0f;
+    ok = arm(rev, {}, &v_rev) && arm({{cat, 1.0f}}, {}, &v_cat) &&
+         arm({{files[0], 1.0f}}, {}, &v_first) && arm(all, turn, &v_dial);
+    ASSERT_TRUE(ok);
+  }
+  ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+  fs::remove_all(dir, sec);
+  if (!ok) { return; }
+
+  const double moved  = rel(v_all, v_base);
+  const double first  = rel(v_first, v_base);
+  const double order  = rel(v_rev, v_all);
+  const double summed = rel(v_cat, v_all);
+  const double dial   = rel(v_dial, v_first);
+  std::printf("[minimax_h3_lora] eight slots: they move the output %.3e "
+              "(adapter 0 alone %.3e) | reversed %.3e | stacked on the "
+              "rank axis %.3e | slots 1..7 at 0 vs adapter 0 alone %.3e\n",
+              moved, first, order, summed, dial);
+  EXPECT_TRUE(moved > 1e-2 && first > 1e-3 && moved > first);
+  // A ULP or two of bf16 in y (eps 2^-8), as the two-slot swap measured:
+  // MEASURED 7.2e-3 reversed and 7.8e-3 stacked on the M4 Pro, against
+  // a move of 0.32. A shared scratch region or a dropped slot is a
+  // different FUNCTION and lands well above the bound.
+  EXPECT_TRUE(order < 0.03 && order < 0.1 * moved);
+  EXPECT_TRUE(summed < 0.03 && summed < 0.1 * moved);
+  EXPECT_TRUE(dial == 0.0);
+}
+
 // The adapter's matrix-core route must agree with the steel pair.
 //
 // The runtime LoRA landed from a box with no matrix cores, so both of its

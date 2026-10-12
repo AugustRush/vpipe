@@ -322,8 +322,9 @@ untouched, so switching adapters or turning one off is a config edit rather
 than a pass over 26 GB. `lora_scale` is live: `1.0` is what upstream tunes
 for, and `0` skips the adapter's GEMMs entirely, so *off* is exactly off.
 
-There is a second slot, `lora2` / `lora2_scale`, if you want a style adapter
-riding alongside.
+There are seven more slots, `lora2` / `lora2_scale` … `lora8` / `lora8_scale`,
+if you want style or identity adapters riding alongside; each strength stays
+live on its own.
 
 ### Running without the LoRA
 

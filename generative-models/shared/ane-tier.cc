@@ -4,6 +4,7 @@
 #include "generative-models/shared/ane-ffn.h"
 
 #include <algorithm>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -62,11 +63,19 @@ projections(Shape s)
   return {};
 }
 
-// Every binding name a projection may carry.
+// Every binding name a projection may carry: the weight's, and adapter
+// i's pair for each of the kMaxAdapters slots.
 constexpr std::string_view kFields[] = {
     "w", "codes", "scales", "qbias", "bias",
     "lora0.a", "lora0.b", "lora1.a", "lora1.b",
+    "lora2.a", "lora2.b", "lora3.a", "lora3.b",
+    "lora4.a", "lora4.b", "lora5.a", "lora5.b",
+    "lora6.a", "lora6.b", "lora7.a", "lora7.b",
 };
+static_assert(std::size(kFields) == 5 + 2 * kMaxAdapters,
+              "a binding pair per adapter slot");
+static_assert(kMaxAdapters == AneFfnSource::kMaxDeltas,
+              "the tier stages what the module folds");
 
 }  // namespace
 

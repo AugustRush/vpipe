@@ -1,5 +1,6 @@
 #include "stages/krea2-model-config-stage.h"
 #include "stages/latent-preview.h"
+#include "stages/lora-slots.h"
 #include "stages/model-registry.h"
 
 #include "common/flex-data.h"
@@ -68,6 +69,13 @@ const ConfigKey kAttrs[] = {
           "`lora_scale` -- which is the point of a second slot: one "
           "adapter stays where it was trained while the other is swept. "
           "0 skips its two GEMMs", .def_real = 1.0},
+  // Slots 3..8, which read exactly as `lora2` does.
+  lora_slots::path_key(2, "krea2-lora"), lora_slots::scale_key(2),
+  lora_slots::path_key(3, "krea2-lora"), lora_slots::scale_key(3),
+  lora_slots::path_key(4, "krea2-lora"), lora_slots::scale_key(4),
+  lora_slots::path_key(5, "krea2-lora"), lora_slots::scale_key(5),
+  lora_slots::path_key(6, "krea2-lora"), lora_slots::scale_key(6),
+  lora_slots::path_key(7, "krea2-lora"), lora_slots::scale_key(7),
   {.key = "vl_max_pixels", .type = ConfigType::Int, .required = false,
    .doc = "grounded encode: the image processor's upper bound. Unset => "
           "the tower default"},
@@ -96,7 +104,7 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "krea2 parameters as one FlexData object {model_family: krea2, "
-          "+vl_*, +lora, +lora2 and their scales, +preview_vae and its "
+          "+vl_*, +lora .. +lora8 and their scales, +preview_vae and its "
           "knobs}. The vl_* keys are for a diffusion-conditioner's "
           "model_config iport (the grounded encode); the lora and preview "
           "keys are for generate-image's. Wire it to both -- each reads "
@@ -159,9 +167,11 @@ Krea2ModelConfigStage::resolved_config() const
   {
     auto in = config().as_object();
     auto o  = fd.as_object();
-    for (const char* k : {"lora", "lora_scale",
-                          "lora2", "lora2_scale"}) {
-      if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
+    for (int i = 0; i < lora_slots::kSlots; ++i) {
+      for (std::string_view k :
+           {lora_slots::kPath[i], lora_slots::kScale[i]}) {
+        if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
+      }
     }
   }
   // Emitted only when a preview VAE is named, like the adapter keys.

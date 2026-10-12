@@ -395,19 +395,21 @@ class MetalMiniMaxH3Transformer {
     QkvLayout qkv_layout = QkvLayout::kAuto;
   };
 
-  // How many adapters may ride the DiT at once.
+  // How many adapters may ride the DiT at once: the shared Stack's
+  // eight, which is what the stages' `lora` .. `lora8` keys name.
   //
-  // Two, because that is what a real request wants: a few-step Turbo
-  // distillation, which is a correction to the WHOLE model and belongs
-  // at the strength it was trained at, and a style or identity adapter,
-  // which is the thing actually being dialled. They stay SEPARATE slots
-  // rather than one merged set of factors because their strengths move
-  // independently -- concatenating them on the rank axis is exact
-  // arithmetic (A = [s1 A1; s2 A2], B = [B1 | B2]) and would be free in
-  // the forward, but it folds both strengths into A and so turns the
-  // live knob back into a rebuild, for the adapter most likely to be
-  // swept.
-  static constexpr int kMaxLoraSlots = 2;
+  // The common request is a few-step Turbo distillation, which is a
+  // correction to the WHOLE model and belongs at the strength it was
+  // trained at, beside style or identity adapters, which are the things
+  // actually being dialled. They stay SEPARATE slots rather than one
+  // merged set of factors because their strengths move independently --
+  // concatenating them on the rank axis is exact arithmetic (A = [s1 A1;
+  // s2 A2], B = [B1 | B2]) and would be free in the forward, but it
+  // folds every strength into A and so turns the live knob back into a
+  // rebuild, for the adapters most likely to be swept. Each slot costs
+  // its own pair of skinny GEMMs and its own rows of the [seq, rank]
+  // scratch; the base tile absorbs one adapter's second GEMM.
+  static constexpr int kMaxLoraSlots = lora::Stack::kMax;
 
   static std::unique_ptr<MetalMiniMaxH3Transformer>
   load(const std::string& dit_dir, metal_compute::MetalCompute* mc,

@@ -26,6 +26,7 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
 #include "generative-models/qwen-image/qwen-image21-layout.h"
+#include "generative-models/train/lora-params.h"
 #include "generative-models/weight-set.h"
 #include "stages/model-quantize-stage.h"
 
@@ -2993,4 +2994,278 @@ TEST(qwen_image_21_dit, runtime_lora_matches_fused)
   EXPECT_TRUE(std::memcmp(streamed.data(), got.data(),
                           n * sizeof(float)) == 0);
   EXPECT_TRUE(std::memcmp(off.data(), base.data(), n * sizeof(float)) == 0);
+}
+
+// ---- eight runtime adapters at once -----------------------------------
+//
+// A DiT carries up to lora::Stack::kMax adapters at once (eight), each
+// its own pair of GEMMs, its own region of the [rows, rank] scratch and
+// its own live strength. Eight DIFFERENT synthetic adapters on the small
+// model, and five things that hold only if the slots are really apart:
+//
+//   ENGAGEMENT  every slot binds, in the order given. Adapter i adapts
+//               attn.to_out.0 in every block and, when i is odd,
+//               img_mlp.out as well, so a slot that shifted would show
+//               up as the wrong module count.
+//   ORDER       naming them in reverse is the same function. A shared
+//               scratch region would make the last writer's
+//               intermediate what every B factor multiplies, and the
+//               two orders would compute two different things.
+//   SUM         the eight are ONE adapter: the same factors stacked on
+//               the rank axis (A = [A0; ..; A7], B = [B0 | .. | B7]) in
+//               a single slot is the same arithmetic up to rounding.
+//   DIAL        slots 1..7 at strength 0 is adapter 0 alone, EXACTLY: a
+//               zero strength encodes nothing.
+//   HOLE        an adapter that cannot be opened keeps its slot, EMPTY,
+//               so the ones after it keep their indices -- a live
+//               strength is addressed by index, and a gap closed up
+//               would send it to the next adapter.
+//
+// Env: VPIPE_QWEN_IMAGE21_GOLDEN (the 2-layer model with random weights,
+// which is all this needs).
+TEST(qwen_image_21_dit, eight_adapters_ride_one_dit)
+{
+  namespace fs = std::filesystem;
+  const char* g = std::getenv("VPIPE_QWEN_IMAGE21_GOLDEN");
+  if (g == nullptr || *g == '\0') { return; }
+  const std::string ckpt = (fs::path(g) / "dit").string();
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalQwenImage21Transformer::Config cfg;
+  if (!MetalQwenImage21Transformer::Config::read_dims(ckpt, &cfg)) {
+    return;
+  }
+  constexpr int kSlots = MetalQwenImage21Transformer::kMaxLoraSlots;
+  EXPECT_TRUE(kSlots == 8);
+  const int H = cfg.hidden, FF = cfg.hidden * cfg.mlp_ratio, R = 4;
+  const int nl = cfg.n_layers;
+
+  // Every factor, f32, distinct per (adapter, block, module, factor).
+  // [rows, cols] row-major; spread chosen so each adapter visibly moves
+  // the output on its own.
+  auto factor = [](int rows, int cols, unsigned seed) {
+    std::vector<float> v((std::size_t)rows * cols);
+    unsigned st = seed * 2654435761u + 12345u;
+    for (float& x : v) {
+      st = st * 1664525u + 1013904223u;
+      x = ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.25f;
+    }
+    return v;
+  };
+  struct Mod { const char* leaf; int n, k; };
+  const Mod kOut{"attn.to_out.0", H, H}, kMlp{"img_mlp.out", H, FF};
+  auto adapts = [&](int i, const Mod& m) {
+    return &m == &kOut || (i % 2) == 1;
+  };
+  auto a_of = [&](int i, int L, const Mod& m) {
+    return factor(R, m.k, (unsigned)(i * 1000 + L * 10 + (&m == &kMlp)));
+  };
+  auto b_of = [&](int i, int L, const Mod& m) {
+    return factor(m.n, R,
+                  (unsigned)(i * 1000 + L * 10 + (&m == &kMlp) + 500));
+  };
+  auto bf16 = [](const std::vector<float>& v) {
+    std::vector<std::uint8_t> out(v.size() * 2);
+    for (std::size_t i = 0; i < v.size(); ++i) {
+      const std::uint16_t h = train::f32_to_bf16(v[i]);
+      std::memcpy(out.data() + 2 * i, &h, 2);
+    }
+    return out;
+  };
+  const fs::path dir = fs::temp_directory_path() / "vpipe-qi21-8-loras";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir, ec);
+  auto pre = [](int L) {
+    return "transformer_blocks." + std::to_string(L) + ".";
+  };
+  std::vector<std::string> files;
+  for (int i = 0; i < kSlots; ++i) {
+    std::vector<train::OutTensor> ts;
+    for (int L = 0; L < nl; ++L) {
+      for (const Mod* m : {&kOut, &kMlp}) {
+        if (!adapts(i, *m)) { continue; }
+        const std::string p = pre(L) + m->leaf;
+        ts.push_back({p + ".lora_A.weight", "BF16", {R, m->k},
+                      bf16(a_of(i, L, *m))});
+        ts.push_back({p + ".lora_B.weight", "BF16", {m->n, R},
+                      bf16(b_of(i, L, *m))});
+      }
+    }
+    files.push_back((dir / ("a" + std::to_string(i) + ".safetensors"))
+                        .string());
+    std::string werr;
+    Q21D_REQUIRE(train::write_safetensors(files.back(), ts, {}, &werr));
+  }
+  // The same factors stacked on the rank axis, one module at a time:
+  // A rows are slot-major, B columns likewise.
+  const std::string cat = (dir / "stacked.safetensors").string();
+  {
+    std::vector<train::OutTensor> ts;
+    for (int L = 0; L < nl; ++L) {
+      for (const Mod* m : {&kOut, &kMlp}) {
+        std::vector<float> a, b;
+        std::vector<std::vector<float>> bs;
+        for (int i = 0; i < kSlots; ++i) {
+          if (!adapts(i, *m)) { continue; }
+          const std::vector<float> ai = a_of(i, L, *m);
+          a.insert(a.end(), ai.begin(), ai.end());
+          bs.push_back(b_of(i, L, *m));
+        }
+        const int rk = R * (int)bs.size();
+        b.resize((std::size_t)m->n * rk);
+        for (int n = 0; n < m->n; ++n) {
+          for (std::size_t j = 0; j < bs.size(); ++j) {
+            for (int r = 0; r < R; ++r) {
+              b[(std::size_t)n * rk + j * R + r] =
+                  bs[j][(std::size_t)n * R + r];
+            }
+          }
+        }
+        const std::string p = pre(L) + m->leaf;
+        ts.push_back({p + ".lora_A.weight", "BF16", {rk, m->k}, bf16(a)});
+        ts.push_back({p + ".lora_B.weight", "BF16", {m->n, rk}, bf16(b)});
+      }
+    }
+    std::string werr;
+    Q21D_REQUIRE(train::write_safetensors(cat, ts, {}, &werr));
+  }
+
+  // A layout the small model takes: 16 text rows, one 256^2 target.
+  const int lg = 256 / 16, n_text = 16;
+  std::vector<std::uint8_t> slot((std::size_t)n_text, 0);
+  slot.insert(slot.end(), (std::size_t)(lg * lg / 4), 1);
+  qi21::Layout lay;
+  std::string lerr;
+  Q21D_REQUIRE(qi21::build_layout(slot, {}, {{1, lg, lg}}, &lay, &lerr));
+  auto rnd = [&](std::size_t n, unsigned seed) {
+    const std::vector<float> f = factor(1, (int)n, seed);
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    if (!b.empty()) {
+      const std::vector<std::uint8_t> h = bf16(f);
+      std::memcpy(b.contents(), h.data(), h.size());
+    }
+    return b;
+  };
+  metal_compute::SharedBuffer lat =
+      rnd((std::size_t)lay.image_len * cfg.in_channels, 71u);
+  metal_compute::SharedBuffer txt =
+      rnd((std::size_t)lay.text_len * cfg.txt_dim, 72u);
+  Q21D_REQUIRE(!lat.empty() && !txt.empty());
+  MetalQwenImage21Transformer::Request req;
+  req.latents = &lat;
+  req.txt = &txt;
+  req.layout = &lay;
+  req.timestep = 0.75f;
+  const std::size_t n = (std::size_t)lay.target_len * cfg.out_channels;
+
+  using Specs = std::vector<MetalQwenImage21Transformer::LoraSpec>;
+  std::vector<int> mods;
+  int slots = 0;
+  // One load and one forward; `turn` dials slots after the load.
+  auto arm = [&](const Specs& specs, const std::vector<float>& turn,
+                 std::vector<float>* out) {
+    auto m =
+        MetalQwenImage21Transformer::load(ckpt, mc, cfg, false, specs);
+    if (m == nullptr) { return false; }
+    for (std::size_t i = 0; i < turn.size(); ++i) {
+      m->set_lora_scale((int)i, turn[i]);
+    }
+    slots = m->lora_slots();
+    mods.assign((std::size_t)kSlots, 0);
+    for (int i = 0; i < kSlots; ++i) {
+      mods[(std::size_t)i] = m->lora_modules(i);
+    }
+    std::string ferr;
+    metal_compute::SharedBuffer o = m->forward(req, &ferr);
+    if (o.empty() || o.byte_size() < n * 2) {
+      std::printf("[eight_adapters] forward failed: %s\n", ferr.c_str());
+      return false;
+    }
+    out->resize(n);
+    const auto* d = static_cast<const std::uint16_t*>(o.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      (*out)[i] = train::bf16_to_f32(d[i]);
+    }
+    return true;
+  };
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double e = (double)a[i] - (double)b[i];
+      num += e * e;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+
+  Specs fwd_specs, rev_specs;
+  for (int i = 0; i < kSlots; ++i) {
+    fwd_specs.push_back({files[(std::size_t)i], 1.0f});
+    rev_specs.push_back({files[(std::size_t)(kSlots - 1 - i)], 1.0f});
+  }
+  std::vector<float> v_base, v_all, v_rev, v_cat, v_first, v_dial;
+  Q21D_REQUIRE(arm({}, {}, &v_base));
+  Q21D_REQUIRE(arm(fwd_specs, {}, &v_all));
+  // ENGAGEMENT, in the order given.
+  EXPECT_TRUE(slots == kSlots);
+  bool order_ok = true;
+  for (int i = 0; i < kSlots; ++i) {
+    order_ok = order_ok && mods[(std::size_t)i] == nl * (1 + i % 2);
+  }
+  EXPECT_TRUE(order_ok);
+  Q21D_REQUIRE(arm(rev_specs, {}, &v_rev));
+  Q21D_REQUIRE(arm({{cat, 1.0f}}, {}, &v_cat));
+  Q21D_REQUIRE(arm({{files[0], 1.0f}}, {}, &v_first));
+  {
+    std::vector<float> turn((std::size_t)kSlots, 0.0f);
+    turn[0] = 1.0f;
+    Q21D_REQUIRE(arm(fwd_specs, turn, &v_dial));
+  }
+
+  const double moved  = rel(v_all, v_base);
+  const double first  = rel(v_first, v_base);
+  const double order  = rel(v_rev, v_all);
+  const double summed = rel(v_cat, v_all);
+  const double dial   = rel(v_dial, v_first);
+  std::printf("[eight_adapters] the eight move the output %.3e (adapter 0 "
+              "alone %.3e) | reversed order %.3e | stacked on the rank axis "
+              "%.3e | slots 1..7 at 0 vs adapter 0 alone %.3e\n", moved,
+              first, order, summed, dial);
+  // The adapters have to be DOING something, or every comparison below
+  // is zero against zero.
+  EXPECT_TRUE(moved > 1e-2 && first > 1e-3 && moved > first);
+  // ORDER and SUM differ from the eight only in how many times y is
+  // rounded to bf16 (eps 2^-8): MEASURED 9.6e-3 and 8.9e-3 on the M4
+  // Pro against a move of 1.02. A slot dropped is ~1/8 of that move,
+  // and a scratch region shared computes a different function, both
+  // well above the bound.
+  EXPECT_TRUE(order < 0.03 && order < 0.1 * moved);
+  EXPECT_TRUE(summed < 0.03 && summed < 0.1 * moved);
+  // DIAL: the same dispatches as adapter 0 alone.
+  EXPECT_TRUE(dial == 0.0);
+
+  // HOLE: slot 3 cannot be opened. It stays a slot that binds nothing,
+  // and slot 4 is still the fifth file -- which, being even, binds only
+  // the attention output.
+  {
+    Specs holed = fwd_specs;
+    holed[3].path = (dir / "missing.safetensors").string();
+    std::vector<float> v_holed, v_off3;
+    Q21D_REQUIRE(arm(holed, {}, &v_holed));
+    EXPECT_TRUE(slots == kSlots);
+    EXPECT_TRUE(mods[3] == 0 && mods[4] == nl && mods[5] == 2 * nl);
+    // ...and is the full set with adapter 3 turned off, to rounding:
+    // the scratch layout differs (the hole has no rank), the GEMMs do
+    // not.
+    std::vector<float> turn((std::size_t)kSlots, 1.0f);
+    turn[3] = 0.0f;
+    Q21D_REQUIRE(arm(fwd_specs, turn, &v_off3));
+    const double hole = rel(v_holed, v_off3);
+    std::printf("[eight_adapters] a hole at slot 3 vs slot 3 dialled to 0: "
+                "%.3e\n", hole);
+    EXPECT_TRUE(hole == 0.0);
+  }
+  fs::remove_all(dir, ec);
 }

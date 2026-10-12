@@ -809,9 +809,29 @@ public:
   // Bytes of checkpoints NOBODY is borrowing -- reclaimable in full, so
   // this is capacity rather than occupancy. Report it as such.
   std::size_t pooled_bytes() const;
+  // SETTLE every checkpoint nobody is borrowing, now: park the recyclable,
+  // drop the rest (release_unheld_). Session::unload_pipeline asks it once
+  // the pipeline is gone. Settling ran only when something asked for it
+  // -- a text encoder's own pool_weights() -- so a finished graph's DiT
+  // and VAE stayed resident and UNPARKED, counted against the process and
+  // never reclaimable, until some later call happened to settle them.
+  // Returns the bytes parked.
+  std::size_t settle_unborrowed();
+  // DROP every checkpoint nobody is borrowing: its bytes given back now,
+  // not kept for a later run (which reads it again). What stays is what
+  // is BORROWED at this moment -- by a loaded pipeline's stages, launched
+  // or not, or by a model kept warm -- and nothing else: a running
+  // pipeline's stage that has let its model go for now loses it. Returns
+  // the bytes dropped (a parked set counts in full).
+  std::size_t drop_unborrowed();
   // Drop pooled sets until `want` bytes have been given back. Returns
   // what was actually freed.
   std::size_t pool_evict(std::size_t want);
+  // TEST HOOK: run once, by the next settle (release_unheld_), after it
+  // has chosen what to park and let go of its lock, and before it parks
+  // -- the window a concurrent weight_set() could hand a chosen set out
+  // in. A test fills it with that hand-out.
+  void        set_before_park_for_test(std::function<void()> hook);
 
   void        set_memory_cap(std::size_t bytes);
   std::size_t memory_cap() const;
@@ -1003,7 +1023,16 @@ private:
 
   // The BORROW RULE, and the only place in this class that parks.
   // Declines a set anything is borrowing; see the definition for why
-  // `borrowers` is passed in rather than derived.
+  // `borrowers` is passed in rather than derived. `epoch` is the set's
+  // hand-out count read in the same walk, under _ws_mu: the park is
+  // abandoned if the set was handed out since
+  // (WeightSet::park_unless_borrowed_since).
+  std::size_t park_if_unborrowed_(const std::shared_ptr<WeightSet>& ws,
+                                  long borrowers, std::uint64_t epoch);
+  // The form without a hand-out count PARKS NOTHING. It is kept only
+  // because ABI 8's snapshot lists it as an exported symbol; without the
+  // count noted where the park was decided, it cannot tell that a
+  // borrower arrived after that.
   std::size_t park_if_unborrowed_(const std::shared_ptr<WeightSet>& ws,
                                   long borrowers);
 
@@ -1136,6 +1165,8 @@ private:
   std::vector<Warm>        _warm;
   std::thread              _warm_reaper;
   bool                     _warm_stop = false;
+  // See set_before_park_for_test(). Guarded by _ws_mu.
+  std::function<void()>    _before_park_for_test;
 };
 
 }

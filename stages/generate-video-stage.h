@@ -5,6 +5,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/generation-input.h"
+#include "stages/lora-slots.h"
 
 // The video denoisers (MetalWanTransformer, MetalMiniMaxH3Transformer) are
 // from-scratch metal-compute modules on the VPIPE_BUILD_APPLE_SILICON axis.
@@ -25,6 +26,7 @@
 #include "stages/model-registry.h"
 #endif
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -399,10 +401,11 @@ private:
   // has delivered its constants.
   FlexData _model_cfg_launch;
   // The runtime LoRA SLOTS for the MiniMax-H3 DiT, off the model_config
-  // beat, in the order the DiT binds them. Two, so a few-step Turbo
-  // distillation and a style or identity adapter can ride together --
-  // see kMaxLoraSlots in the transformer. The PATH is load-time; the
-  // STRENGTH is not, and each slot's moves on its own.
+  // beat, in the order the DiT binds them. Eight (`lora` .. `lora8`,
+  // stages/lora-slots.h), so a few-step Turbo distillation and style or
+  // identity adapters can ride together -- see kMaxLoraSlots in the
+  // transformer. The PATH is load-time; the STRENGTH is not, and each
+  // slot's moves on its own.
   struct H3LoraSlot {
     std::string path;
     double      scale = 1.0;
@@ -412,6 +415,11 @@ private:
     std::string qkv;
   };
   std::vector<H3LoraSlot> _h3_lora;
+  // Config slot -> the DiT's adapter slot, as the load PACKED them (-1:
+  // not loaded). The load drops an empty or unresolvable slot rather than
+  // leaving a hole, so `lora2` named alone is the DiT's slot 0 -- and a
+  // live strength has to go through this, or it lands on an empty slot.
+  std::array<int, lora_slots::kSlots> _h3_lora_model_slot;
   // The DiT slot holding a TaoMate-H3 adapter (recognised from its
   // tensors at load), or -1. With `taomate` auto/on in the model config
   // the clip is made by that method rather than the ordinary denoise.

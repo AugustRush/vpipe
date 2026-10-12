@@ -2713,6 +2713,18 @@ MetalQwenImage21Transformer::bind_loras_(const std::vector<LoraSpec>& loras)
   if (!_lora.init(_mc, _use_mma2) || !_lora.valid()) { return false; }
   const int H = _cfg.hidden, FF = _cfg.hidden * _cfg.mlp_ratio;
   int slot = 0;
+  // An adapter that is not applied still takes its slot, EMPTY, so every
+  // later one keeps the index the caller gave it: a live strength is
+  // addressed by that index, and closing the gap would send it to the
+  // next adapter.
+  auto hole = [&] {
+    _lora_blk[slot].clear();
+    _lora_fix[slot] = FixedLora{};
+    _lora_bound[slot] = 0;
+    _lora_scale[slot] = 0.0f;
+    _lora_rank_prefix[slot] = _lora_rank_total;
+    ++slot;
+  };
   for (const LoraSpec& spec : loras) {
     if (slot >= kMaxLoraSlots || spec.path.empty()) { break; }
     std::string err;
@@ -2725,6 +2737,7 @@ MetalQwenImage21Transformer::bind_loras_(const std::vector<LoraSpec>& loras)
     };
     if (ad == nullptr) {
       warn("did not open: " + (err.empty() ? std::string("unreadable") : err));
+      hole();
       continue;
     }
     {
@@ -2747,6 +2760,7 @@ MetalQwenImage21Transformer::bind_loras_(const std::vector<LoraSpec>& loras)
              "(norms, an output head) beside its factors -- a \"prefused\" "
              "distillation checkpoint, which would run as neither model. "
              "NOT applied");
+        hole();
         continue;
       }
     }

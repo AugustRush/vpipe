@@ -178,6 +178,29 @@ public:
   // Status{1} when none was. Non-virtual, as wait_pipeline.
   Status drop_chat_context(std::string_view key);
 
+  // MODELS LET GO: every model checkpoint nothing holds at this moment --
+  // its weights, the copies a model made of them -- given back now,
+  // rather than kept for a later run, which then reads it from disk
+  // again. For a host that would rather have the memory than a faster
+  // next start.
+  //
+  // What decides it is what is HELD now, not which pipelines exist:
+  //   - A LOADED pipeline holds what its stages hold, launched or not.
+  //     One that finished but was not unloaded still has its models, so
+  //     unload it first.
+  //   - A RUNNING pipeline whose stage has let a model go for now (a
+  //     stage with `unload_when_idle`, between beats; a video model
+  //     released between clips on a small machine) loses it, and its
+  //     stage reads it from disk when it takes it back.
+  //   - The model text-chat keeps warm (keep_loaded) holds its own, and
+  //     stays, with its conversations.
+  // Without this, an UNLOADED pipeline's checkpoints are kept, PARKED --
+  // purgeable, so the kernel may take them -- until another load needs
+  // the room. Returns the bytes given back (0 without a model manager);
+  // a parked checkpoint counts in full, even where the kernel had
+  // already taken some of its pages. Non-virtual, as wait_pipeline.
+  std::size_t release_idle_models();
+
   // Runtime overrides on top of the boot-time `log.*` config block.
   // All four are rejected with Status{3} while any pipeline owned
   // by this session is currently launched -- log-delegate swaps

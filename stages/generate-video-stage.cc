@@ -62,14 +62,18 @@ double video_phys_margin_()
   return v;
 }
 
-// How many MiniMax-H3 runtime-LoRA slots this stage carries beats for.
-// Must not exceed MetalMiniMaxH3Transformer::kMaxLoraSlots, which is the
-// authority; it is repeated rather than referenced because this file's
-// slot bookkeeping lives outside the Apple-Silicon guard and the
-// transformer header does not exist on the other side of it. A stage
-// that named more than the DiT has slots would have its extras warned
-// about and dropped there, which is a message rather than a bug.
-constexpr int kH3LoraSlots = 2;
+// How many MiniMax-H3 runtime-LoRA slots this stage carries beats for:
+// the stages' one count (stages/lora-slots.h), which this file's slot
+// bookkeeping can see outside the Apple-Silicon guard. It must equal
+// MetalMiniMaxH3Transformer::kMaxLoraSlots, asserted where that header
+// exists: fewer leaves slots unreachable, more names adapters the DiT
+// warns about and drops.
+constexpr int kH3LoraSlots = lora_slots::kSlots;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+static_assert(kH3LoraSlots ==
+                  genai::MetalMiniMaxH3Transformer::kMaxLoraSlots,
+              "stages/lora-slots.h and the H3 DiT disagree on the slots");
+#endif
 
 // What THIS stage implements: a two-way decision (destroy or keep, else
 // resolve from the box). "park" would land in the `auto` branch and mean
@@ -561,6 +565,7 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
 {
   _hf_dir = attr_str("hf_dir");
   _dit_dir = attr_str("dit_dir");
+  _h3_lora_model_slot.fill(-1);
   _height = (int)attr_int("height");
   _width  = (int)attr_int("width");
   _frames = (int)attr_int("frames");
@@ -1798,30 +1803,29 @@ GenerateVideoStage::apply_model_config_()
     // what took the whole stage down rather than leaving it inert.
     // family_of() and from_flex() above already tolerate it; this has to
     // as well.
-    // Both adapter slots, read the same way. Slot 0 is the plain `lora`
-    // keys and slot 1 the `lora2` ones, so a graph that names one
-    // adapter reads exactly as it always did and a second is additive.
-    // Which is which is the CALLER's order, not a role the model knows:
-    // the usual pairing is a few-step Turbo distillation and a style or
-    // identity adapter, but nothing here depends on that.
-    static const char* const kKeys[kH3LoraSlots][3] = {
-      {"lora",  "lora_scale",  "lora_qkv_layout"},
-      {"lora2", "lora2_scale", "lora2_qkv_layout"},
-    };
+    // Every adapter slot, read the same way. Slot 0 is the plain `lora`
+    // keys and slot i the `lora<i+1>` ones (stages/lora-slots.h), so a
+    // graph that names one adapter reads exactly as it always did and
+    // each further one is additive. Which is which is the CALLER's
+    // order, not a role the model knows: the usual pairing is a few-step
+    // Turbo distillation and style or identity adapters, but nothing
+    // here depends on that.
     _h3_lora.resize(kH3LoraSlots);
     for (int i = 0; i < kH3LoraSlots; ++i) {
       H3LoraSlot want = _h3_lora[(std::size_t)i];   // nothing said: keep
+      const std::string_view kp = lora_slots::kPath[i];
+      const std::string_view ks = lora_slots::kScale[i];
+      const std::string_view kq = lora_slots::kQkvLayout[i];
       if (_model_cfg.is_object()) {
         const auto o = _model_cfg.as_object();
         // An object beat WITHOUT the key turns that slot OFF: the config
         // source emits the keys only when set, so their absence is the
         // graph saying it wants no adapter there.
-        want.path = o.contains(kKeys[i][0])
-            ? std::string(o.at(kKeys[i][0]).as_string("")) : "";
-        want.scale = o.contains(kKeys[i][1])
-            ? o.at(kKeys[i][1]).as_real(1.0) : 1.0;
-        if (o.contains(kKeys[i][2])) {
-          want.qkv = std::string(o.at(kKeys[i][2]).as_string(""));
+        want.path = o.contains(kp)
+            ? std::string(o.at(kp).as_string("")) : "";
+        want.scale = o.contains(ks) ? o.at(ks).as_real(1.0) : 1.0;
+        if (o.contains(kq)) {
+          want.qkv = std::string(o.at(kq).as_string(""));
         }
       }
       H3LoraSlot& have = _h3_lora[(std::size_t)i];
@@ -1840,18 +1844,21 @@ GenerateVideoStage::apply_model_config_()
             "GenerateVideoStage('{}'): the DiT is already built, so the "
             "model_config beat's `{}` is IGNORED -- it is a load-time "
             "argument. `{}` still applies",
-            this->id(), kKeys[i][0], kKeys[i][1]));
+            this->id(), kp, ks));
       } else {
         have.path = want.path;
         have.qkv  = want.qkv;
       }
       if (want.scale != have.scale) {
         have.scale = want.scale;
-        if (_h3_dit != nullptr && _h3_dit->lora_modules(i) > 0) {
-          _h3_dit->set_lora_scale(i, (float)want.scale);
+        // Through the packing the load recorded: config slot i is the
+        // DiT's slot _h3_lora_model_slot[i], or none.
+        const int ms = _h3_lora_model_slot[(std::size_t)i];
+        if (_h3_dit != nullptr && ms >= 0 && _h3_dit->lora_modules(ms) > 0) {
+          _h3_dit->set_lora_scale(ms, (float)want.scale);
           session()->log_debug(fmt(
-              "GenerateVideoStage('{}'): runtime LoRA slot {} strength "
-              "-> {:.3f}", this->id(), i, want.scale));
+              "GenerateVideoStage('{}'): runtime LoRA `{}` (slot {}) "
+              "strength -> {:.3f}", this->id(), kp, ms, want.scale));
         }
       }
     }
@@ -2374,6 +2381,7 @@ GenerateVideoStage::ensure_expert_(int which)
     using QL = genai::MetalMiniMaxH3Transformer::LoraSpec::QkvLayout;
     int taomate_slot = -1;
     _h3_lora.resize(kH3LoraSlots);
+    _h3_lora_model_slot.fill(-1);
     for (int i = 0; i < kH3LoraSlots; ++i) {
       const H3LoraSlot& sl = _h3_lora[(std::size_t)i];
       if (sl.path.empty()) { continue; }
@@ -2398,6 +2406,7 @@ GenerateVideoStage::ensure_expert_(int which)
       if (genai::minimax_h3::taomate::is_adapter(spec.path)) {
         taomate_slot = (int)loras.size();
       }
+      _h3_lora_model_slot[(std::size_t)i] = (int)loras.size();
       loras.push_back(std::move(spec));
     }
     // NOTE for the pinned prefix: stream_pin_count now measures the
@@ -3671,9 +3680,9 @@ GenerateVideoStage::run_h3_taomate_(const void* cond, int text_rows,
   rc.lora_slot = slot;
   rc.kv_disk = kv_disk;
   rc.kv_bits = kv_bits;
-  rc.lora_scale = slot < (int)_h3_lora.size()
-                      ? (float)_h3_lora[(std::size_t)slot].scale
-                      : 1.0f;
+  // `slot` is the DiT's, which is not the config's once the load has
+  // packed the named slots, so the strength comes from the DiT.
+  rc.lora_scale = _h3_dit->lora_scale(slot);
   UiProgress bar = session()->open_progress("denoise");
   rc.progress = [&bar](int done, int total) {
     bar.update((std::uint64_t)done, (std::uint64_t)total);

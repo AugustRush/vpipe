@@ -24,6 +24,7 @@
 #include "stages/minimax-h3-model-config-stage.h"
 #include "stages/model-catalog.h"
 #include "stages/model-config-source.h"
+#include "stages/lora-slots.h"
 #include "stages/model-registry.h"
 #include "stages/qwen-image-edit-model-config-stage.h"
 #include "stages/wan2-model-config-stage.h"
@@ -636,6 +637,68 @@ TEST(model_config, qwen_image_21_emits_adapter_and_schedule_only_when_set)
   }
 }
 
+// The slots past the second travel like the first two: each source
+// emits a slot's keys only when SET, and a slot named alone is an
+// ordinary request rather than a hole to fill. Checked on every source
+// that names them, at the far end of the range (`lora8`) and in the
+// middle (a strength alone for `lora5`).
+TEST(model_config, every_adapter_slot_reaches_the_beat)
+{
+  Session sess;
+  auto cfg = FlexData::make_object();
+  {
+    auto c = cfg.as_object();
+    c.insert_or_assign("lora8", FlexData::make_string("/m/style.safetensors"));
+    c.insert_or_assign("lora8_scale", FlexData::make_real(0.25));
+    c.insert_or_assign("lora5_scale", FlexData::make_real(0.5));
+  }
+  auto check = [&](const char* who, const FlexData& fd) {
+    auto o = fd.as_object();
+    const bool ok =
+        o.contains("lora8") &&
+        std::string(o.at("lora8").as_string("")) == "/m/style.safetensors" &&
+        o.contains("lora8_scale") &&
+        o.at("lora8_scale").as_real(1.0) == 0.25 && !o.contains("lora") &&
+        !o.contains("lora2") && !o.contains("lora7");
+    EXPECT_TRUE(ok);
+    if (!ok) { std::printf("[model_config] %s lost slot 8\n", who); }
+  };
+  {
+    Krea2ModelConfigStage s(&sess, "k", {}, cfg);
+    const FlexData fd = s.resolved_config();
+    check("krea2", fd);
+    EXPECT_TRUE(fd.as_object().contains("lora5_scale"));
+  }
+  {
+    Flux2ModelConfigStage s(&sess, "f", {}, cfg);
+    const FlexData fd = s.resolved_config();
+    check("flux2", fd);
+    EXPECT_TRUE(fd.as_object().contains("lora5_scale"));
+  }
+  {
+    QwenImage21ModelConfigStage s(&sess, "q", {}, cfg);
+    const FlexData fd = s.resolved_config();
+    check("qwen-image-21", fd);
+    EXPECT_TRUE(fd.as_object().contains("lora5_scale"));
+  }
+  {
+    // H3 writes a slot's strength with its adapter and never without it
+    // (the consumer reads an absent adapter as "slot off"), and carries
+    // the slot's own qkv row order when set.
+    auto h3 = cfg;
+    h3.as_object().insert_or_assign("lora8_qkv_layout",
+                                    FlexData::make_string("per_head"));
+    MiniMaxH3ModelConfigStage s(&sess, "h", {}, h3);
+    const FlexData fd = s.resolved_config();
+    check("minimax-h3", fd);
+    auto o = fd.as_object();
+    EXPECT_FALSE(o.contains("lora5_scale"));
+    EXPECT_TRUE(o.contains("lora8_qkv_layout") &&
+                std::string(o.at("lora8_qkv_layout").as_string("")) ==
+                    "per_head");
+  }
+}
+
 // Every LoRA key offers BOTH pickers: a MODEL picker filtered to its
 // own family, and a FILE browser for `.safetensors`.
 //
@@ -656,23 +719,28 @@ TEST(model_config, qwen_image_21_emits_adapter_and_schedule_only_when_set)
 // DiT, which loads and binds nothing.
 TEST(model_config, every_lora_key_offers_a_filtered_model_picker)
 {
-  struct Row { const char* stage; const char* key; const char* want_type; };
-  const Row rows[] = {
-    {"krea2-model-config",      "lora",  "krea2-lora"},
-    {"krea2-model-config",      "lora2", "krea2-lora"},
-    {"flux2-model-config",      "lora",  "flux2-lora"},
-    {"flux2-model-config",      "lora2", "flux2-lora"},
-    {"minimax-h3-model-config", "lora",  "minimax-h3-lora"},
-    {"minimax-h3-model-config", "lora2", "minimax-h3-lora"},
-    {"qwen-image-21-model-config", "lora",  "qwen-image-21-lora"},
-    {"qwen-image-21-model-config", "lora2", "qwen-image-21-lora"},
-    {"generate-image",          "lora",
-     "krea2-lora,flux2-lora,qwen-image-21-lora"},
-    {"generate-image",          "lora2",
-     "krea2-lora,flux2-lora,qwen-image-21-lora"},
-    {"lora-fuse",               "lora",
-     "krea2-lora,flux2-lora,minimax-h3-lora"},
+  struct Row {
+    const char* stage;
+    std::string_view key;
+    const char* want_type;
   };
+  // Every slot of every stage that names them (stages/lora-slots.h).
+  struct Family { const char* stage; const char* want_type; };
+  const Family families[] = {
+    {"krea2-model-config",         "krea2-lora"},
+    {"flux2-model-config",         "flux2-lora"},
+    {"minimax-h3-model-config",    "minimax-h3-lora"},
+    {"qwen-image-21-model-config", "qwen-image-21-lora"},
+    {"generate-image", "krea2-lora,flux2-lora,qwen-image-21-lora"},
+  };
+  std::vector<Row> rows;
+  for (const Family& f : families) {
+    for (int i = 0; i < lora_slots::kSlots; ++i) {
+      rows.push_back({f.stage, lora_slots::kPath[i], f.want_type});
+    }
+  }
+  rows.push_back({"lora-fuse", "lora",
+                  "krea2-lora,flux2-lora,minimax-h3-lora"});
   for (const Row& row : rows) {
     const StageSpec* sp = StageRegistry::get().spec(row.stage);
     EXPECT_TRUE(sp != nullptr);
@@ -684,7 +752,8 @@ TEST(model_config, every_lora_key_offers_a_filtered_model_picker)
     }
     EXPECT_TRUE(lora != nullptr);
     if (lora == nullptr) {
-      std::printf("[model_config] %s has no `%s`\n", r.stage, r.key);
+      std::printf("[model_config] %s has no `%s`\n", r.stage,
+                  std::string(r.key).c_str());
       continue;
     }
     // A model picker...
@@ -697,7 +766,8 @@ TEST(model_config, every_lora_key_offers_a_filtered_model_picker)
     if (lora->suggest_db_type != r.want_type || !lora->is_path ||
         lora->path_filter != "weights") {
       std::printf("[model_config] %s.%s: suggest_db_type '%s' (want '%s'), "
-                  "is_path %d, path_filter '%s'\n", r.stage, r.key,
+                  "is_path %d, path_filter '%s'\n", r.stage,
+                  std::string(r.key).c_str(),
                   std::string(lora->suggest_db_type).c_str(), r.want_type,
                   (int)lora->is_path,
                   std::string(lora->path_filter).c_str());

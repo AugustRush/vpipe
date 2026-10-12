@@ -166,12 +166,12 @@ class MetalKrea2Transformer {
     float       scale = 1.0f;  // 1.0 = as trained; 0 = exactly off
   };
 
-  // How many adapters may ride the DiT at once. Two, because that is
-  // what a real request wants: an identity or few-step adapter beside a
-  // style one. They stay SEPARATE slots rather than one merged set of
-  // factors -- concatenating them on the rank axis is exact arithmetic
-  // and free in the forward, but it folds both strengths into A and so
-  // turns the live knob back into a rebuild. See lora::Stack.
+  // How many adapters may ride the DiT at once: the shared Stack's eight,
+  // e.g. an identity or few-step adapter beside style ones. They stay
+  // SEPARATE slots rather than one merged set of factors -- concatenating
+  // them on the rank axis is exact arithmetic and free in the forward, but
+  // it folds every strength into A and so turns the live knob back into a
+  // rebuild. See lora::Stack.
   static constexpr int kMaxLoraSlots = genai::lora::Stack::kMax;
 
   static std::unique_ptr<MetalKrea2Transformer>

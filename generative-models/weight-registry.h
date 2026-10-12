@@ -196,6 +196,13 @@ public:
 
   // Park every registered owner. The memory-pressure response: each one
   // reactivates on its next use, reloading only if its pages were taken.
+  // NOT FOR AN OWNER A MODEL IS BORROWING, which is every live
+  // WeightSet: it knows nothing of the manager's borrow rule, so it
+  // parks buffers a running model holds and reads without asking. It
+  // also takes this registry's lock before the owner's, the reverse of
+  // a WeightSet's own park (park_unless_borrowed_since), so the two must
+  // not run at once. Nothing in the host calls it; the manager's parks
+  // are the ones to use.
   std::size_t park_all();
 
   struct Stats {

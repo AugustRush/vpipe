@@ -166,6 +166,39 @@ WeightSet::parked() const noexcept
   return _parked.load(std::memory_order_relaxed);
 }
 
+void
+WeightSet::note_borrowed() noexcept
+{
+  _borrow_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t
+WeightSet::borrow_epoch() const noexcept
+{
+  return _borrow_epoch.load(std::memory_order_relaxed);
+}
+
+size_t
+WeightSet::park_unless_borrowed_since(uint64_t epoch)
+{
+  // _mu BEFORE the registry's lock: the order ensure_active_() already
+  // takes into reactivate(), so a park and a reactivation of this set
+  // cannot wait on each other. The registry's walk re-takes _mu, which
+  // is recursive.
+  //
+  // Relaxed loads are enough. A borrower that read a tensor did so under
+  // _mu AFTER its hand-out was counted, so taking _mu here makes that
+  // count visible; one that has not read yet may or may not be seen, and
+  // either way is safe -- abandoned here, or reactivating on its first
+  // read once the park is done.
+  lock_guard<recursive_mutex> lk(_mu);
+  if (_registry == nullptr ||
+      _borrow_epoch.load(std::memory_order_relaxed) != epoch) {
+    return 0;
+  }
+  return _registry->park(this);
+}
+
 uint64_t
 WeightSet::last_use() const noexcept
 {

@@ -24,6 +24,12 @@
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/runtime-lora.h"
+
+// The stage offers exactly the slots a DiT binds: fewer leaves some
+// unreachable, more names adapters the loader warns about and drops.
+static_assert(vpipe::lora_slots::kSlots == vpipe::genai::lora::Stack::kMax,
+              "stages/lora-slots.h and lora::Stack disagree on the slots");
 #endif
 
 #include <type_traits>
@@ -74,6 +80,22 @@ constexpr SpecExtra kReferenceModeChoices[] = {
 constexpr SpecExtra kSeedSequenceExtra[] = {
   {spec_key::kChoices, kSeedSequenceChoices},
 };
+// The catalogued families this stage can adapt, for every LoRA field's
+// picker. A comma list so the picker offers each and refuses the rest --
+// a Krea-2 adapter on a FLUX.2 DiT binds nothing and says so, but not
+// until it has been fetched. (Z-Image has no catalogued adapter to
+// offer.)
+constexpr std::string_view kLoraTypes =
+    "krea2-lora,flux2-lora,qwen-image-21-lora";
+// Slots 3..8 here: the shared doc, plus what is true only on this stage.
+constexpr std::string_view kLoraMoreDoc =
+    "one more runtime LoRA slot, read exactly as `lora2` is: applied "
+    "alongside the others (every adapted projection adds s B (A x) per "
+    "slot), the same accepted forms, LOAD-time, with its own live "
+    "strength in the matching `_scale` key. Up to eight adapters run at "
+    "once; each costs one more pair of skinny GEMMs, and the base weight "
+    "is still read once. The same key on the family's model-config beat "
+    "OVERRIDES this";
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "Krea-2-Turbo / FLUX.2 model dir (text_encoder/, transformer/, "
@@ -329,11 +351,7 @@ const ConfigKey kAttrs[] = {
           "is up is reported and ignored. A `lora` on the family's "
           "model-config beat OVERRIDES this",
    .suggest_db = kModelRegistryDb,
-   // The catalogued families this stage can adapt. A comma list so the
-   // picker offers each and refuses the rest -- a Krea-2 adapter on a
-   // FLUX.2 DiT binds nothing and says so, but not until it has been
-   // fetched. (Z-Image has no catalogued adapter to offer.)
-   .suggest_db_type = "krea2-lora,flux2-lora,qwen-image-21-lora",
+   .suggest_db_type = kLoraTypes,
    // AND a file browser: a LoRA is as often a download sitting in
    // the sandbox (Civitai) as a catalogued model, and the editor
    // offers both pickers when a field carries both hints.
@@ -354,7 +372,7 @@ const ConfigKey kAttrs[] = {
           "same way. A `lora2` on the family's model-config beat "
           "OVERRIDES this",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2-lora,flux2-lora,qwen-image-21-lora",
+   .suggest_db_type = kLoraTypes,
    // AND a file browser: a LoRA is as often a download sitting in
    // the sandbox (Civitai) as a catalogued model, and the editor
    // offers both pickers when a field carries both hints.
@@ -364,6 +382,19 @@ const ConfigKey kAttrs[] = {
           "`lora_scale` -- which is the point of a second slot: one "
           "adapter stays where it was trained while the other is swept. "
           "0 skips its two GEMMs", .def_real = 1.0},
+  // Slots 3..8, which read exactly as `lora2` does.
+  lora_slots::path_key(2, kLoraTypes, kLoraMoreDoc),
+  lora_slots::scale_key(2),
+  lora_slots::path_key(3, kLoraTypes, kLoraMoreDoc),
+  lora_slots::scale_key(3),
+  lora_slots::path_key(4, kLoraTypes, kLoraMoreDoc),
+  lora_slots::scale_key(4),
+  lora_slots::path_key(5, kLoraTypes, kLoraMoreDoc),
+  lora_slots::scale_key(5),
+  lora_slots::path_key(6, kLoraTypes, kLoraMoreDoc),
+  lora_slots::scale_key(6),
+  lora_slots::path_key(7, kLoraTypes, kLoraMoreDoc),
+  lora_slots::scale_key(7),
   {.key = "reference_mode", .type = ConfigType::String, .required = false,
    .doc = "how the reference latents pair with the conditioning beats. "
           "\"auto\" (the default) is the rule every input of this stage "
@@ -707,10 +738,11 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   _sage    = genai::sage::config_from_flex(&_accel);
   _sol     = genai::sol::config_from_flex(&_accel);
   _i8_gemm = genai::accel::flag(&_accel, genai::accel::kI8Gemm);
-  _lora[0].path  = attr_str("lora");
-  _lora[0].scale = attr_real("lora_scale");
-  _lora[1].path  = attr_str("lora2");
-  _lora[1].scale = attr_real("lora2_scale");
+  for (int i = 0; i < kLoraSlots; ++i) {
+    _lora[(std::size_t)i].path  = attr_str(lora_slots::kPath[i]);
+    _lora[(std::size_t)i].scale = attr_real(lora_slots::kScale[i]);
+  }
+  _lora_model_slot.fill(-1);
   _seed_base = (std::uint64_t)attr_int("seed");
   _seed      = _seed_base;
   {
@@ -1752,14 +1784,11 @@ GenerateImageStage::apply_model_config_()
   // silence. The STRENGTH is live: it rides the adapter's GEMM as a
   // constant, so it can be swept without rebuilding anything.
   //
-  // Both SLOTS, read the same way. Slot 0 is the plain `lora` keys and
-  // slot 1 the `lora2` ones, so a graph that names one adapter reads
-  // exactly as it always did and a second is additive. Which slot holds
-  // what is the caller's order, not a role the model knows.
-  static const char* const kKeys[kLoraSlots][2] = {
-    {"lora",  "lora_scale"},
-    {"lora2", "lora2_scale"},
-  };
+  // Every SLOT, read the same way. Slot 0 is the plain `lora` keys and
+  // slot i the `lora<i+1>` ones (stages/lora-slots.h), so a graph that
+  // names one adapter reads exactly as it always did and each further
+  // one is additive. Which slot holds what is the caller's order, not a
+  // role the model knows.
   auto adapter_keys = [&](const char* what, bool loaded, auto&& push_scale) {
     if (!_model_cfg.is_object()) { return; }
     FlexData cfg = _model_cfg;
@@ -1770,16 +1799,17 @@ GenerateImageStage::apply_model_config_()
       // other keys and not these is saying nothing about the adapter,
       // and reading that as "drop it" would make an unrelated
       // re-emission silently un-adapt the run.
-      const std::string lp = o.contains(kKeys[i][0])
-          ? std::string(o.at(kKeys[i][0]).as_string("")) : sl.path;
-      const double ls = o.contains(kKeys[i][1])
-          ? o.at(kKeys[i][1]).as_real(1.0) : sl.scale;
+      const std::string_view kp = lora_slots::kPath[i];
+      const std::string_view ks = lora_slots::kScale[i];
+      const std::string lp = o.contains(kp)
+          ? std::string(o.at(kp).as_string("")) : sl.path;
+      const double ls = o.contains(ks) ? o.at(ks).as_real(1.0) : sl.scale;
       if (loaded && lp != sl.path) {
         session()->warn(fmt(
             "GenerateImageStage('{}'): the {} DiT is already loaded, so the "
             "model_config beat's `{}` is IGNORED -- it is a load-time "
             "argument. `{}` still applies",
-            this->id(), what, kKeys[i][0], kKeys[i][1]));
+            this->id(), what, kp, ks));
       } else {
         sl.path = lp;
       }
@@ -2056,7 +2086,7 @@ GenerateImageStage::ensure_loaded_()
     session()->info(fmt(
         "GenerateImageStage('{}'): loading the '{}' DiT from '{}' (an "
         "out-of-tree family)", this->id(), _family, root));
-    // This stage's own `lora` / `lora2` keys feed the BUILT-IN families'
+    // This stage's own `lora` .. `lora8` keys feed the BUILT-IN families'
     // loaders. A registered family reads its adapters from its own
     // model_config (its config stage), so keys set here would otherwise
     // do nothing at all -- an adapter that silently never applies.
@@ -2066,7 +2096,7 @@ GenerateImageStage::ensure_loaded_()
             "GenerateImageStage('{}'): `{}` is set on generate-image, but "
             "'{}' is an out-of-tree family that takes adapters on its own "
             "model-config stage -- set it there; it is IGNORED here",
-            this->id(), i == 0 ? "lora" : "lora2", _family));
+            this->id(), lora_slots::kPath[i], _family));
       }
     }
     genai::ImageModelCreateArgs args;

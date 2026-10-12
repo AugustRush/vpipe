@@ -51,7 +51,7 @@ arrives in **8–16 steps** instead of 30+.
     - [Get it](#get-it)
     - [Run it](#run-it)
     - [Runtime (recommended)](#runtime-recommended)
-    - [Two at once](#two-at-once)
+    - [Several at once](#several-at-once)
     - [Merging, and why it loses most of this adapter](#merging-and-why-it-loses-most-of-this-adapter)
     - [Which Turbo adapters work](#which-turbo-adapters-work)
     - [Community LoRAs — Civitai, musubi-tuner, ai-toolkit](#community-loras--civitai-musubi-tuner-ai-toolkit)
@@ -1794,10 +1794,10 @@ running DiT. A beat that changes the adapter after the DiT is built is
 reported and ignored rather than silently applied to the next clip; one that
 changes only the strength is applied.
 
-#### Two at once
+#### Several at once
 
-There are **two slots**. `lora2`, `lora2_scale` and `lora2_qkv_layout` are the
-second one, and they work exactly as the first three do:
+There are **eight slots**: `lora`, then `lora2` … `lora8`, each with its own
+`_scale` and `_qkv_layout`, and every one works exactly as the first does:
 
 ```json
 {
@@ -1806,37 +1806,43 @@ second one, and they work exactly as the first three do:
     "lora":  "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema",
     "lora_scale": 1.0,
     "lora2": "my-style-adapter",
-    "lora2_scale": 0.7
+    "lora2_scale": 0.7,
+    "lora3": "my-character-adapter",
+    "lora3_scale": 0.5
   }
 }
 ```
 
-Every adapted projection then computes `W x + s1 B1 (A1 x) + s2 B2 (A2 x)`.
-The pairing this exists for is a **few-step distillation** in the first slot —
-a correction to the whole model, belonging at the strength it was trained at —
-and a **style or identity adapter** in the second, which is the one you
-actually dial. Nothing in the model distinguishes the slots though: either may
-hold either, and `lora2` alone (no `lora`) is a perfectly ordinary request.
+Every adapted projection then computes
+`W x + s1 B1 (A1 x) + s2 B2 (A2 x) + …`, one term per named slot. The pairing
+this exists for is a **few-step distillation** in one slot — a correction to
+the whole model, belonging at the strength it was trained at — beside **style
+or identity adapters** in the others, which are the ones you actually dial.
+Nothing in the model distinguishes the slots though: any may hold any, a slot
+may be left empty, and `lora2` alone (no `lora`) is a perfectly ordinary
+request.
 
-**The strengths are independent, and both stay live.** That is the reason the
-two are separate slots rather than one merged set of factors. Merging is exact
-arithmetic — stack the factors on the rank axis, `A = [s1 A1; s2 A2]` and
-`B = [B1 | B2]`, and one adapter of rank `r1 + r2` computes the same sum for
-free — but it folds both strengths into `A`, which turns the live knob back
-into a rebuild for the adapter most likely to be swept.
+**The strengths are independent, and all stay live.** That is the reason the
+adapters are separate slots rather than one merged set of factors. Merging is
+exact arithmetic — stack the factors on the rank axis, `A = [s1 A1; s2 A2; …]`
+and `B = [B1 | B2 | …]`, and one adapter of rank `r1 + r2 + …` computes the
+same sum for free — but it folds every strength into `A`, which turns the live
+knob back into a rebuild for the adapters most likely to be swept.
 
-What a second adapter costs is **its own pair of skinny GEMMs**, about 1.5% of
-a projection at rank 64. The base weight is still read once, which is where the
-time actually goes. One caveat if you compare runs: the second adapter's
-delta accumulates onto the output in a separate bf16 pass, so *the same*
-adapter split across both slots at half strength is not bit-identical to one
-slot at full — **measured at 5.7e-3 of the output, flat across strengths**,
-which is one and a half bf16 ULPs and not a scale-dependent error. Two
-*different* adapters pay the same and have nothing to be compared against.
+What each further adapter costs is **its own pair of skinny GEMMs**, about
+1.5% of a projection at rank 64, and its own rows of a small `[rows, rank]`
+scratch. The base weight is still read once, which is where the time actually
+goes. One caveat if you compare runs: each adapter's delta accumulates onto the
+output in its own bf16 pass, so *the same* adapter split across two slots at
+half strength is not bit-identical to one slot at full — **measured at 5.7e-3
+of the output, flat across strengths**, which is one and a half bf16 ULPs and
+not a scale-dependent error. Eight *different* adapters named in the reverse
+order land **7.2e-3** from the original order (measured through four blocks),
+which is the same rounding and not a different sum.
 
-`lora2` is load-time exactly as `lora` is, and `lora2_qkv_layout` is per slot
-because the fused-`qkv` row order is a property of the *file*: two adapters
-from different publishers need different answers.
+`lora2` … `lora8` are load-time exactly as `lora` is, and each slot's
+`_qkv_layout` is its own because the fused-`qkv` row order is a property of the
+*file*: two adapters from different publishers need different answers.
 
 #### Merging, and why it loses most of this adapter
 
@@ -1937,8 +1943,8 @@ separately and are fused here, into whichever grouping the loaded DiT has.
 #### Community LoRAs — Civitai, musubi-tuner, ai-toolkit
 
 A style, motion or character LoRA trained by the community loads exactly as
-the Turbo adapters do: name the `.safetensors` in `lora` (or `lora2`) and set
-its strength with `lora_scale`. In the web UI the field has two buttons — the
+the Turbo adapters do: name the `.safetensors` in `lora` (or any free slot,
+`lora2` … `lora8`) and set its strength with that slot's `_scale`. In the web UI the field has two buttons — the
 model picker for catalogued adapters, and a file browser for a `.safetensors`
 you downloaded into the sandbox. **No conversion is needed.** The reader takes
 each spelling H3's trainers are known to write:
@@ -1983,7 +1989,7 @@ The fused `qkv_proj` carries a row order that the names do not show. As with
 the Turbo adapters, vpipe reads a fused `qkv_proj` adapter as Comfy-Org's
 flat grouping and re-orders it for the per-head MiniMaxAI release. If an
 adapter was trained on MiniMaxAI's own weights, set
-`lora_qkv_layout: per_head` (`lora2_qkv_layout` for the second slot).
+`lora_qkv_layout: per_head` (`lora2_qkv_layout` … for the other slots).
 
 ### FP8 checkpoints — lightx2v's turbo DiT
 
@@ -2109,8 +2115,8 @@ validated at the trained values.
 Keep `lora_scale` at **1.0**. At **0** the model is exactly the base model
 again — both halves of the adapter switch off together, so a graph can A/B the
 two from one loaded model — but values in between are a state the adapter was
-never trained in. HyperFlow takes one adapter slot, so a style or identity
-adapter can still ride in `lora2`. Two flow-map adapters at once are refused.
+never trained in. HyperFlow takes one adapter slot, so style or identity
+adapters can still ride in the other seven. Two flow-map adapters at once are refused.
 Pairing it with a **Turbo** adapter is not refused, and is not useful: both are
 distillations of the same model and they would stack.
 

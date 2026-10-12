@@ -2368,6 +2368,15 @@ MetalZImageTransformer::bind_loras_(const std::vector<LoraSpec>& loras)
             "MetalZImageTransformer: lora '{}' did not open: {}",
             spec.path, err.empty() ? "unreadable" : err));
       }
+      // The slot is still taken, EMPTY, so every later adapter keeps the
+      // index the caller gave it: a live strength is addressed by that
+      // index, and closing the gap would send it to the next adapter.
+      _lora_mod[slot].clear();
+      _lora_ctx[slot].clear();
+      _lora_bound[slot] = 0;
+      _lora_scale[slot] = 0.0f;
+      _lora_rank_prefix[slot] = _lora_rank_total;
+      ++slot;
       continue;
     }
     // resize, not assign: Factors holds SharedBuffers and is move-only.

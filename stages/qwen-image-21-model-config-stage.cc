@@ -1,5 +1,6 @@
 #include "stages/qwen-image-21-model-config-stage.h"
 #include "stages/latent-preview.h"
+#include "stages/lora-slots.h"
 #include "stages/model-registry.h"
 
 #include "common/flex-data.h"
@@ -73,6 +74,13 @@ const ConfigKey kAttrs[] = {
   {.key = "lora2_scale", .type = ConfigType::Real, .required = false,
    .doc = "`lora2`'s strength, per FORWARD and independent of `lora_scale`. "
           "0 skips its two GEMMs", .def_real = 1.0},
+  // Slots 3..8, which read exactly as `lora2` does.
+  lora_slots::path_key(2, "qwen-image-21-lora"), lora_slots::scale_key(2),
+  lora_slots::path_key(3, "qwen-image-21-lora"), lora_slots::scale_key(3),
+  lora_slots::path_key(4, "qwen-image-21-lora"), lora_slots::scale_key(4),
+  lora_slots::path_key(5, "qwen-image-21-lora"), lora_slots::scale_key(5),
+  lora_slots::path_key(6, "qwen-image-21-lora"), lora_slots::scale_key(6),
+  lora_slots::path_key(7, "qwen-image-21-lora"), lora_slots::scale_key(7),
   {.key = "sigmas", .type = ConfigType::Array, .required = false,
    .doc = "the schedule's RAW sigma nodes, highest noise first -- the "
           "diffusers pipeline's `sigmas=` argument -- in place of the "
@@ -112,8 +120,8 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "qwen-image-2.1 parameters as one FlexData object "
-          "{model_family: qwen-image-21, +use_kv_cache, +vl_*, +lora, "
-          "+lora2 and their scales, +sigmas, +shift_terminal, "
+          "{model_family: qwen-image-21, +use_kv_cache, +vl_*, +lora .. "
+          "+lora8 and their scales, +sigmas, +shift_terminal, "
           "+preview_vae and its knobs}, for a generate-image or "
           "diffusion-conditioner model_config iport",
    .type = &typeid(FlexDataPayload),
@@ -183,8 +191,13 @@ QwenImage21ModelConfigStage::resolved_config() const
     // SET, so an unset key reads downstream as "no opinion" and not as a
     // choice of the default.
     auto o = fd.as_object();
-    for (const char* k : {"lora", "lora_scale", "lora2", "lora2_scale",
-                          "sigmas", "shift_terminal"}) {
+    for (int i = 0; i < lora_slots::kSlots; ++i) {
+      for (std::string_view k :
+           {lora_slots::kPath[i], lora_slots::kScale[i]}) {
+        if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
+      }
+    }
+    for (const char* k : {"sigmas", "shift_terminal"}) {
       if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
     }
   }

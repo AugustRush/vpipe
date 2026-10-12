@@ -1,5 +1,6 @@
 #include "stages/flux2-model-config-stage.h"
 #include "stages/latent-preview.h"
+#include "stages/lora-slots.h"
 #include "stages/model-registry.h"
 
 #include "common/flex-data.h"
@@ -70,6 +71,13 @@ const ConfigKey kAttrs[] = {
           "`lora_scale` -- which is the point of a second slot: one "
           "adapter stays where it was trained while the other is swept. "
           "0 skips its two GEMMs", .def_real = 1.0},
+  // Slots 3..8, which read exactly as `lora2` does.
+  lora_slots::path_key(2, "flux2-lora"), lora_slots::scale_key(2),
+  lora_slots::path_key(3, "flux2-lora"), lora_slots::scale_key(3),
+  lora_slots::path_key(4, "flux2-lora"), lora_slots::scale_key(4),
+  lora_slots::path_key(5, "flux2-lora"), lora_slots::scale_key(5),
+  lora_slots::path_key(6, "flux2-lora"), lora_slots::scale_key(6),
+  lora_slots::path_key(7, "flux2-lora"), lora_slots::scale_key(7),
   // The live-preview keys every family's config source shares; see
   // stages/latent-preview.h. FLUX.2's TAE is madebyollin's
   // `taef2`, which reads the DiT's latent unpatchified and NOT
@@ -94,8 +102,8 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "FLUX.2 parameters as one FlexData object {model_family: flux2, "
-          "klein_kv, +lora, +lora2 and their scales, +preview_vae and its "
-          "knobs}, for a generate-image model_config iport",
+          "klein_kv, +lora .. +lora8 and their scales, +preview_vae and "
+          "its knobs}, for a generate-image model_config iport",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -154,9 +162,11 @@ Flux2ModelConfigStage::resolved_config() const
   {
     auto in = config().as_object();
     auto o  = fd.as_object();
-    for (const char* k : {"lora", "lora_scale",
-                          "lora2", "lora2_scale"}) {
-      if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
+    for (int i = 0; i < lora_slots::kSlots; ++i) {
+      for (std::string_view k :
+           {lora_slots::kPath[i], lora_slots::kScale[i]}) {
+        if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
+      }
     }
   }
   // Emitted only when a preview VAE is named, like the adapter keys.

@@ -156,11 +156,11 @@ class MetalZImageTransformer {
     std::string path;          // one .safetensors of lora_A/B pairs
     float       scale = 1.0f;  // 1.0 = as trained; 0 = exactly off
   };
-  // Two adapters at once, which is what a real request wants: a
-  // distillation or identity adapter beside a style one. Separate
-  // slots rather than one merged set of factors -- concatenating on
-  // the rank axis is exact and free in the forward, but it folds both
-  // strengths into A and turns the live knob back into a rebuild.
+  // Up to eight adapters at once: a distillation or identity adapter
+  // beside style ones, say. Separate slots rather than one merged set
+  // of factors -- concatenating on the rank axis is exact and free in
+  // the forward, but it folds every strength into A and turns the live
+  // knob back into a rebuild.
   static constexpr int kMaxLoraSlots = genai::lora::Stack::kMax;
 
   static std::unique_ptr<MetalZImageTransformer>
@@ -452,9 +452,9 @@ class MetalZImageTransformer {
   lora::Applier _lora;
   std::vector<BlockLora> _lora_mod[kMaxLoraSlots];
   std::vector<BlockLora> _lora_ctx[kMaxLoraSlots];
-  float _lora_scale[kMaxLoraSlots] = {0.0f, 0.0f};
-  int _lora_bound[kMaxLoraSlots] = {0, 0};
-  int _lora_rank_prefix[kMaxLoraSlots] = {0, 0};
+  float _lora_scale[kMaxLoraSlots] = {};
+  int _lora_bound[kMaxLoraSlots] = {};
+  int _lora_rank_prefix[kMaxLoraSlots] = {};
   int _lora_rank_total = 0;
   int _lora_slots = 0;
   // Rows the [rows, rank] intermediate is sized for THIS forward, so

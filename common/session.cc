@@ -1019,7 +1019,13 @@ Session::unload_pipeline(PipelineHandle h)
       _pipelines.erase(it);
     }
   }
-  // 'removed' destructed here, after the map lock is released.
+  // Destroyed after the map lock is released -- its stages let go of the
+  // checkpoints they borrowed -- and THEN those are settled: parked, so
+  // the finished graph's weights are reclaimable rather than resident.
+  removed.reset();
+  if (auto* mgr = generative_model_manager()) {
+    (void)mgr->settle_unborrowed();
+  }
   return Status{0};
 }
 
@@ -1163,6 +1169,24 @@ SessionIntf::drop_chat_context(std::string_view key)
   auto* mgr = s->generative_model_manager();
   return mgr != nullptr && mgr->drop_context(std::string(key)) ? Status{0}
                                                                : Status{1};
+}
+
+// SessionIntf's idle models let go (the model manager's unborrowed
+// checkpoints dropped).
+std::size_t
+SessionIntf::release_idle_models()
+{
+  auto* s = dynamic_cast<Session*>(this);
+  auto* mgr = s != nullptr ? s->generative_model_manager() : nullptr;
+  if (mgr == nullptr) {
+    return 0;
+  }
+  const std::size_t freed = mgr->drop_unborrowed();
+  if (freed > 0) {
+    s->info(fmt("release_idle_models: {} MB of idle model checkpoints "
+                "given back", freed >> 20));
+  }
+  return freed;
 }
 
 Status

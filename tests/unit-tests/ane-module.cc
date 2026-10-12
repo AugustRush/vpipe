@@ -3393,6 +3393,25 @@ TEST(ane_tier, gelu_ffn_matches_the_feed_forward_it_wraps)
   EXPECT_TRUE(acc::text(&inf, ane::kInfoError).find("up.weight") !=
               std::string::npos);
 
+  // ane::kMaxAdapters slots a projection: the LAST one's names are known
+  // -- refused here only for the missing .rank, which is checked after
+  // every name -- and one past it is refused by name.
+  EXPECT_TRUE(ane::kMaxAdapters == 8);
+  const std::string l7a = ane::key(ane::kProjUp, "lora7.a");
+  const std::string l7b = ane::key(ane::kProjUp, "lora7.b");
+  const std::string l8a = ane::key(ane::kProjUp, "lora8.a");
+  const ane::Binding last[] = {{l7a, &wu}, {l7b, &wu}};
+  EXPECT_FALSE(tier->stage(0, params, last));
+  const vpipe::FlexData inf7 = tier->info();
+  const std::string e7 = acc::text(&inf7, ane::kInfoError);
+  EXPECT_TRUE(e7.find("unknown binding") == std::string::npos &&
+              e7.find("up.lora7") != std::string::npos);
+  const ane::Binding past[] = {{l8a, &wu}};
+  EXPECT_FALSE(tier->stage(0, params, past));
+  const vpipe::FlexData inf8 = tier->info();
+  EXPECT_TRUE(acc::text(&inf8, ane::kInfoError).find("up.lora8.a") !=
+              std::string::npos);
+
   const std::string nuw = ane::key(ane::kProjUp, "w");
   const std::string nub = ane::key(ane::kProjUp, "bias");
   const std::string ndw = ane::key(ane::kProjDown, "w");
