@@ -246,14 +246,11 @@ struct QuantizedBlockLoader {
       return;
     }
 
-    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
-      for (int i = 0; i < n_reads * pack_factor; i++) {
-        dst[i] = T(0);
-      }
-      return;
-    }
-
-    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+    // bi is a tile ROW in either orientation and src_tile_dim.y is the rows
+    // present, so one test serves both (MLX #3912). The reduction_dim == 1
+    // arm compared bi against .x -- the BK columns, which bi never reaches
+    // -- so a ragged last N tile still read every row past num_outs.
+    if (bi >= src_tile_dim.y) {
       for (int i = 0; i < n_reads * pack_factor; i++) {
         dst[i] = T(0);
       }
@@ -314,7 +311,10 @@ struct QuantizedBlockLoader {
 // same way dense_gemm.metal has always done it (it instantiates aligned_N=false
 // everywhere) and the same way the store already did. The predicate is
 // evaluated once per threadgroup to select a loop, NOT inside the K loop, so an
-// aligned N pays a single comparison -- measured no regression.
+// aligned N pays a single comparison -- measured no regression. That alone
+// did not stop the over-read: load_safe() then tested the row against the
+// tile's column count and zeroed nothing, so every row was still read until
+// its check was corrected too (see QuantizedBlockLoader::load_safe).
 template <
     typename T,
     const int group_size,

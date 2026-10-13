@@ -986,3 +986,68 @@ TEST(metal_lm_smoke, a_warm_model_stays_beside_a_launch_that_fits) {
   std::error_code ec;
   fs::remove_all(other, ec);
 }
+
+// A long prefill onto a BRANCHED context answers as the same tokens fed to
+// an unbranched one. branch() freezes the parent's partial tail page, so
+// the child's next page starts mid-sequence; the steel prefill attention
+// (chunks from 2048 rows) took a key's page to be position / page_tokens
+// and read the wrong keys -- 1 of 12 greedy tokens matched. A 1500-token
+// chunk (the flash member, which always walked the table) is the control.
+// Gated on VPIPE_QWEN35_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, a_long_prefill_onto_a_branch_matches_unbranched) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  if (mgr == nullptr) { return; }
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "f16";
+  spec.page_tokens = 512;
+  spec.max_pages = 64;
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  std::string text;
+  for (int i = 0; i < 400; ++i) {
+    text += "Entry " + std::to_string(i) + ": the courier left station " +
+            std::to_string((i * 37) % 101) + " carrying parcel " +
+            std::to_string((i * 53) % 997) + ". ";
+  }
+  const auto all = lm->tokenizer().encode(text);
+  ASSERT_TRUE(all.size() > 2400);
+  if (all.size() <= 2400) { return; }
+  // 100 tokens leave the parent's only page partial when it branches.
+  const std::span<const std::int32_t> head(all.data(), 100);
+  auto greedy = [&](genai::LoadedLanguageModel::Context& c,
+                    std::span<const std::int32_t> tail) {
+    std::vector<std::int32_t> out;
+    std::int32_t t = lm->prefill(c, tail);
+    for (int i = 0; i < 12 && t >= 0; ++i) {
+      out.push_back(t);
+      t = lm->next_token(c);
+    }
+    return out;
+  };
+  for (const int n : {1500, 2200}) {
+    const std::span<const std::int32_t> tail(all.data() + 100, (size_t)n);
+    auto plain = lm->make_context();
+    ASSERT_TRUE(lm->prefill(plain, head) >= 0);
+    const auto want = greedy(plain, tail);
+    auto parent = lm->make_context();
+    ASSERT_TRUE(lm->prefill(parent, head) >= 0);
+    auto child = lm->branch(parent);
+    ASSERT_TRUE(child.valid());
+    const auto got = greedy(child, tail);
+    int same = 0;
+    for (size_t i = 0; i < want.size() && i < got.size(); ++i) {
+      same += want[i] == got[i] ? 1 : 0;
+    }
+    std::printf("[branch prefill] %d-token chunk onto a branch: %d of %zu "
+                "greedy tokens as unbranched\n", n, same, want.size());
+    EXPECT_TRUE(want.size() == 12 && got == want);
+  }
+  ::unsetenv("VPIPE_LLM_BACKEND");
+}

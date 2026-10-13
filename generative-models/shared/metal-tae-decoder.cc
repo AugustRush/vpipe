@@ -4,6 +4,7 @@
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/shared/mma-tile.h"
 #include "generative-models/weight-set.h"
 
 #include <algorithm>
@@ -807,12 +808,11 @@ MetalTaeDecoder::hw_ok_(const Conv& c, int H, int W, int up, bool cat,
   if (!_use_hwconv || c.whwio.empty() || up != 1 || cat) { return false; }
   if ((c.cout % 64) != 0) { return false; }
   if (whole_tiles && ((H % 8) != 0 || (W % 8) != 0)) { return false; }
-  // The op indexes source and destination through int32 tensor extents.
-  // Fall back before either would overflow, so a very large preview
-  // degrades to the gather conv instead of reading somewhere else.
-  constexpr std::size_t kIdxMax = 0x7fffffffull;
-  if ((std::size_t)c.cin * W * H > kIdxMax ||
-      (std::size_t)c.cout * W * H > kIdxMax) {
+  // The op addresses its source and destination in int32 BYTES. Fall back
+  // before either crosses 2^31, so a very large preview degrades to the
+  // gather conv instead of leaving rows unwritten (f16/bf16: 2 bytes).
+  if (!tensor_op_operand_fits((std::size_t)c.cin * W * H, 2) ||
+      !tensor_op_operand_fits((std::size_t)c.cout * W * H, 2)) {
     return false;
   }
   return true;

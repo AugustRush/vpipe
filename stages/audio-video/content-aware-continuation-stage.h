@@ -23,8 +23,8 @@ namespace vpipe {
 // step at every seam. This stage measures the step on the frames either
 // side of the seam and takes it out of the whole continuation.
 //
-//   iport0  the continuation's frames, planar RGB [3,H,W] u8 or f32
-//           (what vae-decode emits), in order.
+//   iport0  the continuation's frames, planar RGB [3,H,W] u8, f16 or
+//           f32 (what vae-decode emits), in order.
 //   iport1  the reference: the clip being continued, stacked
 //           [T,3,H,W] (what temporal-stack emits for a guide) or one
 //           [3,H,W] frame. Only its LAST `window` frames are used.
@@ -43,6 +43,10 @@ namespace vpipe {
 //   tone      one monotone curve per channel, fitted to the aligned
 //             pixel pairs. A curve rather than a gain and offset, because
 //             the step is not uniform: it is largest in the shadows.
+//
+// On a MOVING shot the geometry measured is mostly the camera's motion
+// over the window, not drift: `apply_geometry: false` keeps it to pair
+// the pixels the tone is fitted on and leaves the frames where they are.
 //
 // Each is REFUSED rather than applied when it does not look like a
 // seam: too few matching blocks, a scale beyond `max_scale`, or a curve
@@ -109,6 +113,7 @@ private:
 
   bool   _tone      = true;
   bool   _geometry  = true;
+  bool   _apply_geo = true;   // false: measured to pair, not applied
   int    _window    = 4;
   double _max_scale = 0.05;
   double _max_tone  = 32.0;

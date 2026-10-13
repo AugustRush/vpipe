@@ -1151,10 +1151,11 @@ MetalWanVae::conv3x3_hw_(Ctx& cx, const Conv& c,
   if (tile == 0 && c.cout > kSmallCoutMax) { return false; }
   const std::size_t hw = (std::size_t)H * W;
   if (tile != 0) {
-    // The op tiles its destination 8x8 and indexes through int32 extents.
-    constexpr std::size_t kIdxMax = 0x7fffffffull;
-    if ((W % 8) != 0 || (H % 8) != 0 || (std::size_t)c.cin * hw > kIdxMax ||
-        (std::size_t)c.cout * hw > kIdxMax) {
+    // The op tiles its destination 8x8 and addresses its source and
+    // destination in int32 BYTES (f16/bf16: 2 a value).
+    if ((W % 8) != 0 || (H % 8) != 0 ||
+        !tensor_op_operand_fits((std::size_t)c.cin * hw, 2) ||
+        !tensor_op_operand_fits((std::size_t)c.cout * hw, 2)) {
       return false;
     }
   }

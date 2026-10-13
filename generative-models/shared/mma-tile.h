@@ -15,6 +15,7 @@
 // output columns a threadgroup owns. So this is a pure rate knob: changing
 // it owes a benchmark, not a token-exactness run.
 
+#include <cstddef>
 #include <cstdlib>
 
 // TOOLKIT: compiled into each plugin (libvpipe_toolkit.a), not exported
@@ -102,6 +103,20 @@ inline int mma_row_band(int N, int K)
   if (band < 128) { band = 128; }
   if (band > (1 << 30)) { band = 1 << 30; }
   return (int)band;
+}
+
+// The MPP convolution2d op has the same line, in BYTES, on its activation
+// and its destination. MEASURED on the M5 (conv2d_mma.hw_op_past_the_2gb_
+// line): a 3x3 over a 2048x2048x288 f16 plane (2.42 GB) returned every
+// sampled row below 1820 -- where the plane crosses 2^31 bytes -- to
+// 2e-4 of a CPU dot product and every row past it UNWRITTEN, with the
+// stream reporting success; 2048x2112x256 the same from row 2048. That
+// is the bottom 11% of a 2048^2 Qwen-Image-2.1 decode. The VAE callers
+// had guarded ELEMENTS against 2^31, which admits planes up to 4 GB, so
+// an operand of either tensor op is judged by this: its bytes.
+inline bool tensor_op_operand_fits(std::size_t elems, std::size_t elt_bytes)
+{
+  return elems * elt_bytes <= (((std::size_t)1 << 31) - 1);
 }
 
 }  // namespace vpipe::genai

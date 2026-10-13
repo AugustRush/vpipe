@@ -516,7 +516,7 @@ private:
 
   metal_compute::ComputeLibrary _lib_qmv, _lib_qmm, _lib_rms, _lib_elt,
       _lib_rope, _lib_sdpa, _lib_dense, _lib_dequant, _lib_dense_mma,
-      _lib_sdpa_mma;
+      _lib_sdpa_mma, _lib_attn_nax;
   // _fn_qmv / _fn_qmm run at the base quant_bits (attn / lm_head); the
   // _mlp / geglu variants run at mlp_bits (gemma4_unified MLP is 8-bit).
   metal_compute::ComputeFunction _fn_qmv, _fn_qmv_add, _fn_qmv_geglu,
@@ -820,6 +820,9 @@ private:
   // _d_scores = f16 [CAP, CAP] per-head score matrix; _d_vT = f16 [Hkv,D,CAP]
   // V transpose. CAP = min(max_seq, 8192). Allocated only when the flag is on.
   metal_compute::SharedBuffer _d_scores, _d_vT;
+  // The NAX global prefill's contiguous K/V [Hkv, kL, D], gathered from the
+  // paged pool per layer; grown to the longest context seen.
+  metal_compute::SharedBuffer _d_nax_k, _d_nax_v;
   // Pipelined PLE production (Design A): split _d_pli into per-chunk buffers so
   // chunks 1..N-1 overlap the layer chain's bubbles (only chunk 0 gates layer
   // 0). _d_x_ple is a private snapshot of _d_x so the chunk GEMVs don't WAR with
@@ -932,6 +935,13 @@ private:
   // GEMM), replacing the inefficient fused sdpa_paged_flash_d512 for the
   // single-chunk (qpos==0) global prefill only. Capped at T_kv<=_scores_cap.
   bool _materialized_global = false;
+  // M5 GLOBAL (head_dim 512) prefill on MLX's NAX head-dim split attention
+  // (attn_steel_nax_dsplit_h_bd512, four 128-wide D slices): the paged pool
+  // gathered into contiguous K/V (_fn_kv_gather), then one dispatch. Ahead
+  // of both the materialized path and pmma2 for any prefill chunk; per
+  // (align_Q, align_K) pipeline. VPIPE_GEMMA_NO_NAX512=1 reverts (A/B).
+  bool _nax512_attn = false;
+  metal_compute::ComputeFunction _fn_nax512[2][2], _fn_kv_gather;
   // All six grouped-MoE-prefill functions validated (see the loader). Off ->
   // the MoE prefill stays on the pair-batched gathers.
   bool _moe_grouped_ok = false;

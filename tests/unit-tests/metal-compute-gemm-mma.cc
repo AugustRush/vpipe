@@ -5300,3 +5300,109 @@ TEST(conv2d_mma, hw_op_wan_causal_conv3d) {
     run(480, 288, 384, 384, 7, /*check=*/true, 3);
   }
 }
+
+// Where the MPP convolution2d op stops being right: an f16 3x3 over planes
+// either side of 2^31 BYTES of activation and destination, sampled rows on
+// both sides of the row where the plane crosses the line, against a CPU
+// dot product. MEASURED on the M5: every row below it at ~2e-4, every row
+// past it unwritten with the stream reporting success -- which is why the
+// VAE callers judge an operand by tensor_op_operand_fits(), its bytes,
+// where they had judged its elements (these planes are under 2^31 of
+// those). The rows below must stay right and the helper must refuse each
+// plane that crosses. ~5 GB of buffers; VPIPE_HWCONV_2GB=1.
+TEST(conv2d_mma, hw_op_past_the_2gb_line) {
+  if (std::getenv("VPIPE_HWCONV_2GB") == nullptr) { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib = mc->load_library("conv2d_mma");
+  struct Case { int W, H, cin, cout; const char* fn; int tile; };
+  const Case cases[] = {
+      {1024, 1024, 288, 288, "conv2d_hw_3x3_s1_c32_f16", 32},
+      {2048, 2048, 288, 288, "conv2d_hw_3x3_s1_c32_f16", 32},
+      {2048, 2112, 256, 256, "conv2d_hw_3x3_s1_f16", 64},
+  };
+  auto hv = [](std::size_t i, std::uint32_t salt) {
+    std::uint32_t x = (std::uint32_t)(i * 2654435761u) ^ salt;
+    x ^= x >> 15; x *= 2246822519u; x ^= x >> 13;
+    return (float)(x & 0xffff) / 65535.0f - 0.5f;
+  };
+  for (const Case& c : cases) {
+    ComputeFunction fn = lib.function(c.fn);
+    ASSERT_TRUE(fn.valid());
+    if (!fn.valid()) { return; }
+    const std::size_t ni = (std::size_t)c.W * c.H * c.cin;
+    const std::size_t no = (std::size_t)c.W * c.H * c.cout;
+    const std::size_t nw = (std::size_t)9 * c.cin * c.cout;
+    const bool fits = genai::tensor_op_operand_fits(ni, 2) &&
+                      genai::tensor_op_operand_fits(no, 2);
+    SharedBuffer ib = mc->make_shared_buffer(ni * 2);
+    SharedBuffer wb = mc->make_shared_buffer(nw * 2);
+    SharedBuffer ob = mc->make_shared_buffer(no * 2);
+    ASSERT_TRUE(!ib.empty() && !wb.empty() && !ob.empty());
+    if (ib.empty() || wb.empty() || ob.empty()) { return; }
+    auto* in = static_cast<_Float16*>(ib.contents());
+    auto* w = static_cast<_Float16*>(wb.contents());
+    for (std::size_t i = 0; i < ni; ++i) { in[i] = (_Float16)hv(i, 7u); }
+    const float ws = 2.0f / std::sqrt(9.0f * c.cin);
+    for (std::size_t i = 0; i < nw; ++i) {
+      w[i] = (_Float16)(hv(i, 99u) * ws);
+    }
+    std::memset(ob.contents(), 0, no * 2);
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder enc = st.begin_compute();
+      enc.set_function(fn);
+      enc.set_buffer(0, ib); enc.set_buffer(1, wb); enc.set_buffer(2, ob);
+      enc.set_constant(3, c.W); enc.set_constant(4, c.H);
+      enc.set_constant(5, c.cin); enc.set_constant(6, c.cout);
+      enc.dispatch({(unsigned)(c.W / 8) * 128u, (unsigned)(c.H / 8),
+                    (unsigned)(c.cout / c.tile)},
+                   {128, 1, 1});
+    }
+    const bool ok = st.commit().wait_ok();
+    const auto* out = static_cast<const _Float16*>(ob.contents());
+    // The row at which (row * W) * max(cin, cout) * 2 crosses 2^31.
+    const double line =
+        2147483648.0 / (2.0 * c.W * std::max(c.cin, c.cout));
+    std::printf("[hw_2gb] %dx%d cin %d cout %d: %.2f GB in, stream ok %d, "
+                "helper says %s, line at row %.1f\n", c.W, c.H, c.cin,
+                c.cout, ni * 2 / 1e9, ok ? 1 : 0, fits ? "fits" : "refuse",
+                line);
+    EXPECT_TRUE(fits == (line >= c.H));
+    const int rows[] = {0, c.H / 2, (int)line - 40, (int)line - 9,
+                        (int)line + 9, (int)line + 40, c.H - 1};
+    const int cols[] = {0, 517, c.W / 2 + 3, c.W - 1};
+    const int chans[] = {0, 31, c.cout / 2 + 1, c.cout - 1};
+    for (const int y : rows) {
+      if (y < 0 || y >= c.H) { continue; }
+      double num = 0.0, den = 0.0;
+      for (const int x : cols) {
+        for (const int oc : chans) {
+          double ref = 0.0;
+          for (int ky = 0; ky < 3; ++ky) {
+            for (int kx = 0; kx < 3; ++kx) {
+              const int sy = y + ky - 1, sx = x + kx - 1;
+              if (sy < 0 || sy >= c.H || sx < 0 || sx >= c.W) { continue; }
+              const _Float16* ip =
+                  in + ((std::size_t)sy * c.W + sx) * c.cin;
+              const _Float16* wp =
+                  w + (std::size_t)(ky * 3 + kx) * c.cin * c.cout + oc;
+              for (int ic = 0; ic < c.cin; ++ic) {
+                ref += (double)ip[ic] * (double)wp[(std::size_t)ic * c.cout];
+              }
+            }
+          }
+          const double got =
+              (double)out[((std::size_t)y * c.W + x) * c.cout + oc];
+          num += (got - ref) * (got - ref); den += ref * ref;
+        }
+      }
+      const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+      const bool below = y + 8 <= line;     // its whole 8-row tile below
+      std::printf("[hw_2gb]   row %5d (%s): rel-L2 %.3e\n", y,
+                  below ? "below the line" : "past the line ", rel);
+      if (below) { EXPECT_TRUE(ok && rel < 2e-3); }
+    }
+  }
+}

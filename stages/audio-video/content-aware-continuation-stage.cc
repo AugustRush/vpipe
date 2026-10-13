@@ -231,15 +231,18 @@ to_planar_(const TensorBeatPayload& t, int first, int count,
   first = std::max(0, std::min(first, frames - 1));
   count = std::max(1, std::min(count, frames - first));
   const bool u8 = t.dtype == TensorBeat::DType::U8;
-  if (!u8 && t.dtype != TensorBeat::DType::F32) { return false; }
+  const bool f16 = t.dtype == TensorBeat::DType::F16;
+  if (!u8 && !f16 && t.dtype != TensorBeat::DType::F32) { return false; }
   const auto bytes = t.materialize_contiguous();
+  const auto* h16 = reinterpret_cast<const _Float16*>(bytes.data());
+  const auto* f32 = reinterpret_cast<const float*>(bytes.data());
   out->assign(frame, 0.0f);
   for (int f = first; f < first + count; ++f) {
     for (size_t i = 0; i < frame; ++i) {
       const size_t k = (size_t)f * frame + i;
-      (*out)[i] += u8 ? (float)bytes[k]
-                      : reinterpret_cast<const float*>(bytes.data())[k] *
-                            255.0f;
+      (*out)[i] += u8    ? (float)bytes[k]
+                   : f16 ? (float)h16[k] * 255.0f
+                         : f32[k] * 255.0f;
     }
   }
   for (float& v : *out) { v /= (float)count; }
@@ -264,8 +267,8 @@ resize_(const vector<float>& src, int sw, int sh, int dw, int dh,
 
 const PortSpec kIports[] = {
   {.name = "frames",
-   .doc = "the continuation's frames, planar RGB [3,H,W] u8 or f32, in "
-          "order -- what vae-decode emits",
+   .doc = "the continuation's frames, planar RGB [3,H,W] u8, f16 or "
+          "f32 (0..1), in order -- what vae-decode emits",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
   {.name = "reference",
@@ -294,6 +297,15 @@ constexpr ConfigKey kAttrs[] = {
           "block-matched displacement field. Takes out a continuation "
           "that came back a fraction of a percent taller, shorter or "
           "offset",
+   .def_bool = true},
+  {.key = "apply_geometry", .type = ConfigType::Bool, .required = false,
+   .doc = "false: the geometry is still measured -- the tone curve is "
+          "fitted on the pixels it pairs -- but the frames are not moved. "
+          "For a seam on a MOVING shot: the frames either side of it are "
+          "`window` frames apart, and the camera's motion over them reads "
+          "as a shift no continuation drifted by; unaligned, the tone fit "
+          "would pair pixels that do not correspond and flatten the "
+          "contrast",
    .def_bool = true},
   {.key = "window", .type = ConfigType::Int, .required = false,
    .doc = "frames averaged on each side of the seam: the reference's last "
@@ -360,6 +372,7 @@ ContentAwareContinuationStage::ContentAwareContinuationStage(
 {
   _tone      = attr_bool("tone");
   _geometry  = attr_bool("geometry");
+  _apply_geo = attr_bool("apply_geometry");
   _window    = (int)attr_int("window");
   _max_scale = attr_real("max_scale");
   _max_tone  = attr_real("max_tone");
@@ -589,10 +602,11 @@ ContentAwareContinuationStage::process(RuntimeContext& ctx)
     const auto* t = dynamic_cast<const TensorBeatPayload*>(in.get());
     if (t == nullptr || t->shape.size() != 3 || t->shape[0] != 3 ||
         (t->dtype != TensorBeat::DType::U8 &&
+         t->dtype != TensorBeat::DType::F16 &&
          t->dtype != TensorBeat::DType::F32)) {
       session()->warn(fmt(
           "ContentAwareContinuationStage('{}'): expected planar RGB [3,H,W] "
-          "u8/f32 frames; dropping beat", this->id()));
+          "u8/f16/f32 frames; dropping beat", this->id()));
       co_return;
     }
   }
@@ -675,7 +689,10 @@ ContentAwareContinuationStage::process(RuntimeContext& ctx)
           "{} of {} blocks), tone {} (shift at 16/64/128/224: "
           "{:+.1f} {:+.1f} {:+.1f} {:+.1f} codes)", this->id(),
           _pending.size(),
-          _geo.identity() ? "unchanged" : "corrected", _geo.sx, _geo.sy,
+          _geo.identity() ? "unchanged"
+          : _apply_geo    ? "corrected"
+                          : "measured, not applied",
+          _geo.sx, _geo.sy,
           _geo.tx, _geo.ty, _geo.blocks_used, _geo.blocks_total,
           _curve.identity() ? "unchanged" : "corrected",
           _curve.ok ? shift_at(16) : 0.0, _curve.ok ? shift_at(64) : 0.0,
@@ -716,7 +733,7 @@ ContentAwareContinuationStage::correct_(const TensorBeatPayload& t)
   if (_fade > 0) {
     wgt = std::max(0.0, 1.0 - (double)idx / (double)_fade);
   }
-  const bool geo = !_geo.identity() && wgt > 0.0;
+  const bool geo = _apply_geo && !_geo.identity() && wgt > 0.0;
   const bool tone = !_curve.identity() && wgt > 0.0;
   if (!geo && !tone) { return nullptr; }   // forward the beat untouched
 
@@ -754,6 +771,12 @@ ContentAwareContinuationStage::correct_(const TensorBeatPayload& t)
     for (size_t i = 0; i < px.size(); ++i) {
       d[i] = (std::uint8_t)std::lround(std::max(0.0f,
                                                 std::min(255.0f, px[i])));
+    }
+  } else if (t.dtype == TensorBeat::DType::F16) {
+    // Kept to the 0..1 a decoder's F16 frames are clamped to.
+    auto* d = reinterpret_cast<_Float16*>(tb.as_f16());
+    for (size_t i = 0; i < px.size(); ++i) {
+      d[i] = (_Float16)std::max(0.0f, std::min(1.0f, px[i] / 255.0f));
     }
   } else {
     float* d = tb.as_f32();

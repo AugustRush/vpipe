@@ -7048,7 +7048,8 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
           (D == 256 && _fn_steel_paged.valid())
           || (D == 128 && _fn_steel_paged128.valid());
       steel_paged = kSteel && _lib_attn.valid() && steel_d &&
-          page_tokens % 16 == 0 && n >= kSteelMin && kSkipMode != 1;
+          page_tokens % PrefillGqaAttnSet::steel_block(D) == 0 &&
+          n >= kSteelMin && kSkipMode != 1;
     }
     // PRIMARY: the prefill GQA attention SET picks steel/flash/qtile per the
     // chunk's n-regime (steel/flash crossover discovered at load). The legacy
@@ -7197,7 +7198,9 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
           enc.set_constant(11, n_pages);
           enc.set_buffer(12, _pgtab);
           const unsigned nqb = (unsigned)((n + 31) / 32);
-          enc.dispatch({32 * nqb, 4 * (unsigned)Hq, 1}, {32, 4, 1});
+          const unsigned wn =
+              (unsigned)PrefillGqaAttnSet::steel_split(D);
+          enc.dispatch({32 * nqb, 4 * (unsigned)Hq, wn}, {32, 4, wn});
         } else {
         // Query-tiled flash (head_dim 256): stages each K/V block once and
         // reuses it across a 16-query tile -> ~16x less K/V traffic than the

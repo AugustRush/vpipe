@@ -9,6 +9,8 @@
 #include "generative-models/shared/mma-tile.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
+#include "apple-silicon/metal-compute/compute-library.h"
+#include "apple-silicon/metal-compute/kernel-contract.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -625,6 +627,28 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_fn_sdpa_pmma2 = m->_lib_sdpa_mma.function("sdpa_paged_mma2_d512_f16");
     m->_pmma2_attn = m->_fn_sdpa_pmma2.valid()
         && std::getenv("VPIPE_GEMMA_NO_MMA2_ATTN") == nullptr;
+    // MLX's NAX head-dim split at head_dim 512 for the paged GLOBAL prefill
+    // (see _nax512_attn), and the pool gather it reads through. One library
+    // carries both element types, by entry name.
+    namespace mcc = metal_compute::contract;
+    m->_lib_attn_nax = mc->load_library("attn_steel_nax");
+    m->_fn_kv_gather = m->_lib_sdpa.function("kv_gather_paged_f16");
+    const std::string nax = "attn_steel_nax_dsplit_h_bd512" + sfx;
+    bool nax_ok = m->_lib_attn_nax.valid() && m->_fn_kv_gather.valid();
+    for (int aq = 0; aq < 2 && nax_ok; ++aq) {
+      for (int ak = 0; ak < 2 && nax_ok; ++ak) {
+        metal_compute::FunctionConstants fc;
+        fc.set_bool(mcc::kAttnAlignQ, aq != 0)
+            .set_bool(mcc::kAttnAlignK, ak != 0)
+            .set_bool(mcc::kAttnHasMask, false)
+            .set_bool(mcc::kAttnCausal, true)
+            .set_bool(mcc::kAttnSinks, false);
+        m->_fn_nax512[aq][ak] = m->_lib_attn_nax.function(nax, fc);
+        nax_ok = m->_fn_nax512[aq][ak].valid();
+      }
+    }
+    m->_nax512_attn =
+        nax_ok && std::getenv("VPIPE_GEMMA_NO_NAX512") == nullptr;
   }
   // Lazy single-pass prefill: grow a fresh context's sliding ring to fit a
   // one-shot prompt that would otherwise wrap (-> the slow staged sliding
@@ -5307,6 +5331,7 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         const char* path =
             skip_attn ? "skip"
           : !paged_full ? (rows == 1 ? "sdpa_mb" : "non-paged")
+          : (rows > 1 && _nax512_attn && D == 512) ? "nax512"
           : (mat_ok && ly.is_full && D == 512) ? "materialized"
           : (rows > 1 && _pmma2_attn) ? "pmma2"
           : (rows > 1 && _pflash_attn && D == 512) ? "pflash"
@@ -5322,11 +5347,67 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         // intentionally no SDPA dispatch (probe)
       } else if (paged_full) {
         // PAGED full-layer attention over the shared pool + page table. The
-        // bulk (n_q>1) uses the matrix-core paged mma2 (M5) or, on a non-
-        // matrix-core GPU (M4), the simdgroup_matrix paged flash; only the
-        // shared-KV tail (n_q=1) falls to the scalar paged kernel (q3/qt match
-        // the q[Hq,n_q,D] layout all three read).
-        if (mat_ok && ly.is_full && D == 512) {
+        // bulk (n_q>1) uses the NAX head-dim split over gathered K/V (M5) or,
+        // on a non-matrix-core GPU (M4), the materialized path or the
+        // simdgroup_matrix paged flash; only the shared-KV tail (n_q=1) falls
+        // to the scalar paged kernel (q3/qt match the q[Hq,n_q,D] layout all
+        // of them read).
+        if (rows > 1 && _nax512_attn && D == 512) {
+          // The pool, prefix and chunk, into contiguous [Hkv, kL, D] K/V --
+          // the gather walks the page table -- then MLX's four-way head-dim
+          // split attention over them, causal from the chunk's position.
+          const int kL = qpos + rows;
+          const std::size_t need = (std::size_t)Hkv * kL * D * 2;
+          if (_d_nax_k.byte_size() < need || _d_nax_v.byte_size() < need) {
+            _d_nax_k = _mc->make_shared_buffer(need);
+            _d_nax_v = _mc->make_shared_buffer(need);
+          }
+          enc.set_function(_fn_kv_gather);
+          enc.set_buffer(0, *Kuse);
+          enc.set_buffer(1, *Vuse);
+          enc.set_buffer(2, _d_nax_k);
+          enc.set_buffer(3, _d_nax_v);
+          enc.set_constant(4, Hkv);
+          enc.set_constant(5, D);
+          enc.set_constant(6, page_tokens);
+          enc.set_constant(7, kL);
+          enc.set_buffer(8, _d_pgtab);
+          enc.dispatch({(unsigned)page_tokens, (unsigned)Hkv,
+                        (unsigned)n_pages},
+                       {32, 1, 1});
+          constexpr int kBQ = 32, kBK = 32;    // the bd512 instantiation's
+          metal_compute::contract::SteelAttnParams p{};
+          p.B = 1; p.H = Hq; p.D = D; p.qL = rows; p.kL = kL;
+          p.gqa_factor = Hq / Hkv;
+          p.scale = one_scale;
+          p.NQ = (rows + kBQ - 1) / kBQ;
+          p.NK = (kL + kBK - 1) / kBK;
+          p.NQ_aligned = rows / kBQ;
+          p.NK_aligned = kL / kBK;
+          p.qL_rem = rows - p.NQ_aligned * kBQ;
+          p.kL_rem = kL - p.NK_aligned * kBK;
+          p.qL_off = kL - rows;
+          p.Q_strides[0] = (std::int64_t)Hq * rows * D;
+          p.Q_strides[1] = (std::int64_t)rows * D;
+          p.Q_strides[2] = D;
+          p.K_strides[0] = (std::int64_t)Hkv * kL * D;
+          p.K_strides[1] = (std::int64_t)kL * D;
+          p.K_strides[2] = D;
+          for (int i = 0; i < 3; ++i) {
+            p.V_strides[i] = p.K_strides[i];
+            p.O_strides[i] = p.Q_strides[i];
+          }
+          enc.set_function(
+              _fn_nax512[p.qL_rem == 0 ? 1 : 0][p.kL_rem == 0 ? 1 : 0]);
+          enc.set_buffer(0, *qsrc);
+          enc.set_buffer(1, _d_nax_k);
+          enc.set_buffer(2, _d_nax_v);
+          enc.set_buffer(3, at);
+          enc.set_constant(4, p);
+          // threadgroup (32, WM = 2, WN = 4): 256 threads.
+          enc.dispatch({32u * (unsigned)p.NQ, 2u * (unsigned)Hq, 4u},
+                       {32u, 2u, 4u});
+        } else if (mat_ok && ly.is_full && D == 512) {
           // MATERIALIZED global prefill (window=0: pure causal). _full_paged
           // still wrote K/V to the pool above (for later decode); we attend
           // over the chunk-local kt/vt, which ARE the whole prefix at qpos==0.

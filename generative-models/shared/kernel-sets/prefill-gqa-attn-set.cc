@@ -193,6 +193,11 @@ PrefillGqaAttnSet::encode_member(metal_compute::ComputeEncoder& enc,
     return;
   }
   const int D = _dims.D, Hq = _dims.Hq, Hkv = _dims.Hkv;
+  // A key block must not leave its page; pages steel cannot walk take the
+  // flash member instead.
+  if (member == kSteel && a.page_tokens % steel_block(D) != 0) {
+    member = _have[kFlash] ? kFlash : kQtile;
+  }
   enc.set_function(_fn[member]);
   enc.set_buffer(0, *a.qt);
   enc.set_buffer(1, *a.kpool);
@@ -210,9 +215,11 @@ PrefillGqaAttnSet::encode_member(metal_compute::ComputeEncoder& enc,
   const unsigned n = (unsigned)a.n;
   const unsigned Hqu = (unsigned)Hq;
   switch (member) {
-    case kSteel:
-      enc.dispatch({32 * ((n + 31) / 32), 4 * Hqu, 1}, {32, 4, 1});
+    case kSteel: {
+      const unsigned wn = (unsigned)steel_split(D);
+      enc.dispatch({32 * ((n + 31) / 32), 4 * Hqu, wn}, {32, 4, wn});
       break;
+    }
     case kMma:
       enc.dispatch({128, Hqu, (n + 15) / 16}, {128, 1, 1});
       break;

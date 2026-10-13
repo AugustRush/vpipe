@@ -76,7 +76,7 @@ darken_(float v)
 }
 
 std::vector<float>
-continuation_of_(const std::vector<float>& ref)
+continuation_of_(const std::vector<float>& ref, bool darken = true)
 {
   // cont(x) = ref(S^-1 (x - c0 - t) + c0): the inverse of what the stage
   // estimates, so its forward warp recovers `ref`.
@@ -88,7 +88,9 @@ continuation_of_(const std::vector<float>& ref)
   inv.ty = -kTy / kSy;
   std::vector<float> c;
   Cac::warp(ref, kW, kH, inv, &c);
-  for (float& v : c) { v = darken_(v); }
+  if (darken) {
+    for (float& v : c) { v = darken_(v); }
+  }
   return c;
 }
 
@@ -151,6 +153,21 @@ beat_u8_(const std::vector<float>& planar, int frames)
   return b;
 }
 
+// The same frame as a decoder's F16 [3,H,W], on 0..1.
+std::unique_ptr<TensorBeatPayload>
+beat_f16_(const std::vector<float>& planar)
+{
+  auto b = std::make_unique<TensorBeatPayload>();
+  b->dtype = TensorBeat::DType::F16;
+  b->shape = {3, kH, kW};
+  b->resize_contiguous(planar.size());
+  auto* d = reinterpret_cast<_Float16*>(b->as_f16());
+  for (size_t i = 0; i < planar.size(); ++i) {
+    d[i] = (_Float16)(std::max(0.0f, std::min(255.0f, planar[i])) / 255.0f);
+  }
+  return b;
+}
+
 class RefSource : public TypedStage<RefSource> {
 public:
   static constexpr const char* kTypeName = "ut-cac-ref";
@@ -181,11 +198,12 @@ public:
   using TypedStage::TypedStage;
   std::vector<float> frame;
   int n = 10, emitted = 0;
+  bool f16 = false;
   Job
   process(RuntimeContext& ctx) override
   {
     if (emitted >= n) { ctx.signal_done(); co_return; }
-    auto b = beat_u8_(frame, 0);
+    auto b = f16 ? beat_f16_(frame) : beat_u8_(frame, 0);
     // Frame number on the sideband, so ORDER is checkable downstream.
     FlexData sb = FlexData::make_object();
     sb.as_object().insert_or_assign("i", FlexData::make_int(emitted));
@@ -211,19 +229,27 @@ public:
   std::vector<std::vector<float>> frames;
   std::vector<int> order;
   bool shape_ok = true;
+  TensorBeat::DType want = TensorBeat::DType::U8;
   Job
   process(RuntimeContext& ctx) override
   {
     auto in = co_await ctx.read(0);
     if (!in) { ctx.signal_done(); co_return; }
     const auto* t = dynamic_cast<const TensorBeatPayload*>(in.get());
-    if (t == nullptr || t->dtype != TensorBeat::DType::U8 ||
+    if (t == nullptr || t->dtype != want ||
         t->shape.size() != 3 || t->shape[1] != kH || t->shape[2] != kW) {
       shape_ok = false;
       co_return;
     }
     std::vector<float> f(t->element_count());
-    for (size_t i = 0; i < f.size(); ++i) { f[i] = (float)t->as_u8()[i]; }
+    if (want == TensorBeat::DType::F16) {
+      const auto* h = reinterpret_cast<const _Float16*>(t->as_f16());
+      for (size_t i = 0; i < f.size(); ++i) {
+        f[i] = (float)h[i] * 255.0f;
+      }
+    } else {
+      for (size_t i = 0; i < f.size(); ++i) { f[i] = (float)t->as_u8()[i]; }
+    }
     frames.push_back(std::move(f));
     int idx = -1;
     if (t->sideband.is_object()) {
@@ -252,7 +278,7 @@ struct Run {
 
 Run
 run_(const std::vector<float>& ref, const std::vector<float>& cont,
-     int n_frames, FlexData cfg)
+     int n_frames, FlexData cfg, bool f16 = false)
 {
   Session sess;
   auto pl = std::make_unique<Pipeline>("p", &sess);
@@ -261,6 +287,7 @@ run_(const std::vector<float>& ref, const std::vector<float>& cont,
                                             FlexData::make_object());
   fs_u->frame = cont;
   fs_u->n = n_frames;
+  fs_u->f16 = f16;
   fs_u->allocate_oports(1);
   auto* fs = static_cast<FrameSource*>(pl->insert_stage(std::move(fs_u)));
   auto rs_u = std::make_unique<RefSource>(&sess, "ref",
@@ -275,6 +302,7 @@ run_(const std::vector<float>& ref, const std::vector<float>& cont,
   auto sk_u = std::make_unique<FrameSink>(&sess, "sink",
                                           std::vector<InEdge>{{st, 0}},
                                           FlexData::make_object());
+  sk_u->want = f16 ? TensorBeat::DType::F16 : TensorBeat::DType::U8;
   auto* sk = static_cast<FrameSink*>(pl->insert_stage(std::move(sk_u)));
   PipelineRuntime rt(pl.get(), &sess);
   Run r;
@@ -369,6 +397,49 @@ TEST(content_aware_continuation, every_frame_comes_out_corrected_in_order)
   std::printf("[content_aware_continuation] graph: %.2f dB before, worst "
               "frame %.2f dB after\n", before, worst);
   EXPECT_TRUE(worst > before + 8.0);
+}
+
+TEST(content_aware_continuation, f16_frames_come_out_f16_and_corrected)
+{
+  // A decoder's F16 frames, against a u8 guide: corrected without being
+  // rounded to eight bits, and handed on as F16.
+  const std::vector<float> ref = texture_(7);
+  const std::vector<float> cont = continuation_of_(ref);
+  const Run r = run_(ref, cont, 6, FlexData::make_object(), /*f16=*/true);
+  ASSERT_TRUE(r.shape_ok);
+  ASSERT_TRUE(r.frames.size() == 6);
+  if (r.frames.size() != 6) { return; }
+  const double before = psnr_(cont, ref);
+  double worst = 1e9;
+  for (const auto& f : r.frames) { worst = std::min(worst, psnr_(f, ref)); }
+  std::printf("[content_aware_continuation] f16: %.2f dB before, worst "
+              "frame %.2f dB after\n", before, worst);
+  EXPECT_TRUE(worst > before + 8.0);
+}
+
+TEST(content_aware_continuation, a_moving_seam_keeps_its_frames_in_place)
+{
+  // On a moving shot the shift measured across the seam is the camera's:
+  // with apply_geometry off it pairs the pixels the tone is fitted on,
+  // and the frames come out un-darkened but where they were.
+  const std::vector<float> ref = texture_(8);
+  const std::vector<float> moved = continuation_of_(ref, /*darken=*/false);
+  const std::vector<float> cont = continuation_of_(ref);
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("apply_geometry",
+                                   FlexData::make_bool(false));
+  const Run r = run_(ref, cont, 6, std::move(cfg));
+  ASSERT_TRUE(r.frames.size() == 6);
+  if (r.frames.size() != 6) { return; }
+  const double before = psnr_(cont, moved);
+  const double toned = psnr_(r.frames.back(), moved);
+  const double placed = psnr_(r.frames.back(), ref);
+  std::printf("[content_aware_continuation] in place: %.2f dB before, "
+              "%.2f dB after against the moved frame, %.2f against the "
+              "reference\n", before, toned, placed);
+  EXPECT_TRUE(toned > before + 8.0);
+  EXPECT_TRUE(toned > 33.0);
+  EXPECT_TRUE(placed < toned - 5.0);
 }
 
 TEST(content_aware_continuation, turned_off_it_is_a_copy)

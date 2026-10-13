@@ -5,6 +5,11 @@
 
 #include "tests/unit-tests/metal-lm/metal-lm-test-common.h"
 
+#include <filesystem>
+
+#include <fcntl.h>
+#include <unistd.h>
+
 namespace {
 // Minimal P6 PPM reader -> planar [3,H,W] u8 (same layout as the stage).
 bool
@@ -669,15 +674,18 @@ TEST(metal_lm_smoke, gemma_mma_prefill_token_exact) {
   EXPECT_TRUE(mism == 0);
 }
 
-// The materialized global-attention prefill (default) must be greedy
-// token-exact with the pflash reference (materialized OFF). REGRESSION GUARD
+// The materialized global-attention prefill (the default without matrix
+// cores) must be greedy token-exact with the pflash reference (materialized
+// OFF). REGRESSION GUARD
 // for the steel dense_gemm_t K-tail bug: the materialized PV GEMM has
 // contraction K = T_kv, and the kernel read the final K-block unmasked when
 // T_kv % 32 != 0, spilling into the next packed row. The prompt below is
 // deliberately NOT a multiple of 32 tokens so the tail block exists; a
 // power-of-two ctx (the perf bench) never tripped it. The sibling mma/steel
 // token-exact tests both run materialized, so they could NOT catch this --
-// this one pins materialized against pflash. Gated on VPIPE_GEMMA4_TEST_MODEL_PATH.
+// this one pins materialized against pflash. The NAX global path is held
+// off, since on a matrix-core GPU it would serve both arms. Gated on
+// VPIPE_GEMMA4_TEST_MODEL_PATH.
 TEST(metal_lm_smoke, gemma_materialized_matches_pflash_token_exact) {
   const char* path = std::getenv("VPIPE_GEMMA4_TEST_MODEL_PATH");
   if (!path || !*path) { return; }
@@ -689,6 +697,7 @@ TEST(metal_lm_smoke, gemma_materialized_matches_pflash_token_exact) {
     // is the kernel that had the K-tail bug; the causal variants mostly mask
     // it, so pin the dense path here to keep this a real regression guard.
     ::setenv("VPIPE_GEMMA_MAT_CAUSAL", "0", 1);
+    ::setenv("VPIPE_GEMMA_NO_NAX512", "1", 1);
     Session sess;
     auto* mc = sess.metal_compute();
     auto* mgr = sess.generative_model_manager();
@@ -722,6 +731,7 @@ TEST(metal_lm_smoke, gemma_materialized_matches_pflash_token_exact) {
   ::unsetenv("VPIPE_LLM_BACKEND");
   ::unsetenv("VPIPE_GEMMA_MATERIALIZED_GLOBAL");
   ::unsetenv("VPIPE_GEMMA_MAT_CAUSAL");
+  ::unsetenv("VPIPE_GEMMA_NO_NAX512");
   ASSERT_TRUE(!ref.empty());
   ASSERT_TRUE(ref.size() == got.size());
   std::size_t mism = 0;
@@ -730,6 +740,106 @@ TEST(metal_lm_smoke, gemma_materialized_matches_pflash_token_exact) {
   }
   std::printf("[metal_lm_smoke.gemma_materialized_matches_pflash_token_exact] "
               "%zu tokens, %zu mismatches\n", ref.size(), mism);
+  EXPECT_TRUE(mism == 0);
+}
+
+// On a GPU with matrix cores the GLOBAL (head_dim 512) prefill runs MLX's
+// NAX head-dim split over K/V gathered from the paged pool. It must answer
+// greedy token-exact with the routing it replaced -- materialized for a
+// fresh prompt, pmma2 mid-context -- over the three ways K/V reach it: a
+// fresh prompt, a second chunk onto the same context, and a long chunk
+// onto a BRANCHED context, whose partial inner page the gather has to walk.
+// Lengths are off the 32-row tile so both align function constants run.
+// ENGAGEMENT is asserted, not assumed: the model's per-layer path log
+// (VPIPE_GEMMA_ATTN_PATH) is captured and must name nax512 in one arm and
+// never in the other. Matrix cores + VPIPE_GEMMA4_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, gemma_nax512_matches_materialized_token_exact) {
+  const char* path = std::getenv("VPIPE_GEMMA4_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  {
+    Session probe;
+    auto* mc = probe.metal_compute();
+    if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  }
+  struct Arm { std::vector<std::int32_t> tokens; int nax_layers = 0; };
+  auto run = [&](bool nax) -> Arm {
+    Arm arm;
+    ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+    ::setenv("VPIPE_GEMMA_ATTN_PATH", "1", 1);
+    if (nax) { ::unsetenv("VPIPE_GEMMA_NO_NAX512"); }
+    else     { ::setenv("VPIPE_GEMMA_NO_NAX512", "1", 1); }
+    const std::string log = (std::filesystem::temp_directory_path() /
+        ("vpipe-gemma-path-" + std::to_string(::getpid()) + ".log"))
+        .string();
+    std::fflush(stderr);
+    const int saved = ::dup(2);
+    const int fd = ::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) { ::dup2(fd, 2); ::close(fd); }
+    {
+      Session sess;
+      auto* mgr = sess.generative_model_manager();
+      genai::LoadSpec spec;
+      spec.hf_dir = path;
+      spec.compute_dtype = "f16";
+      spec.page_tokens = 512;
+      spec.max_pages = 32;
+      auto lm = mgr ? mgr->load(spec) : nullptr;
+      if (lm && lm->valid()) {
+        std::string text;
+        for (int i = 0; i < 160; ++i) {
+          text += "Ledger line " + std::to_string(i) + ": the ferry from " +
+                  std::to_string((i * 29) % 83) + " docked with " +
+                  std::to_string((i * 41) % 613) + " crates. ";
+        }
+        const auto all = lm->tokenizer().encode(text);
+        auto greedy = [&](genai::LoadedLanguageModel::Context& c,
+                          std::span<const std::int32_t> tail) {
+          std::int32_t t = lm->prefill(c, tail);
+          for (int i = 0; i < 12 && t >= 0; ++i) {
+            arm.tokens.push_back(t);
+            t = lm->next_token(c);
+          }
+        };
+        if (all.size() > 1500) {
+          // A fresh 1001-token prompt, then 333 more onto it.
+          auto c = lm->make_context();
+          greedy(c, std::span<const std::int32_t>(all.data(), 1001));
+          greedy(c, std::span<const std::int32_t>(all.data() + 1001, 333));
+          // 100 tokens, branched, then 1201 onto the child.
+          auto parent = lm->make_context();
+          (void)lm->prefill(parent,
+                            std::span<const std::int32_t>(all.data(), 100));
+          auto child = lm->branch(parent);
+          greedy(child,
+                 std::span<const std::int32_t>(all.data() + 100, 1201));
+        }
+      }
+    }
+    std::fflush(stderr);
+    if (saved >= 0) { ::dup2(saved, 2); ::close(saved); }
+    std::ifstream in(log);
+    for (std::string line; std::getline(in, line);) {
+      if (line.find("path=nax512") != std::string::npos) { ++arm.nax_layers; }
+    }
+    std::error_code ec;
+    std::filesystem::remove(log, ec);
+    return arm;
+  };
+  const Arm ref = run(false);
+  const Arm got = run(true);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ::unsetenv("VPIPE_GEMMA_ATTN_PATH");
+  ::unsetenv("VPIPE_GEMMA_NO_NAX512");
+  std::size_t mism = 0;
+  for (std::size_t i = 0; i < ref.tokens.size() && i < got.tokens.size();
+       ++i) {
+    if (ref.tokens[i] != got.tokens[i]) { ++mism; }
+  }
+  std::printf("[gemma_nax512] %zu tokens, %zu mismatches; nax512 ran on %d "
+              "layer-chunks (%d with it off)\n", ref.tokens.size(), mism,
+              got.nax_layers, ref.nax_layers);
+  ASSERT_TRUE(ref.tokens.size() == 36 && got.tokens.size() == 36);
+  EXPECT_TRUE(got.nax_layers > 0 && ref.nax_layers == 0);
   EXPECT_TRUE(mism == 0);
 }
 

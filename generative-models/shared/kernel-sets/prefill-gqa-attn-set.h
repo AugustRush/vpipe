@@ -102,6 +102,18 @@ class PrefillGqaAttnSet {
   // Whether a named member loaded here ("nax", "steel", ...).
   bool has(std::string_view member) const;
 
+  // The steel member's shape (attn_steel_paged): the key block a page must
+  // be a multiple of, and how many simdgroups split the head dim -- its
+  // threadgroup is (32, 4, split). Head dim 256 splits with 32-key blocks;
+  // 128 keeps 16 and no split, which measured faster there. The model's
+  // own steel path reads the same two.
+  static constexpr int steel_block(int head_dim) {
+    return head_dim == 256 ? 32 : 16;
+  }
+  static constexpr int steel_split(int head_dim) {
+    return head_dim == 256 ? 2 : 1;
+  }
+
  private:
   enum Member {
     kScalar = 0, kQtile = 1, kFlash = 2, kMma = 3, kSteel = 4,

@@ -1277,8 +1277,8 @@ TEST(sdpa_mma, qwen_prefill_d256_vs_nax_split) {
       enc.set_constant(10, pt); enc.set_constant(11, 1);
       enc.set_buffer(12, ptb);
       switch (a) {
-        case kSteel:
-          enc.dispatch({32 * ((nu + 31) / 32), 4 * H, 1}, {32, 4, 1});
+        case kSteel:   // head-dim split: (32, 4, 2)
+          enc.dispatch({32 * ((nu + 31) / 32), 4 * H, 2}, {32, 4, 2});
           break;
         case kMma:
           enc.dispatch({128, H, (nu + 15) / 16}, {128, 1, 1});
@@ -1386,12 +1386,29 @@ TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
   ASSERT_TRUE(set.ready());
   if (!set.ready()) { return; }
 
-  struct Case { int n, q_offset; };
-  const Case cases[] = {{300, 0}, {700, 0}, {1500, 0}, {2085, 0},
-                        {1000, 900}, {37, 2000}, {1024, 1024}};
+  // A BRANCHED layout is what ContextManager::branch() leaves: the parent's
+  // partial tail page frozen, so the next page starts mid-sequence and
+  // position / page_tokens is no longer the page. Inner pages here hold 100
+  // and 37 keys. The flash reference is itself held to a CPU oracle there.
+  struct Case { int n, q_offset; bool branched; };
+  const Case cases[] = {{300, 0, false}, {700, 0, false}, {1500, 0, false},
+                        {2085, 0, false}, {1000, 900, false},
+                        {37, 2000, false}, {1024, 1024, false},
+                        {2085, 0, true}, {1000, 900, true},
+                        {300, 600, true}};
   for (const Case& cs : cases) {
     const int n = cs.n, qoff = cs.q_offset, kL = qoff + n;
-    const int n_pages = (kL + page_tokens - 1) / page_tokens;
+    std::vector<int> nvs;                        // keys per page, in order
+    for (int g = 0; g < kL;) {
+      int nv = std::min(page_tokens, kL - g);
+      const int p = (int)nvs.size();
+      if (cs.branched && p == 1) { nv = std::min(nv, 100); }
+      if (cs.branched && p == 3) { nv = std::min(nv, 37); }
+      nvs.push_back(nv);
+      g += nv;
+    }
+    const int n_pages = (int)nvs.size();
+    std::vector<float> kg((size_t)Hkv * kL * D), vg((size_t)Hkv * kL * D);
     std::mt19937 rng(91 + n + 7 * qoff);
     std::uniform_real_distribution<float> d(-1.0f, 1.0f);
     SharedBuffer qb = mc->make_shared_buffer((size_t)Hq * n * D * 2);
@@ -1412,10 +1429,10 @@ TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
       auto* k = static_cast<std::uint16_t*>(kb.contents());
       auto* v = static_cast<std::uint16_t*>(vb.contents());
       auto* pt = static_cast<std::int32_t*>(ptb.contents());
+      int gstart = 0;
       for (int p = 0; p < n_pages; ++p) {
         const int pid = n_pages - 1 - p;
-        const int gstart = p * page_tokens;
-        const int nvalid = std::min(page_tokens, kL - gstart);
+        const int nvalid = nvs[(size_t)p];
         pt[p * 3] = pid; pt[p * 3 + 1] = nvalid; pt[p * 3 + 2] = gstart;
         for (int h = 0; h < Hkv; ++h) {
           for (int sl = 0; sl < nvalid; ++sl) {
@@ -1424,9 +1441,13 @@ TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
                                + e;
               k[i] = enc16(d(rng) * 0.2f, bf16);
               v[i] = enc16(d(rng) * 0.2f, bf16);
+              const size_t gi = ((size_t)h * kL + gstart + sl) * D + e;
+              kg[gi] = dec16(k[i], bf16);
+              vg[gi] = dec16(v[i], bf16);
             }
           }
         }
+        gstart += nvalid;
       }
     }
     genai::PrefillGqaAttnSet::Attn a;
@@ -1446,6 +1467,46 @@ TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
     SharedBuffer ref = mc->make_shared_buffer((size_t)Hq * n * D * 2);
     ASSERT_TRUE(run("flash", ref));
     const auto* r = static_cast<const std::uint16_t*>(ref.contents());
+    if (cs.branched) {
+      // Flash against a CPU oracle on sampled rows, so the members below
+      // are measured against a reference that walks these pages right.
+      const auto* qh = static_cast<const std::uint16_t*>(qb.contents());
+      const float sc = 1.0f / std::sqrt((float)D);
+      double num = 0.0, den = 0.0;
+      for (const int h : {0, Hq - 1}) {
+        const int kvh = h / (Hq / Hkv);
+        for (const int row : {0, n / 2, n - 1}) {
+          const int qpos = qoff + row;
+          std::vector<double> w((size_t)qpos + 1);
+          double mx = -1e300;
+          for (int g = 0; g <= qpos; ++g) {
+            double dot = 0.0;
+            for (int e = 0; e < D; ++e) {
+              dot += (double)dec16(qh[((size_t)h * n + row) * D + e], bf16) *
+                     kg[((size_t)kvh * kL + g) * D + e];
+            }
+            w[(size_t)g] = dot * sc;
+            mx = std::max(mx, w[(size_t)g]);
+          }
+          double l = 0.0;
+          for (double& x : w) { x = std::exp(x - mx); l += x; }
+          for (int e = 0; e < D; ++e) {
+            double o = 0.0;
+            for (int g = 0; g <= qpos; ++g) {
+              o += w[(size_t)g] * vg[((size_t)kvh * kL + g) * D + e];
+            }
+            o /= l;
+            const double got = dec16(r[((size_t)h * n + row) * D + e], bf16);
+            num += (got - o) * (got - o); den += o * o;
+          }
+        }
+      }
+      const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+      std::printf("[qwen_set] %s D=%d n=%4d q_offset=%4d branched flash vs "
+                  "oracle rel-L2 %.2e\n", bf16 ? "bf16" : "f16 ", D, n, qoff,
+                  rel);
+      EXPECT_TRUE(rel < 1e-2);
+    }
     for (const char* member : {"steel", "nax", "nax-split", "mma"}) {
       SharedBuffer out = mc->make_shared_buffer((size_t)Hq * n * D * 2);
       const bool ran = run(member, out);
@@ -1466,9 +1527,9 @@ TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
         num += (x - y) * (x - y); den += x * x;
       }
       const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
-      std::printf("[qwen_set] %s D=%d n=%4d q_offset=%4d pages=%2d %-9s vs "
-                  "flash rel-L2 %.2e\n", bf16 ? "bf16" : "f16 ", D, n, qoff,
-                  n_pages, member, rel);
+      std::printf("[qwen_set] %s D=%d n=%4d q_offset=%4d pages=%2d%s %-9s "
+                  "vs flash rel-L2 %.2e\n", bf16 ? "bf16" : "f16 ", D, n,
+                  qoff, n_pages, cs.branched ? " branched" : "", member, rel);
       // f16 lands 2-5e-4 from flash and bf16 1.2-2.2e-3 (its rounding
       // floor) on the M5.
       EXPECT_TRUE(rel < 5e-3);

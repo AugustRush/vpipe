@@ -210,6 +210,18 @@ template [[host_name("attn_steel_nax_dsplit_h_bd256")]] [[kernel]] decltype(atte
                                                                 float>)
 attention_nax_dsplit<half, 64, 32, 256, 4, 2, half, float>;
 
+// head_dim 512 (Gemma-4's global layers): MLX #4487's FOUR-way split, each
+// simdgroup a 128-wide slice of D, 32-row query tiles over WM = 2 row groups
+// (256 threads). MEASURED on the M5 at 16 q / 1 kv heads, causal f16, against
+// the matmul2d sdpa_causal_mma2_d512 it replaces: 3.9x at 1k rows, 4.7x at
+// 4k, 5.1x at 8k; 8 q / 2 kv 4.7x at 4k and 3.1x at 16k; rel-L2 5e-4.
+template [[host_name("attn_steel_nax_dsplit_h_bd512")]] [[kernel]]
+decltype(attention_nax_dsplit<half, 32, 32, 512, 2, 4, half, float>)
+attention_nax_dsplit<half, 32, 32, 512, 2, 4, half, float>;
+template [[host_name("attn_steel_nax_dsplit_h_bd512_bf16")]] [[kernel]]
+decltype(attention_nax_dsplit<bfloat, 32, 32, 512, 2, 4, bfloat, float>)
+attention_nax_dsplit<bfloat, 32, 32, 512, 2, 4, bfloat, float>;
+
 
 
 
@@ -243,4 +255,10 @@ kernel void attn_steel_nax_h_bd256(device half* O [[buffer(3)]],
 kernel void attn_steel_nax_dsplit_h_bd256(device half* O [[buffer(3)]],
                                           uint t [[thread_position_in_grid]])
 { if (t == 0) { O[0] = (half)0; } }
+kernel void attn_steel_nax_dsplit_h_bd512(device half* O [[buffer(3)]],
+                                          uint t [[thread_position_in_grid]])
+{ if (t == 0) { O[0] = (half)0; } }
+kernel void attn_steel_nax_dsplit_h_bd512_bf16(device bfloat* O [[buffer(3)]],
+                                               uint t [[thread_position_in_grid]])
+{ if (t == 0) { O[0] = (bfloat)0; } }
 #endif

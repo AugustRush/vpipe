@@ -1065,13 +1065,12 @@ MetalKrea2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
                  : ((c.cout % 32) == 0 && c32_ok) ? 32
                  : ((c.cout % 16) == 0 && c16_ok) ? 16 : 0;
   if ((OW % 8) != 0 || (OH % 8) != 0 || tile == 0) { return false; }
-  // The MPP conv op indexes its source/dest through int32 tensor extents; fall
-  // back to the (uint-safe) im2col path before cin*W*H or cout*OW*OH would
-  // overflow a signed int (~3K px), so a very large decode degrades to im2col
-  // instead of silently corrupting.
-  constexpr std::size_t kIdxMax = 0x7fffffffull;
-  if ((std::size_t)c.cin * W * H > kIdxMax ||
-      (std::size_t)c.cout * OW * OH > kIdxMax) {
+  // The MPP conv op addresses its source and destination in int32 BYTES;
+  // past 2^31 of either it leaves rows unwritten and says nothing. Fall back
+  // to the (uint-safe) im2col path first, so a very large decode degrades
+  // to im2col instead of silently corrupting (f16/bf16: 2 bytes).
+  if (!tensor_op_operand_fits((std::size_t)c.cin * W * H, 2) ||
+      !tensor_op_operand_fits((std::size_t)c.cout * OW * OH, 2)) {
     return false;
   }
   enc.set_function(
@@ -1189,14 +1188,16 @@ MetalKrea2Vae::maybe_tune_conv_(int H, int W, SharedBuffer& col,
   // every 3x3 lands in the fallback and every shape is worth tuning.
   bool all = !_use_hwconv;
   if (!all) {
-    constexpr std::size_t kIdxMax = 0x7fffffffull;
     int h = H, w = W;                      // walk the decoder's pyramid
     const int base = _cfg.dec_base();
     const int nlev = _cfg.levels();
     for (int lvl = 0; lvl < nlev && !all; ++lvl) {
       const int cin = base * _cfg.dim_mult[(std::size_t)lvl];
       if ((h % 8) != 0 || (w % 8) != 0) { all = true; break; }
-      if ((std::size_t)cin * w * h > kIdxMax) { all = true; break; }
+      if (!tensor_op_operand_fits((std::size_t)cin * w * h, 2)) {
+        all = true;
+        break;
+      }
       h /= 2; w /= 2;
     }
   }
@@ -1342,7 +1343,8 @@ MetalKrea2Vae::decode_gathers_(int hL, int wL) const noexcept
   const std::size_t base = (std::size_t)_cfg.dec_base();
   return !_use_hwconv || !_fn_conv_hw_s1_c32.valid() || (hL % 8) != 0 ||
          (wL % 8) != 0 ||
-         base * (std::size_t)_cfg.dim_mult[1] * Hout * Wout > 0x7fffffffull;
+         !tensor_op_operand_fits(
+             base * (std::size_t)_cfg.dim_mult[1] * Hout * Wout, 2);
 }
 
 // The im2col band: the scratch a gathering 3x3 streams its [H*W, 9*cin]

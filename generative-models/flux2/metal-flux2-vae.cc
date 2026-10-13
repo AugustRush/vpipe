@@ -828,12 +828,14 @@ MetalFlux2Vae::maybe_tune_conv_(int H, int W)
   }
   bool needed = !_use_hwconv;
   if (!needed) {
-    constexpr std::size_t kIdxMax = 0x7fffffffull;
     int h = H, w = W;                       // walk the decoder's pyramid
     for (int lvl = 3; lvl >= 0 && !needed; --lvl) {
       const int cin = _cfg.block_out[lvl];
       if ((h % 8) != 0 || (w % 8) != 0) { needed = true; break; }
-      if ((std::size_t)cin * w * h > kIdxMax) { needed = true; break; }
+      if (!tensor_op_operand_fits((std::size_t)cin * w * h, 2)) {
+        needed = true;
+        break;
+      }
       h /= 2; w /= 2;
     }
   }
@@ -1028,13 +1030,12 @@ MetalFlux2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
   if (!_use_hwconv || c.whwio.empty()) { return false; }
   const int OH = H / stride, OW = W / stride;
   if ((OW % 8) != 0 || (OH % 8) != 0 || (c.cout % 64) != 0) { return false; }
-  // The MPP conv op indexes its source/dest through int32 tensor extents; fall
-  // back to the (uint-safe) im2col path before cin*W*H or cout*OW*OH would
-  // overflow a signed int (~3K px), so a very large decode degrades to im2col
-  // instead of silently corrupting.
-  constexpr std::size_t kIdxMax = 0x7fffffffull;
-  if ((std::size_t)c.cin * W * H > kIdxMax ||
-      (std::size_t)c.cout * OW * OH > kIdxMax) {
+  // The MPP conv op addresses its source and destination in int32 BYTES;
+  // past 2^31 of either it leaves rows unwritten and says nothing. Fall back
+  // to the (uint-safe) im2col path first, so a very large decode degrades
+  // to im2col instead of silently corrupting (f16/bf16: 2 bytes).
+  if (!tensor_op_operand_fits((std::size_t)c.cin * W * H, 2) ||
+      !tensor_op_operand_fits((std::size_t)c.cout * OW * OH, 2)) {
     return false;
   }
   enc.set_function(stride == 2 ? _fn_conv_hw_s2 : _fn_conv_hw_s1);
