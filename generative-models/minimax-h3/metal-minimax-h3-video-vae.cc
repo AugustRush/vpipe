@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <map>
 #include <string>
@@ -40,6 +41,38 @@ constexpr const char* kKey = "minimax-h3-vvae/bf16|";
 // count as an int, so the band keeps that honest at any extent; it is
 // far above every shape that tiles, so nothing real splits.
 constexpr std::size_t kEltBand = 1u << 30;
+
+// The hardware conv's tiles (conv3d_hw_causal_s*_<name>_f16): the
+// tuned candidates in order, then the partial-tile entry. Channels x
+// width x height of the destination tile, and simdgroups.
+struct C3Geom { int tc, tw, th, sg; };
+constexpr const char* kC3Names[] = {"c128", "c128d", "c128w16d", "tail",
+                                    "c16"};
+constexpr C3Geom kC3Geom[] = {{128, 8, 8, 4}, {128, 8, 8, 4},
+                              {128, 16, 8, 8}, {128, 8, 8, 4},
+                              {16, 8, 8, 4}};
+
+// Rows per threadgroup of the three-pass norm's statistics pass. A
+// 256x256 frame is 128 bands, so a 17-frame clip is ~2000 threadgroups.
+constexpr int kGnBand = 512;
+
+// VPIPE_H3_VVAE_ENC_PROFILE, read once.
+bool
+enc_profile_on_()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("VPIPE_H3_VVAE_ENC_PROFILE");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+
+double
+ms_since_(std::chrono::steady_clock::time_point t0)
+{
+  return std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+}
 
 // The Comfy-Org single-file video VAE keeps the wrapper config (and,
 // nested under "source_config", the net's) under this `__metadata__`
@@ -693,9 +726,11 @@ MetalMiniMaxH3VideoVae::linear_(WeightSet& ws, const std::string& nm)
 // im2col_hwc_3x3x3_reflect_tiled emits; the 1x1x1 shortcut and quant
 // convolutions are already a Linear and go through linear_() untouched.
 MetalMiniMaxH3VideoVae::Conv3d
-MetalMiniMaxH3VideoVae::conv3d_(WeightSet& ws, const std::string& nm)
+MetalMiniMaxH3VideoVae::conv3d_(WeightSet& ws, const std::string& nm,
+                                bool hw)
 {
   Conv3d c;
+  c.name = nm;
   const auto* info = ws.src().info(nm + ".weight");
   if (info == nullptr || info->shape.size() != 5) { return c; }
   const auto& sh = info->shape;
@@ -711,10 +746,23 @@ MetalMiniMaxH3VideoVae::conv3d_(WeightSet& ws, const std::string& nm)
   if (kt != 3 || kh != 3 || kw != 3) { return Conv3d{}; }
   c.spatial = true;
   c.k = 27 * c.cin;
-  const int cin = c.cin, cout = c.cout;
   c.l.b = weight_(ws, nm + ".bias");
-  c.l.w = ws.derived(std::string(kKey) + "c3d|" + nm,
-                     [&]() -> SharedBuffer {
+  // The kernel's output tile is 128 channels (or 16, at stride 1 only:
+  // see hw_route_), and it always adds a bias.
+  const bool hwio = hw && c.cout % 16 == 0 && !c.l.b.empty();
+  SharedBuffer w = c3d_weight_(ws, nm, c.cin, c.cout, hwio);
+  if (w.empty()) { return Conv3d{}; }
+  (hwio ? c.whwio : c.l.w) = std::move(w);
+  return c;
+}
+
+SharedBuffer
+MetalMiniMaxH3VideoVae::c3d_weight_(WeightSet& ws, const std::string& nm,
+                                    int cin, int cout, bool hwio)
+{
+  const std::string key =
+      std::string(kKey) + (hwio ? "c3d-hwio|" : "c3d|") + nm;
+  return ws.derived(key, [&]() -> SharedBuffer {
     // Read UNCACHED: the permuted bf16 copy below is what the model
     // keeps, and caching the f32 original next to it would hold a
     // second, four-times-larger copy of every convolution.
@@ -751,8 +799,10 @@ MetalMiniMaxH3VideoVae::conv3d_(WeightSet& ws, const std::string& nm)
             for (int i = 0; i < cin; ++i) {
               const std::size_t si =
                   ((((std::size_t)o * cin + i) * 3 + t) * 3 + ky) * 3 + kx;
-              d[((std::size_t)o * 27 + tap) * cin + i] =
-                  f32_to_bf16_(src(si));
+              const std::size_t di =
+                  hwio ? ((std::size_t)tap * cin + i) * cout + o
+                       : ((std::size_t)o * 27 + tap) * cin + i;
+              d[di] = f32_to_bf16_(src(si));
             }
           }
         }
@@ -760,17 +810,28 @@ MetalMiniMaxH3VideoVae::conv3d_(WeightSet& ws, const std::string& nm)
     }
     return out;
   }, _part);
-  if (c.l.w.empty()) { return Conv3d{}; }
-  return c;
+}
+
+SharedBuffer
+MetalMiniMaxH3VideoVae::gemm_weight_(const Conv3d& c)
+{
+  if (!_ws) { return {}; }
+  // Attributed to the encoder's part, like everything else it loads, so
+  // releasing the encoder drops it too.
+  const std::string saved = _part;
+  _part = "encoder";
+  SharedBuffer w = c3d_weight_(*_ws, c.name, c.cin, c.cout, false);
+  _part = saved;
+  return w;
 }
 
 bool
 MetalMiniMaxH3VideoVae::load_encoder_(WeightSet& ws)
 {
   const Config& c = _cfg;
-  _enc_conv_in = conv3d_(ws, "encoder.conv_in");
-  _enc_conv_out = conv3d_(ws, "encoder.conv_out");
-  _quant_conv   = conv3d_(ws, "quant_conv");
+  _enc_conv_in = conv3d_(ws, "encoder.conv_in", _use_hwconv);
+  _enc_conv_out = conv3d_(ws, "encoder.conv_out", _use_hwconv);
+  _quant_conv   = conv3d_(ws, "quant_conv", false);
   _enc_norm_w   = weight_(ws, "encoder.norm_out.weight");
   _enc_norm_b   = weight_(ws, "encoder.norm_out.bias");
   if (_enc_conv_in.empty() || _enc_conv_out.empty() || _quant_conv.empty() ||
@@ -797,10 +858,10 @@ MetalMiniMaxH3VideoVae::load_encoder_(WeightSet& ws)
       r.n1b = weight_(ws, p + "norm1.bias");
       r.n2w = weight_(ws, p + "norm2.weight");
       r.n2b = weight_(ws, p + "norm2.bias");
-      r.c1  = conv3d_(ws, p + "conv1");
-      r.c2  = conv3d_(ws, p + "conv2");
+      r.c1  = conv3d_(ws, p + "conv1", _use_hwconv);
+      r.c2  = conv3d_(ws, p + "conv2", _use_hwconv);
       if (r.cin != r.cout) {
-        r.skip = conv3d_(ws, p + "nin_shortcut");
+        r.skip = conv3d_(ws, p + "nin_shortcut", false);
         if (r.skip.empty()) { return false; }
       }
       if (r.n1w.empty() || r.n1b.empty() || r.n2w.empty() || r.n2b.empty() ||
@@ -810,7 +871,7 @@ MetalMiniMaxH3VideoVae::load_encoder_(WeightSet& ws)
       lv.res.push_back(std::move(r));
     }
     if (lv.space * lv.time > 1) {
-      lv.down = conv3d_(ws, base + "downsample.conv");
+      lv.down = conv3d_(ws, base + "downsample.conv", _use_hwconv);
       if (lv.down.empty()) { return false; }
     }
     prev = lv.cout;
@@ -879,6 +940,35 @@ MetalMiniMaxH3VideoVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
       !m->_fn_gn_frames.valid() || !m->_fn_im2col_r.valid() ||
       !m->_fn_residual.valid()) {
     return nullptr;
+  }
+  // The coalesced three-pass GroupNorm, on every GPU (see
+  // group_norm_frames_stats_f16 for why the one-pass kernel is slow).
+  m->_fn_gn_stats = m->_lib_elt.function("group_norm_frames_stats_f16");
+  m->_fn_gn_fin   = m->_lib_elt.function("group_norm_frames_finalize_f16");
+  m->_fn_gn_apply = m->_lib_elt.function("group_norm_frames_apply_f16");
+  m->_gn3 = m->_fn_gn_stats.valid() && m->_fn_gn_fin.valid() &&
+            m->_fn_gn_apply.valid() &&
+            std::getenv("VPIPE_H3_VVAE_GN_ONEPASS") == nullptr;
+  // M5: the encoder's 3x3x3 convs on the hardware convolution op. Decided
+  // here because the encoder's loader builds each conv's weight in the
+  // layout of its route. It reads frames the norm REFLECT-PADS, so it
+  // needs the three-pass norm too. VPIPE_VAE_NO_HWCONV, as the other VAEs.
+  if (mc->supports_matrix_cores() && m->_gn3 &&
+      std::getenv("VPIPE_VAE_NO_HWCONV") == nullptr) {
+    m->_lib_convhw = mc->load_library("conv2d_mma_bf16");
+    m->_fn_pad = m->_lib_elt.function("reflect_pad_hwc_f16");
+    m->_use_hwconv = m->_fn_pad.valid();
+    for (int st = 0; st < 2; ++st) {
+      // The 16-channel entry is stride 1 only.
+      const int n = (st == 0) ? kC3C16 : kC3Tail;
+      for (int k = 0; k <= n; ++k) {
+        const std::string nm = std::string("conv3d_hw_causal_s") +
+                               (st == 0 ? "1_" : "2_") + kC3Names[k] +
+                               "_f16";
+        m->_fn_c3hw[st][k] = m->_lib_convhw.function(nm);
+        m->_use_hwconv = m->_use_hwconv && m->_fn_c3hw[st][k].valid();
+      }
+    }
   }
   m->_lib_attn = mc->load_library("attn_steel");
   m->_attn_p = mc->make_shared_buffer(sizeof(float) * 64);
@@ -1718,24 +1808,206 @@ MetalMiniMaxH3VideoVae::encoded_frames_for(const Config& cfg, int T)
   return t;
 }
 
+bool
+MetalMiniMaxH3VideoVae::gn_coalesced_(int C) const
+{
+  if (!_gn3 || C <= 0 || C % 4 != 0) { return false; }
+  const int C4 = C / 4;
+  return C4 <= 256 && 256 % C4 == 0 && C4 % _cfg.gn_groups == 0;
+}
+
 void
 MetalMiniMaxH3VideoVae::enc_gn_(ComputeEncoder& enc, const SharedBuffer& in,
                                 const SharedBuffer& gamma,
                                 const SharedBuffer& beta,
-                                const SharedBuffer& out, int T, int rows,
-                                int C, bool silu)
+                                const SharedBuffer& out, int T, int H, int W,
+                                int C, bool silu, bool pad)
 {
-  enc.set_function(_fn_gn_frames);
+  const int rows = H * W;
+  const int G = _cfg.gn_groups;
+  if (!gn_coalesced_(C)) {
+    enc.set_function(_fn_gn_frames);
+    enc.set_buffer(0, in);
+    enc.set_buffer(1, gamma);
+    enc.set_buffer(2, beta);
+    enc.set_buffer(3, out);
+    enc.set_constant(4, rows);
+    enc.set_constant(5, C);
+    enc.set_constant(6, G);
+    enc.set_constant(7, _cfg.enc_norm_eps);
+    enc.set_constant(8, silu ? 1 : 0);
+    enc.dispatch({256, (unsigned)G, (unsigned)T}, {256, 1, 1});
+    return;
+  }
+  const int nband = (rows + kGnBand - 1) / kGnBand;
+  enc.set_function(_fn_gn_stats);
   enc.set_buffer(0, in);
-  enc.set_buffer(1, gamma);
-  enc.set_buffer(2, beta);
-  enc.set_buffer(3, out);
-  enc.set_constant(4, rows);
-  enc.set_constant(5, C);
-  enc.set_constant(6, _cfg.gn_groups);
-  enc.set_constant(7, _cfg.enc_norm_eps);
+  enc.set_buffer(1, _es.gn_part);
+  enc.set_constant(2, rows);
+  enc.set_constant(3, C);
+  enc.set_constant(4, G);
+  enc.set_constant(5, kGnBand);
+  enc.dispatch({256, (unsigned)nband, (unsigned)T}, {256, 1, 1});
+  enc.set_function(_fn_gn_fin);
+  enc.set_buffer(0, _es.gn_part);
+  enc.set_buffer(1, _es.gn_stats);
+  enc.set_constant(2, nband);
+  enc.set_constant(3, G);
+  enc.set_constant(4, rows * (C / G));
+  enc.set_constant(5, _cfg.enc_norm_eps);
+  enc.dispatch({(unsigned)G, (unsigned)T, 1}, {(unsigned)G, 1, 1});
+  enc.set_function(_fn_gn_apply);
+  enc.set_buffer(0, in);
+  enc.set_buffer(1, _es.gn_stats);
+  enc.set_buffer(2, gamma);
+  enc.set_buffer(3, beta);
+  enc.set_buffer(4, out);
+  enc.set_constant(5, rows);
+  enc.set_constant(6, C);
+  enc.set_constant(7, G);
   enc.set_constant(8, silu ? 1 : 0);
-  enc.dispatch({256, (unsigned)_cfg.gn_groups, (unsigned)T}, {256, 1, 1});
+  enc.set_constant(9, W);
+  enc.set_constant(10, H);
+  enc.set_constant(11, pad ? 1 : 0);
+  enc.dispatch({(unsigned)(rows * (C / 4)), (unsigned)T, 1}, {256, 1, 1});
+}
+
+void
+MetalMiniMaxH3VideoVae::enc_pad_(ComputeEncoder& enc, const SharedBuffer& in,
+                                 int T, int H, int W, int C, int lo, int hi,
+                                 const SharedBuffer& out)
+{
+  const int Hp = H + lo + hi, Wp = W + lo + hi;
+  enc.set_function(_fn_pad);
+  enc.set_buffer(0, in);
+  enc.set_buffer(1, out);
+  enc.set_constant(2, H);
+  enc.set_constant(3, W);
+  enc.set_constant(4, C);
+  enc.set_constant(5, lo);
+  enc.set_constant(6, hi);
+  enc.dispatch({(unsigned)(Wp * C), (unsigned)Hp, (unsigned)T}, {256, 1, 1});
+}
+
+void
+MetalMiniMaxH3VideoVae::c3_dispatch_(ComputeEncoder& enc, const Conv3d& c,
+                                     int cand, const SharedBuffer& in,
+                                     int Ti, int H, int W,
+                                     const SharedBuffer& out, int stride_t,
+                                     int stride_s, const SharedBuffer* res)
+{
+  const int Ho = (stride_s == 2) ? (H - 2) / 2 + 1 : H;
+  const int Wo = (stride_s == 2) ? (W - 2) / 2 + 1 : W;
+  const int pad = (stride_s == 2) ? 1 : 2;
+  const int To = (Ti - 1) / stride_t + 1;
+  const C3Geom& g = kC3Geom[cand];
+  enc.set_function(_fn_c3hw[stride_s == 2 ? 1 : 0][cand]);
+  enc.set_buffer(0, in);
+  enc.set_buffer(1, c.whwio);
+  enc.set_buffer(2, out);
+  enc.set_buffer(3, c.l.b);
+  enc.set_buffer(4, res != nullptr ? *res : out);
+  enc.set_constant(5, W + pad);
+  enc.set_constant(6, H + pad);
+  enc.set_constant(7, c.cin);
+  enc.set_constant(8, c.cout);
+  enc.set_constant(9, Wo);
+  enc.set_constant(10, Ho);
+  enc.set_constant(11, Ti);
+  enc.set_constant(12, stride_t);
+  enc.set_constant(13, res != nullptr ? 1 : 0);
+  enc.set_constant(14, 0);
+  const unsigned tg = (unsigned)(g.sg * 32);
+  enc.dispatch({(unsigned)((Wo + g.tw - 1) / g.tw) * tg,
+                (unsigned)((Ho + g.th - 1) / g.th),
+                (unsigned)(To * (c.cout / g.tc))}, {tg, 1, 1});
+}
+
+int
+MetalMiniMaxH3VideoVae::c3_pick_(int stride, int cin, int cout, int H,
+                                 int W) const
+{
+  for (const C3Tune& t : _c3_tuned) {
+    if (t.stride == stride && t.cin == cin && t.cout == cout && t.H == H &&
+        t.W == W) {
+      return t.pick;
+    }
+  }
+  return -1;
+}
+
+void
+MetalMiniMaxH3VideoVae::c3_tune_(const Conv3d& c, int Ti, int H, int W,
+                                 int stride_t, int stride_s)
+{
+  if (c.cout % 128 != 0 || c3_pick_(stride_s, c.cin, c.cout, H, W) >= 0) {
+    return;
+  }
+  // A few frames are enough to rank the tiles -- the shape that decides
+  // is the frame's -- and keep the tuning to milliseconds a shape. The
+  // trial reads `_es.b` and writes `_es.c`: `_es.a` holds this encode's
+  // input. Their contents are garbage, which a timing does not mind.
+  const int ti = std::min(Ti, 3);
+  const int pick = autotune_vote(kC3Cands, /*rounds=*/3, /*reps=*/1,
+      [&](int i) {
+        return autotune_time(_mc, 1, [&](ComputeEncoder& enc) {
+          c3_dispatch_(enc, c, i, _es.b, ti, H, W, _es.c, stride_t,
+                       stride_s, nullptr);
+        });
+      });
+  _c3_tuned.push_back(C3Tune{stride_s, c.cin, c.cout, H, W, pick});
+  if (_mc->session() != nullptr) {
+    const std::string nm = kC3Names[pick];
+    _mc->session()->log_debug(fmt(
+        "MiniMax-H3 video VAE: hardware conv s{} {}->{} at {}x{} takes "
+        "the {} tile", stride_s, c.cin, c.cout, W, H, nm));
+  }
+}
+
+bool
+MetalMiniMaxH3VideoVae::hw_route_(const Conv3d& c, int H, int W,
+                                  int stride_s, bool from_norm) const
+{
+  if (!_use_hwconv || c.whwio.empty() || H < 2 || W < 2) { return false; }
+  // The 16-channel tile has no stride-2 twin.
+  if (c.cout % 128 != 0 && stride_s != 1) { return false; }
+  if (from_norm && !gn_coalesced_(c.cin)) { return false; }
+  // The op addresses one padded FRAME as its source, in int32 bytes.
+  const int pad = (stride_s == 2) ? 1 : 2;
+  return tensor_op_operand_fits(
+      (std::size_t)(H + pad) * (std::size_t)(W + pad) * (std::size_t)c.cin,
+      2);
+}
+
+int
+MetalMiniMaxH3VideoVae::enc_conv_hw_(ComputeEncoder& enc, const Conv3d& c,
+                                     const SharedBuffer& in, int Ti, int H,
+                                     int W, const SharedBuffer& out,
+                                     int stride_t, int stride_s,
+                                     const SharedBuffer* res)
+{
+  if (Ti <= 0 || H <= 0 || W <= 0) { return 0; }
+  const int Ho = (stride_s == 2) ? (H - 2) / 2 + 1 : H;
+  const int Wo = (stride_s == 2) ? (W - 2) / 2 + 1 : W;
+  const int To = (Ti - 1) / stride_t + 1;
+  // Counted by LIVE taps, exactly as the gather route counts them, so the
+  // two report the same arithmetic for the same conv.
+  for (int t = 0; t < To; ++t) {
+    int live = 0;
+    for (int kt = 0; kt < 3; ++kt) {
+      const int si = t * stride_t + kt - 2;
+      live += (si >= 0 && si < Ti) ? 1 : 0;
+    }
+    _flops.gemm((long long)Ho * Wo, c.cout, 9LL * live * c.cin);
+  }
+  // A grid with a partial tile takes the guarded entry; otherwise the
+  // tile this shape measured fastest on (tuned in encode()).
+  const bool partial = (Ho % 8) != 0 || (Wo % 16) != 0;
+  int cand = partial ? kC3Tail : c3_pick_(stride_s, c.cin, c.cout, H, W);
+  if (cand < 0) { cand = 0; }
+  if (c.cout % 128 != 0) { cand = kC3C16; }
+  c3_dispatch_(enc, c, cand, in, Ti, H, W, out, stride_t, stride_s, res);
+  return To;
 }
 
 int
@@ -1756,6 +2028,17 @@ MetalMiniMaxH3VideoVae::enc_conv_(ComputeEncoder& enc, const Conv3d& c,
     gemm_(enc, in, 0, c.l, out, 0, (int)voxels, c.cout, c.cin);
     return Ti;
   }
+  // A conv loaded for the hardware route has no GEMM weight until an
+  // extent that route declines asks for one.
+  Linear lazy;
+  const Linear* lp = &c.l;
+  if (c.l.w.empty()) {
+    lazy.w = gemm_weight_(c);
+    if (lazy.w.empty()) { return 0; }
+    lazy.b = c.l.b.subview(0, c.l.b.byte_size());
+    lp = &lazy;
+  }
+  const Linear& l = *lp;
   const int Ho = (stride_s == 2) ? (H - 2) / 2 + 1 : H;
   const int Wo = (stride_s == 2) ? (W - 2) / 2 + 1 : W;
   // A stride-2 convolution gets its padding from the reference's
@@ -1803,7 +2086,7 @@ MetalMiniMaxH3VideoVae::enc_conv_(ComputeEncoder& enc, const Conv3d& c,
       enc.set_constant(11, stride_s);
       enc.set_constant(12, pad_lo);
       enc.dispatch({(unsigned)(27 * c.cin), (unsigned)mrows, 1}, {64, 1, 1});
-      gemm_uncounted_(enc, _es.col, 0, c.l, out,
+      gemm_uncounted_(enc, _es.col, 0, l, out,
                       ((std::size_t)t * ohw + r0) * (std::size_t)c.cout,
                       mrows, c.cout, 27 * c.cin);
     }
@@ -1822,11 +2105,21 @@ MetalMiniMaxH3VideoVae::ensure_enc_scratch_(int T, int H, int W)
   // because a checkpoint with a different `space_down` would move it.
   std::size_t need =
       (std::size_t)T * H * W * (std::size_t)std::max(c.in_channels, c.base_ch);
+  // The hardware route's inputs are reflect-padded frames, one pixel
+  // all round -- the widest pad either stride uses.
+  const int pad = _use_hwconv ? 2 : 0;
+  // The three-pass norm's partials: every frame's bands at every level.
+  std::size_t gn_part = 0, gn_stats = 0;
+  const std::size_t G = (std::size_t)c.gn_groups;
   int t = T, h = H, w = W;
   for (std::size_t i = 0; i < _enc_levels.size(); ++i) {
     const EncLevel& lv = _enc_levels[i];
-    need = std::max(need, (std::size_t)t * h * w *
+    need = std::max(need, (std::size_t)t * (h + pad) * (w + pad) *
                               (std::size_t)std::max(lv.cin, lv.cout));
+    const std::size_t nband =
+        ((std::size_t)h * w + kGnBand - 1) / kGnBand;
+    gn_part = std::max(gn_part, (std::size_t)t * nband * G * 2);
+    gn_stats = std::max(gn_stats, (std::size_t)t * G * 2);
     if (lv.space > 1) { h = (h - 2) / 2 + 1; w = (w - 2) / 2 + 1; }
     if (lv.time > 1) { t = (t - 1) / lv.time + 1; }
     need = std::max(need, (std::size_t)t * h * w * (std::size_t)lv.cout);
@@ -1854,7 +2147,11 @@ MetalMiniMaxH3VideoVae::ensure_enc_scratch_(int T, int H, int W)
   s.b = _mc->make_shared_buffer(need * 2);
   s.c = _mc->make_shared_buffer(need * 2);
   s.col = _mc->make_shared_buffer(s.col_cap * 2);
-  if (s.a.empty() || s.b.empty() || s.c.empty() || s.col.empty()) {
+  s.gn_part  = _mc->make_shared_buffer(std::max<std::size_t>(gn_part, 2) * 4);
+  s.gn_stats = _mc->make_shared_buffer(std::max<std::size_t>(gn_stats, 2) *
+                                       4);
+  if (s.a.empty() || s.b.empty() || s.c.empty() || s.col.empty() ||
+      s.gn_part.empty() || s.gn_stats.empty()) {
     return false;
   }
   _es = std::move(s);
@@ -1891,6 +2188,8 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
     return fail("activation allocation failed (out of GPU memory)");
   }
 
+  const bool prof = enc_profile_on_();
+  auto pclock = std::chrono::steady_clock::now();
   // Channel-first [C, T, H, W] -> per-frame channel-last [T, H*W, C],
   // the layout every kernel below reads. Done on the host for the same
   // reason as the decoder's: it is one pass over the input and the GPU
@@ -1954,18 +2253,24 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
     for (const EncLevel& lv : _enc_levels) {
       for (const EncResnet& r : lv.res) {
         for (const Conv3d* cv : {&r.c1, &r.c2}) {
-          if (cv->empty() || cv->k != 3) { continue; }
+          // The 3x3x3 GEMMs only: `k` is the GEMM's depth (27*cin), so
+          // the test this replaces -- `k != 3` -- skipped every conv and
+          // nothing here ever ran. A conv on the hardware route has no
+          // GEMM to tune.
+          if (cv->l.w.empty() || !cv->spatial) { continue; }
           const std::size_t per_row = (std::size_t)27 * cv->cin;
           const std::size_t ohw = (std::size_t)hh * ww;
           std::size_t band = per_row > 0 ? _es.col_cap / per_row : ohw;
           band = std::min(std::max<std::size_t>(band, 1), ohw);
           band = std::min<std::size_t>(band, 4096);
           const int M = (int)band, N = cv->cout, K = (int)per_row;
-          if (M < 128 || _es.a.byte_size() < (std::size_t)M * N * 2) {
+          // The trial GEMMs write `_es.b`: `_es.a` already holds the
+          // input this encode is about to read.
+          if (M < 128 || _es.b.byte_size() < (std::size_t)M * N * 2) {
             continue;
           }
           auto run = [&](ComputeEncoder& enc) {
-            gemm_mma_(enc, _es.col, 0, cv->l, _es.a, 0, M, N, K);
+            gemm_mma_(enc, _es.col, 0, cv->l, _es.b, 0, M, N, K);
           };
           // Tile first, with the split held off: the two decisions are not
           // independent (a split changes how much work each tile does), and
@@ -1995,26 +2300,102 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
     }
     (void)tt;
   }
+  // The hardware conv's tile, per shape, before the stream opens.
+  if (_use_hwconv) {
+    int tt = T, hh = H, ww = W;
+    if (hw_route_(_enc_conv_in, hh, ww, 1, false)) {
+      c3_tune_(_enc_conv_in, tt, hh, ww, 1, 1);
+    }
+    for (const EncLevel& lv : _enc_levels) {
+      for (const EncResnet& r : lv.res) {
+        for (const Conv3d* cv : {&r.c1, &r.c2}) {
+          if (hw_route_(*cv, hh, ww, 1, true)) {
+            c3_tune_(*cv, tt, hh, ww, 1, 1);
+          }
+        }
+      }
+      if (!lv.down.empty() && hw_route_(lv.down, hh, ww, lv.space, false)) {
+        c3_tune_(lv.down, tt, hh, ww, lv.time, lv.space);
+      }
+      if (lv.space > 1) { hh = (hh - 2) / 2 + 1; ww = (ww - 2) / 2 + 1; }
+      if (lv.time > 1) { tt = (tt - 1) / lv.time + 1; }
+    }
+  }
   _flops.begin();
+  if (prof) { prof_add_("host: transpose in", ms_since_(pclock)); }
   CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();
-    t = enc_conv_(enc, _enc_conv_in, *buf[cur], t, h, w, *buf[spare(0)], 1, 1);
+    // A profile bucket ends here: commit, wait, and charge the time since
+    // the last mark to `bucket`.
+    pclock = std::chrono::steady_clock::now();
+    auto mark = [&](const std::string& bucket) {
+      if (!prof) { return; }
+      enc.end();
+      _flops.flush(stream);
+      std::string ge;
+      (void)stream.commit().wait_ok(&ge);
+      prof_add_(bucket, ms_since_(pclock));
+      stream = _mc->make_command_stream();
+      enc = stream.begin_compute();
+      pclock = std::chrono::steady_clock::now();
+    };
+    if (hw_route_(_enc_conv_in, h, w, 1, false)) {
+      enc_pad_(enc, *buf[cur], t, h, w, IC, 1, 1, *buf[spare(1)]);
+      t = enc_conv_hw_(enc, _enc_conv_in, *buf[spare(1)], t, h, w,
+                       *buf[spare(0)], 1, 1, nullptr);
+    } else {
+      t = enc_conv_(enc, _enc_conv_in, *buf[cur], t, h, w, *buf[spare(0)], 1,
+                    1);
+    }
     cur = spare(0);
     if (t == 0) { return fail("conv_in produced no frames"); }
+    mark("conv_in");
 
     for (std::size_t li = 0; li < (std::size_t)levels; ++li) {
       const EncLevel& lv = _enc_levels[li];
+      const std::string lname = "L" + std::to_string(li);
       for (const EncResnet& r : lv.res) {
         const int s1 = spare(0), s2 = spare(1);
         const std::size_t rows = (std::size_t)h * w;
         // norm -> silu -> conv1 -> norm -> silu -> conv2, then the skip.
-        enc_gn_(enc, *buf[cur], r.n1w, r.n1b, *buf[s1], t, (int)rows, r.cin,
-                true);
-        enc_conv_(enc, r.c1, *buf[s1], t, h, w, *buf[s2], 1, 1);
-        enc_gn_(enc, *buf[s2], r.n2w, r.n2b, *buf[s1], t, (int)rows, r.cout,
-                true);
+        // On the hardware route each norm writes its conv's input
+        // reflect-padded, and conv2 adds the residual in its epilogue.
+        const bool hw1 = hw_route_(r.c1, h, w, 1, true);
+        const bool hw2 = hw_route_(r.c2, h, w, 1, true);
+        enc_gn_(enc, *buf[cur], r.n1w, r.n1b, *buf[s1], t, h, w, r.cin,
+                true, hw1);
+        mark("norm");
+        if (hw1) {
+          enc_conv_hw_(enc, r.c1, *buf[s1], t, h, w, *buf[s2], 1, 1,
+                       nullptr);
+        } else {
+          enc_conv_(enc, r.c1, *buf[s1], t, h, w, *buf[s2], 1, 1);
+        }
+        mark(lname + " conv3");
+        enc_gn_(enc, *buf[s2], r.n2w, r.n2b, *buf[s1], t, h, w, r.cout,
+                true, hw2);
+        mark("norm");
+        if (hw2) {
+          if (r.skip.empty()) {
+            enc_conv_hw_(enc, r.c2, *buf[s1], t, h, w, *buf[s2], 1, 1,
+                         buf[cur]);
+            mark(lname + " conv3");
+            cur = s2;
+          } else {
+            // conv1's output is spent (the norm read it), so the
+            // shortcut takes its buffer, and the sum lands in `cur`,
+            // whose last reader was the shortcut.
+            enc_conv_(enc, r.skip, *buf[cur], t, h, w, *buf[s2], 1, 1);
+            mark("conv1 shortcut");
+            enc_conv_hw_(enc, r.c2, *buf[s1], t, h, w, *buf[cur], 1, 1,
+                         buf[s2]);
+            mark(lname + " conv3");
+          }
+          continue;
+        }
         enc_conv_(enc, r.c2, *buf[s1], t, h, w, *buf[s2], 1, 1);
+        mark(lname + " conv3");
         const std::size_t n = (std::size_t)t * rows * (std::size_t)r.cout;
         // Elementwise over the whole activation, which at a full-frame
         // encode is 2.2e9 elements -- past the int this used to narrow
@@ -2033,22 +2414,35 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
         };
         if (r.skip.empty()) {
           residual(cur, s2, s1);
+          mark("residual");
         } else {
           // The 1x1x1 shortcut has to run BEFORE the add, and it reads
           // the resnet's input -- which is why three buffers are the
           // minimum here and not two.
           enc_conv_(enc, r.skip, *buf[cur], t, h, w, *buf[s1], 1, 1);
+          mark("conv1 shortcut");
           residual(s1, s2, cur);
+          mark("residual");
           continue;                    // the sum landed back in `cur`
         }
         cur = s1;
       }
       if (!lv.down.empty()) {
-        const int s1 = spare(0);
-        const int nt =
-            enc_conv_(enc, lv.down, *buf[cur], t, h, w, *buf[s1], lv.time,
-                      lv.space);
+        const int s1 = spare(0), s2 = spare(1);
+        int nt = 0;
+        if (hw_route_(lv.down, h, w, lv.space, false)) {
+          // Stride 2 pads the bottom and right only; a stride-1 temporal
+          // downsample would pad all round, as the norm does.
+          const int lo = (lv.space == 2) ? 0 : 1;
+          enc_pad_(enc, *buf[cur], t, h, w, lv.cout, lo, 1, *buf[s2]);
+          nt = enc_conv_hw_(enc, lv.down, *buf[s2], t, h, w, *buf[s1],
+                            lv.time, lv.space, nullptr);
+        } else {
+          nt = enc_conv_(enc, lv.down, *buf[cur], t, h, w, *buf[s1],
+                         lv.time, lv.space);
+        }
         if (nt == 0) { return fail("a downsample produced no frames"); }
+        mark(lname + " down");
         if (lv.space > 1) { h = (h - 2) / 2 + 1; w = (w - 2) / 2 + 1; }
         t = nt;
         cur = s1;
@@ -2057,11 +2451,18 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
 
     if (head) {
       const int s1 = spare(0), s2 = spare(1);
-      enc_gn_(enc, *buf[cur], _enc_norm_w, _enc_norm_b, *buf[s1], t, h * w,
-              _enc_levels.back().cout, true);
-      enc_conv_(enc, _enc_conv_out, *buf[s1], t, h, w, *buf[s2], 1, 1);
+      const bool hwo = hw_route_(_enc_conv_out, h, w, 1, true);
+      enc_gn_(enc, *buf[cur], _enc_norm_w, _enc_norm_b, *buf[s1], t, h, w,
+              _enc_levels.back().cout, true, hwo);
+      if (hwo) {
+        enc_conv_hw_(enc, _enc_conv_out, *buf[s1], t, h, w, *buf[s2], 1, 1,
+                     nullptr);
+      } else {
+        enc_conv_(enc, _enc_conv_out, *buf[s1], t, h, w, *buf[s2], 1, 1);
+      }
       enc_conv_(enc, _quant_conv, *buf[s2], t, h, w, *buf[s1], 1, 1);
       cur = s1;
+      mark("head");
     }
   }
   std::string gpu_err;
@@ -2071,6 +2472,7 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
                     ? std::string("MiniMax-H3 video VAE encode failed")
                     : gpu_err);
   }
+  pclock = std::chrono::steady_clock::now();
 
   // Back to channel-first [2*z, To, h, w], matching what decode() takes.
   SharedBuffer out =
@@ -2089,7 +2491,41 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
       }
     }
   }
+  if (prof) { prof_add_("host: transpose out", ms_since_(pclock)); }
   return out;
+}
+
+void
+MetalMiniMaxH3VideoVae::prof_add_(const std::string& name, double ms)
+{
+  for (ProfBucket& b : _enc_prof) {
+    if (b.name == name) { b.ms += ms; ++b.marks; return; }
+  }
+  _enc_prof.push_back(ProfBucket{name, ms, 1});
+}
+
+void
+MetalMiniMaxH3VideoVae::prof_log_(int T, int H, int W)
+{
+  if (_enc_prof.empty() || _mc->session() == nullptr) { return; }
+  double tot = 0.0;
+  for (const ProfBucket& b : _enc_prof) { tot += b.ms; }
+  std::string line;
+  for (const ProfBucket& b : _enc_prof) {
+    line += std::format("\n  {:<20} {:>9.1f} ms {:>5.1f}%  ({} marks)",
+                        b.name, b.ms,
+                        tot > 0.0 ? 100.0 * b.ms / tot : 0.0, b.marks);
+  }
+  std::string route = _use_hwconv ? "hardware conv" : "im2col + GEMM";
+  for (const C3Tune& t : _c3_tuned) {
+    route += std::format("; s{} {}->{} {}x{} {}", t.stride, t.cin, t.cout,
+                         t.W, t.H, kC3Names[t.pick]);
+  }
+  _mc->session()->log_normal(fmt(
+      "MiniMax-H3 video VAE encode profile, {}x{}x{} ({}; each GPU "
+      "bucket is a commit AND a wait): {:.1f} ms{}",
+      T, W, H, route, tot, line));
+  _enc_prof.clear();
 }
 
 // ---- tiling and clip chunking ------------------------------------------
@@ -2241,6 +2677,7 @@ MetalMiniMaxH3VideoVae::encode_tiled_(const SharedBuffer& x, int T, int H,
       if (stopping()) { return {}; }
       const int y0 = ys.start[i], th = ys.length[i];
       const int x0 = xs.start[j], tw = xs.length[j];
+      const auto pc = std::chrono::steady_clock::now();
       SharedBuffer sub =
           _mc->make_shared_buffer((std::size_t)IC * T * th * tw * 2);
       if (sub.empty()) {
@@ -2259,6 +2696,7 @@ MetalMiniMaxH3VideoVae::encode_tiled_(const SharedBuffer& x, int T, int H,
           }
         }
       }
+      if (enc_profile_on_()) { prof_add_("host: tile copy", ms_since_(pc)); }
       if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
       SharedBuffer enc = encode(sub, T, th, tw, err);
       if (enc.empty()) { return {}; }
@@ -2267,9 +2705,11 @@ MetalMiniMaxH3VideoVae::encode_tiled_(const SharedBuffer& x, int T, int H,
       tiles.push_back(std::move(enc));
     }
   }
+  const auto pc = std::chrono::steady_clock::now();
   SharedBuffer out =
       stitch_(tiles, ys, xs, c.patch, 2 * c.z_channels, encoded_frames(T),
               H / c.patch, W / c.patch);
+  if (enc_profile_on_()) { prof_add_("host: stitch", ms_since_(pc)); }
   if (out.empty() && err != nullptr) { *err = "tile stitch failed"; }
   return out;
 }
@@ -2455,9 +2895,11 @@ MetalMiniMaxH3VideoVae::encode_video(const SharedBuffer& x, int T, int H,
     _prog_total = calls * tiles;
     _prog_done  = 0;
   }
+  _enc_prof.clear();
   if (T == 1) {
     SharedBuffer out = encode_tiled_(x, 1, H, W, err);
     if (!out.empty() && latent_frames != nullptr) { *latent_frames = 1; }
+    prof_log_(1, H, W);
     return out;
   }
   const int cl = c.clip_length, IC = c.in_channels;
@@ -2485,6 +2927,7 @@ MetalMiniMaxH3VideoVae::encode_video(const SharedBuffer& x, int T, int H,
 
   for (int n = 0; n < nclips; ++n) {
     if (stopping()) { return {}; }
+    const auto pc0 = std::chrono::steady_clock::now();
     auto* cd = static_cast<std::uint16_t*>(clip.contents());
     for (int ch = 0; ch < IC; ++ch) {
       for (int t = 0; t < cl; ++t) {
@@ -2496,8 +2939,10 @@ MetalMiniMaxH3VideoVae::encode_video(const SharedBuffer& x, int T, int H,
                     src + ((std::size_t)ch * T + st) * plane, plane * 2);
       }
     }
+    if (enc_profile_on_()) { prof_add_("host: clip copy", ms_since_(pc0)); }
     SharedBuffer enc = encode_tiled_(clip, cl, H, W, err);
     if (enc.empty()) { return {}; }
+    const auto pc = std::chrono::steady_clock::now();
     const auto* ed = static_cast<const std::uint16_t*>(enc.contents());
     for (int ch = 0; ch < ZC2; ++ch) {
       for (int f = 0; f < per; ++f) {
@@ -2507,8 +2952,10 @@ MetalMiniMaxH3VideoVae::encode_video(const SharedBuffer& x, int T, int H,
                     ed + ((std::size_t)ch * per + f) * lplane, lplane * 2);
       }
     }
+    if (enc_profile_on_()) { prof_add_("host: clip copy", ms_since_(pc)); }
   }
   if (latent_frames != nullptr) { *latent_frames = total; }
+  prof_log_(T, H, W);
   return out;
 }
 

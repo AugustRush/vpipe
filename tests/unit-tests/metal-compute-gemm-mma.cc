@@ -5406,3 +5406,352 @@ TEST(conv2d_mma, hw_op_past_the_2gb_line) {
     }
   }
 }
+
+// The MiniMax-H3 encoder's causal 3x3x3 conv on the hardware op
+// (conv3d_hw_causal_s{1,2}_*): every entry against a CPU oracle -- the
+// three tuned tiles and the partial-tile one, at stride 1 and 2, a
+// temporal stride of 2, and the fused residual. The input is handed in
+// already padded, so the oracle reads it as given: dest (t, y, x) is
+// bias + res + the sum over live taps kt (input frame t*stride_t+kt-2)
+// of in[si][S*y+ky][S*x+kx] . w[kt][ky][kx]. bf16, as the encoder runs.
+namespace {
+
+struct C3Case {
+  int W, H, C, Cout, Ti, stride_t, stride_s;
+};
+
+// Runs entry `name` on one case; returns rel-L2 against the oracle.
+double
+c3_run_case_(MetalCompute* mc, ComputeLibrary& lib, const std::string& name,
+             int tw, int th, int tc, int sg, const C3Case& k)
+{
+  const int pad = (k.stride_s == 2) ? 1 : 2;
+  const int Wp = k.W + pad, Hp = k.H + pad;
+  const int Wo = (k.stride_s == 2) ? (k.W - 2) / 2 + 1 : k.W;
+  const int Ho = (k.stride_s == 2) ? (k.H - 2) / 2 + 1 : k.H;
+  const int To = (k.Ti - 1) / k.stride_t + 1;
+  std::mt19937 rng(91u + (unsigned)(k.W * 31 + k.C + k.stride_s));
+  std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+  const std::size_t nin = (std::size_t)k.Ti * Hp * Wp * k.C;
+  const std::size_t nw = (std::size_t)27 * k.C * k.Cout;
+  const std::size_t nout = (std::size_t)To * Ho * Wo * k.Cout;
+  std::vector<float> in(nin), w(nw), b((std::size_t)k.Cout), r(nout);
+  const float ws = 1.0f / std::sqrt(27.0f * (float)k.C);
+  // Values rounded to bf16 first, so the oracle sees what the GPU does.
+  auto q = [](float v) { return bf16_to_f32(f32_to_bf16(v)); };
+  for (auto& v : in) { v = q(d(rng)); }
+  for (auto& v : w) { v = q(d(rng) * ws); }
+  for (auto& v : b) { v = q(0.1f * d(rng)); }
+  for (auto& v : r) { v = q(d(rng)); }
+  ComputeFunction fn = lib.function(name);
+  if (!fn.valid()) { return 1.0; }
+  auto upload = [&](const std::vector<float>& v) {
+    SharedBuffer sb = mc->make_shared_buffer(v.size() * 2);
+    auto* p = static_cast<std::uint16_t*>(sb.contents());
+    for (std::size_t i = 0; i < v.size(); ++i) { p[i] = f32_to_bf16(v[i]); }
+    return sb;
+  };
+  SharedBuffer bin = upload(in), bw = upload(w), bb = upload(b),
+               br = upload(r);
+  SharedBuffer bo = mc->make_shared_buffer(nout * 2);
+  std::memset(bo.contents(), 0xff, nout * 2);       // NaN: unwritten shows
+  {
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder enc = st.begin_compute();
+      enc.set_function(fn);
+      enc.set_buffer(0, bin); enc.set_buffer(1, bw); enc.set_buffer(2, bo);
+      enc.set_buffer(3, bb); enc.set_buffer(4, br);
+      enc.set_constant(5, Wp); enc.set_constant(6, Hp);
+      enc.set_constant(7, k.C); enc.set_constant(8, k.Cout);
+      enc.set_constant(9, Wo); enc.set_constant(10, Ho);
+      enc.set_constant(11, k.Ti); enc.set_constant(12, k.stride_t);
+      enc.set_constant(13, 1);
+      enc.set_constant(14, 0);
+      enc.dispatch({(unsigned)(((Wo + tw - 1) / tw) * sg * 32),
+                    (unsigned)((Ho + th - 1) / th),
+                    (unsigned)(To * (k.Cout / tc))},
+                   {(unsigned)(sg * 32), 1, 1});
+    }
+    if (!st.commit().wait_ok()) { return 1.0; }
+  }
+  const auto* go = static_cast<const std::uint16_t*>(bo.contents());
+  double num = 0.0, den = 0.0;
+  const int S = k.stride_s;
+  for (int t = 0; t < To; ++t) {
+    for (int y = 0; y < Ho; ++y) {
+      for (int x = 0; x < Wo; ++x) {
+        for (int o = 0; o < k.Cout; ++o) {
+          const std::size_t oi =
+              (((std::size_t)t * Ho + y) * Wo + x) * k.Cout + o;
+          double acc = b[(std::size_t)o] + r[oi];
+          for (int kt = 0; kt < 3; ++kt) {
+            const int si = t * k.stride_t + kt - 2;
+            if (si < 0 || si >= k.Ti) { continue; }
+            for (int ky = 0; ky < 3; ++ky) {
+              for (int kx = 0; kx < 3; ++kx) {
+                const float* ip =
+                    &in[(((std::size_t)si * Hp + S * y + ky) * Wp + S * x +
+                         kx) * k.C];
+                const float* wp =
+                    &w[(((std::size_t)kt * 3 + ky) * 3 + kx) * k.C * k.Cout +
+                       o];
+                for (int c = 0; c < k.C; ++c) {
+                  acc += (double)ip[c] * (double)wp[(std::size_t)c * k.Cout];
+                }
+              }
+            }
+          }
+          const double e = (double)bf16_to_f32(go[oi]) - acc;
+          num += e * e;
+          den += acc * acc;
+        }
+      }
+    }
+  }
+  const double rel = den > 0.0 ? std::sqrt(num / den) : 1.0;
+  return std::isfinite(rel) ? rel : 1.0;
+}
+
+}  // namespace
+
+TEST(conv2d_mma, hw_op_causal3d_matches_oracle) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib = mc->load_library("conv2d_mma_bf16");
+  struct Entry { const char* sfx; int tw, th, tc, sg; bool tail; };
+  const Entry entries[] = {{"c128", 8, 8, 128, 4, false},
+                           {"c128d", 8, 8, 128, 4, false},
+                           {"c128w16d", 16, 8, 128, 8, false},
+                           {"tail", 8, 8, 128, 4, true}};
+  // Whole tiles for every entry; then grids only the tail entry serves.
+  const C3Case whole[] = {{32, 16, 64, 128, 4, 1, 1},
+                          {32, 32, 64, 256, 5, 2, 2},
+                          {32, 16, 3, 128, 4, 1, 1},
+                          {32, 16, 8, 128, 4, 1, 1}};
+  const C3Case ragged[] = {{20, 12, 64, 128, 3, 1, 1},
+                           {26, 22, 64, 128, 5, 2, 2}};
+  for (const Entry& e : entries) {
+    for (int st = 1; st <= 2; ++st) {
+      const std::string name = std::string("conv3d_hw_causal_s") +
+                               (st == 1 ? "1_" : "2_") + e.sfx + "_f16";
+      for (const C3Case& k : whole) {
+        if (k.stride_s != st) { continue; }
+        const double rel = c3_run_case_(mc, lib, name, e.tw, e.th, e.tc,
+                                        e.sg, k);
+        std::printf("[c3d] %-32s %dx%d %d->%d Ti=%d st=%d/%d rel %.2e\n",
+                    name.c_str(), k.W, k.H, k.C, k.Cout, k.Ti, k.stride_t,
+                    k.stride_s, rel);
+        EXPECT_TRUE(rel < 1e-2);
+      }
+      if (!e.tail) { continue; }
+      for (const C3Case& k : ragged) {
+        if (k.stride_s != st) { continue; }
+        const double rel = c3_run_case_(mc, lib, name, e.tw, e.th, e.tc,
+                                        e.sg, k);
+        std::printf("[c3d] %-32s %dx%d %d->%d Ti=%d st=%d/%d rel %.2e\n",
+                    name.c_str(), k.W, k.H, k.C, k.Cout, k.Ti, k.stride_t,
+                    k.stride_s, rel);
+        EXPECT_TRUE(rel < 1e-2);
+      }
+    }
+  }
+  // The 16-channel entry (stride 1, guarded): the encoder's conv_out,
+  // 1024 -> 48, on a whole grid and a ragged one.
+  const C3Case c16[] = {{16, 16, 128, 48, 5, 1, 1}, {20, 12, 64, 48, 3, 1, 1}};
+  for (const C3Case& k : c16) {
+    const double rel = c3_run_case_(mc, lib, "conv3d_hw_causal_s1_c16_f16",
+                                    8, 8, 16, 4, k);
+    std::printf("[c3d] %-32s %dx%d %d->%d Ti=%d rel %.2e\n",
+                "conv3d_hw_causal_s1_c16_f16", k.W, k.H, k.C, k.Cout, k.Ti,
+                rel);
+    EXPECT_TRUE(rel < 1e-2);
+  }
+}
+
+// The same entries TIMED at the encoder's real shapes -- its 256x256
+// tile's levels -- for the tile table in conv2d_mma.metal. A sweep, not a
+// gate: it prints. Env: VPIPE_HWCONV_C3D_BENCH=1.
+TEST(conv2d_mma, hw_op_causal3d_tile_sweep) {
+  const char* on = std::getenv("VPIPE_HWCONV_C3D_BENCH");
+  if (on == nullptr || *on == '\0' || *on == '0') { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib = mc->load_library("conv2d_mma_bf16");
+  struct Var { const char* name; int tw, th, sg; };
+  const Var vars[] = {{"c128", 8, 8, 4}, {"c128d", 8, 8, 4},
+                      {"c128w16d", 16, 8, 8}};
+  struct Shape { int W, H, C, Cout, T; };
+  // VPIPE_HWCONV_C3D_T: frames (5 by default; a reference clip is 17
+  // at the first two levels).
+  const char* te = std::getenv("VPIPE_HWCONV_C3D_T");
+  const int T = (te != nullptr && std::atoi(te) > 0) ? std::atoi(te) : 5;
+  const char* ce = std::getenv("VPIPE_HWCONV_C3D_CHUNK");
+  const int chunk = (ce != nullptr && std::atoi(ce) > 0) ? std::atoi(ce) : T;
+  const Shape shapes[] = {{256, 256, 128, 128, T}, {128, 128, 128, 256, T},
+                          {128, 128, 256, 256, T}, {64, 64, 256, 256, T},
+                          {32, 32, 512, 512, T}, {16, 16, 1024, 1024, T}};
+  for (const Shape& sh : shapes) {
+    const int Wp = sh.W + 2, Hp = sh.H + 2;
+    const std::size_t nin = (std::size_t)sh.T * Hp * Wp * sh.C;
+    const std::size_t nw = (std::size_t)27 * sh.C * sh.Cout;
+    const std::size_t nout = (std::size_t)sh.T * sh.H * sh.W * sh.Cout;
+    SharedBuffer in = mc->make_shared_buffer(nin * 2);
+    SharedBuffer wt = mc->make_shared_buffer(nw * 2);
+    SharedBuffer bs = mc->make_shared_buffer((std::size_t)sh.Cout * 2);
+    SharedBuffer out = mc->make_shared_buffer(nout * 2);
+    ASSERT_TRUE(!in.empty() && !wt.empty() && !bs.empty() && !out.empty());
+    {
+      std::mt19937 rng(5u + (unsigned)sh.C);
+      std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+      auto* pi = static_cast<std::uint16_t*>(in.contents());
+      for (std::size_t i = 0; i < nin; ++i) { pi[i] = f32_to_bf16(d(rng)); }
+      auto* pw = static_cast<std::uint16_t*>(wt.contents());
+      const float ws = 1.0f / std::sqrt(27.0f * (float)sh.C);
+      for (std::size_t i = 0; i < nw; ++i) {
+        pw[i] = f32_to_bf16(d(rng) * ws);
+      }
+      std::memset(bs.contents(), 0, (std::size_t)sh.Cout * 2);
+    }
+    double flops = 0.0;
+    for (int t = 0; t < sh.T; ++t) {
+      const int live = std::min(t, 2) + 1;
+      flops += 2.0 * sh.H * sh.W * sh.Cout * 9.0 * live * sh.C;
+    }
+    std::printf("[c3d] %dx%d %d->%d T=%d (%.1f GFLOP)\n", sh.W, sh.H, sh.C,
+                sh.Cout, sh.T, flops * 1e-9);
+    for (const Var& v : vars) {
+      ComputeFunction fn = lib.function(std::string("conv3d_hw_causal_s1_") +
+                                        v.name + "_f16");
+      ASSERT_TRUE(fn.valid());
+      double best = 1e30;
+      for (int r = 0; r < 4; ++r) {
+        CommandStream st = mc->make_command_stream();
+        {
+          ComputeEncoder enc = st.begin_compute();
+          // `chunk` output frames a dispatch (VPIPE_HWCONV_C3D_CHUNK).
+          for (int f0 = 0; f0 < sh.T; f0 += chunk) {
+            const int nf = std::min(chunk, sh.T - f0);
+            enc.set_function(fn);
+            enc.set_buffer(0, in); enc.set_buffer(1, wt);
+            enc.set_buffer(2, out); enc.set_buffer(3, bs);
+            enc.set_buffer(4, out);
+            enc.set_constant(5, Wp); enc.set_constant(6, Hp);
+            enc.set_constant(7, sh.C); enc.set_constant(8, sh.Cout);
+            enc.set_constant(9, sh.W); enc.set_constant(10, sh.H);
+            enc.set_constant(11, sh.T); enc.set_constant(12, 1);
+            enc.set_constant(13, 0); enc.set_constant(14, f0);
+            enc.dispatch({(unsigned)((sh.W / v.tw) * v.sg * 32),
+                          (unsigned)(sh.H / v.th),
+                          (unsigned)(nf * (sh.Cout / 128))},
+                         {(unsigned)(v.sg * 32), 1, 1});
+          }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = st.commit().wait_ok();
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (ok && r > 0) { best = std::min(best, ms); }
+      }
+      std::printf("[c3d]   %-10s %8.2f ms  %6.2f TFLOP/s\n", v.name, best,
+                  flops * 1e-9 / best);
+    }
+  }
+}
+
+// The H3 encoder's level-0 conv against a large bf16 matmul2d GEMM,
+// ALTERNATED for several seconds: on a power-limited GPU (the fanless M5)
+// a burst runs ~2x what the box sustains, so the only figure that says
+// how well the conv uses the matrix hardware is its rate RELATIVE to a
+// GEMM's in the same thermal state. Env: VPIPE_HWCONV_C3D_SUSTAIN=<rounds>.
+TEST(conv2d_mma, hw_op_causal3d_vs_gemm_sustained) {
+  const char* on = std::getenv("VPIPE_HWCONV_C3D_SUSTAIN");
+  if (on == nullptr || std::atoi(on) <= 0) { return; }
+  const int rounds = std::atoi(on);
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lc = mc->load_library("conv2d_mma_bf16");
+  ComputeLibrary lg = mc->load_library("dense_gemm_mma_bf16");
+  ComputeFunction fc = lc.function("conv3d_hw_causal_s1_c128_f16");
+  ComputeFunction fg = lg.function("dense_gemm_mma_t_n128x256_f16");
+  ASSERT_TRUE(fc.valid() && fg.valid());
+  // Conv: a reference clip's level 0, 17 frames of 256^2, 128 -> 128.
+  const int T = 17, W = 256, H = 256, C = 128, Co = 128;
+  const int Wp = W + 2, Hp = H + 2;
+  double cflops = 0.0;
+  for (int t = 0; t < T; ++t) {
+    cflops += 2.0 * H * W * Co * 9.0 * (std::min(t, 2) + 1) * C;
+  }
+  // GEMM: 4096^3.
+  const int M = 4096, N = 4096, K = 4096;
+  const double gflops = 2.0 * M * N * K;
+  auto rnd = [](SharedBuffer& b, std::size_t n, float s, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) { p[i] = f32_to_bf16(d(rng) * s); }
+  };
+  const std::size_t nin = (std::size_t)T * Hp * Wp * C;
+  const std::size_t nw = (std::size_t)27 * C * Co;
+  const std::size_t nout = (std::size_t)T * H * W * Co;
+  SharedBuffer cin = mc->make_shared_buffer(nin * 2);
+  SharedBuffer cw = mc->make_shared_buffer(nw * 2);
+  SharedBuffer cb = mc->make_shared_buffer((std::size_t)Co * 2);
+  SharedBuffer co = mc->make_shared_buffer(nout * 2);
+  SharedBuffer gx = mc->make_shared_buffer((std::size_t)M * K * 2);
+  SharedBuffer gw = mc->make_shared_buffer((std::size_t)N * K * 2);
+  SharedBuffer gy = mc->make_shared_buffer((std::size_t)M * N * 2);
+  ASSERT_TRUE(!cin.empty() && !cw.empty() && !co.empty() && !gx.empty() &&
+              !gw.empty() && !gy.empty());
+  rnd(cin, nin, 1.0f, 1);
+  rnd(cw, nw, 0.03f, 2);
+  rnd(cb, (std::size_t)Co, 0.1f, 3);
+  rnd(gx, (std::size_t)M * K, 1.0f, 4);
+  rnd(gw, (std::size_t)N * K, 0.02f, 5);
+  auto timed = [&](auto&& enc_fn) {
+    CommandStream st = mc->make_command_stream();
+    { ComputeEncoder enc = st.begin_compute(); enc_fn(enc); }
+    const auto t0 = std::chrono::steady_clock::now();
+    (void)st.commit().wait_ok();
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+  };
+  double tc = 0.0, tg = 0.0;
+  for (int r = 0; r < rounds; ++r) {
+    const double a = timed([&](ComputeEncoder& enc) {
+      enc.set_function(fc);
+      enc.set_buffer(0, cin); enc.set_buffer(1, cw); enc.set_buffer(2, co);
+      enc.set_buffer(3, cb); enc.set_buffer(4, co);
+      enc.set_constant(5, Wp); enc.set_constant(6, Hp);
+      enc.set_constant(7, C); enc.set_constant(8, Co);
+      enc.set_constant(9, W); enc.set_constant(10, H);
+      enc.set_constant(11, T); enc.set_constant(12, 1);
+      enc.set_constant(13, 0); enc.set_constant(14, 0);
+      enc.dispatch({(unsigned)((W / 8) * 128), (unsigned)(H / 8),
+                    (unsigned)(T * (Co / 128))}, {128, 1, 1});
+    });
+    const double b = timed([&](ComputeEncoder& enc) {
+      enc.set_function(fg);
+      enc.set_buffer(0, gx); enc.set_buffer(1, gw); enc.set_buffer(2, gw);
+      enc.set_buffer(3, gy);
+      enc.set_constant(4, K); enc.set_constant(5, N); enc.set_constant(6, M);
+      enc.set_constant(7, 0);
+      enc.dispatch({(unsigned)(((N + 255) / 256) * 256),
+                    (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+    });
+    tc += a;
+    tg += b;
+    if (r == 0 || r + 1 == rounds || (r + 1) % 10 == 0) {
+      std::printf("[c3d-sus] round %3d: conv %.2f TFLOP/s, gemm %.2f "
+                  "TFLOP/s\n", r + 1, cflops * 1e-9 / a, gflops * 1e-9 / b);
+    }
+  }
+  const double rc = cflops * rounds * 1e-9 / tc;
+  const double rg = gflops * rounds * 1e-9 / tg;
+  std::printf("[c3d-sus] %d rounds, %.1f s: conv %.2f TFLOP/s, gemm %.2f "
+              "TFLOP/s -- conv at %.0f%% of the GEMM's rate\n", rounds,
+              (tc + tg) * 1e-3, rc, rg, 100.0 * rc / rg);
+}

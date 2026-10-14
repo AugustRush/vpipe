@@ -420,7 +420,49 @@ TEST(vae_flops, minimax_h3_video_vae_counts_its_layers)
     EXPECT_TRUE(g == f);
     EXPECT_TRUE(m->gpu_flops().pending() == 0);
   }
+  // The ENCODE, derived from the config: every 3x3x3 conv at its LIVE
+  // temporal taps (output frame t reads input frames t*st-2 .. t*st, and
+  // one before the clip is causal padding), every 1x1x1 as a GEMM over
+  // the voxels. Whichever route runs it -- im2col + GEMM, or the M5's
+  // hardware conv -- must count exactly this.
   const int ET = 5, EH = 64, EW = 64;
+  std::uint64_t ewant = 0;
+  {
+    auto conv3 = [&](int& t, int& h, int& w, int cin, int cout, int st,
+                     int ss) {
+      const int ho = (ss == 2) ? (h - 2) / 2 + 1 : h;
+      const int wo = (ss == 2) ? (w - 2) / 2 + 1 : w;
+      const int to = (t - 1) / st + 1;
+      for (int o = 0; o < to; ++o) {
+        int live = 0;
+        for (int kt = 0; kt < 3; ++kt) {
+          const int si = o * st + kt - 2;
+          live += (si >= 0 && si < t) ? 1 : 0;
+        }
+        ewant += gemm_flops((long long)ho * wo, cout, 9LL * live * cin);
+      }
+      t = to; h = ho; w = wo;
+    };
+    int t = ET, h = EH, w = EW;
+    conv3(t, h, w, cfg.in_channels, cfg.base_ch, 1, 1);
+    int prev = cfg.base_ch;
+    for (std::size_t i = 0; i < cfg.ch_mult.size(); ++i) {
+      const int co = cfg.base_ch * cfg.ch_mult[i];
+      for (int j = 0; j < cfg.res_blocks; ++j) {
+        const int ci = (j == 0) ? prev : co;
+        conv3(t, h, w, ci, co, 1, 1);
+        conv3(t, h, w, co, co, 1, 1);
+        if (ci != co) { ewant += gemm_flops((long long)t * h * w, co, ci); }
+      }
+      if (cfg.space_down[i] * cfg.time_down[i] > 1) {
+        conv3(t, h, w, co, co, cfg.time_down[i], cfg.space_down[i]);
+      }
+      prev = co;
+    }
+    conv3(t, h, w, prev, 2 * cfg.z_channels, 1, 1);
+    ewant += gemm_flops((long long)t * h * w, 2 * cfg.z_channels,
+                        2 * cfg.z_channels);
+  }
   SharedBuffer x = zeros_(mc, (std::size_t)cfg.in_channels * ET * EH * EW);
   ASSERT_TRUE(!x.empty());
   {
@@ -428,8 +470,10 @@ TEST(vae_flops, minimax_h3_video_vae_counts_its_layers)
     ASSERT_TRUE(!m->encode(x, ET, EH, EW, &err).empty());
     const auto [f, g] = c.take(m->gpu_flops());
     std::printf("[vae_flops] h3 video encode %dx%dx%d: counted %.4f GFLOP, "
-                "credited %.4f\n", ET, EW, EH, f / 1e9, g / 1e9);
-    EXPECT_TRUE(f > 0 && g == f);
+                "derived %.4f, credited %.4f\n", ET, EW, EH, f / 1e9,
+                ewant / 1e9, g / 1e9);
+    EXPECT_TRUE(f == ewant);
+    EXPECT_TRUE(g == f);
     EXPECT_TRUE(m->gpu_flops().pending() == 0);
   }
 }

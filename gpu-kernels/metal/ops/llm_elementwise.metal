@@ -1379,6 +1379,193 @@ kernel void group_norm_frames_f16(
   }
 }
 
+// group_norm_frames_f16 in three COALESCED passes.
+//
+// The one-pass kernel above gives every (frame, group) its own
+// threadgroup. The groups are 4-32 channels of a channel-last row 128-1024
+// wide, so each of the G threadgroups reads a sliver of every row -- 8
+// bytes of each 256-byte row at C = 128 -- and a frame is fetched G times
+// over. MEASURED on a 17x832x480 encode, twelve 256^2 tiles: 6.0 s of
+// norms on the M4 Pro (16% of it, more than every level below the first
+// two put together) and 12.6 s on the M5; these three passes take 0.82 s
+// and ~1.2 s, the latter with a commit per norm to time it.
+//
+// Pass 1, per (frame, band of rows): each group's sum and sum of squares
+// as float partials. A threadgroup reads whole rows, every channel, in
+// order. Each thread owns ONE vec4 of channels -- 256 is a multiple of
+// C/4 -- and that vec4 lies inside one group, since C/G is a multiple of
+// 4. The host checks both and keeps the one-pass kernel otherwise.
+//   0:x[T,rows,C] 1:part[T,nband,G,2] 2:rows 3:C 4:G 5:band
+//   grid {256, nband, T}, tg {256,1,1}
+kernel void group_norm_frames_stats_f16(
+    const device VPIPE_ELT* x    [[buffer(0)]],
+    device float*           part [[buffer(1)]],
+    constant int&      rows [[buffer(2)]],
+    constant int&      C    [[buffer(3)]],
+    constant int&      G    [[buffer(4)]],
+    constant int&      band [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tgpg [[threadgroups_per_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+  const int C4   = C / 4;
+  const int v    = (int)lid % C4;
+  const int step = 256 / C4;               // rows one sweep covers
+  const int r0   = (int)tgid.y * band;
+  const int r1   = min(r0 + band, rows);
+  const device VPIPE_ELT4* xf = reinterpret_cast<const device VPIPE_ELT4*>(
+      x + (long)tgid.z * (long)rows * (long)C);
+  float s = 0.0f, q = 0.0f;
+  for (int r = r0 + (int)lid / C4; r < r1; r += step) {
+    const float4 a = float4(xf[(long)r * C4 + v]);
+    s += (a.x + a.y) + (a.z + a.w);
+    q += dot(a, a);
+  }
+  threadgroup float ts[256];
+  threadgroup float tq[256];
+  ts[lid] = s;
+  tq[lid] = q;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Group g is vec4 slots [g*Cg4, (g+1)*Cg4), each held by `step`
+  // threads: slot + k*C4.
+  const int Cg4 = C4 / G;
+  if ((int)lid < G) {
+    float a = 0.0f, b = 0.0f;
+    for (int k = 0; k < step; ++k) {
+      for (int j = 0; j < Cg4; ++j) {
+        const int t = k * C4 + (int)lid * Cg4 + j;
+        a += ts[t];
+        b += tq[t];
+      }
+    }
+    device float* p =
+        part + (((long)tgid.z * tgpg.y + tgid.y) * (long)G + lid) * 2;
+    p[0] = a;
+    p[1] = b;
+  }
+}
+
+// Pass 2: a (frame, group)'s partials into its mean and 1/std.
+//   0:part[T,nband,G,2] 1:stats[T,G,2] 2:nband 3:G 4:count (rows*C/G)
+//   5:eps   grid {G, T}
+kernel void group_norm_frames_finalize_f16(
+    const device float* part  [[buffer(0)]],
+    device float*       stats [[buffer(1)]],
+    constant int&      nband [[buffer(2)]],
+    constant int&      G     [[buffer(3)]],
+    constant int&      count [[buffer(4)]],
+    constant float&    eps   [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if ((int)gid.x >= G) { return; }
+  float s = 0.0f, q = 0.0f;
+  for (int b = 0; b < nband; ++b) {
+    const device float* p =
+        part + (((long)gid.y * nband + b) * (long)G + gid.x) * 2;
+    s += p[0];
+    q += p[1];
+  }
+  const float n    = (float)count;
+  const float mean = s / n;
+  const float var  = max(q / n - mean * mean, 0.0f);
+  device float* o = stats + ((long)gid.y * G + gid.x) * 2;
+  o[0] = mean;
+  o[1] = 1.0f / sqrt(var + eps);
+}
+
+// Pass 3: normalize, affine, optional SiLU, one vec4 a thread. With
+// `pad` the output is the frame REFLECT-PADDED by one pixel all round,
+// [T, H+2, W+2, C], which is what the hardware convolution that reads
+// it wants (conv3d_hw_causal_s1_f16) -- written here so the pad costs
+// no pass of its own. A pixel next to an edge also fills the halo cell
+// that reflects it: padded row 0 is image row 1 and padded row H+1 is
+// image row H-2 (torch's reflect, edge not repeated), and the same for
+// columns; a corner is both. Needs H, W >= 2.
+//   0:x[T,rows,C] 1:stats[T,G,2] 2:gamma[C] 3:beta[C] 4:out 5:rows 6:C
+//   7:G 8:do_silu 9:W 10:H 11:pad   grid {rows*C/4, T}
+kernel void group_norm_frames_apply_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    const device float*     stats [[buffer(1)]],
+    const device VPIPE_ELT* gamma [[buffer(2)]],
+    const device VPIPE_ELT* beta  [[buffer(3)]],
+    device VPIPE_ELT*       out   [[buffer(4)]],
+    constant int&      rows    [[buffer(5)]],
+    constant int&      C       [[buffer(6)]],
+    constant int&      G       [[buffer(7)]],
+    constant int&      do_silu [[buffer(8)]],
+    constant int&      W       [[buffer(9)]],
+    constant int&      H       [[buffer(10)]],
+    constant int&      pad     [[buffer(11)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int C4 = C / 4;
+  if ((long)gid.x >= (long)rows * C4) { return; }
+  const int  r = (int)gid.x / C4;
+  const int  v = (int)gid.x % C4;
+  const long t = (long)gid.y;
+  const int  g = (v * 4) / (C / G);
+  const device float* st = stats + (t * G + g) * 2;
+  const float mean = st[0], inv = st[1];
+  const float4 a  = float4(reinterpret_cast<const device VPIPE_ELT4*>(x)
+                               [(t * rows + r) * C4 + v]);
+  const float4 gm = float4(reinterpret_cast<const device VPIPE_ELT4*>(
+      gamma)[v]);
+  const float4 bt = float4(reinterpret_cast<const device VPIPE_ELT4*>(
+      beta)[v]);
+  float4 y = (a - mean) * inv * gm + bt;
+  if (do_silu != 0) { y = y / (1.0f + exp(-y)); }
+  const VPIPE_ELT4 o = VPIPE_ELT4(y);
+  device VPIPE_ELT4* of = reinterpret_cast<device VPIPE_ELT4*>(out);
+  if (pad == 0) {
+    of[(t * rows + r) * C4 + v] = o;
+    return;
+  }
+  const int  Wp = W + 2;
+  const int  yy = r / W, xx = r % W;
+  const long fb = t * (long)(H + 2) * Wp;
+  int rs[3], cs[3];
+  int nr = 0, nc = 0;
+  rs[nr++] = yy + 1;
+  if (yy == 1)     { rs[nr++] = 0; }
+  if (yy == H - 2) { rs[nr++] = H + 1; }
+  cs[nc++] = xx + 1;
+  if (xx == 1)     { cs[nc++] = 0; }
+  if (xx == W - 2) { cs[nc++] = W + 1; }
+  for (int i = 0; i < nr; ++i) {
+    for (int j = 0; j < nc; ++j) {
+      of[(fb + (long)rs[i] * Wp + cs[j]) * C4 + v] = o;
+    }
+  }
+}
+
+// REFLECT-pad a channel-last clip [T, H, W, C] by `lo` cells before and
+// `hi` after on both spatial axes: out [T, H+lo+hi, W+lo+hi, C], torch's
+// reflect (edge not repeated). For an input the hardware convolution
+// reads that no norm wrote -- the MiniMax-H3 encoder's downsample, whose
+// pad is (0, 1): bottom and right only.
+//   0:in 1:out 2:H 3:W 4:C 5:lo 6:hi   grid {Wp*C, Hp, T}
+kernel void reflect_pad_hwc_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H  [[buffer(2)]],
+    constant int&      W  [[buffer(3)]],
+    constant int&      C  [[buffer(4)]],
+    constant int&      lo [[buffer(5)]],
+    constant int&      hi [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int Wp = W + lo + hi, Hp = H + lo + hi;
+  if ((int)gid.x >= Wp * C || (int)gid.y >= Hp) { return; }
+  const int px = (int)gid.x / C, c = (int)gid.x % C;
+  int sy = (int)gid.y - lo, sx = px - lo;
+  if (sy < 0)  { sy = -sy; }
+  if (sy >= H) { sy = 2 * H - 2 - sy; }
+  if (sx < 0)  { sx = -sx; }
+  if (sx >= W) { sx = 2 * W - 2 - sx; }
+  out[(((long)gid.z * Hp + gid.y) * Wp + px) * C + c] =
+      in[(((long)gid.z * H + sy) * W + sx) * C + c];
+}
+
 // Causal depthwise Conv1d, kernel K, per-channel weight w[D, K] (tap kk
 // pairs with input position t+kk-(K-1); left-padded with zeros). One
 // thread per (t, d).   0:in[T,D] 1:w[D,K] 2:out[T,D] 3:T 4:D 5:K.

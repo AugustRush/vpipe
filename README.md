@@ -16,6 +16,8 @@
 ![Python](https://img.shields.io/badge/Python-bindings-green)
 ![Status](https://img.shields.io/badge/Status-alpha-orange)
 
+**[🌟 New! Try Valtz for streamlined creative work, powered by VPIPE 🌟](https://github.com/tgo-app-dev/valtz)**
+
 **[Download the macOS app](https://github.com/tgo-app-dev/vpipe/releases/latest)**
 · **[Run the first example](#first-example)**
 · **[Try image editing](docs/KLEIN.md)** ([简体中文](docs/KLEIN-zh-cn.md))

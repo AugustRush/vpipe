@@ -329,6 +329,18 @@ TEST(apple_media_stages, a_long_movie_is_counted_and_paced)
       std::function<void(AvfSaveVideoStage&)>(
           [&](AvfSaveVideoStage& sink) { total = sink.progress_total(); })));
   EXPECT_TRUE(total == 0);  // no sideband frames: uncounted
+  // Its report named as a host asks, to tell it from another graph's;
+  // unnamed, "save video".
+  std::string desc;
+  REQUIRE_(write_<AvfSaveVideoStage>(
+      sess, frames,
+      cfg_({{"path", str_(path)}, {"frames", FlexData::make_uint(3)},
+            {"progress", str_("export")}}),
+      std::function<void(AvfSaveVideoStage&)>(
+          [&](AvfSaveVideoStage& sink) { desc = sink.progress_desc(); })));
+  EXPECT_TRUE(desc == "export");
+  AvfSaveVideoStage plain(&sess, "out", {}, cfg_({{"path", str_(path)}}));
+  EXPECT_TRUE(plain.progress_desc() == "save video");
   AvfLoadVideoStage paced(&sess, "in", {}, cfg_({{"url", str_(path)}}));
   EXPECT_TRUE(paced.oport_policy(0).capacity == 4);
   EXPECT_TRUE(paced.oport_policy(0).mode == OverrunPolicy::Backpressure);

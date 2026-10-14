@@ -37,8 +37,9 @@ public:
   // Test-only.
   std::uint64_t frames_written() const noexcept { return _written; }
   bool finished() const noexcept { return _finished; }
-  // What its progress counted against (0: uncounted).
+  // What its progress counted against (0: uncounted), and its name.
   std::uint64_t progress_total() const noexcept { return _total; }
+  const std::string& progress_desc() const noexcept { return _desc; }
 
 private:
   void finish_();
@@ -60,6 +61,7 @@ private:
   int         _matrix = 0;
 
   std::uint64_t _expected = 0;   // config.frames; 0 = from the frames
+  std::string   _desc;           // config.progress: the report's name
 
   std::unique_ptr<apple_media::VideoWriter> _writer;
   bool          _failed = false;

@@ -282,6 +282,17 @@ TEST(minimax_h3_vvae, encode_matches_golden)
   SharedBuffer mom = m->encode(xb, T, H, W, &eerr);
   if (mom.empty()) { std::printf("[minimax_h3_vvae] %s\n", eerr.c_str()); }
   ASSERT_TRUE(!mom.empty());
+  // ENGAGEMENT before accuracy: on matrix cores the convs run on the
+  // hardware convolution unless told not to, and a golden that passed on
+  // the im2col route would say nothing about it. Every level of a 32^2
+  // clip reaches it -- the deep ones through the partial-tile entry.
+  const bool want_hw = mc->supports_matrix_cores() &&
+                       std::getenv("VPIPE_VAE_NO_HWCONV") == nullptr;
+  std::printf("[minimax_h3_vvae] encode route: %s (%d tuned shapes)\n",
+              m->uses_hwconv() ? "hardware conv" : "im2col + GEMM",
+              m->hwconv_tuned_shapes());
+  EXPECT_TRUE(m->uses_hwconv() == want_hw);
+  EXPECT_TRUE(!want_hw || m->hwconv_tuned_shapes() > 0);
   // The depth override changes the channel count, so size the
   // comparison from the golden rather than from the config.
   if (mom.byte_size() < ref.size() * 2) {
@@ -894,6 +905,99 @@ TEST(minimax_h3_vvae, decode_bench)
               LT, lh, lw, frames, lw * cfg.patch, lh * cfg.patch, ms,
               ms / (double)frames, cfg.tile_size);
   EXPECT_TRUE(ms > 0.0);
+}
+
+// encode_video's wall clock and achieved rate on one clip -- the shape a
+// reference encode takes, and the number the FLOP meter is read against.
+// The rate is the GPU arithmetic the encode counted (gpu_flops()) over
+// the WALL clock, so host time inside the call counts against it.
+//
+// Env: VPIPE_MINIMAX_H3_VVAE_ENC_BENCH=1 + VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+// Geometry ..._ENC_BENCH_{T,H,W} (default 17x480x832, one clip of 12
+// tiles), ..._ENC_BENCH_REPS timed runs after a warm one (default 2), and
+// ..._ENC_BENCH_DUMP=<file> writes the last run's moments as f32.
+TEST(minimax_h3_vvae, encode_bench)
+{
+  const char* on   = std::getenv("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH");
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (on == nullptr || *on == '\0' || *on == '0') { return; }
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &err));
+  auto vae = MetalMiniMaxH3VideoVae::load(root, mc, cfg);
+  ASSERT_TRUE(vae != nullptr);
+  if (vae == nullptr) { return; }
+
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int T = envi("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH_T", 17);
+  const int H = envi("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH_H", 480);
+  const int W = envi("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH_W", 832);
+  const int reps = std::max(1, envi("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH_REPS",
+                                    2));
+  const int IC = cfg.in_channels;
+  const std::size_t n = (std::size_t)IC * T * H * W;
+  SharedBuffer x = mc->make_shared_buffer(n * 2);
+  ASSERT_TRUE(!x.empty());
+  if (x.empty()) { return; }
+  {
+    // Smooth in space, drifting in time, different per channel: a
+    // picture's statistics rather than noise's, so the norms see the
+    // kind of activation a real reference gives them.
+    auto* d = static_cast<std::uint16_t*>(x.contents());
+    std::size_t i = 0;
+    for (int c = 0; c < IC; ++c) {
+      for (int t = 0; t < T; ++t) {
+        for (int y = 0; y < H; ++y) {
+          for (int xx = 0; xx < W; ++xx) {
+            const float v = 0.6f * std::sin(0.031f * (float)xx +
+                                            0.017f * (float)y +
+                                            0.2f * (float)t + (float)c) +
+                            0.3f * std::cos(0.11f * (float)y -
+                                            0.05f * (float)xx);
+            d[i++] = f32_to_bf16_(v);
+          }
+        }
+      }
+    }
+  }
+  int lf = 0;
+  SharedBuffer out = vae->encode_video(x, T, H, W, &lf, &err);   // warm
+  if (out.empty()) { std::printf("[minimax_h3_vvae] %s\n", err.c_str()); }
+  ASSERT_TRUE(!out.empty() && lf > 0);
+  if (out.empty()) { return; }
+
+  for (int r = 0; r < reps; ++r) {
+    const std::uint64_t f0 = vae->gpu_flops().flushed();
+    const auto t0 = std::chrono::steady_clock::now();
+    out = vae->encode_video(x, T, H, W, &lf, &err);
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    ASSERT_TRUE(!out.empty());
+    const double gf = (double)(vae->gpu_flops().flushed() - f0) * 1e-9;
+    std::printf("[minimax_h3_vvae] encode %d frames of %dx%d -> %d latent "
+                "frames in %.0f ms (%.1f ms/frame): %.1f GFLOP counted, "
+                "%.2f TFLOP/s\n", T, W, H, lf, ms, ms / (double)T, gf,
+                gf / ms);
+  }
+  if (const char* dp = std::getenv("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH_DUMP")) {
+    std::FILE* f = std::fopen(dp, "wb");
+    if (f != nullptr) {
+      const auto* d = static_cast<const std::uint16_t*>(out.contents());
+      const std::size_t m = out.byte_size() / 2;
+      std::vector<float> v(m);
+      for (std::size_t k = 0; k < m; ++k) { v[k] = bf16_to_f32_(d[k]); }
+      std::fwrite(v.data(), 4, m, f);
+      std::fclose(f);
+      std::printf("[minimax_h3_vvae] dumped %zu floats to %s\n", m, dp);
+    }
+  }
 }
 
 // The ANE feed-forward tier against the GPU alone, one decode() tile.

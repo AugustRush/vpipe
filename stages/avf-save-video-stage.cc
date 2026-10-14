@@ -107,6 +107,12 @@ constexpr ConfigKey kAttrs[] = {
           "frames' sideband `frames`, else uncounted. Nothing is cut or "
           "padded to it",
    .def_uint = 0},
+  {.key = "progress", .type = ConfigType::String, .required = false,
+   .doc = "the progress report's name (\"save video\" by default) -- for "
+          "a host running several graphs at once, which tells their "
+          "reports apart by it (the session's list does not say whose "
+          "each is)",
+   .def_str = "save video"},
 };
 const PortSpec kIports[] = {
   {.name = "frames",
@@ -177,6 +183,8 @@ AvfSaveVideoStage::AvfSaveVideoStage(const SessionContextIntf* s,
   _transfer = (int)attr_uint("color_transfer");
   _matrix = (int)attr_uint("color_matrix");
   _expected = attr_uint("frames");
+  _desc = attr_str("progress");
+  if (_desc.empty()) { _desc = "save video"; }
 }
 
 AvfSaveVideoStage::~AvfSaveVideoStage() = default;
@@ -290,7 +298,7 @@ AvfSaveVideoStage::process(RuntimeContext& ctx)
           sb.as_object().at(sideband::kFrames).as_int(0);
       _total = n > 0 ? (std::uint64_t)n : 0;
     }
-    _bar = session()->open_progress("save video");
+    _bar = session()->open_progress(_desc);
     _bar.update(0, _total);
   }
   std::string err;
