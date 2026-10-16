@@ -65,6 +65,9 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "extra av_dict options passed to the demuxer open"},
 };
 
+// Packets the reader may run ahead of its consumer.
+constexpr unsigned kOportDepth = 64;
+
 const PortSpec kOports[] = {
   {.name = "audio",
    .doc = "ONE ENCODED PACKET per beat as an EncodedSegment with "
@@ -125,6 +128,14 @@ LoadAudioStage::LoadAudioStage(const SessionContextIntf* s,
                     this->id()));
   }
   allocate_oports(spec().oports.size());
+  // A FILE READER WAITS FOR ITS CONSUMER. Left at the default depth it
+  // demuxed thousands of packets a second into a buffer that throws at
+  // 2048, so a long track feeding anything slower than the disk -- a
+  // resample, then a model taking seconds a chunk -- ran a song's worth
+  // ahead, tripped it, and drained: the separation of a 3:34 song came
+  // out 29 s short. A packet is a few KB, so 64 ahead keeps the decoder
+  // fed and costs nothing.
+  set_oport_policy(0, {kOportDepth, OverrunPolicy::Backpressure});
 }
 
 LoadAudioStage::~LoadAudioStage()

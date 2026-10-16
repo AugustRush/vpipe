@@ -123,12 +123,13 @@ speed claim. [^3]
 | Workload family | Verified status |
 | --- | --- |
 | Video + audio generation | MiniMax H3 FL2VA/REF2VA, Turbo LoRA, and LTX-2.5 plugin workflows. |
-| Image generation / editing | **Krea-2 Turbo:** 12B text-to-image on the published bf16 weights, run-time LoRA and a live per-step preview. **FLUX.2-klein-9B / 9b-kv:** 4-bit reference image editing and two-reference composition, 4-step default pipelines and compare-image UI on Apple Silicon; the -kv variant trades a little quality for speed. |
+| Image generation / editing | **Krea-2 Turbo:** 12B text-to-image on the published bf16 weights, run-time LoRA and a live per-step preview. **FLUX.2-klein-9B / 9b-kv:** 4-bit reference image editing and two-reference composition, 4-step default pipelines and compare-image UI on Apple Silicon; the -kv variant trades a little quality for speed. **FLUX.3 Image Klein:** text-to-image and reference editing on the published bf16 weights in 16 steps, the joint blocks' feed-forward on the ANE (1.6x on an M4 Pro). |
 | Multimodal / LLM / VLM inference | **Qwen chat and VQA:** local chat with image input, sampler control, stateful turns, and documented per-run token logs. **Ministral 3 14B:** text and image chat (Pixtral vision tower) on the MLX 4-bit weights. |
 
 See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)** for the H3 workload,
 settings, caveats, and Turbo LoRA notes; **[docs/KREA-2.md](docs/KREA-2.md)**
 for text-to-image, the tuned 8-step schedule and the live denoising preview;
+**[docs/FLUX3.md](docs/FLUX3.md)** for FLUX.3 Image Klein;
 and **[docs/KLEIN.md](docs/KLEIN.md)** and
 **[docs/QWEN35-CHAT.md](docs/QWEN35-CHAT.md)** for image editing and chat
 workflows, and **[docs/MINISTRAL3.md](docs/MINISTRAL3.md)** for Ministral 3
@@ -390,8 +391,9 @@ web UI, and adds speech transcription. For image editing from a reference
 photo, **[docs/KLEIN.md](docs/KLEIN.md)**; for text-to-image,
 **[docs/KREA-2.md](docs/KREA-2.md)**; for text-to-video *with sound*,
 **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**; for whole songs from a style
-prompt and lyrics, **[docs/YUE2.md](docs/YUE2.md)**. Each ships the
-pipelines it describes.
+prompt and lyrics, **[docs/YUE2.md](docs/YUE2.md)**; to split a song into
+its vocals and accompaniment, **[docs/BS-ROFORMER.md](docs/BS-ROFORMER.md)**.
+Each ships the pipelines it describes.
 
 ---
 

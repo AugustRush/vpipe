@@ -3,18 +3,30 @@
 // family's latents become frames through the STOCK `vae-decode` stage
 // rather than a stage of its own.
 //
-// The vae-decode CONSULT itself (a claim_for() before the built-in
-// `_class_name` chain) needs a checkpoint on disk to exercise, so it is
-// not tested here -- the same boundary video-model-registry.cc draws.
-// This isolates the registry contract that consult depends on:
+// Mostly the registry contract the vae-decode consult depends on:
 // first-wins, claim order, a throwing probe not being fatal, the refusal
 // to take a built-in family's NAME, and the frame-chunk contract
-// including its abort path.
+// including its abort path. The last test runs the STAGE over a family
+// that claims a marker file, for what the stage does with a family's
+// picture (content-refusal.cc does the same for its refusal card).
 
 #include "minitest.h"
 
+#include "apple-silicon/tensor-beat.h"
+#include "common/beat-keys.h"
+#include "common/flex-data.h"
+#include "common/job.h"
+#include "common/session.h"
 #include "generative-models/vae-model-registry.h"
+#include "pipeline/pipeline-runtime.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/runtime-context.h"
+#include "pipeline/typed-stage.h"
+#include "stages/vae-decode-stage.h"
 
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -254,3 +266,162 @@ TEST(vae_model_registry, a_false_sink_aborts_the_decode)
   EXPECT_FALSE(ok);
   EXPECT_TRUE(calls == 1);
 }
+
+// ---- the stage over a registered family -------------------------------
+
+namespace {
+
+const char* const kCropMarker = "ut-vae-crop.marker";
+
+// An image VAE whose picture says which column each sample is: sample
+// value -1 + 2 x / 255, so the stage's U8 picture reads x.
+class ColumnDecoder : public VaeDecoder {
+public:
+  int latent_channels() const override { return 4; }
+  int spatial_compression() const override { return 8; }
+  bool decode(const VaeDecodeRequest& req, const VaeFrameSink& sink,
+              std::string*) override
+  {
+    const int H = req.shape[1] * 8, W = req.shape[2] * 8;
+    _px.assign((std::size_t)3 * H * W, 0.0f);
+    for (int c = 0; c < 3; ++c) {
+      for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+          _px[((std::size_t)c * H + y) * W + x] = -1.0f + 2.0f * x / 255.0f;
+        }
+      }
+    }
+    VaeFrameChunk k;
+    k.rgb = _px.data();
+    k.channels = 3;
+    k.n = 1;
+    k.height = H;
+    k.width = W;
+    k.frames_total = 1;
+    return sink(k);
+  }
+private:
+  std::vector<float> _px;
+};
+
+class ColumnFamily : public VaeModelFamily {
+public:
+  std::string_view tag() const noexcept override { return "ut-vae-crop"; }
+  bool claims(const std::string& root, const std::string&,
+              const std::string&) const override
+  {
+    std::error_code ec;
+    return std::filesystem::exists(
+        std::filesystem::path(root) / kCropMarker, ec);
+  }
+  std::unique_ptr<VaeDecoder>
+  load_decoder(const VaeModelCreateArgs&) override
+  {
+    return std::make_unique<ColumnDecoder>();
+  }
+};
+
+class OneLatent : public TypedStage<OneLatent> {
+public:
+  static constexpr const char* kTypeName = "ut-vae-crop-src";
+  using TypedStage::TypedStage;
+  std::unique_ptr<BeatPayloadIntf> beat;
+  Job process(RuntimeContext& ctx) override
+  {
+    if (beat) { co_await ctx.write(0, std::move(beat)); co_return; }
+    ctx.signal_done();
+  }
+  const StageSpec& spec() const noexcept override
+  {
+    static const PortSpec op[] = {{.name = "out", .doc = "", .type = nullptr}};
+    static const StageSpec s = {.type_name = kTypeName, .doc = "",
+                                .display_name = "", .oports = op};
+    return s;
+  }
+};
+
+class Pictures : public TypedStage<Pictures> {
+public:
+  static constexpr const char* kTypeName = "ut-vae-crop-sink";
+  using TypedStage::TypedStage;
+  std::vector<std::unique_ptr<BeatPayloadIntf>> captured;
+  Job process(RuntimeContext& ctx) override
+  {
+    auto p = co_await ctx.read(0);
+    if (!p) { ctx.signal_done(); co_return; }
+    captured.push_back(std::move(p));
+  }
+  const StageSpec& spec() const noexcept override
+  {
+    static const PortSpec ip[] = {{.name = "in", .doc = "", .type = nullptr}};
+    static const StageSpec s = {.type_name = kTypeName, .doc = "",
+                                .display_name = "", .iports = ip};
+    return s;
+  }
+};
+
+}  // namespace
+
+// sideband::kCropBox promises that VAE-DECODE cuts the picture back, not
+// that a built-in VAE does: a registered family sees the box in
+// req.sideband and has no reason to know what it means. A [4, 2, 3] latent
+// decodes to 24x16; the box [3, 2, 21, 14] leaves 18x12 starting at
+// column 3.
+TEST(vae_model_registry, the_stage_cuts_a_familys_picture_to_the_box)
+{
+  static const bool once =
+      VaeModelRegistry::get().add(std::make_unique<ColumnFamily>());
+  (void)once;
+  const auto root =
+      std::filesystem::temp_directory_path() / "vpipe-ut-vae-crop";
+  std::filesystem::create_directories(root);
+  std::ofstream(root / kCropMarker) << "x";
+  Session sess;
+
+  auto lat = std::make_unique<TensorBeatPayload>();
+  lat->dtype = TensorBeat::DType::F32;
+  lat->shape = {4, 2, 3};
+  lat->resize_contiguous(24);
+  FlexData box = FlexData::make_array();
+  for (int v : {3, 2, 21, 14}) {
+    box.as_array().push_back(FlexData::make_int(v));
+  }
+  FlexData sb = FlexData::make_object();
+  sb.as_object().insert_or_assign(sideband::kCropBox, std::move(box));
+  lat->sideband = std::move(sb);
+
+  auto pl = std::make_unique<Pipeline>("p", &sess);
+  auto su = std::make_unique<OneLatent>(&sess, "src", std::vector<InEdge>{},
+                                        FlexData::make_object());
+  su->beat = std::move(lat);
+  su->allocate_oports(1);
+  auto* src = pl->insert_stage(std::move(su));
+  FlexData c = FlexData::make_object();
+  c.as_object().insert_or_assign("hf_dir",
+                                 FlexData::make_string(root.string()));
+  auto* vae = pl->insert_stage(std::make_unique<VaeDecodeStage>(
+      &sess, "vae", std::vector<InEdge>{{src, 0}}, std::move(c)));
+  auto* sink = static_cast<Pictures*>(pl->insert_stage(
+      std::make_unique<Pictures>(&sess, "sink",
+                                 std::vector<InEdge>{{vae, 0}},
+                                 FlexData::make_object())));
+  PipelineRuntime rt(pl.get(), &sess);
+  if (rt.launch()) {
+    rt.wait_idle();
+    rt.stop();
+  }
+  std::filesystem::remove_all(root);
+
+  ASSERT_TRUE(sink->captured.size() == 1);
+  if (sink->captured.size() != 1) { return; }
+  const auto* tb =
+      dynamic_cast<const TensorBeatPayload*>(sink->captured[0].get());
+  ASSERT_TRUE(tb != nullptr);
+  if (tb == nullptr) { return; }
+  EXPECT_TRUE(tb->shape == std::vector<std::int64_t>({3, 12, 18}));
+  const auto px = tb->materialize_contiguous();
+  ASSERT_TRUE(px.size() == (std::size_t)3 * 12 * 18);
+  if (px.size() != (std::size_t)3 * 12 * 18) { return; }
+  EXPECT_TRUE(px[0] == 3 && px[17] == 20);    // columns 3 .. 20
+}
+

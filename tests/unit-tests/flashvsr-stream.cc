@@ -91,13 +91,14 @@ public:
   using TypedStage::TypedStage;
   std::vector<std::vector<std::uint8_t>> frames;
   std::size_t next = 0;
+  int h = kSize, w = kSize;
   Job
   process(RuntimeContext& ctx) override
   {
     if (next >= frames.size()) { ctx.signal_done(); co_return; }
     auto b = std::make_unique<TensorBeatPayload>();
     b->dtype = TensorBeat::DType::U8;
-    b->shape = {3, kSize, kSize};
+    b->shape = {3, h, w};
     b->resize_contiguous(frames[next].size());
     std::memcpy(b->as_u8(), frames[next].data(), frames[next].size());
     b->sideband = FlexData::make_object();
@@ -121,6 +122,14 @@ public:
   static constexpr const char* kTypeName = "ut-flashvsr-stream-sink";
   using TypedStage::TypedStage;
   std::vector<std::vector<std::uint8_t>> frames;
+  // Conditioning beats, when the sink sits after the source encoder:
+  // their bf16 rows and their sideband.
+  std::vector<std::vector<std::uint16_t>> rows;
+  std::vector<FlexData> sidebands;
+  struct Beats {
+    std::vector<std::vector<std::uint16_t>> rows;
+    std::vector<FlexData> sidebands;
+  };
   Job
   process(RuntimeContext& ctx) override
   {
@@ -130,6 +139,12 @@ public:
     if (tb != nullptr && tb->dtype == TensorBeat::DType::U8) {
       const auto px = tb->materialize_contiguous();
       frames.emplace_back(px.begin(), px.end());
+    } else if (tb != nullptr && tb->dtype == TensorBeat::DType::Bf16) {
+      const auto px = tb->materialize_contiguous();
+      std::vector<std::uint16_t> r(px.size() / 2);
+      std::memcpy(r.data(), px.data(), r.size() * 2);
+      rows.push_back(std::move(r));
+      sidebands.push_back(tb->sideband);
     }
   }
   const StageSpec&
@@ -157,10 +172,11 @@ struct Run {
 };
 
 // The graph, run to the end.
+// `color_fix` < 0 leaves the key unset, for the release's own default.
 Run
 restore_(const std::string& root,
          const std::vector<std::vector<std::uint8_t>>& src, int group,
-         int overlap, const char* continuity, bool color_fix,
+         int overlap, const char* continuity, int color_fix,
          int clip_frames = 41, int blend_frames = 8)
 {
   Session sess;
@@ -177,13 +193,17 @@ restore_(const std::string& root,
             {"group_size", FlexData::make_int(group)},
             {"overlap", FlexData::make_int(overlap)}})));
 
-  auto enc_up = std::make_unique<FlashVsrSrcEncoderStage>(
-      &sess, "enc", std::vector<InEdge>{{s_stack, 0}},
+  FlexData ecfg =
       obj_({{"hf_dir", FlexData::make_string(root)},
             {"continuity", FlexData::make_string(continuity)},
-            {"color_fix", FlexData::make_bool(color_fix)},
             {"clip_frames", FlexData::make_int(clip_frames)},
-            {"blend_frames", FlexData::make_int(blend_frames)}}));
+            {"blend_frames", FlexData::make_int(blend_frames)}});
+  if (color_fix >= 0) {
+    ecfg.as_object().insert_or_assign("color_fix",
+                                      FlexData::make_bool(color_fix != 0));
+  }
+  auto enc_up = std::make_unique<FlashVsrSrcEncoderStage>(
+      &sess, "enc", std::vector<InEdge>{{s_stack, 0}}, std::move(ecfg));
   auto* enc = enc_up.get();
   Stage* s_enc = pl->insert_stage(std::move(enc_up));
 
@@ -254,10 +274,10 @@ TEST(flashvsr_stream, groups_restore_as_one_pass)
   const auto src = source_();
 
   // ONE group: the stream in one beat (and its end in another).
-  const Run one = restore_(root, src, kFrames, 0, "stream", true);
+  const Run one = restore_(root, src, kFrames, 0, "stream", 1);
   // Groups of 25 overlapping by 4, as a clip graph cuts them -- AUTO, which
   // must choose the stream at this size on any box this test runs on.
-  const Run cut = restore_(root, src, 25, 4, "auto", true);
+  const Run cut = restore_(root, src, 25, 4, "auto", 1);
 
   ASSERT_TRUE(cut.mode == FlashVsrSrcEncoderStage::Continuity::kStream);
   std::printf("  one group: %zu frames; groups of 25+4: %zu frames (source "
@@ -280,7 +300,7 @@ TEST(flashvsr_stream, groups_restore_as_one_pass)
 
   // THE COLOUR FIX: without it the same stream decodes to other bytes, and
   // with it every frame's channel means sit closer to its source frame's.
-  const Run raw = restore_(root, src, kFrames, 0, "stream", false);
+  const Run raw = restore_(root, src, kFrames, 0, "stream", 0);
   ASSERT_TRUE(raw.frames.size() == one.frames.size());
   if (raw.frames.size() != one.frames.size()) { return; }
   double err_fix = 0.0, err_raw = 0.0;
@@ -349,9 +369,9 @@ TEST(flashvsr_stream, clips_cross_fade_their_cuts)
   const char* root = std::getenv("VPIPE_FLASHVSR_TEST_MODEL_PATH");
   if (root == nullptr || *root == '\0') { return; }
   const auto src = source_();
-  const Run hard = restore_(root, src, 25, 0, "clips", true, 25, 0);
-  const Run soft = restore_(root, src, 25, 0, "clips", true, 25, 8);
-  const Run one = restore_(root, src, 25, 0, "stream", true);
+  const Run hard = restore_(root, src, 25, 0, "clips", 1, 25, 0);
+  const Run soft = restore_(root, src, 25, 0, "clips", 1, 25, 8);
+  const Run one = restore_(root, src, 25, 0, "stream", 1);
   ASSERT_TRUE(hard.mode == FlashVsrSrcEncoderStage::Continuity::kClips);
   EXPECT_TRUE((int)hard.frames.size() == kFrames);
   EXPECT_TRUE((int)soft.frames.size() == kFrames);
@@ -397,4 +417,161 @@ TEST(flashvsr_stream, auto_streams_where_the_carries_fit)
   } else {
     ::unsetenv("VPIPE_RAM_LIMIT_MB");
   }
+}
+
+// ---- FlashVSR+ ---------------------------------------------------------
+//
+// The same graph and the same promises on FlashVSR+ Turbo, whose chunks
+// take 16 source frames where v1.1's take 8 (17 to open, not 25), whose
+// stream carries a window per LAYER of two sizes, and whose reference
+// restores every source frame with no colour fix. Env:
+// VPIPE_FLASHVSR_PLUS_TEST_MODEL_PATH (the repository root), and for the
+// rows VPIPE_FLASHVSR_PLUS_GOLDEN (tools/dump_flashvsr_plus_golden.py).
+
+namespace {
+
+std::string
+plus_turbo_()
+{
+  const char* m = std::getenv("VPIPE_FLASHVSR_PLUS_TEST_MODEL_PATH");
+  return m != nullptr && *m != '\0' ? std::string(m) + "/turbo" : "";
+}
+
+// The source through temporal-stack and the encoder alone: its beats.
+Sink::Beats
+encode_(const std::string& root,
+        const std::vector<std::vector<std::uint8_t>>& src, int h, int w,
+        int group)
+{
+  Session sess;
+  auto pl = std::make_unique<Pipeline>("p", &sess);
+  auto fs = std::make_unique<Frames>(&sess, "src", std::vector<InEdge>{},
+                                     FlexData::make_object());
+  fs->frames = src;
+  fs->h = h;
+  fs->w = w;
+  fs->allocate_oports(1);
+  Stage* s_src = pl->insert_stage(std::move(fs));
+  Stage* s_stack = pl->insert_stage(std::make_unique<TemporalStackStage>(
+      &sess, "stack", std::vector<InEdge>{{s_src, 0}},
+      obj_({{"mode", FlexData::make_string("video")},
+            {"group_size", FlexData::make_int(group)},
+            {"overlap", FlexData::make_int(0)}})));
+  Stage* s_enc = pl->insert_stage(std::make_unique<FlashVsrSrcEncoderStage>(
+      &sess, "enc", std::vector<InEdge>{{s_stack, 0}},
+      obj_({{"hf_dir", FlexData::make_string(root)},
+            {"continuity", FlexData::make_string("stream")}})));
+  auto* sink = static_cast<Sink*>(pl->insert_stage(std::make_unique<Sink>(
+      &sess, "sink", std::vector<InEdge>{{s_enc, 0}},
+      FlexData::make_object())));
+  {
+    PipelineRuntime rt(pl.get(), &sess);
+    if (rt.launch()) {
+      rt.wait_idle();
+      rt.stop();
+    }
+  }
+  return {std::move(sink->rows), std::move(sink->sidebands)};
+}
+
+}  // namespace
+
+TEST(flashvsr_stream, plus_groups_restore_as_one_pass)
+{
+  const std::string root = plus_turbo_();
+  if (root.empty()) { return; }
+  const auto src = source_();
+  // The colour fix left to the release: off for FlashVSR+, as its
+  // reference has it -- so the default and an explicit `false` agree.
+  const Run one = restore_(root, src, kFrames, 0, "stream", -1, 0);
+  const Run off = restore_(root, src, kFrames, 0, "stream", 0, 0);
+  const Run cut = restore_(root, src, 20, 0, "stream", -1, 0);
+  std::printf("  FlashVSR+ Turbo: one group %zu frames, groups of 20 %zu "
+              "(source %d)\n", one.frames.size(), cut.frames.size(),
+              kFrames);
+  // EVERY source frame comes back: the end is padded past the look-ahead.
+  EXPECT_TRUE((int)one.frames.size() == kFrames);
+  EXPECT_TRUE(one.frames == cut.frames);
+  EXPECT_TRUE(one.frames == off.frames);
+  // Clips at the release's own length (49): every frame, exactly once.
+  const Run clips = restore_(root, src, 25, 0, "clips", -1, 0, 8);
+  ASSERT_TRUE(clips.mode == FlashVsrSrcEncoderStage::Continuity::kClips);
+  EXPECT_TRUE((int)clips.frames.size() == kFrames);
+  const Seams sc = seams_(clips.frames), so = seams_(one.frames);
+  std::printf("  clips of 49 blending 8: %zu frames, worst change %.2fx "
+              "the median (stream %.2fx)\n", clips.frames.size(),
+              sc.max_ratio, so.max_ratio);
+}
+
+// The encoder's own cadence, through the stage, against the reference's
+// rows: 17 frames to open and 16 a chunk, the end padded with the last
+// frame, and the beats' bookkeeping -- chunks in order, every real frame
+// counted once, the last beat final.
+TEST(flashvsr_stream, plus_encoder_rows_match_reference)
+{
+  const std::string root = plus_turbo_();
+  const char* g = std::getenv("VPIPE_FLASHVSR_PLUS_GOLDEN");
+  if (root.empty() || g == nullptr || *g == '\0') { return; }
+  const std::string dir = std::string(g) + "/turbo-384x640";
+  constexpr int H = 384, W = 640, F = 61, L = 16;
+  const std::size_t frame = (std::size_t)3 * H * W;
+  std::vector<std::uint8_t> all(frame * F);
+  {
+    std::FILE* f = std::fopen((dir + "/lq_video_u8.bin").c_str(), "rb");
+    if (f == nullptr) { return; }
+    const std::size_t n = std::fread(all.data(), 1, all.size(), f);
+    std::fclose(f);
+    if (n != all.size()) { return; }
+  }
+  std::vector<std::vector<std::uint8_t>> src;
+  for (int i = 0; i < F; ++i) {
+    src.emplace_back(all.begin() + (std::ptrdiff_t)(i * frame),
+                     all.begin() + (std::ptrdiff_t)((i + 1) * frame));
+  }
+  const Sink::Beats b = encode_(root, src, H, W, 20);
+  const std::size_t row_frame = (std::size_t)(H / 16) * (W / 16) * 1536;
+  std::vector<std::uint16_t> rows;
+  int next = 0;
+  long long valid = 0;
+  bool final_seen = false;
+  for (std::size_t i = 0; i < b.rows.size(); ++i) {
+    FlexData sb = b.sidebands[i];
+    auto o = sb.as_object();
+    const int c0 = (int)o.at(genai::flashvsr_stream::kChunk0).as_int(-1);
+    const int n = (int)o.at(genai::flashvsr_stream::kChunks).as_int(0);
+    EXPECT_TRUE(c0 == next);
+    EXPECT_TRUE(b.rows[i].size() == (std::size_t)4 * n * row_frame);
+    next = c0 + n;
+    valid += o.at(sideband::kValidFrames).as_int(0);
+    final_seen = o.at(sideband::kStreamFinal).as_bool(false);
+    EXPECT_FALSE(o.contains(sideband::kColorRef));
+    rows.insert(rows.end(), b.rows[i].begin(), b.rows[i].end());
+  }
+  std::printf("  %zu beats, %d chunks, %lld valid frames (source %d)%s\n",
+              b.rows.size(), next, valid, F, final_seen ? ", final" : "");
+  EXPECT_TRUE(next == L / 4 && valid == F && final_seen);
+  ASSERT_TRUE(rows.size() == (std::size_t)L * row_frame);
+  if (rows.size() != (std::size_t)L * row_frame) { return; }
+  double worst = 0.0;
+  for (int i = 0; i < L; ++i) {
+    std::FILE* f = std::fopen(
+        (dir + "/lq_proj" + std::to_string(i) + ".f32").c_str(), "rb");
+    if (f == nullptr) { return; }
+    std::vector<float> want(row_frame);
+    const std::size_t n = std::fread(want.data(), 4, row_frame, f);
+    std::fclose(f);
+    if (n != row_frame) { return; }
+    double num = 0.0, den = 0.0;
+    for (std::size_t k = 0; k < row_frame; ++k) {
+      std::uint32_t u = (std::uint32_t)rows[(std::size_t)i * row_frame + k]
+                        << 16;
+      float got;
+      std::memcpy(&got, &u, 4);
+      num += ((double)got - want[k]) * ((double)got - want[k]);
+      den += (double)want[k] * want[k];
+    }
+    worst = std::max(worst, std::sqrt(num / den));
+  }
+  std::printf("  encoder rows vs the reference: worst rel-L2 %.5f\n", worst);
+  EXPECT_TRUE(worst < 0.01);
 }

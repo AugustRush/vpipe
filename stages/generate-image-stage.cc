@@ -13,6 +13,7 @@
 #include "generative-models/image-model-registry.h"
 #include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/torch-randn.h"
 #include "stages/denoise-progress.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/weight-set.h"
@@ -86,7 +87,7 @@ constexpr SpecExtra kSeedSequenceExtra[] = {
 // until it has been fetched. (Z-Image has no catalogued adapter to
 // offer.)
 constexpr std::string_view kLoraTypes =
-    "krea2-lora,flux2-lora,qwen-image-21-lora";
+    "krea2-lora,flux2-lora,flux3-lora,qwen-image-21-lora";
 // Slots 3..8 here: the shared doc, plus what is true only on this stage.
 constexpr std::string_view kLoraMoreDoc =
     "one more runtime LoRA slot, read exactly as `lora2` is: applied "
@@ -104,7 +105,7 @@ const ConfigKey kAttrs[] = {
           "overrides it",
    .suggest_db = kModelRegistryDb, .suggest_db_type =
        "krea2,flux2,qwen-image,qwen-image-edit,qwen-image-21,"
-       "boogu-image,boogu-image-edit,z-image,vosr",
+       "boogu-image,boogu-image-edit,z-image,flux3,vosr",
    .model_channel = "diffusion-model"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else "
@@ -115,7 +116,7 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type =
        "krea2-dit,flux2-dit,qwen-image-edit-dit,qwen-image-21-dit,"
-       "boogu-image-dit,z-image-dit"},
+       "boogu-image-dit,z-image-dit,flux3-dit"},
   {.key = "strength", .type = ConfigType::Real, .required = false,
    .doc = "img2img strength in [0,1]; 0 (default) = text-to-image from noise "
           "(the init latent arrives on the `latent` iport from vae-encode)"},
@@ -571,6 +572,15 @@ dit_floor_bytes_(const std::string& root, const std::string& dit)
       return genai::MetalZImageTransformer::streaming_floor_bytes(dit);
     }
   }
+  // FLUX.3 ANSWERS FOR ITSELF too: its four stacks (three per-mode, one
+  // joint) are ONE block shape sharing ONE slot pair, where the stem list
+  // below would book a pair per stem.
+  {
+    genai::MetalFlux3Transformer::Config fc;
+    if (genai::MetalFlux3Transformer::Config::read_dims(dit, &fc)) {
+      return genai::MetalFlux3Transformer::streaming_floor_bytes(dit);
+    }
+  }
   // EVERY stack, not just the first. These models stream BOTH of their
   // stacks and keep a slot pair for each, so a stem list that names one
   // leaves the other in the trunk -- MEASURED on FLUX.2-klein-9B, whose
@@ -909,6 +919,7 @@ unclaimed_class_(const std::string& transformer_dir)
                           "QwenImageTransformer2DModel",
                           "QwenImage21Transformer2DModel",
                           "ZImageTransformer2DModel",
+                          "Flux3Transformer2DModel",
                           "BooguImageTransformer2DModel"}) {
     if (cls == own) { return {}; }
   }
@@ -924,7 +935,8 @@ bool
 family_implements_sol_(const std::string& family)
 {
   return family == "krea2" || family == "flux2" ||
-         family == "qwen-image-21" || family == "z-image";
+         family == "qwen-image-21" || family == "z-image" ||
+         family == "flux3";
 }
 
 int
@@ -939,7 +951,10 @@ latent_scale_(const std::string& family)
   // [channels, H/(8*patch), W/(8*patch)] and Z-Image's VAE is patch 1,
   // so a reference latent cell is 8 pixels and inferring a size at 16
   // would ask for twice the picture.
-  if (family == "flux2" || family == "qwen-image-21") { return 16; }
+  // FLUX.3 takes FLUX.2's VAE unchanged, so its cell is 16 too.
+  if (family == "flux2" || family == "flux3" || family == "qwen-image-21") {
+    return 16;
+  }
   return 8;
 }
 
@@ -994,6 +1009,10 @@ t2i_family_(const std::string& transformer_dir)
       if (obj.contains("_class_name")) {
         const std::string cls(obj.at("_class_name").as_string(""));
         if (cls == "Flux2Transformer2DModel") { return "flux2"; }
+        // FLUX.3 Image Klein: nothing like FLUX.2's network, and named
+        // because the fall-through below would load a Krea-2 config over
+        // its weights.
+        if (cls == "Flux3Transformer2DModel") { return "flux3"; }
         if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
         // Qwen-Image-2.1. A DIFFERENT network from the line above --
         // single-stream, /16 VAE, RGBA -- and named here because the
@@ -1274,7 +1293,7 @@ GenerateImageStage::reset_run_state()
   // reloading on top of a resident copy is exactly what doubles peak
   // memory.
   if (!_dit && !_flux2_dit && !_qie_dit && !_boogu_dit && !_qi21_dit &&
-      !_zi_dit) {
+      !_zi_dit && !_flux3_dit) {
     _load_attempted = false;
     _dit_unloaded   = false;
     // The holding correction describes a DiT that is no longer here. A
@@ -1334,6 +1353,9 @@ GenerateImageStage::reset_run_state()
   _zi_guidance  = 0.0;
   _zi_cfg_norm  = 0.0;
   _zi_cfg_trunc = 1.0;
+  // FLUX.3's schedule override: a graph that stops naming one must not
+  // keep running it.
+  _flux3_alpha_cfg = 0.0;
   // Qwen-Image-2.1's schedule keys, which carry no default of their own
   // to argue about: a graph that stops naming a turbo schedule must not
   // keep running it.
@@ -1385,6 +1407,7 @@ GenerateImageStage::dit_resident_bytes_() const
 {
   if (_qi21_dit) { return (std::size_t)_qi21_dit->resident_bytes(); }
   if (_zi_dit) { return (std::size_t)_zi_dit->resident_bytes(); }
+  if (_flux3_dit) { return (std::size_t)_flux3_dit->resident_bytes(); }
   // A registered family's generator answers the same question. Without
   // it a streaming plugin DiT whose residency grows stayed declared at
   // the floor its load reported -- the trunk -- for the whole run.
@@ -1707,6 +1730,42 @@ GenerateImageStage::declare_resources() const
       out.push_back(std::move(c));
     }
   }
+  // FLUX.3's ACTIVATIONS, which no weight claim can see and which are
+  // most of the denoise at large sizes: 8.1 GB at 4096^2 against an
+  // 11.1 GB DiT -- and on a box that streams the DiT, nearly all of what
+  // the denoise holds. MEASURED there before this claim existed: the
+  // plan's denoise phase read 989 MB on the M5 for a forward that held
+  // 9.4 GB. Sized from the geometry, so an edit graph -- which takes its
+  // size from the reference -- books the presence marker instead.
+  if (t2i_family_(dit) == "flux3") {
+    genai::MetalFlux3Transformer::Config fc;
+    std::size_t bytes = model_memory::kUnknownArena;
+    if (_width > 0 && _height > 0 &&
+        genai::MetalFlux3Transformer::Config::read_dims(dit, &fc)) {
+      bytes = genai::MetalFlux3Transformer::forward_scratch_bytes(
+          fc, genai::MetalFlux3Transformer::ane_plan_seq(_width, _height));
+    }
+    for (auto& c : model_memory::scratch_claims(
+             fmt("flux3-dit:{}", this->id())(), bytes,
+             model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
+  // FLUX.3's tier is the joint blocks' feed-forward: ONE runtime-weight
+  // module, one unit, in the denoise phase.
+  if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
+      t2i_family_(dit) == "flux3") {
+    genai::MetalFlux3Transformer::Config fc;
+    (void)genai::MetalFlux3Transformer::Config::read_dims(dit, &fc);
+    for (auto& c : model_memory::coreml_claims(
+             ane_claim_label_(),
+             genai::MetalFlux3Transformer::ane_runtime_bytes(
+                 fc, genai::MetalFlux3Transformer::ane_plan_seq(_width,
+                                                                _height)),
+             1, model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
   if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
       t2i_family_(dit) == "flux2") {
     genai::MetalFlux2Transformer::Config fc;
@@ -1887,6 +1946,29 @@ GenerateImageStage::apply_model_config_()
                    }
                  });
   }
+  if (_family == "flux3") {
+    // `alpha` reshapes the schedule (t = a s / (1 + (a - 1) s)); absent is
+    // "no opinion", and the checkpoint's own (6.93) stands.
+    if (_model_cfg.is_object()) {
+      auto o = _model_cfg.as_object();
+      if (o.contains("alpha")) {
+        const double a = o.at("alpha").as_real(0.0);
+        if (a > 0.0) {
+          _flux3_alpha_cfg = a;
+        } else {
+          session()->warn(fmt(
+              "GenerateImageStage('{}'): model_config `alpha` must be > 0; "
+              "IGNORED, the checkpoint's {} stands", this->id(),
+              _flux3_alpha));
+        }
+      }
+    }
+    adapter_keys("FLUX.3", _flux3_dit != nullptr, [&](int i, float s) {
+      if (_flux3_dit && _flux3_dit->lora_modules(i) > 0) {
+        _flux3_dit->set_lora_scale(i, s);
+      }
+    });
+  }
   if (_family == "flux2") {
     _flux2_params =
         genai::MetalFlux2Transformer::GenerationParams::from_flex(_model_cfg,
@@ -2036,6 +2118,13 @@ GenerateImageStage::ensure_loaded_()
   // (multi-step, 0.5B/SD2, auxiliary time conditioning), which matters
   // more here than usual: those load through the same tensor names and
   // then compute the wrong answer rather than failing.
+  // FLUX.3 in BFL's own single-file layout: refused by name, because the
+  // "krea2" fall-through below would otherwise take it.
+  if (_plugin_family == nullptr && genai::flux3::is_bfl_root_layout(root)) {
+    session()->error(fmt("GenerateImageStage('{}'): {}; inert", this->id(),
+                         genai::flux3::bfl_root_layout_message(root)));
+    return;
+  }
   if (_plugin_family == nullptr && _family == "krea2") {
     std::string vwhy;
     genai::MetalVosrTransformer::Config vc;
@@ -2196,6 +2285,7 @@ GenerateImageStage::ensure_loaded_()
       // row here announces itself as a different model while loading
       // correctly. Two already did.
       _family == "flux2" ? "FLUX.2"
+      : _family == "flux3" ? "FLUX.3 Image Klein"
       : _family == "qwen-image-edit" ? "Qwen-Image-Edit MMDiT"
       : _family == "qwen-image-21" ? "Qwen-Image-2.1 single-stream"
       : _family == "boogu-image" ? "Boogu-Image NextDiT"
@@ -2493,6 +2583,68 @@ GenerateImageStage::ensure_loaded_()
     } else if (!load_z_image_dit_()) {
       session()->error(fmt(
           "GenerateImageStage('{}'): failed to load the Z-Image DiT from "
+          "'{}'; inert", this->id(), dit_dir));
+      return;
+    }
+  } else if (_family == "flux3") {
+    // A 5.6B DiT (11 GB bf16) beside a Qwen3-VL-4B encoder (~8 GB). The
+    // one plan_streaming() rule; VPIPE_FLUX3_STREAM overrides.
+    const auto plan = model_memory::plan_streaming(
+        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+    bool stream_blocks = plan.stream;
+    if (const char* e = std::getenv("VPIPE_FLUX3_STREAM")) {
+      stream_blocks = (std::atoi(e) != 0);
+    }
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): FLUX.3 footprint {} GB (others {} GB) + "
+        "{} GB headroom vs {} GB RAM -> {}", this->id(),
+        plan.footprint >> 30, plan.others >> 30,
+        model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
+        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+    _flux3_dit_dir = dit_dir;
+    _dit_holding_dir = dit_dir;
+    _flux3_stream = stream_blocks;
+    // THE SAMPLER THE CHECKPOINT STATES: <root>/config.json carries the
+    // schedule's alpha and the distilled step count. A graph's own
+    // scheduler-select or `steps` still wins on the count.
+    {
+      namespace fs = std::filesystem;
+      std::ifstream in(fs::path(root) / "config.json");
+      if (in) {
+        try {
+          FlexData fd = FlexData::from_json(in);
+          if (fd.is_object() && fd.as_object().contains("sampler")) {
+            const FlexData smp = fd.as_object().at("sampler");
+            if (smp.is_object()) {
+              auto so = smp.as_object();
+              if (so.contains("alpha")) {
+                _flux3_alpha = so.at("alpha").as_real(_flux3_alpha);
+              }
+              if (so.contains("steps")) {
+                _flux3_steps = (int)so.at("steps").as_int(_flux3_steps);
+              }
+            }
+          }
+        } catch (...) {
+        }
+      }
+    }
+    // FLUX.2's VAE, unchanged (stored F32), so FLUX.2's decode peak.
+    _vae_base = flux2_vae_base_(root);
+    _release_scratch = stream_blocks;
+    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
+    if (stream_blocks) {
+      // Deferred like the other streaming families: both stages load in
+      // initialize(), and a DiT beside a resident encoder is the peak.
+      _dit_unloaded = true;
+      session()->info(fmt(
+          "GenerateImageStage('{}'): memory-bounded -- the FLUX.3 DiT loads "
+          "on the first conditioning beat (block streaming on) and is freed "
+          "for the vae-decode, so it never shares the box with the text "
+          "encoder", this->id()));
+    } else if (!load_flux3_dit_()) {
+      session()->error(fmt(
+          "GenerateImageStage('{}'): failed to load the FLUX.3 DiT from "
           "'{}'; inert", this->id(), dit_dir));
       return;
     }
@@ -2939,7 +3091,10 @@ GenerateImageStage::free_z_image_dit_for_decode_(int gen_w, int gen_h)
   // The plain AutoencoderKL that FLUX.1 and Boogu use, so the same peak.
   const std::size_t peak =
       flux2_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 128);
-  const std::size_t budget = mc->memory_budget().available_physical;
+  // SETTLED: the last forward's scratch (8 GB at 4096^2) is still on its
+  // way back to the system when this runs.
+  const std::size_t budget =
+      mc->memory_budget_settled().available_physical;
   if (peak <= budget) { return; }
   session()->info(fmt(
       "GenerateImageStage('{}'): freeing the Z-Image DiT before a {}x{} "
@@ -2950,6 +3105,66 @@ GenerateImageStage::free_z_image_dit_for_decode_(int gen_w, int gen_h)
     mgr->pool_weights(_zi_dit_dir);
   }
   _zi_dit.reset();
+  _dit_unloaded = true;
+}
+
+bool
+GenerateImageStage::load_flux3_dit_()
+{
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr || _flux3_dit_dir.empty()) { return false; }
+  genai::MetalFlux3Transformer::Config cfg;
+  if (!genai::MetalFlux3Transformer::Config::read_dims(_flux3_dit_dir,
+                                                       &cfg)) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): '{}' does not hold a "
+        "Flux3Transformer2DModel config this build runs", this->id(),
+        _flux3_dit_dir));
+    return false;
+  }
+  cfg.i8_gemm = _i8_gemm;
+  cfg.sage = _sage;
+  cfg.sol = _sol;
+  cfg.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+  cfg.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+  cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
+                                            0);
+  cfg.ane_layers = (int)genai::accel::integer(&_accel,
+                                              genai::accel::kAneLayers, 0);
+  _flux3_dit = genai::MetalFlux3Transformer::load(
+      weight_set_(_flux3_dit_dir), mc, cfg, _flux3_stream,
+      lora_specs_<genai::MetalFlux3Transformer::LoraSpec>());
+  if (_flux3_dit && _flux3_stream) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): FLUX.3 DiT streaming its {} blocks; the "
+        "resident set grows as the box allows", this->id(),
+        _flux3_dit->n_blocks()));
+  }
+  return (bool)_flux3_dit;
+}
+
+void
+GenerateImageStage::free_flux3_dit_for_decode_(int gen_w, int gen_h)
+{
+  if (!_flux3_dit) { return; }
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr) { return; }
+  const std::size_t peak =
+      flux2_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 128);
+  // SETTLED: the last forward's scratch (8 GB at 4096^2) is still on its
+  // way back to the system when this runs.
+  const std::size_t budget =
+      mc->memory_budget_settled().available_physical;
+  if (peak <= budget) { return; }
+  session()->info(fmt(
+      "GenerateImageStage('{}'): freeing the FLUX.3 DiT before a {}x{} "
+      "decode ({} MB wanted, {} MB free)", this->id(), gen_w, gen_h,
+      peak >> 20, budget >> 20));
+  publish_decode_arena_(peak);
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->pool_weights(_flux3_dit_dir);
+  }
+  _flux3_dit.reset();
   _dit_unloaded = true;
 }
 
@@ -4462,6 +4677,254 @@ GenerateImageStage::generate_z_image_(
   return unpack(packed);
 }
 
+// FLUX.3 Image Klein: the flow map's own loop.
+//
+// Everything below is the reference sampler (BFL's sampling.py, which
+// diffusers' modular pipeline reproduces), to the bit where a bit
+// matters:
+//   * the schedule t_k = a s / (1 + (a - 1) s) over s = linspace(1, 0,
+//     N + 1), in f32 exactly as torch forms it (flux3::schedule);
+//   * the noise is torch.randn((h*w, 128)) from a CPU generator seeded
+//     with the seed -- TOKEN-major, rounded to bf16 -- so a seed gives
+//     the reference's own picture;
+//   * each step x += (t_{k+1} - t_k) v(x, t_k, t_{k+1}): a flow map
+//     takes the time it jumps TO, which is why this is not FlowSampler.
+// The state stays f32 between bf16 forwards; the reference rounds it to
+// bf16 every step, which is measurably worse against its own f32 run.
+std::vector<float>
+GenerateImageStage::generate_flux3_(
+    const metal_compute::SharedBuffer& text, int n_rows, int gen_h,
+    int gen_w, const std::vector<RefLatent>& refs,
+    const std::vector<float>* init_packed,
+    const std::function<void(const std::vector<float>&)>& emit_step) const
+{
+  auto* mc = session()->services()->metal_compute();
+  using metal_compute::SharedBuffer;
+  if (mc == nullptr || !_flux3_dit) { return {}; }
+  const auto& dcfg = _flux3_dit->config();
+  const int IC = dcfg.in_channels;          // 128
+  // THE UNDISTILLED BASE IS NOT A FLOW MAP: it samples 50 steps with CFG
+  // against an empty-prompt negative, and run through this loop it would
+  // make a picture -- the wrong one -- without a word. Refused until that
+  // loop exists and has a reference to be checked against.
+  if (!dcfg.flow_map) {
+    session()->error(fmt(
+        "GenerateImageStage('{}'): this FLUX.3 checkpoint is not a flow map "
+        "(FLUX.3 Image Klein Base?) -- it needs a CFG sampler this stage does "
+        "not run for FLUX.3. Use the distilled flux-3-image-klein",
+        this->id()));
+    return {};
+  }
+  if ((gen_h % 16) != 0 || (gen_w % 16) != 0 || gen_h <= 0 || gen_w <= 0) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): FLUX.3 needs a size that is a multiple "
+        "of 16 (got {}x{})", this->id(), gen_w, gen_h));
+    return {};
+  }
+  const int gh = gen_h / 16, gw = gen_w / 16;
+  const int img_seq = gh * gw;
+  if (n_rows <= 0 ||
+      text.byte_size() < (std::size_t)n_rows * dcfg.joint_dim * 2) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): the FLUX.3 DiT wants [rows, {}] bf16 "
+        "conditioning (the diffusion-conditioner's flux3 family); got {} "
+        "bytes for {} rows", this->id(), dcfg.joint_dim, text.byte_size(),
+        n_rows));
+    return {};
+  }
+
+  // ---- the references: token-major bf16, in order ----------------------
+  //
+  // vae-encode hands over FLUX.2's normalized, patchified latent
+  // [128, h, w]; the DiT takes it token-major, row r * w + c, and gives
+  // reference n the rope coordinate l = -(1 + n).
+  std::vector<SharedBuffer> rbufs;
+  std::vector<genai::MetalFlux3Transformer::Ref> rreq;
+  rbufs.reserve(refs.size());
+  for (const RefLatent& r : refs) {
+    if (r.empty()) { continue; }
+    if (r.c != dcfg.cond_in) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): a reference latent has {} channels, the "
+          "FLUX.3 DiT takes {} (FLUX.2's VAE through vae-encode); ignoring it",
+          this->id(), r.c, dcfg.cond_in));
+      continue;
+    }
+    const std::size_t n = (std::size_t)r.h * r.w;
+    SharedBuffer b = mc->make_shared_buffer(n * r.c * 2);
+    if (b.empty()) { return {}; }
+    auto* d = static_cast<std::uint16_t*>(b.contents());
+    for (int y = 0; y < r.h; ++y) {
+      for (int x = 0; x < r.w; ++x) {
+        const std::size_t t = (std::size_t)y * r.w + x;
+        for (int c = 0; c < r.c; ++c) {
+          d[t * r.c + c] =
+              f32_to_bf16_(r.chw[((std::size_t)c * r.h + y) * r.w + x]);
+        }
+      }
+    }
+    rbufs.push_back(std::move(b));
+  }
+  {
+    std::size_t bi = 0;
+    for (const RefLatent& r : refs) {
+      if (r.empty() || r.c != dcfg.cond_in) { continue; }
+      rreq.push_back({&rbufs[bi++], r.h, r.w});
+    }
+  }
+  if (!rreq.empty()) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): FLUX.3 conditioning on {} reference "
+        "image(s)", this->id(), rreq.size()));
+  }
+
+  // ---- the schedule ----------------------------------------------------
+  //
+  // A scheduler-select beat or `steps` sets the COUNT; the curve is the
+  // checkpoint's own, which no scheduler here spells.
+  const int S = _scheduler_latched && _scheduler_spec.steps > 0
+                    ? _scheduler_spec.steps
+                    : (_steps_set ? _steps : _flux3_steps);
+  const double alpha =
+      _flux3_alpha_cfg > 0.0 ? _flux3_alpha_cfg : _flux3_alpha;
+  const std::vector<float> sched = genai::flux3::schedule(S, (float)alpha);
+  if ((int)sched.size() != S + 1) { return {}; }
+
+  // ---- the noise -------------------------------------------------------
+  std::vector<float> x((std::size_t)img_seq * IC);
+  {
+    genai::TorchCpuRandn rng((std::uint64_t)_seed);
+    const std::vector<float> z = rng.randn(x.size());
+    if (z.size() != x.size()) { return {}; }
+    for (std::size_t i = 0; i < x.size(); ++i) {
+      x[i] = bf16_to_f32_(f32_to_bf16_(z[i]));
+    }
+  }
+  if (init_packed != nullptr && init_packed->size() == x.size()) {
+    x = *init_packed;                  // supplied (repro / golden)
+  }
+  SharedBuffer latbuf = mc->make_shared_buffer(x.size() * 2);
+  if (latbuf.empty()) { return {}; }
+
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, S, 1);
+  ScopedBlockProgress<std::remove_reference_t<decltype(*_flux3_dit)>>
+      prog_guard(_flux3_dit.get(), prog);
+
+  // ---- how much of the stack this run may KEEP --------------------------
+  //
+  // BlockResidency refuses every admission until a reserve is DECLARED;
+  // declaring nothing reads as a checkpoint re-read every step.
+  if (_flux3_dit->streaming()) {
+    const std::size_t peak =
+        flux2_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 128);
+    const auto mb = mc->memory_budget();
+    const bool decode_runs_beside_us =
+        mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
+    _flux3_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    _flux3_dit->set_residency_schedule(S);
+  }
+
+  bool ane_checked = false;
+  X0Tap tap;
+  auto unpack = [&](const std::vector<float>& pk) {
+    std::vector<float> latent((std::size_t)IC * gh * gw);
+    for (int i = 0; i < gh; ++i) {
+      for (int j = 0; j < gw; ++j) {
+        const std::size_t t = (std::size_t)i * gw + j;
+        for (int c = 0; c < IC; ++c) {
+          latent[((std::size_t)c * gh + i) * gw + j] = pk[t * IC + c];
+        }
+      }
+    }
+    return latent;
+  };
+
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int k = 0; k < S; ++k) {
+    tap.arm(_preview && _preview->due(k + 1, S));
+    {
+      auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
+      for (std::size_t i = 0; i < x.size(); ++i) {
+        lb[i] = f32_to_bf16_(x[i]);
+      }
+    }
+    genai::MetalFlux3Transformer::Request req;
+    req.latents = &latbuf;
+    req.grid_h = gh;
+    req.grid_w = gw;
+    req.text = &text;
+    req.text_rows = n_rows;
+    req.refs = rreq;
+    req.t = sched[(std::size_t)k];
+    req.t_next = sched[(std::size_t)k + 1];
+    std::string e;
+    SharedBuffer v = _flux3_dit->forward(req, &e);
+    prog.end_forward();
+    // After the first forward, where the ANE tier arms or declines: book
+    // what is HELD. revise_scratch() refuses to create, so this is a
+    // no-op when the plan booked nothing.
+    if (!ane_checked && _flux3_dit->ane_attempted()) {
+      ane_checked = true;
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        mgr->revise_scratch(
+            "coreml:" + ane_claim_label_(),
+            _flux3_dit->ane_armed()
+                ? genai::MetalFlux3Transformer::ane_runtime_bytes(
+                      dcfg, n_rows + img_seq)
+                : 0);
+      }
+    }
+    if (v.empty()) {
+      // A cooperative stop comes back empty with NO reason.
+      if (!e.empty()) {
+        session()->warn(fmt("GenerateImageStage('{}'): FLUX.3 forward "
+                            "failed: {}", this->id(), e));
+      }
+      return {};
+    }
+    const auto* vp = static_cast<const std::uint16_t*>(v.contents());
+    std::vector<float> vel(x.size());
+    for (std::size_t i = 0; i < vel.size(); ++i) {
+      vel[i] = bf16_to_f32_(vp[i]);
+    }
+    tap.take(x, sched[(std::size_t)k], vel);
+    const float dt = sched[(std::size_t)k + 1] - sched[(std::size_t)k];
+    for (std::size_t i = 0; i < x.size(); ++i) { x[i] += dt * vel[i]; }
+    if (emit_step) { emit_step(unpack(x)); }
+    if (tap.ready()) {
+      // taef2 reads FLUX.2's latent unpatchified and NOT un-normalized --
+      // the same space this one is in (see generate_flux2_).
+      const std::vector<float> z = unpack(tap.x0);
+      const int L = IC / 4, h8 = 2 * gh, w8 = 2 * gw;
+      std::vector<float> lat((std::size_t)L * h8 * w8);
+      for (int cc = 0; cc < IC; ++cc) {
+        const int c = cc / 4, ph = (cc % 4) / 2, pw = cc % 2;
+        for (int yy = 0; yy < gh; ++yy) {
+          for (int xx = 0; xx < gw; ++xx) {
+            lat[((std::size_t)c * h8 + 2 * yy + ph) * w8 + 2 * xx + pw] =
+                z[((std::size_t)cc * gh + yy) * gw + xx];
+          }
+        }
+      }
+      _preview->submit(std::move(lat), L, 1, h8, w8, k + 1, S);
+    }
+    prog.end_step(k);
+  }
+  const double secs = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - t0).count();
+  session()->info(fmt(
+      "GenerateImageStage('{}'): FLUX.3 latent generated in {:.2f}s ({} "
+      "steps, alpha {:.2f}, {} text + {} image + {} reference rows)",
+      this->id(), secs, S, alpha, n_rows, img_seq,
+      [&] {
+        int n = 0;
+        for (const auto& r : rreq) { n += r.grid_h * r.grid_w; }
+        return n;
+      }()));
+  return unpack(x);
+}
+
 std::vector<float>
 GenerateImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
                                   int n_real,
@@ -5031,12 +5494,28 @@ GenerateImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
 
 
 void
-GenerateImageStage::tag_model_(TensorBeat& tb) const
+GenerateImageStage::tag_output_(TensorBeat& tb) const
 {
   // `_hf_dir` is the reference the user actually named (a registry key like
   // "local/Krea-2-Turbo-8bit", or a path), which is the meaningful
   // identity of the generator -- not the resolved directory.
   provenance::set_model_name(tb.sideband, _hf_dir);
+  // BFL's single-reference edit generates on the reference's padded canvas
+  // and cuts the result back to the picture: the box comes from
+  // image-resample `pad_to_grid` through vae-encode, and vae-decode cuts.
+  // Only when this output IS that canvas -- its size was taken from the
+  // reference (no width/height configured), there is exactly one
+  // reference, and the two latent grids agree. A configured size, or
+  // several references, is a different picture with nothing to cut back
+  // to (BFL's rule too).
+  if (!_infer_size || _ref.size() != 1 || _ref[0].crop_box.is_null()) {
+    return;
+  }
+  const RefLatent& r = _ref[0];
+  const std::size_t n = tb.shape.size();
+  if (n < 2 || tb.shape[n - 2] != r.h || tb.shape[n - 1] != r.w) { return; }
+  if (!tb.sideband.is_object()) { tb.sideband = FlexData::make_object(); }
+  tb.sideband.as_object().insert_or_assign(sideband::kCropBox, r.crop_box);
 }
 
 Job
@@ -5159,6 +5638,13 @@ GenerateImageStage::process(RuntimeContext& ctx)
     dst.c = (int)tb.shape[0];
     dst.h = (int)tb.shape[1];
     dst.w = (int)tb.shape[2];
+    if (tb.sideband.is_object()) {
+      FlexData sb = tb.sideband;          // as_object() is a view: keep it
+      auto so = sb.as_object();
+      if (so.contains(sideband::kCropBox)) {
+        dst.crop_box = so.at(sideband::kCropBox);
+      }
+    }
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): {} = [{}, {}, {}]", this->id(), what,
         dst.c, dst.h, dst.w));
@@ -5371,6 +5857,12 @@ GenerateImageStage::process(RuntimeContext& ctx)
         "prompt", this->id()));
     if (load_z_image_dit_()) { _dit_unloaded = false; }
   }
+  if (_family == "flux3" && _dit_unloaded && !_flux3_dit) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): reloading the FLUX.3 DiT for the next "
+        "prompt", this->id()));
+    if (load_flux3_dit_()) { _dit_unloaded = false; }
+  }
   if (_family == "boogu-image" && _dit_unloaded && !_boogu_dit) {
     session()->info(fmt(
         "GenerateImageStage('{}'): reloading the Boogu-Image DiT for the next "
@@ -5383,6 +5875,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
       : _family == "boogu-image" ? (bool)_boogu_dit
       : _family == "qwen-image-21" ? (bool)_qi21_dit
       : _family == "z-image" ? (bool)_zi_dit
+      : _family == "flux3" ? (bool)_flux3_dit
       : _family == "vosr" ? (bool)_vosr
       : (bool)_dit;
   if (!have_dit) {
@@ -5552,7 +6045,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
       so->dtype = TensorBeat::DType::F32;
       so->shape = shape;
       so->resize_contiguous(lat.size());
-      tag_model_(*so);
+      tag_output_(*so);
       std::memcpy(so->as_f32(), lat.data(), lat.size() * sizeof(float));
       step_alive = ctx.write_sync(1, std::move(so));
     };
@@ -5737,7 +6230,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
         to.insert_or_assign(kv.first, kv.second);
       }
     }
-    tag_model_(*out);
+    tag_output_(*out);
     ++_latents_emitted;
     session()->info(fmt(
         "GenerateImageStage('{}'): '{}' latent {} floats ({} steps @ {}x{})",
@@ -5810,7 +6303,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
     out->shape = {Cdit, fgh, fgw};
     out->resize_contiguous(fl.size());
     std::memcpy(out->as_f32(), fl.data(), fl.size() * sizeof(float));
-    tag_model_(*out);
+    tag_output_(*out);
     ++_latents_emitted;
     session()->info(fmt(
         "GenerateImageStage('{}'): FLUX.2 latent [{}, {}, {}] ({} steps @ {}x{})",
@@ -5844,7 +6337,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
     out->shape = {16, lh, lw};
     out->resize_contiguous(ql.size());
     std::memcpy(out->as_f32(), ql.data(), ql.size() * sizeof(float));
-    tag_model_(*out);
+    tag_output_(*out);
     ++_latents_emitted;
     session()->info(fmt(
         "GenerateImageStage('{}'): Qwen-Image-Edit latent [16, {}, {}] "
@@ -5985,7 +6478,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
     out->shape = {_vosr_cfg.latent_ch, lh, lw};
     out->resize_contiguous(vout.size());
     std::memcpy(out->as_f32(), vout.data(), vout.size() * sizeof(float));
-    tag_model_(*out);
+    tag_output_(*out);
     ++_latents_emitted;
     session()->info(fmt(
         "GenerateImageStage('{}'): VOSR latent [{}, {}, {}] ({} step{} @ "
@@ -6027,7 +6520,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
     out->shape = {QZ, qlh, qlw};
     out->resize_contiguous(ql.size());
     std::memcpy(out->as_f32(), ql.data(), ql.size() * sizeof(float));
-    tag_model_(*out);
+    tag_output_(*out);
     ++_latents_emitted;
     session()->info(fmt(
         "GenerateImageStage('{}'): Qwen-Image-2.1 latent [{}, {}, {}] ({} "
@@ -6067,7 +6560,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
     out->shape = {ZZ, lh, lw};
     out->resize_contiguous(zl.size());
     std::memcpy(out->as_f32(), zl.data(), zl.size() * sizeof(float));
-    tag_model_(*out);
+    tag_output_(*out);
     ++_latents_emitted;
     session()->info(fmt(
         "GenerateImageStage('{}'): Z-Image latent [{}, {}, {}] ({} steps @ "
@@ -6077,6 +6570,43 @@ GenerateImageStage::process(RuntimeContext& ctx)
     // denoised, which is the number a peer has to size against.
     correct_dit_holding_("after a generation");
     free_z_image_dit_for_decode_(gen_w, gen_h);
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
+  // ---- FLUX.3: text (+ references) -> the flow map's 16 steps ->
+  // [128, H/16, W/16], FLUX.2's VAE's own latent, which vae-decode takes
+  // unchanged. ----
+  if (_family == "flux3") {
+    const int C3 = _flux3_dit->config().in_channels;
+    std::vector<RefLatent> frefs;
+    for (const RefLatent& r : _ref) { frefs.push_back(r); }
+    _flux3_dit->set_stream_stop(stopping);
+    LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                         0.0, 0);
+    const int lh3 = gen_h / 16, lw3 = gen_w / 16;
+    const std::vector<float> fl =
+        generate_flux3_(cond, n_real, gen_h, gen_w, frefs, init_ptr,
+                        step_emitter({C3, lh3, lw3}));
+    _flux3_dit->set_stream_stop({});
+    if (fl.empty()) {
+      session()->info(fmt(
+          "GenerateImageStage('{}'): FLUX.3 generation {}; dropping beat",
+          this->id(), ctx.stop_requested() ? "stopped" : "failed"));
+      co_return;
+    }
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {C3, lh3, lw3};
+    out->resize_contiguous(fl.size());
+    std::memcpy(out->as_f32(), fl.data(), fl.size() * sizeof(float));
+    tag_output_(*out);
+    ++_latents_emitted;
+    session()->info(fmt(
+        "GenerateImageStage('{}'): FLUX.3 latent [{}, {}, {}] @ {}x{}",
+        this->id(), C3, lh3, lw3, gen_w, gen_h));
+    correct_dit_holding_("after a generation");
+    free_flux3_dit_for_decode_(gen_w, gen_h);
     co_await ctx.write(0, std::move(out));
     co_return;
   }
@@ -6100,7 +6630,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
     out->shape = {16, lh, lw};
     out->resize_contiguous(bl.size());
     std::memcpy(out->as_f32(), bl.data(), bl.size() * sizeof(float));
-    tag_model_(*out);
+    tag_output_(*out);
     ++_latents_emitted;
     session()->info(fmt(
         "GenerateImageStage('{}'): Boogu-Image latent [16, {}, {}] ({} steps "
@@ -6159,7 +6689,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
   out->resize_contiguous(out_latent.size());
   std::memcpy(out->as_f32(), out_latent.data(),
               out_latent.size() * sizeof(float));
-  tag_model_(*out);
+  tag_output_(*out);
   ++_latents_emitted;
   session()->info(fmt(
       "GenerateImageStage('{}'): latent [16, {}, {}] ({}+{} {} steps @ "

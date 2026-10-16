@@ -265,6 +265,45 @@ kernel void flashvsr_route_keep(
   keep[o] = (p[o] > thr[(ulong)h * (uint)groups + (uint)g]) ? 1u : 0u;
 }
 
+// FlashVSR+'s answer to a query block the threshold left with NO key
+// block: keep its first candidate, as its reference does. A strict
+// `p > threshold` can do that when the group's scores tie, and the span
+// kernel's softmax over nothing is 0/0 -- a NaN row that every later
+// block's attention spreads.
+//
+// "First" is in the REFERENCE's key order, which is oldest window first.
+// The ring holds the same windows in slot order, so the oldest is at
+// slot `first_win`; within a window the band is the only candidate rule
+// and it is spatial, so the first candidate is that window's lowest
+// spatial block inside the row's band.
+//
+//   0:keep [H,Nq,Nk] uchar  1:band [S,S] uchar
+//   2:Nq 3:Nk 4:S 5:first_win.  grid {Nq, H}.
+kernel void flashvsr_route_fallback(
+    device uchar*       keep      [[buffer(0)]],
+    const device uchar* band      [[buffer(1)]],
+    constant int&       Nq        [[buffer(2)]],
+    constant int&       Nk        [[buffer(3)]],
+    constant int&       S         [[buffer(4)]],
+    constant int&       first_win [[buffer(5)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const uint i = tpig.x, h = tpig.y;
+  if (i >= (uint)Nq) { return; }
+  device uchar* row = keep + ((ulong)h * (uint)Nq + i) * (uint)Nk;
+  for (int j = 0; j < Nk; ++j) {
+    if (row[j] != 0u) { return; }
+  }
+  const uint si = i % (uint)S;
+  for (int j = 0; j < S; ++j) {
+    if (band[(ulong)si * (uint)S + (uint)j] != 0u) {
+      const int k = first_win * S + j;
+      if (k < Nk) { row[k] = 1u; }
+      return;
+    }
+  }
+}
+
 // qb_off[H][NQ + 1], the CSR offsets into qb_blocks.
 //
 // Serial in ONE thread on purpose: the array is H*(NQ+1) entries -- a

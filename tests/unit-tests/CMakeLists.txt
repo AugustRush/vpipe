@@ -194,6 +194,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         flashvsr-accel.cc
         flashvsr-kv.cc
         flashvsr-stream.cc
+        flashvsr-plus.cc
         perf-flops.cc
         torch-zip.cc
         wan-vae.cc
@@ -249,6 +250,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         qwen-image-21-dit.cc
         z-image-dit.cc
         yue2.cc
+        bs-roformer.cc
         qwen-image-edit-text.cc
         qwen-image-edit-dit.cc
         qwen-image-edit-vision.cc
@@ -256,6 +258,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         qwen-image-edit-t2i.cc
         qwen-image-edit-awq.cc
         flux2-smoke.cc
+        flux3-dit.cc
+        flux3-pipeline.cc
         image-memory-plan.cc
         boogu-smoke.cc
         llm-chat-template.cc

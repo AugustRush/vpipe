@@ -1297,6 +1297,61 @@ const STRINGS = {
       + '串流情形下，分塊長度由濾鏡自己決定。宣告的時脈組是串流情形下的答案'
       + '；`stacked` 時 oport_clock_group() 與輸入埠共用時脈'],
 
+  // ---- Audio Separate (audio) ----
+  'stage.audio-separate.name': ['',
+      '音频分离',
+      '音訊分離'],
+  'stage.audio-separate.doc': ['',
+      '用 BS-RoFormer（MSST 检查点 + YAML）从音乐中分离出一个声源——例如人声'
+      + '——并输出该声源以及去掉它之后的混音。流式运行：音轨被切成模型的重叠'
+      + '分块，再交叉淡化拼接回去，结果与整段分离完全一致。',
+      '用 BS-RoFormer（MSST 檢查點 + YAML）從音樂中分離出一個聲源——例如人聲'
+      + '——並輸出該聲源以及去掉它之後的混音。串流執行：音軌被切成模型的重疊'
+      + '分塊，再交叉淡化拼接回去，結果與整段分離完全一致。'],
+  'cfg.audio-separate.hf_dir': ['',
+      '分离模型：模型库键、存放 MSST 检查点及其 YAML 的目录，或 .ckpt 文件本'
+      + '身。pcunwa/BS-Roformer-Resurrection 在目录中登记为两个模型：人声与伴'
+      + '奏。可选：模型输入端口上的 model-select 来源会覆盖它',
+      '分離模型：模型庫鍵、存放 MSST 檢查點及其 YAML 的目錄，或 .ckpt 檔案本'
+      + '身。pcunwa/BS-Roformer-Resurrection 在目錄中登記為兩個模型：人聲與伴'
+      + '奏。可選：模型輸入埠上的 model-select 來源會覆蓋它'],
+  'cfg.audio-separate.checkpoint': ['',
+      '检查点文件名，用于目录中有多个检查点（Resurrection 仓库就有两个）而模'
+      + '型库记录又没有指定其中之一的情形',
+      '檢查點檔名，用於目錄中有多個檢查點（Resurrection 儲存庫就有兩個）而模'
+      + '型庫記錄又沒有指定其中之一的情形'],
+  'cfg.audio-separate.config': ['',
+      'MSST 的 YAML 配置，当它没有按检查点命名（<stem>-Config.yaml、'
+      + '<stem>.yaml……）、也不是旁边唯一的 YAML 时使用。相对于检查点所在目录',
+      'MSST 的 YAML 設定，當它沒有按檢查點命名（<stem>-Config.yaml、'
+      + '<stem>.yaml……）、也不是旁邊唯一的 YAML 時使用。相對於檢查點所在目錄'],
+  'cfg.audio-separate.stem': ['',
+      '哪个声源送到 `stem` 输出端口，按名称（来自 YAML 的 training 段）或序号'
+      + '。默认：模型的第一个——对单声源模型而言就是它的目标',
+      '哪個聲源送到 `stem` 輸出埠，按名稱（來自 YAML 的 training 段）或序號'
+      + '。預設：模型的第一個——對單聲源模型而言就是它的目標'],
+  'cfg.audio-separate.num_overlap': ['',
+      '每个采样被多少个分块覆盖。0（默认）沿用 YAML 中的值（Resurrection 为 '
+      + '2）。耗时随之线性增长；重叠越多，分块之间的接缝越平滑',
+      '每個取樣被多少個分塊覆蓋。0（預設）沿用 YAML 中的值（Resurrection 為 '
+      + '2）。耗時隨之線性增長；重疊越多，分塊之間的接縫越平滑'],
+  'port.audio-separate.in.pcm': ['',
+      'f32 PCM，单声道 [N] 或平面的 [C, N]，采样率须为模型的采样率（边带 '
+      + '`sample_rate`）。流式：节拍长度任意',
+      'f32 PCM，單聲道 [N] 或平面的 [C, N]，取樣率須為模型的取樣率（邊帶 '
+      + '`sample_rate`）。串流：節拍長度任意'],
+  'port.audio-separate.in.model': ['',
+      '可选的共享模型引用，来自 model-select 来源；覆盖 hf_dir',
+      '可選的共享模型參照，來自 model-select 來源；覆蓋 hf_dir'],
+  'port.audio-separate.out.stem': ['',
+      '分离出的声源，平面 [C, N] f32，采样率与输入相同。比输入落后约一个模型'
+      + '分块，节拍长度由本阶段自己决定',
+      '分離出的聲源，平面 [C, N] f32，取樣率與輸入相同。比輸入落後約一個模型'
+      + '分塊，節拍長度由本階段自己決定'],
+  'port.audio-separate.out.residual': ['',
+      '混音减去该声源——人声模型的伴奏。布局与节拍同 `stem`',
+      '混音減去該聲源——人聲模型的伴奏。版面與節拍同 `stem`'],
+
   // ---- Audio → PCM (audio) ----
   'stage.audio-to-pcm.name': ['', '音频流 → PCM', '音訊串流 → PCM'],
   'stage.audio-to-pcm.doc': ['',
@@ -4485,24 +4540,32 @@ const STRINGS = {
       + '就是它需要的記憶體），以及決定它讀取哪些 key 塊的路由。發出一個節拍'
       + '即結束；若接了 trigger 輸入埠，則每收到一個節拍發出一個。'],
   'cfg.flashvsr-model-config.kv_ratio': ['',
-      '每个 block 保留多少个更早 chunk 的时间窗口用于跨窗注意力（不填时取参考'
-      + '实现的 3）。这是该模型最大的一笔分配：每个 block 的窗口是 kv_ratio + '
-      + '1 个键值窗口，至少三个——1920x1152 下取 3 为 12.7 GB，取 2 为 9.6 GB'
-      + '。调低它以适配机器；代价是修复能往回看多远来保持一致性',
-      '每個 block 保留多少個更早 chunk 的時間視窗用於跨視窗注意力（不填時取參'
-      + '考實作的 3）。這是該模型最大的一筆配置：每個 block 的視窗是 kv_ratio '
-      + '+ 1 個鍵值視窗，至少三個——1920x1152 下取 3 為 12.7 GB，取 2 為 9.6 '
-      + 'GB。調低它以配合機器；代價是修復能往回看多遠來保持一致性'],
+      '每个 block 保留多少个更早 chunk 的时间窗口用于跨窗注意力（不填'
+      + '时取参考实现的 3）。串流时这是该模型最大的一笔分配：v1.1 在组与组之'
+      + '间为每个 block 携带 kv_ratio 个键值窗口——1920x1152 下取 3 为 9.6 GB。'
+      + 'FlashVSR+ Turbo 的 25 个混合层无论此值多少都只保留一个窗口，因此它'
+      + '在该尺寸下的串流携带 4.2 GB。调低它以适配机器；代价是修复能往回看多'
+      + '远来保持一致性',
+      '每個 block 保留多少個更早 chunk 的時間視窗用於跨視窗注意力（不'
+      + '填時取參考實作的 3）。串流時這是該模型最大的一筆配置：v1.1 在組與組'
+      + '之間為每個 block 攜帶 kv_ratio 個鍵值視窗——1920x1152 下取 3 為 9.6 '
+      + 'GB。FlashVSR+ Turbo 的 25 個混合層無論此值多少都只保留一個視窗，因'
+      + '此它在該尺寸下的串流攜帶 4.2 GB。調低它以配合機器；代價是修復能往回'
+      + '看多遠來保持一致性'],
   'cfg.flashvsr-model-config.sparse_ratio': ['',
-      '路由保留多少个 key 块，并像参考实现那样按帧面积缩放，因此同一个取值在'
-      + '任何分辨率下都表示同一种选择性（不填时取 2.0；1.5 更快，2.0 更稳）',
-      '路由保留多少個 key 塊，並像參考實作那樣按影格面積縮放，因此同一個取值'
-      + '在任何解析度下都表示同一種選擇性（不填時取 2.0；1.5 更快，2.0 更穩）'],
+      '路由保留多少个 key 块，按各版本自己的约定。FlashVSR-v1.1 像其参'
+      + '考实现那样按帧面积缩放，因此同一个取值在任何分辨率下都表示同一种选'
+      + '择性（不填时取 2.0；1.5 更快，2.0 更稳）；FlashVSR+ 按原值使用（不'
+      + '填时取 2.5）',
+      '路由保留多少個 key 塊，按各版本自己的約定。FlashVSR-v1.1 像其參'
+      + '考實作那樣按影格面積縮放，因此同一個取值在任何解析度下都表示同一種'
+      + '選擇性（不填時取 2.0；1.5 更快，2.0 更穩）；FlashVSR+ 按原值使用（'
+      + '不填時取 2.5）'],
   'cfg.flashvsr-model-config.local_range': ['',
-      '始终参与注意力的空间带，单位是窗口块（不填时取 11；9 细节更锐利，11 更'
-      + '稳定）',
-      '始終參與注意力的空間帶，單位是視窗塊（不填時取 11；9 細節更銳利，11 更'
-      + '穩定）'],
+      '始终参与注意力的空间带，单位是窗口块（不填时取 11；9 细节更锐利'
+      + '，11 更稳定）。FlashVSR+ Turbo 的混合层保持各自的 3',
+      '始終參與注意力的空間帶，單位是視窗塊（不填時取 11；9 細節更銳利'
+      + '，11 更穩定）。FlashVSR+ Turbo 的混合層保持各自的 3'],
   'port.flashvsr-model-config.trigger': ['',
       '可选：用于触发重新发出配置的节拍（chrono 计时、提示词源、反馈回路都'
       + '行）。任何载荷都可以——收到本身就是信号。不接线时，本阶段在整段运行中'
@@ -4554,12 +4617,16 @@ const STRINGS = {
       + '流所需的狀態時走串流——1920x1152 約 20 GB，512x512 約 2.5 GB——否則按'
       + '片段修復'],
   'cfg.flashvsr-src-encoder.clip_frames': ['',
-      '按片段修复时：每个片段的源帧数，须为 8k+1 且不少于 25。每个片段修复其'
-      + '前 clip_frames - 4 帧（最后四帧是模型的前瞻）。片段越长，重叠的代价'
-      + '摊得越薄，运行时占用也越多（41）',
-      '按片段修復時：每個片段的來源影格數，須為 8k+1 且不少於 25。每個片段修'
-      + '復其前 clip_frames - 4 個影格（最後四個是模型的前瞻）。片段越長，重疊'
-      + '的代價攤得越薄，執行時占用也越多（41）'],
+      '按片段修复时：每个片段的源帧数——须为整数个 chunk：FlashVSR-v1.'
+      + '1 为 8k+1 且不少于 25，FlashVSR+ 为 16k+1（会向上取整到该规则）。每'
+      + '个片段修复其前 clip_frames - 4 帧（最后四帧是模型的前瞻）。片段越长'
+      + '，重叠的代价摊得越薄，运行时占用也越多（0 为默认：v1.1 取 41，FlashVSR+'
+      + ' 取 49）',
+      '按片段修復時：每個片段的來源影格數——須為整數個 chunk：FlashVSR-'
+      + 'v1.1 為 8k+1 且不少於 25，FlashVSR+ 為 16k+1（會向上取整到該規則）'
+      + '。每個片段修復其前 clip_frames - 4 個影格（最後四個是模型的前瞻）。'
+      + '片段越長，重疊的代價攤得越薄，執行時占用也越多（0 為預設：v1.1 取 '
+      + '41，FlashVSR+ 取 49）'],
   'cfg.flashvsr-src-encoder.blend_frames': ['',
       '按片段修复时：每个片段与下一个片段共享的修复帧数，解码会在两者之间做'
       + '交叉淡化（升余弦），让切口成为过渡而不是跳变；0 表示硬切。每一帧都'
@@ -4568,10 +4635,12 @@ const STRINGS = {
       + '做交叉淡化（升餘弦），讓切口成為過渡而不是跳變；0 表示硬切。每一個'
       + '影格都要多修復一次（8）'],
   'cfg.flashvsr-src-encoder.color_fix': ['',
-      '为每个修复出的帧带上其源帧的颜色统计，供解码按它们匹配各通道'
-      + '（AdaIN）——这是 FlashVSR 参考实现默认施加的颜色校正（true）',
-      '為每個修復出的影格帶上其來源影格的色彩統計，供解碼按它們匹配各通道'
-      + '（AdaIN）——這是 FlashVSR 參考實作預設施加的色彩校正（true）'],
+      '为每个修复出的帧带上其源帧的颜色统计，供解码按它们匹配各通道（'
+      + 'AdaIN）。不填时跟随该版本自己的参考实现：FlashVSR-v1.1 默认施加，开'
+      + '启；FlashVSR+ 的模型无需它也能保持颜色，关闭',
+      '為每個修復出的影格帶上其來源影格的色彩統計，供解碼按它們匹配各'
+      + '通道（AdaIN）。不填時跟隨該版本自己的參考實作：FlashVSR-v1.1 預設施'
+      + '加，開啟；FlashVSR+ 的模型無需它也能保持色彩，關閉'],
   'port.flashvsr-src-encoder.source': ['',
       '像素域的低质量片段：平面 U8 RGB [frames, 3, H, W]，`fps` 放在边带上，'
       + '这正是 temporal-stack 构造出的形状。必接——这个模型族只以它的源作为'
@@ -4713,6 +4782,88 @@ const STRINGS = {
       + 'generate-image 的 model_config 输入端口使用',
       'FLUX.2 參數，作為一個 FlexData 物件 {model_family: flux2, klein_kv, '
       + '+lora, +lora2 與它們的強度，+preview_vae 與它的選項}，供 '
+      + 'generate-image 的 model_config 輸入埠使用'],
+
+  // ---- FLUX.3 Model Config (model-specific-config) ----
+  'stage.flux3-model-config.name': ['',
+      'FLUX.3 模型配置',
+      'FLUX.3 模型設定'],
+  'stage.flux3-model-config.doc': ['',
+      '源：FLUX.3 Image Klein 的专属参数——采样日程的 alpha、运行时 LoRA 槽'
+      + '位和实时预览。普通运行一个都不需要：检查点自己声明了采样器。发一个'
+      + '节拍即结束；若接了 trigger 输入端口，则每收到一个节拍发一次。',
+      '來源：FLUX.3 Image Klein 的專屬參數——取樣排程的 alpha、執行階段 LoRA'
+      + ' 槽位和即時預覽。一般執行一個都不需要：檢查點自己宣告了取樣器。發一'
+      + '個節拍即結束；若接了 trigger 輸入埠，則每收到一個節拍發一次。'],
+  'cfg.flux3-model-config.alpha': ['',
+      '采样日程的形状：第 k 步运行在 t = a s / (1 + (a - 1) s)，s = 1 - k / '
+      + 'steps。数值越大，越多步数花在高噪声段。默认（0）即检查点自己的值'
+      + '——蒸馏版 Klein 为 6.93，从它的 config.json 读取。步数本身由 '
+      + 'generate-image 的 `steps`（或 scheduler-select）决定，检查点同样给'
+      + '了默认值（16）',
+      '取樣排程的形狀：第 k 步執行於 t = a s / (1 + (a - 1) s)，s = 1 - k / '
+      + 'steps。數值越大，越多步數花在高雜訊段。預設（0）即檢查點自己的值'
+      + '——蒸餾版 Klein 為 6.93，從它的 config.json 讀取。步數本身由 '
+      + 'generate-image 的 `steps`（或 scheduler-select）決定，檢查點同樣給'
+      + '了預設值（16）'],
+  'cfg.flux3-model-config.lora': ['',
+      '在运行时生效的 LoRA——每个被适配的投影计算 W x + scale * B (A x)。可'
+      + '以是一个已注册的模型、一个含单个 .safetensors 的目录，或指向该文件'
+      + '的路径。模块名采用检查点自身使用的 diffusers 写法（mode_blocks.'
+      + 'image.N.attn.to_q、txt_mode_blocks.N.ff.linear_in、'
+      + 'single_transformer_blocks.N.attn.to_out.0 等），可以带 `'
+      + 'diffusion_model.` 或 `transformer.` 前缀；为其他模型准备的适配器一'
+      + '个都绑不上，并会明确报告。加载时生效：在 DiT 构建之前读取，之后再'
+      + '改的节拍只会被报告并忽略（强度仍可实时调整）',
+      '在執行階段生效的 LoRA——每個被套用的投影計算 W x + scale * B (A x)。'
+      + '可以是一個已註冊的模型、一個含單個 .safetensors 的目錄，或指向該檔'
+      + '案的路徑。模組名採用檢查點自身使用的 diffusers 寫法（mode_blocks.'
+      + 'image.N.attn.to_q、txt_mode_blocks.N.ff.linear_in、'
+      + 'single_transformer_blocks.N.attn.to_out.0 等），可以帶 `'
+      + 'diffusion_model.` 或 `transformer.` 前綴；為其他模型準備的轉接器一'
+      + '個都綁不上，並會明確報告。載入時生效：在 DiT 建構之前讀取，之後再'
+      + '改的節拍只會被報告並忽略（強度仍可即時調整）'],
+  'cfg.flux3-model-config.lora_scale': ['',
+      '适配器强度，按每次前向生效：可实时调整，无需重新加载即可扫参。1.0 '
+      + '= 与训练时一致；0 会跳过两个适配器 GEMM，所以关掉就是真的关掉',
+      '轉接器強度，按每次前向生效：可即時調整，無需重新載入即可掃參。1.0 '
+      + '= 與訓練時一致；0 會跳過兩個轉接器 GEMM，所以關掉就是真的關掉'],
+  'cfg.flux3-model-config.preview_vae': ['',
+      '可选：用于实时预览的小型自编码器（TAE）。FLUX.3 用的是 FLUX.2 的 '
+      + 'VAE，所以 FLUX.2 的 TAE（madebyollin 的 taef2）可原样预览它。每走'
+      + '完一个去噪步，模型对成片的干净估计会由它解码，写到去噪阶段的 '
+      + '`preview` 输出端口。留空（默认）即关闭预览——那时什么都不加载、不'
+      + '解码',
+      '可選：用於即時預覽的小型自編碼器（TAE）。FLUX.3 用的是 FLUX.2 的 '
+      + 'VAE，所以 FLUX.2 的 TAE（madebyollin 的 taef2）可原樣預覽它。每走'
+      + '完一個去噪步，模型對成片的乾淨估計會由它解碼，寫到去噪階段的 '
+      + '`preview` 輸出埠。留空（預設）即關閉預覽——那時什麼都不載入、不'
+      + '解碼'],
+  'cfg.flux3-model-config.preview_every': ['',
+      '每 N 个去噪步渲染一次预览；最后一步总会渲染。解码在单独的线程上进'
+      + '行，绝不让生成等待。它与去噪共用 GPU，所以 N 越大，还给去噪的 GPU '
+      + '时间越多。填 0 即关闭预览',
+      '每 N 個去噪步渲染一次預覽；最後一步總會渲染。解碼在單獨的執行緒上進'
+      + '行，絕不讓生成等待。它與去噪共用 GPU，所以 N 越大，還給去噪的 GPU '
+      + '時間越多。填 0 即關閉預覽'],
+  'cfg.flux3-model-config.preview_max_edge': ['',
+      '预览画面的最长边（像素）；解码出的画面会按整数倍做盒式缩小，直到放'
+      + '得下。填 0 即按解码原样发送',
+      '預覽畫面的最長邊（像素）；解碼出的畫面會按整數倍做盒式縮小，直到放'
+      + '得下。填 0 即按解碼原樣傳送'],
+  'port.flux3-model-config.trigger': ['',
+      '可选的节拍，用于控制何时重新发出配置（chrono 滴答、提示词源、反馈回'
+      + '路等）。负载内容不限——收到本身就是信号。未接时，本阶段每次运行只发'
+      + '一次',
+      '可選的節拍，用於控制何時重新發出設定（chrono 滴答、提示詞來源、回饋'
+      + '迴路等）。負載內容不限——收到本身就是訊號。未接時，本階段每次執行只'
+      + '發一次'],
+  'port.flux3-model-config.model_config': ['',
+      'FLUX.3 参数，作为一个 FlexData 对象 {model_family: flux3, +alpha, '
+      + '+lora .. +lora8 与它们的强度，+preview_vae 与它的选项}，供 '
+      + 'generate-image 的 model_config 输入端口使用',
+      'FLUX.3 參數，作為一個 FlexData 物件 {model_family: flux3, +alpha, '
+      + '+lora .. +lora8 與它們的強度，+preview_vae 與它的選項}，供 '
       + 'generate-image 的 model_config 輸入埠使用'],
 
   // ---- Krea-2 Model Config (model-specific-config) ----
@@ -6969,12 +7120,16 @@ const STRINGS = {
       '合成結果：依 output 為平面 [3,H,W] 或 [4,H,W]，dtype 跟隨 front'],
   'stage.image-resample.doc': ['',
       '把 rgb-frames 重采样到固定的宽 x 高，宽高比的处理方式（填充 / 裁剪 /'
-      + ' 拉伸 / 手动）与填充色均可配置。默认使用 Lanczos-3 重采样；\'bilinear\''
+      + ' 拉伸 / 手动）与填充色均可配置——或用 pad_to_grid / crop_to_grid 按源'
+      + '图自身的宽高比落到边长网格上（FLUX.3 的参考图规则）。'
+      + '默认使用 Lanczos-3 重采样；\'bilinear\''
       + ' 更省，\'bicubic\' 与 PIL 一致。f16 与 f32 帧（RGB 或 RGBA）以任一滤'
       + '波器在 GPU 上重采样；u8 RGB 帧用 bilinear 或 lanczos 时走 GPU；其余'
       + '走 CPU。输入端口与输出端口同属一个时钟域（1:1）。',
       '把 rgb-frames 重新取樣到固定的寬 x 高，長寬比的處理方式（填充 / 裁剪'
-      + ' / 拉伸 / 手動）與填充色均可設定。預設使用 Lanczos-3 重新取樣；'
+      + ' / 拉伸 / 手動）與填充色均可設定——或用 pad_to_grid / crop_to_grid '
+      + '依來源自身的長寬比落到邊長網格上（FLUX.3 的參考圖規則）。'
+      + '預設使用 Lanczos-3 重新取樣；'
       + '\'bilinear\' 更省，\'bicubic\' 與 PIL 一致。f16 與 f32 影格（RGB 或 '
       + 'RGBA）以任一濾波器在 GPU 上重新取樣；u8 RGB 影格用 bilinear 或 '
       + 'lanczos 時走 GPU；其餘走 CPU。輸入埠與輸出埠同屬一個時脈域（1:1）。'],
@@ -6991,10 +7146,40 @@ const STRINGS = {
   'cfg.image-resample.fit': ['',
       '宽高比处理方式：pad（对齐长边并用 pad_color 填充）| crop（对齐短边并'
       + '居中裁剪）| stretch（改变宽高比）| manual（从 src_x,src_y 起按 '
-      + 'scale 采样，其余填充）',
+      + 'scale 采样，其余填充）。另有两种按源图决定输出尺寸、忽略 '
+      + 'width/height，供要求边长落在网格上的模型使用：pad_to_grid（缩小直到'
+      + '每边向上取整到 `grid` 后的画布不超过 max_pixels；图像居中，其余镜像'
+      + '填充到画布；图像所在矩形以 `crop_box` 随附，vae-decode 据此把编辑结'
+      + '果裁回——FLUX.3 的单参考图编辑）| crop_to_grid（缩小到不超过 '
+      + 'max_pixels，每边向下取整到 `grid` 并居中裁剪——FLUX.3 对多张参考图'
+      + '中每一张的规则）',
       '長寬比處理方式：pad（對齊長邊並用 pad_color 填充）| crop（對齊短邊並'
       + '置中裁剪）| stretch（改變長寬比）| manual（從 src_x,src_y 起按 '
-      + 'scale 取樣，其餘填充）'],
+      + 'scale 取樣，其餘填充）。另有兩種依來源決定輸出尺寸、忽略 '
+      + 'width/height，供要求邊長落在網格上的模型使用：pad_to_grid（縮小直到'
+      + '每邊向上取整到 `grid` 後的畫布不超過 max_pixels；影像置中，其餘鏡像'
+      + '填補到畫布；影像所在矩形以 `crop_box` 隨附，vae-decode 據此把編輯結'
+      + '果裁回——FLUX.3 的單參考圖編輯）| crop_to_grid（縮小到不超過 '
+      + 'max_pixels，每邊向下取整到 `grid` 並置中裁剪——FLUX.3 對多張參考圖'
+      + '中每一張的規則）'],
+  'cfg.image-resample.grid': ['',
+      'pad_to_grid / crop_to_grid：每条输出边都落在其倍数上（16：一个 FLUX '
+      + 'VAE 潜变量格）',
+      'pad_to_grid / crop_to_grid：每條輸出邊都落在其倍數上（16：一個 FLUX '
+      + 'VAE 潛變量格）'],
+  'cfg.image-resample.max_pixels': ['',
+      'pad_to_grid / crop_to_grid：输出最多的像素数（pad_to_grid 计入填充后'
+      + '的画布）。FLUX.3 单张参考图用 4194304（4 MiB），多张时每张用 '
+      + '1048576（1 MiB）',
+      'pad_to_grid / crop_to_grid：輸出最多的像素數（pad_to_grid 計入填補後'
+      + '的畫布）。FLUX.3 單張參考圖用 4194304（4 MiB），多張時每張用 '
+      + '1048576（1 MiB）'],
+  'cfg.image-resample.min_side': ['',
+      'pad_to_grid：画布最短的边长；更小的图像会被填充到该长度',
+      'pad_to_grid：畫布最短的邊長；更小的影像會被填補到該長度'],
+  'cfg.image-resample.max_side': ['',
+      'pad_to_grid：画布最长的边长（0：除 max_pixels 外不设限）',
+      'pad_to_grid：畫布最長的邊長（0：除 max_pixels 外不設限）'],
   'cfg.image-resample.pad_color': ['',
       'pad / manual 所用的 #RRGGBB 纯色填充（f16 / f32 帧按 0..1 归一化解读）',
       'pad / manual 所用的 #RRGGBB 純色填充（f16 / f32 影格按 0..1 正規化解讀）'],
@@ -7943,15 +8128,19 @@ const STRINGS = {
     '該槽位那個融合 attn.qkv_proj 的列順序，含義與 `lora` 的 '
     + '`lora_qkv_layout` 完全相同。之所以逐槽位設定，是因為列順序是檔案的屬性',
   ];
+  // [stage, overrides, h3, first slot]. FLUX.3's `lora2` takes the shared
+  // slot doc too (its stage declares only `lora` by hand), so its run of
+  // shared slots starts at 2.
   const stages = [
-    ['generate-image', true, false],
-    ['krea2-model-config', false, false],
-    ['flux2-model-config', false, false],
-    ['qwen-image-21-model-config', false, false],
-    ['minimax-h3-model-config', false, true],
+    ['generate-image', true, false, 3],
+    ['krea2-model-config', false, false, 3],
+    ['flux2-model-config', false, false, 3],
+    ['flux3-model-config', false, false, 2],
+    ['qwen-image-21-model-config', false, false, 3],
+    ['minimax-h3-model-config', false, true, 3],
   ];
-  for (const [stage, over, h3] of stages) {
-    for (let n = 3; n <= 8; ++n) {
+  for (const [stage, over, h3, first] of stages) {
+    for (let n = first; n <= 8; ++n) {
       const k = `cfg.${stage}.lora${n}`;
       STRINGS[k] = ['', ...path.map((p, i) => over ? p + overrides[i] : p)];
       STRINGS[`${k}_scale`] = ['', ...scale];

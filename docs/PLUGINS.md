@@ -1066,14 +1066,15 @@ ctx->register_image_family(std::make_unique<AcmeImage>());
 ```
 
 The seam is the **generation**, not the step, for the reason the video
-one gives: `generate-image` holds seven built-in denoisers side by side
+one gives: `generate-image` holds eight built-in denoisers side by side
 because their per-step forwards do not agree — Krea-2 takes a packed
 `[img_seq, z*4]` latent with one timestep, Qwen-Image-Edit runs a dual
 stream, FLUX.2 appends multi-reference tokens with their own RoPE band,
 Qwen-Image-2.1 is block-causal over one joint sequence with a cross-step
-KV cache, and Boogu and Z-Image are NextDiTs whose timestep conventions
-run in opposite directions. An interface wide enough for all seven
-describes none of them. One level up they all answer the same question: given
+KV cache, Boogu and Z-Image are NextDiTs whose timestep conventions
+run in opposite directions, and FLUX.3 is a flow map that runs three
+token modes through blocks of their own and takes each step's target
+time. An interface wide enough for all eight describes none of them. One level up they all answer the same question: given
 conditioning, geometry, a step count and a seed, produce a latent.
 
 **It returns a latent, not pixels**, and that is what makes an image
@@ -1102,9 +1103,9 @@ under [Live previews](#live-previews), `req.output_wanted` /
 (`[z, h, w]`), is decoded as one latent frame by the TAE your config
 source names. That is the same path Krea-2's built-in previews take.
 
-The registry is consulted **before** the built-in `flux2` / `krea2` /
-`qwen-image-edit` / `qwen-image-21` / `boogu-image` / `z-image`
-dispatch. The built-ins
+The registry is consulted **before** the built-in `flux2` / `flux3` /
+`krea2` / `qwen-image-edit` / `qwen-image-21` / `boogu-image` /
+`z-image` dispatch. The built-ins
 are unchanged and unregistered: this adds a path, it does not reroute the
 existing ones.
 
@@ -1310,6 +1311,15 @@ and list the same file in `files`. `model-fetch` downloads each URL as-is
 into the entry's directory and registers it as an ordinary model. `hf_path`
 is then only the registry key and directory name. This is a packaging fact
 in the bag, not a field, so it cost no ABI bump.
+
+**Several models as folders of one repo.** When a repository publishes
+models as sibling folders around files they share — FlashVSR+ keeps
+`turbo/` and `base/` beside one VAE — give each its own entry (`name` keeps
+the registry keys apart) and set `catalog_extra::kLocalSubdir` in `extra`
+to the folder. `files` stay repo-relative and the download is shared, but
+the record's `local_path` is the folder itself, so every stage handed the
+model gets the variant it names rather than the repository root. A host
+that predates the key ignores it and registers the root.
 
 **Mirrors.** `hf_path` is a HuggingFace coordinate, and it stays the entry's
 identity — the registry key and the on-disk directory come from it whichever

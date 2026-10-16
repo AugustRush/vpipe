@@ -1,0 +1,39 @@
+{
+  "id": "prepare-bs-roformer",
+  "stages": [
+    {
+      "id": "fetch-vocals",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "pcunwa/BS-Roformer-Resurrection",
+        "model_variant": "vocals",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-inst",
+      "type": "model-fetch",
+      "iports": [
+        {
+          "src": "fetch-vocals",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "model_path": "pcunwa/BS-Roformer-Resurrection",
+        "model_variant": "instrumental",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

@@ -3,6 +3,7 @@
 #include "apple-silicon/metal-compute/image-ops.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/tensor-beat.h"
+#include "common/beat-keys.h"
 #include "common/flex-data.h"
 #include "common/job.h"
 #include "common/vpipe-format.h"
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace std;
 
@@ -54,11 +56,18 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
   _gpu    = attr_bool("gpu");
   parse_hex_color_(attr_str("pad_color"), &_pad_r, &_pad_g, &_pad_b);
 
+  _grid       = static_cast<int>(attr_int("grid"));
+  _max_pixels = attr_int("max_pixels");
+  _min_side   = static_cast<int>(attr_int("min_side"));
+  _max_side   = static_cast<int>(attr_int("max_side"));
+
   const string fit = attr_str("fit");
-  if      (fit == "crop")    { _mode = 1; }
-  else if (fit == "stretch") { _mode = 2; }
-  else if (fit == "manual")  { _mode = 3; }
-  else                       { _mode = 0; }   // pad (default)
+  if      (fit == "crop")         { _mode = 1; }
+  else if (fit == "stretch")      { _mode = 2; }
+  else if (fit == "manual")       { _mode = 3; }
+  else if (fit == "pad_to_grid")  { _mode = 4; }
+  else if (fit == "crop_to_grid") { _mode = 5; }
+  else                            { _mode = 0; }   // pad (default)
 
   const string alg = attr_str("algorithm");
   // LANCZOS unless bilinear is asked for by name. The fallback is the
@@ -71,7 +80,17 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
   // Deferred validation: the ctor never throws (Stage::fail_config).
   // At least one of width / height must be positive; a missing (<= 0)
   // axis is inferred per-frame from the source aspect ratio.
-  if (_out_w <= 0 && _out_h <= 0) {
+  if (_mode >= 4) {
+    // The grid fits size the output from the source; width / height are
+    // not read, so nothing about them can be wrong.
+    if (_grid <= 0 || _max_pixels <= 0 || _min_side < 0 ||
+        _max_side < 0 || (_max_side > 0 && _max_side < _min_side)) {
+      fail_config(fmt("ImageResampleStage('{}'): fit '{}' wants grid > 0, "
+                      "max_pixels > 0 and 0 <= min_side <= max_side (got "
+                      "grid {}, max_pixels {}, sides {}..{})", this->id(),
+                      fit, _grid, _max_pixels, _min_side, _max_side));
+    }
+  } else if (_out_w <= 0 && _out_h <= 0) {
     fail_config(fmt("ImageResampleStage('{}'): at least one of width / "
                     "height must be > 0 (got {}x{})",
                     this->id(), _out_w, _out_h));
@@ -94,7 +113,7 @@ namespace {
 // These must agree with the ctor's own branch chains above, which stay
 // the authority on what is accepted.
 constexpr SpecExtra kFitChoices[] = {
-  {spec_key::kChoices, "pad,crop,stretch,manual"},
+  {spec_key::kChoices, "pad,crop,stretch,manual,pad_to_grid,crop_to_grid"},
 };
 constexpr SpecExtra kAlgorithmChoices[] = {
   {spec_key::kChoices, "lanczos,bilinear,bicubic"},
@@ -111,8 +130,35 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "fit", .type = ConfigType::String,
    .doc = "aspect-ratio handling: pad (match long side + pad_color) | "
           "crop (match short side + centre-crop) | stretch (change AR) | "
-          "manual (sample from src_x,src_y at scale, pad the rest)",
+          "manual (sample from src_x,src_y at scale, pad the rest). Two "
+          "more size the output from the source and ignore width/height, "
+          "for a model that wants sides on a grid: pad_to_grid (scale down "
+          "until the picture, rounded UP to `grid` per side, is at most "
+          "max_pixels; centre it and mirror-pad to that canvas; the "
+          "picture's rectangle rides on as `crop_box`, so vae-decode cuts "
+          "the edited result back to it -- FLUX.3's single-reference edit) "
+          "| crop_to_grid (scale down to at most max_pixels, centre-crop "
+          "each side DOWN to `grid` -- FLUX.3's rule for each of several "
+          "references)",
    .def_str = "pad", .extra = kFitChoices},
+  {.key = "grid", .type = ConfigType::Int,
+   .doc = "pad_to_grid / crop_to_grid: the multiple every output side "
+          "lands on (16: a FLUX VAE latent cell)",
+   .def_int = 16},
+  {.key = "max_pixels", .type = ConfigType::Int,
+   .doc = "pad_to_grid / crop_to_grid: the most pixels the output may "
+          "have (pad_to_grid counts the padded canvas). FLUX.3 uses "
+          "4194304 (4 MiB) for a single reference and 1048576 (1 MiB) for "
+          "each of several",
+   .def_int = 4194304},
+  {.key = "min_side", .type = ConfigType::Int,
+   .doc = "pad_to_grid: the shortest side the canvas may have; a smaller "
+          "picture is padded out to it",
+   .def_int = 64},
+  {.key = "max_side", .type = ConfigType::Int,
+   .doc = "pad_to_grid: the longest side the canvas may have (0: no "
+          "limit beyond max_pixels)",
+   .def_int = 4096},
   {.key = "pad_color", .type = ConfigType::String,
    .doc = "#RRGGBB solid pad colour for pad / manual (f16 / f32 frames "
           "treat it as 0..1 normalised)",
@@ -161,7 +207,9 @@ const StageSpec kSpec = {
   .type_name = "image-resample",
   .doc       = "Resample rgb-frames to a fixed width x height, with a "
                "configurable aspect-ratio fit (pad / crop / stretch / "
-               "manual) and pad colour. Resamples with Lanczos-3 by "
+               "manual) and pad colour -- or, with pad_to_grid / "
+               "crop_to_grid, to the source's own aspect on a side grid "
+               "(FLUX.3's reference rules). Resamples with Lanczos-3 by "
                "default; 'bilinear' is cheaper and 'bicubic' matches PIL. "
                "f16 and f32 frames, RGB or RGBA, resample on the GPU with "
                "every filter; u8 RGB with bilinear or lanczos; the rest on "
@@ -376,16 +424,185 @@ ImageResampleStage::process(RuntimeContext& ctx)
         "[4,H,W] u8/f16/f32 TensorBeat; dropping beat", this->id()));
     co_return;
   }
-  using DType = TensorBeat::DType;
   const int CH = static_cast<int>(tin->shape[0]);
   const int in_h = static_cast<int>(tin->shape[1]);
   const int in_w = static_cast<int>(tin->shape[2]);
   if (in_w <= 0 || in_h <= 0) { co_return; }
 
-  // Resolve the output size against this frame: an axis left at 0 is
-  // inferred from the other so the source aspect ratio is preserved.
-  int out_w = 0, out_h = 0;
-  resolve_out_dims_(in_w, in_h, &out_w, &out_h);
+  if (_mode < 4) {
+    // Resolve the output size against this frame: an axis left at 0 is
+    // inferred from the other so the source aspect ratio is preserved.
+    int out_w = 0, out_h = 0;
+    resolve_out_dims_(in_w, in_h, &out_w, &out_h);
+    auto out = resample_(*tin, out_w, out_h);
+    if (!out) { co_return; }
+    // A rectangle on the picture that came in is not one on this one.
+    if (out->sideband.is_object()) {
+      out->sideband.as_object().erase(sideband::kCropBox);
+    }
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
+  // pad_to_grid / crop_to_grid: resample to the fit (nothing to do when
+  // the source already is it), then pad the canvas out or cut it in.
+  const GridFit g = grid_fit(in_w, in_h);
+  if (g.out_w <= 0 || g.out_h <= 0) {
+    session()->warn(fmt(
+        "ImageResampleStage('{}'): a {}x{} picture is smaller than one "
+        "{}-pixel grid cell; dropping beat", this->id(), in_w, in_h,
+        _grid));
+    co_return;
+  }
+  std::unique_ptr<TensorBeatPayload> fitted;
+  const TensorBeat* src = tin;
+  if (g.fit_w != in_w || g.fit_h != in_h) {
+    fitted = resample_(*tin, g.fit_w, g.fit_h);
+    if (!fitted) { co_return; }
+    src = fitted.get();
+  }
+  const auto bytes = src->materialize_contiguous();
+  const size_t esz = TensorBeat::byte_size_of(src->dtype);
+  auto out = std::make_unique<TensorBeatPayload>();
+  out->dtype = src->dtype;
+  out->shape = { CH, g.out_h, g.out_w };
+  out->sideband = tin->sideband;
+  out->resize_contiguous(static_cast<size_t>(CH) * g.out_w * g.out_h);
+  uint8_t* dst = out->bytes_();
+  if (_mode == 5) {
+    // Cut the canvas out of the picture at (x0, y0).
+    for (int c = 0; c < CH; ++c) {
+      for (int y = 0; y < g.out_h; ++y) {
+        const size_t s0 = ((static_cast<size_t>(c) * g.fit_h + g.y0 + y) *
+                               g.fit_w + g.x0) * esz;
+        const size_t d0 =
+            ((static_cast<size_t>(c) * g.out_h + y) * g.out_w) * esz;
+        std::memcpy(dst + d0, bytes.data() + s0,
+                    static_cast<size_t>(g.out_w) * esz);
+      }
+    }
+  } else {
+    // Mirror the picture out to the canvas. numpy's np.pad modes, which
+    // BFL pads with: `reflect` (the edge sample not repeated) when the
+    // picture's shorter side is longer than the grid, else `symmetric`
+    // (repeated) -- periodic, so a pad longer than the side keeps
+    // mirroring rather than running out.
+    const bool refl = std::min(g.fit_w, g.fit_h) > _grid;
+    auto mirror = [refl](int i, int n) {
+      if (refl) {
+        if (n == 1) { return 0; }
+        const int m = 2 * (n - 1);
+        i %= m;
+        if (i < 0) { i += m; }
+        return i >= n ? m - i : i;
+      }
+      const int m = 2 * n;
+      i %= m;
+      if (i < 0) { i += m; }
+      return i >= n ? m - 1 - i : i;
+    };
+    std::vector<int> xs(static_cast<size_t>(g.out_w));
+    for (int x = 0; x < g.out_w; ++x) {
+      xs[static_cast<size_t>(x)] = mirror(x - g.x0, g.fit_w);
+    }
+    for (int c = 0; c < CH; ++c) {
+      for (int y = 0; y < g.out_h; ++y) {
+        const int sy = mirror(y - g.y0, g.fit_h);
+        const uint8_t* srow = bytes.data() +
+            ((static_cast<size_t>(c) * g.fit_h + sy) * g.fit_w) * esz;
+        uint8_t* drow = dst +
+            ((static_cast<size_t>(c) * g.out_h + y) * g.out_w) * esz;
+        for (int x = 0; x < g.out_w; ++x) {
+          std::memcpy(drow + static_cast<size_t>(x) * esz,
+                      srow + static_cast<size_t>(xs[static_cast<size_t>(x)])
+                                 * esz, esz);
+        }
+      }
+    }
+  }
+  // The picture's own rectangle on the canvas, for whatever generates on
+  // the canvas to be cut back to (vae-decode). Only when there IS a pad:
+  // BFL crops nothing otherwise, and neither does a box that is all of it.
+  if (!out->sideband.is_object()) { out->sideband = FlexData::make_object(); }
+  out->sideband.as_object().erase(sideband::kCropBox);
+  if (_mode == 4 && (g.fit_w != g.out_w || g.fit_h != g.out_h)) {
+    FlexData box = FlexData::make_array();
+    for (int v : { g.x0, g.y0, g.x0 + g.fit_w, g.y0 + g.fit_h }) {
+      box.as_array().push_back(FlexData::make_int(v));
+    }
+    out->sideband.as_object().insert(sideband::kCropBox, std::move(box));
+  }
+  session()->log_debug(fmt(
+      "ImageResampleStage('{}'): {}x{} -> {}x{} on a {}x{} canvas at "
+      "({}, {})", this->id(), in_w, in_h, g.fit_w, g.fit_h, g.out_w,
+      g.out_h, g.x0, g.y0));
+  co_await ctx.write(0, std::move(out));
+}
+
+ImageResampleStage::GridFit
+ImageResampleStage::grid_fit(int in_w, int in_h) const noexcept
+{
+  GridFit g;
+  if (in_w <= 0 || in_h <= 0 || _grid <= 0 || _max_pixels <= 0) {
+    return g;
+  }
+  const double area = static_cast<double>(in_w) * in_h;
+  const double cap = static_cast<double>(_max_pixels);
+  if (_mode == 5) {
+    // flux3.pipeline.prepare_multi_reference: sides FLOORED under the
+    // cap, then each cut down to the grid, centred.
+    int w = in_w, h = in_h;
+    if (area > cap) {
+      const double sc = std::sqrt(cap / area);
+      w = static_cast<int>(in_w * sc);
+      h = static_cast<int>(in_h * sc);
+    }
+    g.fit_w = w; g.fit_h = h;
+    g.out_w = w / _grid * _grid;
+    g.out_h = h / _grid * _grid;
+    if (g.out_w <= 0 || g.out_h <= 0) { g.out_w = g.out_h = 0; return g; }
+    g.x0 = (w - g.out_w) / 2;
+    g.y0 = (h - g.out_h) / 2;
+    return g;
+  }
+  // flux3.pipeline.reference_canvas: never up; the CANVAS -- each side
+  // rounded up to the grid, held to [min_side, max_side] -- at most the
+  // cap, stepping the first guess down by 0.5% until it is. Sides round
+  // half to even, as Python's round() does.
+  double scale = std::min(1.0, std::sqrt(cap / area));
+  if (_max_side > 0) {
+    scale = std::min(scale, static_cast<double>(_max_side) /
+                                std::max(in_w, in_h));
+  }
+  auto side = [&](int v) {
+    int c = (v + _grid - 1) / _grid * _grid;
+    c = std::max(c, _min_side);
+    return _max_side > 0 ? std::min(c, _max_side) : c;
+  };
+  for (int it = 0; it < 4096; ++it) {
+    const int fw = std::max(1, static_cast<int>(std::nearbyint(in_w * scale)));
+    const int fh = std::max(1, static_cast<int>(std::nearbyint(in_h * scale)));
+    const int cw = side(fw), ch = side(fh);
+    if (static_cast<double>(cw) * ch <= cap) {
+      g.fit_w = fw; g.fit_h = fh; g.out_w = cw; g.out_h = ch;
+      g.x0 = (cw - fw) / 2;
+      g.y0 = (ch - fh) / 2;
+      return g;
+    }
+    scale *= 0.995;
+  }
+  return g;
+}
+
+std::unique_ptr<TensorBeatPayload>
+ImageResampleStage::resample_(const TensorBeatPayload& in, int out_w,
+                              int out_h)
+{
+  using DType = TensorBeat::DType;
+  const TensorBeatPayload* tin = &in;
+  const int CH = static_cast<int>(tin->shape[0]);
+  const int in_h = static_cast<int>(tin->shape[1]);
+  const int in_w = static_cast<int>(tin->shape[2]);
 
   // Both the resample kernel and the CPU fallback assume a tightly
   // packed planar source (row pitch == in_w). Producers can hand us
@@ -434,15 +651,14 @@ ImageResampleStage::process(RuntimeContext& ctx)
                *_mc, *src_h,
                tin->dtype == DType::F16 ? metal_compute::PlanarFloat::F16
                                         : metal_compute::PlanarFloat::F32,
-               CH, in_w, in_h, *dst, out_w, out_h, _mode, _src_x, _src_y,
+               CH, in_w, in_h, *dst, out_w, out_h, geom_mode_(), _src_x, _src_y,
                static_cast<float>(_scale), _alg, pad, session())) {
-      TensorBeat tb;
-      tb.dtype = tin->dtype;
-      tb.shape = { CH, out_h, out_w };
-      tb.sideband = tin->sideband;
-      tb.external = std::move(dst);
-      co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(tb)));
-      co_return;
+      auto tb = std::make_unique<TensorBeatPayload>();
+      tb->dtype = tin->dtype;
+      tb->shape = { CH, out_h, out_w };
+      tb->sideband = tin->sideband;
+      tb->external = std::move(dst);
+      return tb;
     }
     // fall through to the CPU path on any GPU failure
   }
@@ -461,21 +677,19 @@ ImageResampleStage::process(RuntimeContext& ctx)
       const bool ok = dst && (_alg == 1
           ? metal_compute::resample_lanczos_planar_u8_to_u8(
                 *_mc, *src_h, in_w, in_h, *dst, out_w, out_h,
-                _mode, _src_x, _src_y, static_cast<float>(_scale),
+                geom_mode_(), _src_x, _src_y, static_cast<float>(_scale),
                 _pad_r, _pad_g, _pad_b, session())
           : metal_compute::resample_planar_u8_to_u8(
                 *_mc, *src_h, in_w, in_h, *dst, out_w, out_h,
-                _mode, _src_x, _src_y, static_cast<float>(_scale),
+                geom_mode_(), _src_x, _src_y, static_cast<float>(_scale),
                 _pad_r, _pad_g, _pad_b, session()));
       if (ok) {
-        TensorBeat tb;
-        tb.dtype = TensorBeat::DType::U8;
-        tb.shape = { 3, out_h, out_w };
-        tb.sideband = tin->sideband;
-        tb.external = std::move(dst);
-        co_await ctx.write(0,
-            make_payload<TensorBeatPayload>(std::move(tb)));
-        co_return;
+        auto tb = std::make_unique<TensorBeatPayload>();
+        tb->dtype = TensorBeat::DType::U8;
+        tb->shape = { 3, out_h, out_w };
+        tb->sideband = tin->sideband;
+        tb->external = std::move(dst);
+        return tb;
       }
     }
     // fall through to the CPU path on any GPU failure
@@ -560,20 +774,18 @@ ImageResampleStage::process(RuntimeContext& ctx)
     }
   }
   if (is_f16) {
-    TensorBeat narrow;
-    narrow.dtype = DType::F16;
-    narrow.shape = tb.shape;
-    narrow.sideband = std::move(tb.sideband);
+    auto narrow = std::make_unique<TensorBeatPayload>();
+    narrow->dtype = DType::F16;
+    narrow->shape = tb.shape;
+    narrow->sideband = std::move(tb.sideband);
     const size_t n = static_cast<size_t>(CH) * out_w * out_h;
-    narrow.resize_contiguous(n);
+    narrow->resize_contiguous(n);
     const float* f = tb.as_f32();
-    auto* h = reinterpret_cast<_Float16*>(narrow.bytes_());
+    auto* h = reinterpret_cast<_Float16*>(narrow->bytes_());
     for (size_t i = 0; i < n; ++i) { h[i] = static_cast<_Float16>(f[i]); }
-    co_await ctx.write(0,
-        make_payload<TensorBeatPayload>(std::move(narrow)));
-    co_return;
+    return narrow;
   }
-  co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(tb)));
+  return std::make_unique<TensorBeatPayload>(std::move(tb));
 }
 
 VPIPE_REGISTER_STAGE(ImageResampleStage)

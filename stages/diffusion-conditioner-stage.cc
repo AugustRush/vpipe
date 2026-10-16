@@ -1,4 +1,5 @@
 #include "stages/diffusion-conditioner-stage.h"
+#include "generative-models/flux3/metal-flux3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/gen-input.h"
 #include "common/beat-keys.h"
@@ -70,8 +71,8 @@ const ConfigKey kAttrs[] = {
           "transformer's _class_name selects the family + encoder. OPTIONAL: a "
           "model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,flux2,qwen-image,qwen-image-edit,qwen-image-21,"
-       "boogu-image,boogu-image-edit,"
+   .suggest_db_type = "krea2,flux2,flux3,qwen-image,qwen-image-edit,"
+       "qwen-image-21,boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,vosr",
    .model_channel = "diffusion-model"},
   {.key = "encoder_dir", .type = ConfigType::String, .required = false,
@@ -395,6 +396,14 @@ constexpr const char* kSuffix = "<|im_end|>\n<|im_start|>assistant\n";
 constexpr int kDropPrefix = 34;
 const int kSelectLayers[12] = {2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35};
 const int kFluxTaps[3] = {9, 18, 27};
+// FLUX.3 Image Klein: EIGHT Qwen3-VL taps, hidden_states[4, 8, .., 32] in
+// HF's counting (the output of layer k-1), concatenated per token into
+// [rows, 8 x 2560] = the DiT's joint_attention_dim. The last four layers
+// of the 36 are never read.
+const int kFlux3Taps[8] = {4, 8, 12, 16, 20, 24, 28, 32};
+// The prompt is right-padded to a multiple of 80 with <|endoftext|>, and
+// the DiT attends to EVERY row it is given, pads included.
+constexpr int kFlux3PadMultiple = 80;
 
 constexpr const char* kQiePrefix =
     "<|im_start|>system\nDescribe the key features of the input image (color, "
@@ -690,6 +699,51 @@ genai::MetalQwenModel::Config encoder_config_boogu_(const std::string& enc_dir)
   }
   return c;
 }
+// FLUX.3 Image Klein's text encoder is a stock Qwen3-VL-4B-Instruct
+// (`Qwen3VLForConditionalGeneration`: 36 layers, hidden 2560, 32q/8kv,
+// rope theta 5e6, TIED embeddings) under the same `model.language_model.`
+// wrapper Boogu's is -- so Boogu's reader, pointed at text_encoder/. Two
+// things differ, both from how FLUX.3 READS it:
+//   * only the first 32 layers are ever run (the deepest tap is
+//     hidden_states[32]), so the last four are not loaded at all;
+//   * its prompts run to thousands of tokens (the reference truncates at
+//     its config's max_tokens), so the page pool is allowed to grow.
+genai::MetalQwenModel::Config
+encoder_config_flux3_(const std::string& enc_dir)
+{
+  genai::MetalQwenModel::Config c = encoder_config_boogu_(enc_dir);
+  int deepest = 0;
+  for (int k : kFlux3Taps) { deepest = std::max(deepest, k); }
+  c.n_layers = std::min(c.n_layers, deepest);
+  c.max_seq = 8192;
+  return c;
+}
+
+// The prompt-length cap FLUX.3's checkpoint states for its encoder
+// (<root>/config.json text_encoder.max_tokens, 8192 in the published one),
+// which diffusers' pipeline also uses. 8192 when the file says nothing.
+int
+flux3_max_tokens_(const std::string& root)
+{
+  namespace fs = std::filesystem;
+  std::ifstream in(fs::path(root) / "config.json");
+  if (!in) { return 8192; }
+  try {
+    FlexData fd = FlexData::from_json(in);
+    if (!fd.is_object()) { return 8192; }
+    auto o = fd.as_object();
+    if (!o.contains("text_encoder")) { return 8192; }
+    const FlexData te = o.at("text_encoder");
+    if (!te.is_object()) { return 8192; }
+    auto t = te.as_object();
+    const int n = t.contains("max_tokens") ? (int)t.at("max_tokens").as_int(0)
+                                           : 0;
+    return n > 0 ? n : 8192;
+  } catch (...) {
+    return 8192;
+  }
+}
+
 // Qwen-Image-2.1's text encoder is the SAME Qwen3-VL 8B Boogu-Image
 // drives, under the same `model.language_model.` / `model.visual.`
 // wrapper -- 36 layers, hidden 4096, 32q/8kv, head_dim 128, ffn 12288,
@@ -755,6 +809,11 @@ std::string family_(const std::string& transformer_dir)
       if (obj.contains("_class_name")) {
         const std::string cls(obj.at("_class_name").as_string(""));
         if (cls == "Flux2Transformer2DModel") { return "flux2"; }
+        // FLUX.3 Image Klein. Named because its encoder is a Qwen3-VL the
+        // "krea2" default would happily load -- and condition with
+        // Krea-2's 12 taps and system prompt instead of FLUX.3's eight
+        // taps of a bare user turn.
+        if (cls == "Flux3Transformer2DModel") { return "flux3"; }
         if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
         // Qwen-Image-2.1 -- a different network from the two above, and
         // a different conditioning recipe. Named explicitly because it
@@ -1122,6 +1181,7 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   }
   genai::MetalQwenModel::Config ecfg =
       _family == "flux2" ? encoder_config_flux2_(_enc_dir)
+      : _family == "flux3" ? encoder_config_flux3_(_enc_dir)
       : _family == "qwen-image-edit" ? encoder_config_qie_()
       : _family == "boogu-image" ? encoder_config_boogu_(_enc_dir)
       : _family == "qwen-image-21" ? encoder_config_qwen_image21_(_enc_dir)
@@ -1598,6 +1658,15 @@ DiffusionConditionerStage::ensure_loaded_()
     return;
   }
   const std::string root = resolve_model_dir(session(), _hf_dir);
+  // FLUX.3 in BFL's own single-file layout has no transformer/ to name
+  // its family, so family_() would answer "krea2" and the prompt would
+  // be encoded as Krea-2's. Refused by name instead.
+  if (genai::flux3::is_bfl_root_layout(root)) {
+    session()->error(fmt("DiffusionConditionerStage('{}'): {}; inert",
+                         this->id(),
+                         genai::flux3::bfl_root_layout_message(root)));
+    return;
+  }
   // What the models DB recorded, for the registry probe below. It is the
   // only thing that can identify a bare weights directory, and it is
   // read here rather than there so the lookup happens once.
@@ -1843,6 +1912,7 @@ DiffusionConditionerStage::ensure_loaded_()
       "DiffusionConditionerStage('{}'): family {} encoder ({}), hidden {}",
       this->id(), _family,
       _family == "flux2" ? "Qwen3 dense"
+      : _family == "flux3" ? "Qwen3-VL, 8 taps"
       : _family == "qwen-image-edit" ? "Qwen2.5-VL"
       : _family == "boogu-image" ? "Qwen3-VL (mllm)"
       : _family == "wan" ? "umT5-XXL"
@@ -2546,6 +2616,87 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     }
     n_real_out = n;
     return h;
+  }
+
+  if (_family == "flux3") {
+    // BFL's TextEncoder.encode, which diffusers' pipeline reproduces: a
+    // bare user turn with the generation prompt -- no system message and
+    // no <think> block (Qwen3-VL-Instruct's template has none) -- right-
+    // padded with <|endoftext|> to a multiple of 80.
+    const std::string tmpl = std::string("<|im_start|>user\n") + text +
+                             "<|im_end|>\n<|im_start|>assistant\n";
+    auto ids = encode_with_specials_(*_tokenizer, tmpl);
+    if (ids.empty()) { return {}; }
+    const int max_tokens = flux3_max_tokens_(_root_dir);
+    // truncation=True keeps the FIRST max_length tokens.
+    if ((int)ids.size() > max_tokens) { ids.resize((std::size_t)max_tokens); }
+    const int real_n = (int)ids.size();
+    const int n = std::min(
+        (real_n + kFlux3PadMultiple - 1) / kFlux3PadMultiple *
+            kFlux3PadMultiple,
+        max_tokens);
+    {
+      std::int32_t pad = _tokenizer->special_token_id("<|endoftext|>");
+      if (pad < 0) { pad = 151643; }
+      ids.resize((std::size_t)n, pad);
+    }
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
+    if (x.empty()) { return {}; }
+    const auto* tbl = static_cast<const std::uint8_t*>(_embed.contents());
+    auto* xb = static_cast<std::uint8_t*>(x.contents());
+    const std::size_t vocab = _embed.byte_size() / ((std::size_t)EH * 2);
+    for (int i = 0; i < n; ++i) {
+      const std::uint32_t id = (std::uint32_t)ids[(std::size_t)i];
+      if (id >= vocab) { return {}; }
+      std::memcpy(xb + (std::size_t)i * EH * 2,
+                  tbl + (std::size_t)id * EH * 2, (std::size_t)EH * 2);
+    }
+    // THE PAD ROWS SIT AT POSITION 1, not at their row: the reference
+    // forms its positions as cumsum(mask) - 1 with the pads filled with 1.
+    // With all three mRoPE axes equal, Qwen3-VL's interleaved sections
+    // reduce to plain RoPE at that position.
+    std::vector<std::int32_t> pos((std::size_t)3 * n);
+    for (int a = 0; a < 3; ++a) {
+      for (int i = 0; i < n; ++i) {
+        pos[(std::size_t)a * n + i] = i < real_n ? i : 1;
+      }
+    }
+    std::vector<int> taps_l;
+    for (int k : kFlux3Taps) { taps_l.push_back(k - 1); }
+    genai::ContextManager* cm = _encoder->context_manager();
+    const genai::ContextId cid = cm->acquire_root();
+    // key_valid_len = real_n: HF's attention_mask over a right-padded
+    // prompt. A real row attends causally; a pad row attends to the real
+    // rows ONLY -- not to itself or another pad -- which, with every pad
+    // at the same position on the same token, makes all of them equal.
+    SharedBuffer taps;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmDitText,
+                         kPerfLlmDitTextBegin, (std::uint64_t)n);
+      taps = _encoder->forward_embeddings_taps_mrope(cid, x, n, pos, taps_l,
+                                                     real_n);
+    }
+    cm->release(cid);
+    if (taps.empty()) { return {}; }
+    // [tap][row][hidden] -> [row][tap * hidden + h], bf16 as it came.
+    const int NT = (int)taps_l.size();
+    SharedBuffer ctxb =
+        mc->make_shared_buffer((std::size_t)n * NT * EH * 2);
+    if (ctxb.empty()) { return {}; }
+    const auto* tp = static_cast<const std::uint16_t*>(taps.contents());
+    auto* cp = static_cast<std::uint16_t*>(ctxb.contents());
+    for (int p = 0; p < n; ++p) {
+      for (int j = 0; j < NT; ++j) {
+        std::memcpy(cp + ((std::size_t)p * NT + j) * EH,
+                    tp + ((std::size_t)j * n + p) * EH,
+                    (std::size_t)EH * 2);
+      }
+    }
+    n_real_out = n;
+    session()->log_debug(fmt("DiffusionConditionerStage('{}'): [{}] flux3 -> "
+                             "[{}, {}] bf16 ({} real tokens)", this->id(),
+                             which, n, NT * EH, real_n));
+    return ctxb;
   }
 
   if (_family == "flux2") {
@@ -3993,13 +4144,17 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   auto shape_for = [&](int rows) -> std::vector<std::int64_t> {
     if (_family == "krea2") { return {rows, 12, _enc_hidden}; }
     if (_family == "flux2") { return {rows, 3 * _enc_hidden}; }
+    if (_family == "flux3") { return {rows, 8 * _enc_hidden}; }
     return {rows, _enc_hidden};   // the single-tap families
   };
   // Element type the paired DiT consumes: krea2/flux2 -> f16, the single-tap
-  // families (qwen-image-edit, a profile family, ...) -> bf16.
-  const TensorBeat::DType cdt = single_tap_(_family, _profile)
-                                    ? TensorBeat::DType::Bf16
-                                                     : TensorBeat::DType::F16;
+  // families (qwen-image-edit, a profile family, ...) -> bf16. FLUX.3 is a
+  // tap STACK and bf16: the reference hands its DiT the taps in bf16, and
+  // Qwen3-VL's deep residuals are not guaranteed to sit inside f16's range.
+  const TensorBeat::DType cdt =
+      (single_tap_(_family, _profile) || _family == "flux3")
+          ? TensorBeat::DType::Bf16
+          : TensorBeat::DType::F16;
 
   // ---- MANDATORY content screen ----------------------------------------
   // When the family provides one: on the encoder this stage already owns,

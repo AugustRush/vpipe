@@ -7,6 +7,7 @@
 #include "common/lmdb-env.h"
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
+#include "generative-models/flux3/metal-flux3-transformer.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/boogu/metal-boogu-calibration.h"
 #include "generative-models/flux2/metal-flux2-calibration.h"
@@ -148,6 +149,7 @@ dit_class_family_(const std::string& class_name)
 {
   if (class_name == "Krea2Transformer2DModel") { return "krea2"; }
   if (class_name == "Flux2Transformer2DModel") { return "flux2"; }
+  if (class_name == "Flux3Transformer2DModel") { return "flux3"; }
   if (class_name == "QwenImage21Transformer2DModel") {
     return "qwen-image-21";
   }
@@ -545,6 +547,18 @@ dit_quant_linears_(const std::string& family)
     // velocity leaves through proj_out, and the shared modulation feeds
     // all 32 blocks.
     return {"to_q", "to_k", "to_v", "0", "gate_layer", "proj", "out"};
+  }
+  if (family == "flux3") {
+    // FLUX.3 Image Klein: ONE block shape in four stacks (three per-mode,
+    // one joint), six Linears each -- attn.to_q / to_k / to_v, to_out.0
+    // (leaf "0"), and the feed-forward's fused gate|up ff.linear_in and its
+    // ff.linear_out. Every one of those leaves is unique to the blocks.
+    // Model-level stays bf16: the three input embedders (the text one is
+    // K = 20480 and every prompt enters through it), the two timestep
+    // embedders, the modulation tables (leaf "linear", which
+    // quant_modulation opts into at 8 bits) and proj_out, through which
+    // every velocity value leaves.
+    return {"to_q", "to_k", "to_v", "0", "linear_in", "linear_out"};
   }
   if (family == "z-image") {
     // NextDiT / Lumina, single-stream. Seven Linears a block: the
@@ -1435,6 +1449,20 @@ ModelQuantizeStage::quantize_dit_component_(
   }
   const bool is_qi21 = (family == "qwen-image-21");
   const bool is_zimage = (family == "z-image");
+  const bool is_flux3 = (family == "flux3");
+  if (_quant_modulation && is_flux3) {
+    // FLUX.3's modulation is SIX model-level tables (early_ and
+    // single_stream_modulations, per mode) plus norm_out's -- leaf
+    // "linear" for all seven, and nothing else in the checkpoint shares
+    // it. Shared by every block, so 8-bit regardless of the body.
+    opt.quant_linears.push_back("linear");
+    opt.high_bit_leaves.push_back("linear");
+    opt.high_bits = 8;
+    session()->info(fmt(
+        "ModelQuantizeStage('{}'): quantizing FLUX.3's modulation tables "
+        "(*_stream_modulations.*.linear, norm_out.linear) at 8-bit; body "
+        "stays {}-bit", this->id(), _bits));
+  }
   if (_quant_modulation && is_zimage) {
     // Z-Image's per-block adaLN is `adaLN_modulation.0` -> leaf "0",
     // which is ALSO attention.to_out.0 and is therefore already in the
@@ -1494,6 +1522,13 @@ ModelQuantizeStage::quantize_dit_component_(
       opt.quant_exclude.push_back(e);
     }
   }
+  if (is_flux3) {
+    // Named, though no block leaf reaches them: a family's exclude list is
+    // what keeps a later leaf added to the set from catching an embedder.
+    opt.quant_exclude = {"x_embedders.", "context_embedder",
+                         "timestep_embedder.", "target_timestep_embedder.",
+                         "proj_out"};
+  }
   if (family == "z-image") {
     // The model-level weights, kept bf16 on the usual grounds: all of
     // them are small and every value in the model passes through one of
@@ -1530,6 +1565,16 @@ ModelQuantizeStage::quantize_dit_component_(
       // weights. The four refiner blocks keep the base width -- two of
       // them are the only place the caption is processed at all.
       opt.layer_prefix = "layers.";
+    } else if (is_flux3) {
+      // Rank the JOINT stack: 28 of the 43 blocks. The 15 per-mode blocks
+      // keep the base width -- they are the only place each mode is
+      // processed on its own, the text's included. config.json's
+      // num_layers is the PER-MODE count (5), so the joint one is read.
+      opt.layer_prefix = "single_transformer_blocks.";
+      genai::MetalFlux3Transformer::Config fc;
+      if (genai::MetalFlux3Transformer::Config::read_dims(dit_dir, &fc)) {
+        opt.n_layers = fc.n_single;
+      }
     } else if (is_boogu) {
       // Rank Boogu's single-stream tail: 32 of its 46 blocks and the bulk of
       // the weights. (The 8 dual-stream blocks and the 6 refiners keep the
@@ -1568,6 +1613,14 @@ ModelQuantizeStage::quantize_dit_component_(
           "collector, and the fall-through would calibrate a Krea-2 model "
           "over these weights -- refusing. Use plain or mixed "
           "quantization, or supply calib_dir", this->id()));
+      return false;
+    }
+    if (is_flux3 && _calib_dir.empty()) {
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): flux3 has no on-device AWQ collector, "
+          "and the fall-through would calibrate a Krea-2 model over these "
+          "weights -- refusing. Use plain or mixed quantization, or supply "
+          "calib_dir", this->id()));
       return false;
     }
     if (is_qi21 && _calib_dir.empty()) {

@@ -53,7 +53,7 @@ namespace {
 // Every config source, by the type name a pipeline spells.
 const char* const kSources[] = {
   "wan2-model-config", "minimax-h3-model-config", "flux2-model-config",
-  "krea2-model-config", "boogu-image-model-config",
+  "flux3-model-config", "krea2-model-config", "boogu-image-model-config",
   "qwen-image-edit-model-config", "qwen-image-21-model-config",
   "z-image-model-config",
 };
@@ -729,9 +729,11 @@ TEST(model_config, every_lora_key_offers_a_filtered_model_picker)
   const Family families[] = {
     {"krea2-model-config",         "krea2-lora"},
     {"flux2-model-config",         "flux2-lora"},
+    {"flux3-model-config",         "flux3-lora"},
     {"minimax-h3-model-config",    "minimax-h3-lora"},
     {"qwen-image-21-model-config", "qwen-image-21-lora"},
-    {"generate-image", "krea2-lora,flux2-lora,qwen-image-21-lora"},
+    {"generate-image",
+     "krea2-lora,flux2-lora,flux3-lora,qwen-image-21-lora"},
   };
   std::vector<Row> rows;
   for (const Family& f : families) {

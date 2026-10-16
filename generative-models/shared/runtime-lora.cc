@@ -1,6 +1,7 @@
 #include "generative-models/shared/runtime-lora.h"
 
 #include "generative-models/shared/fp8-layout.h"
+#include "generative-models/shared/mma-tile.h"
 
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
@@ -971,6 +972,27 @@ Applier::apply(metal_compute::ComputeEncoder& enc, const SharedBuffer& x,
   if (scale == 0.0f) { return; }
   const int r = f.rank;
   const bool mma = _mma && m >= mma_min_m;
+
+  // IN ROW BANDS on the matrix-core route: past 2^31 BYTES on any operand
+  // the tiles stop storing, SILENTLY, and the second GEMM ACCUMULATES
+  // into the projection's own output -- 2.4 GB for a 4096^2 FLUX.3 feed-
+  // forward ([65616, 18432]), whose rows past the line would keep the
+  // base result and lose the adapter. The band is set by the widest
+  // operand of EITHER GEMM (x is [m, k], t [m, r], y [m, n]); t is
+  // [m, r] with row stride r, so a band is a plain offset in all three.
+  // Below the line the band is m and this is the one pass it was.
+  if (mma) {
+    const int band = mma_row_band(n > r ? n : r, k);
+    if (m > band) {
+      for (int m0 = 0; m0 < m; m0 += band) {
+        const int rows = (m - m0) < band ? (m - m0) : band;
+        apply(enc, x, x_off + (std::size_t)m0 * k, f, y,
+              y_off + (std::size_t)m0 * n, rows, n, k, scale, mma_min_m,
+              scratch_off + (std::size_t)m0 * r);
+      }
+      return;
+    }
+  }
 
   // t = x A^T, into the scratch.
   const metal_compute::ComputeFunction* fa = mma ? route_a_(r) : nullptr;

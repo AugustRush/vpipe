@@ -35,6 +35,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace vpipe;
@@ -291,6 +292,71 @@ TEST(load_audio, drives_audio_to_pcm)
   // A 12000/32767 sine: decoded, not silence, and not clipped.
   EXPECT_TRUE(sink->peak > 0.2 && sink->peak <= 1.0);
 
+  std::filesystem::remove(path);
+}
+
+// ---- a long file into a consumer slower than the disk -----------------
+//
+// The reader is faster than anything after it -- a few thousand packets
+// a second off a local file -- and a model downstream takes seconds a
+// chunk. The reader must WAIT for it. On a default-depth oport it did
+// not: it ran 2048 packets ahead, the buffer called that a structural
+// imbalance and the pipeline drained, so a separation of a 3:34 song
+// came out 29 s short with nothing but a warning (MEASURED on the M5;
+// the same graph on the M4 Pro happened to keep up). 2048 packets of
+// 1024 samples is about two minutes at 16 kHz, so any song is past it.
+//
+// The sink blocks its thread the way a model's forward does. The claim
+// is the one that failed: every sample of the file comes out.
+TEST(load_audio, a_long_file_waits_for_a_slow_consumer)
+{
+  // 48 kHz resampled to 44.1, as a music graph does: the resample is
+  // what lets the reader get ahead of audio-to-pcm at all.
+  const int kRate = 48000, kOut = 44100, kSamples = kRate * 200;
+  const std::string path =
+      write_wav_(kRate, kSamples, "vpipe-ut-load-audio-long.wav");
+  if (path.empty()) { return; }
+
+  class SlowSink : public PcmSink {
+  public:
+    using PcmSink::PcmSink;
+    Job
+    process(RuntimeContext& ctx) override
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      co_await PcmSink::process(ctx);
+    }
+  };
+
+  Session sess;
+  auto pl = std::make_unique<Pipeline>("p", &sess);
+  auto lcfg = FlexData::make_object();
+  lcfg.as_object().insert_or_assign("input_url", FlexData::make_string(path));
+  auto* la = static_cast<LoadAudioStage*>(pl->insert_stage(
+      std::make_unique<LoadAudioStage>(&sess, "la", std::vector<InEdge>{},
+                                       lcfg)));
+  auto pcfg = FlexData::make_object();
+  pcfg.as_object().insert_or_assign("output_sample_rate",
+                                    FlexData::make_int(kOut));
+  pcfg.as_object().insert_or_assign("chunk_duration_s",
+                                    FlexData::make_real(10.0));
+  auto* tp = static_cast<AudioToPcmStage*>(pl->insert_stage(
+      std::make_unique<AudioToPcmStage>(&sess, "to-pcm",
+                                        std::vector<InEdge>{{la, 0}}, pcfg)));
+  auto* sink = static_cast<SlowSink*>(pl->insert_stage(
+      std::make_unique<SlowSink>(&sess, "sink", std::vector<InEdge>{{tp, 0}},
+                                 FlexData::make_object())));
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  const std::size_t want = (std::size_t)kSamples * kOut / kRate;
+  std::printf("[load_audio] long file: %llu packets, %zu of ~%zu samples "
+              "out\n", (unsigned long long)la->packets_emitted(),
+              sink->samples, want);
+  EXPECT_TRUE(la->packets_emitted() > 2048);
+  EXPECT_TRUE(sink->samples + 64 >= want && sink->samples <= want + 64);
   std::filesystem::remove(path);
 }
 

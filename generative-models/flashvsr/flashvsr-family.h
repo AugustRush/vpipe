@@ -1,6 +1,7 @@
 #ifndef GENERATIVE_MODELS_FLASHVSR_FLASHVSR_FAMILY_H
 #define GENERATIVE_MODELS_FLASHVSR_FLASHVSR_FAMILY_H
 
+#include "generative-models/flashvsr/metal-flashvsr-transformer.h"
 #include "generative-models/video-model-registry.h"
 
 #include <cstddef>
@@ -52,20 +53,32 @@ namespace genai {
 // graph that resamples its input has already chosen the output
 // resolution; the stage's own width and height are read as a cap when
 // they are set and ignored when they are not.
-// WHERE FLASHVSR'S PARTS LIVE under one checkpoint root, in either of the
-// two layouts it arrives in. Every consumer -- the denoiser's load, the
+// WHERE FLASHVSR'S PARTS LIVE under one checkpoint root, in each of the
+// layouts it arrives in. Every consumer -- the denoiser's load, the
 // source encoder stage, claims(), the memory declarations -- goes through
-// this, so the two layouts are told apart in exactly one place.
+// this, so the layouts are told apart in exactly one place.
 //
+// v1.1:
 //   CONVERTED (tools/flashvsr_prepare_checkpoint.py): one index names the
 //     denoiser, `lq_proj.*` and `posi_context`; the VAE is `vae/`.
 //   PUBLISHED (the model page, as the catalogue fetches it): the denoiser
 //     safetensors, `LQ_proj_in.ckpt` and `posi_prompt.pth` as torch
 //     files, and `Wan2.1_VAE.pth` bare. Read in place -- torch files map
 //     as shards (shared/torch-zip.h) -- so nothing is converted or copied.
+//   Converted wins when both are present, which is what a directory the
+//   converter ran over looks like: its index then names the same bytes.
 //
-// Converted wins when both are present, which is what a directory the
-// converter ran over looks like: its index then names the same bytes.
+// FlashVSR+ (ruchangyao/FlashVSR_plus): one repository, two variants
+// side by side -- `turbo/` and `base/`, each a `dit.safetensors` and a
+// `lq_proj_in.safetensors` -- sharing the root's `Wan2.1_VAE.pth` and the
+// fixed context (`posi_prompt.pth`, byte-identical to v1.1's).
+//   A VARIANT FOLDER is the model: its name, or the root config.json's
+//     `variants` map, says which -- and it has to, because the two are the
+//     same tensors and differ only in how the stack is driven (Turbo's
+//     hybrid layers). The VAE and the context are found beside it or one
+//     level up.
+//   THE REPOSITORY ROOT is Turbo, the reference's default -- or Base when
+//     only Base is there.
 struct FlashVsrLayout {
   std::string denoiser;        // what the denoiser's WeightSet opens
   std::string source;          // ...the source projection's
@@ -74,9 +87,22 @@ struct FlashVsrLayout {
   std::string context_name;    // its tensor name
   std::string vae;             // the VAE, or empty when absent
   bool        published = false;
+  // FlashVSR+, and which variant: "turbo" or "base", empty when nothing
+  // says (refused at load rather than guessed).
+  bool        plus = false;
+  std::string variant;
 };
 
 bool resolve_flashvsr_layout(const std::string& root, FlashVsrLayout* out);
+
+// How the layout's release drives the stack (see
+// MetalFlashVsrTransformer::Schedule). A FlashVSR+ variant nothing names
+// is sized as Base, whose windows are the larger.
+MetalFlashVsrTransformer::Schedule
+flashvsr_schedule(const FlashVsrLayout& layout);
+// ...for a root: v1.1's when it is not a FlashVSR checkpoint at all.
+MetalFlashVsrTransformer::Schedule
+flashvsr_schedule(const std::string& root);
 
 // ---- ONE SOURCE, ONE PASS ----------------------------------------------
 //

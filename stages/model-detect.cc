@@ -1,5 +1,6 @@
 #include "stages/model-detect.h"
 
+#include "generative-models/bs-roformer/bs-roformer-config.h"
 #include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/detect-profile.h"
 #include "generative-models/image-model-registry.h"
@@ -194,6 +195,9 @@ family_version_(const std::string& mt, std::string& family,
       {"krea2-lora",             "Krea",        "2"},
       {"flux2",                  "FLUX",        "2"},
       {"flux2-lora",             "FLUX",        "2"},
+      {"flux3",                  "FLUX",        "3 Image Klein"},
+      {"flux3-dit",              "FLUX",        "3 Image Klein"},
+      {"flux3-lora",             "FLUX",        "3 Image Klein"},
       {"qwen-image",             "Qwen-Image",  "2512"},
       {"qwen-image-edit",        "Qwen-Image",  "Edit-2511"},
       {"qwen-image-21",          "Qwen-Image",  "2.1"},
@@ -216,6 +220,7 @@ family_version_(const std::string& mt, std::string& family,
       {"moss-codec-v2",          "MOSS",        "Audio-Tokenizer"},
       {"yue2",                   "YuE",         "2"},
       {"yue2-vae",               "YuE",         "2-Vae"},
+      {"bs-roformer",            "BS-RoFormer", "MSST"},
       {"dflash",                 "DFlash",      "1"},
       {"dflash2",                "DFlash",      "2"},
       {"yolo",                   "YOLOX",       "L"},
@@ -333,6 +338,10 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
   // checkpoint is `claims()` on the model registries, which reads the
   // weights rather than a table.
   if (cls == "Flux2Transformer2DModel")      { return "flux2"; }
+  // FLUX.3 Image Klein -- a different network from FLUX.2 (three token
+  // modes, a flow map), sharing only the VAE. One tag for text-to-image
+  // and editing: a reference is an optional token mode of the same DiT.
+  if (cls == "Flux3Transformer2DModel")      { return "flux3"; }
   if (cls == "Krea2Transformer2DModel")      { return "krea2"; }
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit"; }
   // Qwen-Image-2.1. NOT split on `edit` the way Boogu is: one checkpoint
@@ -479,6 +488,7 @@ std::string
 dit_component_tag_(const std::string& cls)
 {
   if (cls == "Flux2Transformer2DModel")      { return "flux2-dit"; }
+  if (cls == "Flux3Transformer2DModel")      { return "flux3-dit"; }
   if (cls == "Krea2Transformer2DModel")      { return "krea2-dit"; }
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit-dit"; }
   if (cls == "QwenImage21Transformer2DModel") { return "qwen-image-21-dit"; }
@@ -957,6 +967,18 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
     }
   }
 
+  // ---- 2d. an MSST source separator ----------------------------------
+  // A torch .ckpt beside the YAML that describes it, no config.json: the
+  // shape every Music-Source-Separation-Training checkpoint ships in.
+  // The YAML names the network; only a BS-RoFormer is runnable here (the
+  // audio-separate stage), so only that one is tagged.
+  if (d.model_type.empty() && genai::looks_like_bs_roformer_dir(dir)) {
+    d.model_type    = "bs-roformer";
+    d.detected_by   = "msst-yaml";
+    d.weight_format = "torch";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
+
   // ---- 3. a plain HF / MLX checkpoint (config.json at the root) -------
   // Also catches a bare DiT component: a diffusers config carries
   // `_class_name` where an HF one carries `model_type`.
@@ -1124,6 +1146,28 @@ resolve_vae_dir(const std::string& root)
     const fs::path vae = fs::path(root) / "Wan2.1_VAE.pth";
     if (fs::exists(vae) && fs::exists(fs::path(root) / "LQ_proj_in.ckpt")) {
       return vae.string();
+    }
+  }
+  // FlashVSR+: the same VAE, shared by a repository's variant folders
+  // (turbo/, base/) and kept one level up -- so a variant folder, which
+  // is what a record names, finds it there; the repository root finds it
+  // beside a variant.
+  {
+    const fs::path r(root);
+    auto variant = [](const fs::path& d) {
+      return fs::exists(d / "dit.safetensors") &&
+             fs::exists(d / "lq_proj_in.safetensors");
+    };
+    if (variant(r)) {
+      for (const fs::path& d : {r, r.parent_path()}) {
+        if (fs::exists(d / "Wan2.1_VAE.pth")) {
+          return (d / "Wan2.1_VAE.pth").string();
+        }
+      }
+    }
+    if (fs::exists(r / "Wan2.1_VAE.pth") &&
+        (variant(r / "turbo") || variant(r / "base"))) {
+      return (r / "Wan2.1_VAE.pth").string();
     }
   }
   // A repack keeping its VAE as ONE freely-named file under `vae/`, with

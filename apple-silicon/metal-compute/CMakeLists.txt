@@ -193,6 +193,10 @@ add_vpipe_metal_kernel(qwen3_5_vision SRC encoders/qwen3_5_vision.metal)
 add_vpipe_metal_kernel(qwen3_5_vision_bf16 SRC encoders/qwen3_5_vision.metal
                        DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(audio_encoder SRC encoders/audio_encoder.metal)
+# BS-RoFormer's band split, token-major RoPE, head gates and mask head
+# (generative-models/bs-roformer/).
+add_vpipe_metal_kernel(band_split_roformer
+                       SRC encoders/band_split_roformer.metal)
 set(STEEL_GEMM_HDRS
     vendored/mlx/backend/metal/kernels/steel/defines.h
     vendored/mlx/backend/metal/kernels/steel/utils.h

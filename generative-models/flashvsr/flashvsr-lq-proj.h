@@ -94,15 +94,15 @@ class FlashVsrLqProj {
   // denoiser's own set, so its file size would be the wrong answer.
   static std::size_t weight_bytes(const std::string& source,
                                   const std::string& prefix);
-  // What projecting one clip of `frames` source frames at height x width
-  // holds beyond the weights: the im2col band, a call's activations (four
-  // source frames in, the reference's cadence), both convolutions'
-  // carries, and the clip's rows -- kept until the beat is assembled, and
-  // then copied into it. 741 MB at 1920x1152 x 25 against 748 MB of live
-  // buffers measured.
+  // What projecting one clip that yields `row_frames` row frames at
+  // height x width holds beyond the weights: the im2col band, a call's
+  // activations (four source frames in, the reference's cadence), both
+  // convolutions' carries, and the clip's rows -- kept until the beat is
+  // assembled, and then copied into it. 741 MB at 1920x1152 x 25 frames
+  // (six row frames) against 748 MB of live buffers measured.
   static std::size_t working_bytes(const std::string& source,
                                    const std::string& prefix, int height,
-                                   int width, int frames);
+                                   int width, int row_frames);
 
   const Config& config() const noexcept { return _cfg; }
 

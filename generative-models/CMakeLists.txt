@@ -57,6 +57,9 @@ set(LOCAL_SOURCES
   shared/kernel-sets/decode-gqa-attn-set.cc
   shared/kernel-sets/prefill-gqa-attn-set.cc
   shared/whisper-feature-extractor.cc
+  shared/stft.cc
+  shared/yaml-subset.cc
+  shared/overlap-demix.cc
   gemma4/gemma-hidden-state-encoder.cc
   gemma4/gemma4-audio-feature-extractor.cc
   gemma4/gemma4-unified-embedder.cc
@@ -105,9 +108,12 @@ set(LOCAL_SOURCES
   yue2/metal-yue2-model.cc
   yue2/metal-oobleck-decoder.cc
   yue2/yue2-vae-family.cc
+  bs-roformer/bs-roformer-config.cc
+  bs-roformer/metal-bs-roformer.cc
   flux2/metal-flux2-transformer.cc
   flux2/metal-flux2-vae.cc
   flux2/metal-flux2-calibration.cc
+  flux3/metal-flux3-transformer.cc
   boogu/metal-boogu-transformer.cc
   boogu/metal-boogu-calibration.cc
   flashvsr/flashvsr-lq-proj.cc
@@ -182,6 +188,11 @@ set(LOCAL_HEADERS
   shared/mcp/shell-tool.h
   shared/mcp/url-fetch.h
   shared/whisper-feature-extractor.h
+  shared/stft.h
+  shared/yaml-subset.h
+  shared/overlap-demix.h
+  bs-roformer/bs-roformer-config.h
+  bs-roformer/metal-bs-roformer.h
   gemma4/gemma4-audio-feature-extractor.h
   gemma4/gemma4-unified-embedder.h
   gemma4/metal-gemma-model.h
@@ -201,6 +212,7 @@ set(LOCAL_HEADERS
   qwen-image/qwen-image21-lora-trainer.h
   z-image/z-image-layout.h
   z-image/metal-z-image-transformer.h
+  flux3/metal-flux3-transformer.h
   llama3/metal-llama-model.h
   llama3/metal-llama-model-exec.h
   llama3/metal-llama-weights.h

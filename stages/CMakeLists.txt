@@ -35,6 +35,7 @@ set(LOCAL_SOURCES
   minimax-h3-model-config-stage.cc
   flashvsr-src-encoder-stage.cc
   flux2-model-config-stage.cc
+  flux3-model-config-stage.cc
   krea2-model-config-stage.cc
   boogu-image-model-config-stage.cc
   qwen-image-21-model-config-stage.cc
@@ -115,6 +116,7 @@ set(LOCAL_HEADERS
   latent-preview.h
   flashvsr-src-encoder-stage.h
   flux2-model-config-stage.h
+  flux3-model-config-stage.h
   krea2-model-config-stage.h
   boogu-image-model-config-stage.h
   qwen-image-21-model-config-stage.h
@@ -195,6 +197,8 @@ if(VPIPE_BUILD_APPLE_SILICON)
   list(APPEND LOCAL_HEADERS text-to-speech-stage.h)
   list(APPEND LOCAL_SOURCES generate-audio-stage.cc)
   list(APPEND LOCAL_HEADERS generate-audio-stage.h)
+  list(APPEND LOCAL_SOURCES audio-separate-stage.cc)
+  list(APPEND LOCAL_HEADERS audio-separate-stage.h)
   list(APPEND LOCAL_SOURCES model-quantize-stage.cc)
   list(APPEND LOCAL_HEADERS model-quantize-stage.h)
   list(APPEND LOCAL_SOURCES model-eval-stage.cc)

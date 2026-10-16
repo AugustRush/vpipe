@@ -1,0 +1,97 @@
+{
+  "id": "bs-roformer-separate-vocals",
+  "stages": [
+    {
+      "id": "load-audio",
+      "type": "load-audio",
+      "iports": [],
+      "config": {
+        "input_url": "song.m4a"
+      }
+    },
+    {
+      "id": "audio-to-pcm",
+      "type": "audio-to-pcm",
+      "iports": [
+        {
+          "src": "load-audio",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_sample_rate": 44100,
+        "channels": 2,
+        "chunk_duration_s": 10,
+        "flush_on_eos": true
+      }
+    },
+    {
+      "id": "audio-separate",
+      "type": "audio-separate",
+      "iports": [
+        {
+          "src": "audio-to-pcm",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "pcunwa/BS-Roformer-Resurrection-vocals"
+      }
+    },
+    {
+      "id": "stack-vocals",
+      "type": "temporal-stack",
+      "iports": [
+        {
+          "src": "audio-separate",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "mode": "audio"
+      }
+    },
+    {
+      "id": "save-vocals",
+      "type": "save-audio",
+      "iports": [
+        {
+          "src": "stack-vocals",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_path": "song-vocals.m4a",
+        "bitrate": 256000
+      }
+    },
+    {
+      "id": "stack-instrumental",
+      "type": "temporal-stack",
+      "iports": [
+        {
+          "src": "audio-separate",
+          "oport": 1
+        }
+      ],
+      "config": {
+        "mode": "audio"
+      }
+    },
+    {
+      "id": "save-instrumental",
+      "type": "save-audio",
+      "iports": [
+        {
+          "src": "stack-instrumental",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_path": "song-instrumental.m4a",
+        "bitrate": 256000
+      }
+    }
+  ],
+  "subpipelines": []
+}

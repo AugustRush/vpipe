@@ -14,20 +14,24 @@ const ConfigKey kAttrs[] = {
   {.key = "kv_ratio", .type = ConfigType::Real, .required = false,
    .doc = "temporal windows of EARLIER chunks each block keeps to attend "
           "across (the reference's 3 when unset). The largest allocation "
-          "the model makes: the window is kv_ratio + 1 windows of keys and "
-          "values per block, at least three -- 12.7 GB at 1920x1152 and 3, "
-          "9.6 GB at 2. Lower it to fit a box; it shortens how far back "
-          "the restoration can look for consistency",
+          "the model makes when it streams: v1.1 carries kv_ratio windows "
+          "of keys and values per block between groups -- 9.6 GB at "
+          "1920x1152 and 3. FlashVSR+ Turbo's 25 hybrid layers keep one "
+          "whatever this says, so its stream carries 4.2 GB there. Lower it "
+          "to fit a box; it shortens how far back the restoration can look "
+          "for consistency",
    .def_real = 3.0},
   {.key = "sparse_ratio", .type = ConfigType::Real, .required = false,
-   .doc = "how many key blocks the routing keeps, scaled by the frame area "
-          "as the reference scales it, so one value means one selectivity "
-          "at every resolution (2.0 when unset; 1.5 is faster, 2.0 more "
-          "stable)",
+   .doc = "how many key blocks the routing keeps, in the release's own "
+          "terms. FlashVSR-v1.1 scales it by the frame area as its "
+          "reference does, so one value means one selectivity at every "
+          "resolution (2.0 when unset; 1.5 is faster, 2.0 more stable); "
+          "FlashVSR+ takes it as it is (2.5 when unset)",
    .def_real = 2.0},
   {.key = "local_range", .type = ConfigType::Int, .required = false,
    .doc = "the always-attended spatial band, in window blocks (11 when "
-          "unset; 9 for sharper detail, 11 for stability)",
+          "unset; 9 for sharper detail, 11 for stability). FlashVSR+ "
+          "Turbo's hybrid layers keep their own 3",
    .def_int = 11},
 };
 const PortSpec kIports[] = {

@@ -2,6 +2,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/beat-keys.h"
+#include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/flashvsr/flashvsr-lq-proj.h"
 #include "generative-models/flashvsr/metal-flashvsr-transformer.h"
@@ -12,7 +13,9 @@
 #include "stages/model-memory.h"
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <cstdlib>
 #include <string>
@@ -41,6 +44,78 @@ constexpr const char* kPublishedDenoiser =
 constexpr const char* kPublishedSource  = "LQ_proj_in.ckpt";
 constexpr const char* kPublishedContext = "posi_prompt.pth";
 constexpr const char* kPublishedVae     = "Wan2.1_VAE.pth";
+// FlashVSR+'s, one pair per variant folder.
+constexpr const char* kPlusDenoiser = "dit.safetensors";
+constexpr const char* kPlusSource   = "lq_proj_in.safetensors";
+
+// The variant a FlashVSR+ folder holds: its own name when that is one of
+// the two, else the repository config's `variants` map read backwards
+// (name -> {"path": folder}). Empty when neither says.
+std::string
+plus_variant_(const fs::path& dir)
+{
+  std::string base = dir.filename().string();
+  std::transform(base.begin(), base.end(), base.begin(),
+                 [](unsigned char c) { return (char)std::tolower(c); });
+  if (base == "turbo" || base == "base") { return base; }
+  std::ifstream in(dir.parent_path() / "config.json");
+  if (!in) { return {}; }
+  try {
+    FlexData cfg = FlexData::from_json(in);
+    if (!cfg.is_object() || !cfg.as_object().contains("variants")) {
+      return {};
+    }
+    FlexData vs = cfg.as_object().at("variants");
+    if (!vs.is_object()) { return {}; }
+    for (const auto& [name, v] : vs.as_object()) {
+      FlexData one = v;
+      if (one.is_object() && one.as_object().contains("path") &&
+          std::string(one.as_object().at("path").as_string("")) ==
+              dir.filename().string()) {
+        std::string n(name);
+        std::transform(n.begin(), n.end(), n.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return n == "turbo" || n == "base" ? n : std::string{};
+      }
+    }
+  } catch (...) {
+  }
+  return {};
+}
+
+// A FlashVSR+ variant folder `dir`, or false.
+bool
+resolve_plus_variant_(const fs::path& dir, FlashVsrLayout* out)
+{
+  std::error_code ec;
+  const fs::path dit = dir / kPlusDenoiser;
+  const fs::path src = dir / kPlusSource;
+  if (!fs::is_regular_file(dit, ec) || !fs::is_regular_file(src, ec)) {
+    return false;
+  }
+  // The shared files sit beside the variant or one level up, where the
+  // repository keeps them.
+  auto shared = [&](const char* name) -> std::string {
+    for (const fs::path& d : {dir, dir.parent_path()}) {
+      if (fs::is_regular_file(d / name, ec)) { return (d / name).string(); }
+    }
+    return {};
+  };
+  const std::string ctx = shared(kPublishedContext);
+  if (ctx.empty()) { return false; }
+  FlashVsrLayout l;
+  l.denoiser = dit.string();
+  l.source = src.string();
+  l.source_prefix = "";
+  l.context = ctx;
+  l.context_name = "posi_prompt";
+  l.vae = shared(kPublishedVae);
+  l.published = true;
+  l.plus = true;
+  l.variant = plus_variant_(dir);
+  if (out != nullptr) { *out = std::move(l); }
+  return true;
+}
 
 // The sets the DENOISER reads: its own, plus the context's when that is a
 // separate file. The source projection is the source encoder stage's
@@ -61,9 +136,13 @@ denoiser_sets_(const std::string& root)
 // the generation and for the memory plan, so the window a plan sized is
 // the window the forward allocates.
 MetalFlashVsrTransformer::Params
-params_from_config_(const FlexData* fd)
+params_from_config_(const FlexData* fd,
+                    const MetalFlashVsrTransformer::Schedule& sch)
 {
-  MetalFlashVsrTransformer::Params p;
+  // The release's own defaults: v1.1 and FlashVSR+ spell sparse_ratio
+  // differently (scaled by the frame area, or not).
+  MetalFlashVsrTransformer::Params p =
+      MetalFlashVsrTransformer::Params::defaults(sch);
   if (fd == nullptr || !fd->is_object()) { return p; }
   auto o = fd->as_object();
   if (o.contains("sparse_ratio")) {
@@ -79,6 +158,22 @@ params_from_config_(const FlexData* fd)
     if (v >= 1) { p.local_range = v; }
   }
   return p;
+}
+
+// The layout and the denoiser's geometry, with the release's schedule:
+// the one read every memory figure here starts from.
+bool
+config_for_root_(const std::string& root, FlashVsrLayout* layout,
+                 MetalFlashVsrTransformer::Config* cfg,
+                 std::string* err = nullptr)
+{
+  if (!resolve_flashvsr_layout(root, layout) ||
+      !MetalFlashVsrTransformer::config_from_checkpoint(layout->denoiser, cfg,
+                                                        err)) {
+    return false;
+  }
+  cfg->schedule = flashvsr_schedule(*layout);
+  return true;
 }
 
 class FlashVsrGenerator final : public VideoGenerator {
@@ -155,13 +250,18 @@ class FlashVsrGenerator final : public VideoGenerator {
       return refuse(fmt("stream rows name chunks {}+{}, which is no chunk "
                         "at all", chunk0, chunks)());
     }
-    const int frames = MetalFlashVsrTransformer::align_frames(req.frames);
+    const MetalFlashVsrTransformer::Schedule& sch =
+        _dit->config().schedule;
+    const int frames =
+        MetalFlashVsrTransformer::align_frames(sch, req.frames);
     const int want_t =
-        stream ? (chunk0 == 0 ? 2 * chunks + 4 : 2 * chunks)
-               : MetalFlashVsrTransformer::latent_frames(frames);
+        stream ? (chunk0 == 0 ? sch.latents(chunks)
+                              : sch.chunk_latents * chunks)
+               : MetalFlashVsrTransformer::latent_frames(sch, frames);
     if (want_t <= 0) {
-      return refuse(fmt("a {}-frame clip is all warmup; 25 frames is the "
-                        "shortest that restores anything", req.frames)());
+      return refuse(fmt("a {}-frame clip is all warmup; {} frames is the "
+                        "shortest that restores anything", req.frames,
+                        sch.frames_through(0))());
     }
     const int tok = (H / 16) * (W / 16);
     if (tok <= 0 || req.cond_rows % tok != 0) {
@@ -182,7 +282,7 @@ class FlashVsrGenerator final : public VideoGenerator {
     r.height = H;
     r.width = W;
     r.seed = req.seed;
-    r.params = params_from_config_(req.model_config);
+    r.params = params_from_config_(req.model_config, sch);
     if (stream) {
       r.chunk0 = chunk0;
       r.chunks = chunks;
@@ -258,6 +358,17 @@ resolve_flashvsr_layout(const std::string& root, FlashVsrLayout* out)
     return true;
   }
 
+  // FlashVSR+: a variant folder, or the repository holding them -- Turbo
+  // when it is there, as the reference's own CLI defaults to it.
+  if (resolve_plus_variant_(r, out)) { return true; }
+  for (const char* v : {"turbo", "base"}) {
+    if (fs::is_regular_file(r / "config.json", ec) &&
+        resolve_plus_variant_(r / v, out)) {
+      if (out != nullptr) { out->variant = v; }
+      return true;
+    }
+  }
+
   // PUBLISHED: recognised by its files, each opened by path.
   const fs::path dit = r / kPublishedDenoiser;
   const fs::path src = r / kPublishedSource;
@@ -278,6 +389,24 @@ resolve_flashvsr_layout(const std::string& root, FlashVsrLayout* out)
   return true;
 }
 
+MetalFlashVsrTransformer::Schedule
+flashvsr_schedule(const FlashVsrLayout& layout)
+{
+  using S = MetalFlashVsrTransformer::Schedule;
+  if (!layout.plus) { return S::v1_1(); }
+  return S::plus(layout.variant == "turbo");
+}
+
+MetalFlashVsrTransformer::Schedule
+flashvsr_schedule(const std::string& root)
+{
+  FlashVsrLayout l;
+  if (!resolve_flashvsr_layout(root, &l)) {
+    return MetalFlashVsrTransformer::Schedule::v1_1();
+  }
+  return flashvsr_schedule(l);
+}
+
 std::size_t
 flashvsr_stream_bytes(const std::string& root, int width, int height,
                       double kv_ratio)
@@ -285,12 +414,9 @@ flashvsr_stream_bytes(const std::string& root, int width, int height,
   if (width <= 0 || height <= 0) { return 0; }
   FlashVsrLayout layout;
   MetalFlashVsrTransformer::Config cfg;
-  if (!resolve_flashvsr_layout(root, &layout) ||
-      !MetalFlashVsrTransformer::config_from_checkpoint(layout.denoiser,
-                                                        &cfg)) {
-    return 0;
-  }
-  MetalFlashVsrTransformer::Params prm;
+  if (!config_for_root_(root, &layout, &cfg)) { return 0; }
+  MetalFlashVsrTransformer::Params prm =
+      MetalFlashVsrTransformer::Params::defaults(cfg.schedule);
   prm.kv_ratio = kv_ratio;
   // The VAE is Wan 2.1's; read its config where the checkpoint has one.
   MetalWanVae::Config vcfg;
@@ -312,11 +438,7 @@ flashvsr_stream_fits(const std::string& root, int width, int height,
   if (carries == 0) { return false; }
   FlashVsrLayout layout;
   MetalFlashVsrTransformer::Config cfg;
-  if (!resolve_flashvsr_layout(root, &layout) ||
-      !MetalFlashVsrTransformer::config_from_checkpoint(layout.denoiser,
-                                                        &cfg)) {
-    return false;
-  }
+  if (!config_for_root_(root, &layout, &cfg)) { return false; }
   MetalWanVae::Config vcfg;
   if (!layout.vae.empty() &&
       !MetalWanVae::config_from_json(layout.vae, vcfg, nullptr)) {
@@ -336,7 +458,8 @@ flashvsr_stream_fits(const std::string& root, int width, int height,
       (std::size_t)MetalFlashVsrTransformer::streaming_floor_bytes(cfg) +
       FlashVsrLqProj::weight_bytes(layout.source, layout.source_prefix) +
       FlashVsrLqProj::working_bytes(layout.source, layout.source_prefix,
-                                    height, width, 25) +
+                                    height, width,
+                                    cfg.schedule.latents(1)) +
       (peak > vae_carries ? peak - vae_carries : 0);
   if (need != nullptr) { *need = total; }
   const std::size_t ram = model_memory::phys_ram();
@@ -353,9 +476,10 @@ FlashVsrVideoFamily::claims(const std::string& root,
 }
 
 int
-FlashVsrVideoFamily::align_frames(const std::string&, int frames) const
+FlashVsrVideoFamily::align_frames(const std::string& root, int frames) const
 {
-  return MetalFlashVsrTransformer::align_frames(frames);
+  return MetalFlashVsrTransformer::align_frames(flashvsr_schedule(root),
+                                                frames);
 }
 
 void
@@ -404,9 +528,7 @@ FlashVsrVideoFamily::declare_holdings(const std::string& root) const
   h.floor = h.preload;
   FlashVsrLayout layout;
   MetalFlashVsrTransformer::Config cfg;
-  if (resolve_flashvsr_layout(root, &layout) &&
-      MetalFlashVsrTransformer::config_from_checkpoint(layout.denoiser,
-                                                       &cfg)) {
+  if (config_for_root_(root, &layout, &cfg)) {
     std::size_t floor =
         (std::size_t)MetalFlashVsrTransformer::streaming_floor_bytes(cfg);
     // A CONVERTED directory is one set: the projection and the fixed
@@ -430,10 +552,12 @@ FlashVsrVideoFamily::declare_holdings(const std::string& root) const
 }
 
 std::size_t
-FlashVsrVideoFamily::latent_bytes(const std::string&, int width, int height,
-                                  int frames) const
+FlashVsrVideoFamily::latent_bytes(const std::string& root, int width,
+                                  int height, int frames) const
 {
-  const int t = MetalFlashVsrTransformer::latent_frames(frames);
+  const auto sch = flashvsr_schedule(root);
+  const int t = MetalFlashVsrTransformer::latent_frames(
+      sch, MetalFlashVsrTransformer::align_frames(sch, frames));
   if (t <= 0 || width <= 0 || height <= 0) { return 0; }
   return (std::size_t)16 * t * (height / 8) * (width / 8) * sizeof(float);
 }
@@ -448,11 +572,7 @@ FlashVsrVideoFamily::denoise_scratch_bytes(const std::string& root, int width,
   MetalFlashVsrTransformer::Config cfg;
   // The geometry comes off the checkpoint's own shapes -- one header read,
   // no weights -- so a checkpoint of another width is sized as itself.
-  if (!resolve_flashvsr_layout(root, &layout) ||
-      !MetalFlashVsrTransformer::config_from_checkpoint(layout.denoiser,
-                                                        &cfg)) {
-    return 0;
-  }
+  if (!config_for_root_(root, &layout, &cfg)) { return 0; }
   // ...AND THE SOURCE PROJECTION'S, which a pipelined graph runs for the
   // NEXT clip while this one denoises: the conditioning stage sees one
   // clip at a time and cannot know the geometry before its first beat,
@@ -465,7 +585,7 @@ FlashVsrVideoFamily::denoise_scratch_bytes(const std::string& root, int width,
   // exactly when flashvsr_stream_fits() says so, the same rule asked the
   // same way.
   const MetalFlashVsrTransformer::Params prm =
-      params_from_config_(model_config);
+      params_from_config_(model_config, cfg.schedule);
   const std::size_t windows =
       flashvsr_stream_fits(root, width, height)
           ? (std::size_t)MetalFlashVsrTransformer::stream_window_bytes(
@@ -474,8 +594,11 @@ FlashVsrVideoFamily::denoise_scratch_bytes(const std::string& root, int width,
   return (std::size_t)MetalFlashVsrTransformer::denoise_scratch_bytes(
              cfg, height, width, frames, prm) +
          windows +
-         FlashVsrLqProj::working_bytes(layout.source, layout.source_prefix,
-                                       height, width, frames);
+         FlashVsrLqProj::working_bytes(
+             layout.source, layout.source_prefix, height, width,
+             MetalFlashVsrTransformer::latent_frames(
+                 cfg.schedule, MetalFlashVsrTransformer::align_frames(
+                                   cfg.schedule, frames)));
 }
 
 std::unique_ptr<VideoGenerator>
@@ -492,10 +615,21 @@ FlashVsrVideoFamily::load(const VideoModelCreateArgs& args)
 
   FlashVsrLayout layout;
   if (!resolve_flashvsr_layout(root, &layout)) {
-    return fail(fmt("'{}' holds neither a converted FlashVSR checkpoint nor "
-                    "the published files ({}, {}, {})", root,
+    return fail(fmt("'{}' holds neither a converted FlashVSR checkpoint, "
+                    "the published v1.1 files ({}, {}, {}), nor a "
+                    "FlashVSR+ variant ({} and {} beside {})", root,
                     kPublishedDenoiser, kPublishedSource,
+                    kPublishedContext, kPlusDenoiser, kPlusSource,
                     kPublishedContext)());
+  }
+  // TURBO AND BASE ARE THE SAME TENSORS; only the folder says which, and
+  // running one's weights with the other's attention layout is a quietly
+  // worse picture. So an unnamed one is refused, not guessed.
+  if (layout.plus && layout.variant.empty()) {
+    return fail(fmt("'{}' is a FlashVSR+ variant, but neither its folder "
+                    "name nor the repository's config.json says whether "
+                    "it is turbo or base -- keep it in a folder of that "
+                    "name, as the repository publishes it", root)());
   }
   MetalFlashVsrTransformer::Config cfg;
   std::string err;
@@ -503,6 +637,7 @@ FlashVsrVideoFamily::load(const VideoModelCreateArgs& args)
                                                         &err)) {
     return fail("cannot read the checkpoint's geometry: " + err);
   }
+  cfg.schedule = flashvsr_schedule(layout);
   // What the graph asked for. Both are decided at LOAD -- int8 sizes a
   // scratch and Sage builds a kernel variant -- so they come off the
   // create args, which the stage fills from the same config as the
@@ -539,9 +674,16 @@ FlashVsrVideoFamily::load(const VideoModelCreateArgs& args)
   if (dit == nullptr) { return fail(err.empty() ? "load failed" : err); }
   if (args.session != nullptr) {
     args.session->log_normal(fmt(
-        "flashvsr: {} blocks at {} wide, {}x{} heads; one step at a fixed "
-        "timestep over a constant conditioning", cfg.n_layers, cfg.hidden,
-        cfg.n_heads, cfg.head_dim));
+        "flashvsr: {} -- {} blocks at {} wide, {}x{} heads; one step at a "
+        "fixed timestep over a constant conditioning; chunks of {} latent "
+        "frames{}",
+        layout.plus ? "FlashVSR+ " + layout.variant : std::string("v1.1"),
+        cfg.n_layers, cfg.hidden, cfg.n_heads, cfg.head_dim,
+        cfg.schedule.chunk_latents,
+        cfg.schedule.sliding_layers.empty()
+            ? std::string()
+            : fmt(", {} hybrid layers (3x3 band, one window kept)",
+                  cfg.schedule.sliding_layers.size())()));
     // What the graph GOT, which is not always what it asked for: Sage
     // without the NAX entry, or either tier on a box with no matrix
     // cores, runs the plain kernels and says so here.

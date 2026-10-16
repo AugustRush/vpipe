@@ -374,7 +374,12 @@ MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_fn_gn_stats  = m->_lib_elt.function("group_norm_chan_stats_f16");
   m->_fn_gn_reduce = m->_lib_elt.function("group_norm_group_stats_f32");
   m->_fn_gn_apply  = m->_lib_elt.function("group_norm_apply_f16");
-  m->_fast_gnorm = m->_fn_gn_stats.valid() && m->_fn_gn_reduce.valid()
+  // The exact tiled decode's own two (decode_exact_). Without them a decode
+  // that does not fit falls back to windows.
+  m->_fn_gn_stats_rect =
+      m->_lib_elt.function("group_norm_chan_stats_rect_f16");
+  m->_fn_copy_rect_wide = m->_lib_elt.function("copy_rect_wide_f16");
+  m->_fast_gnorm =m->_fn_gn_stats.valid() && m->_fn_gn_reduce.valid()
                    && m->_fn_gn_apply.valid()
                    && std::getenv("VPIPE_VAE_NO_FAST_GNORM") == nullptr;
   if (m->_fast_gnorm) {
@@ -1374,6 +1379,902 @@ MetalFlux2Vae::decode_tile_side_(std::size_t budget) const noexcept
   return 0;
 }
 
+// ---- the decoder's ops ------------------------------------------------
+//
+// One compute encoder and a pool of reusable buffers. The encoder is
+// serial, so a released buffer is handed out again only after its last
+// reader -- which bounds a command buffer to the ops' concurrent working
+// set rather than to every op it records.
+//
+// A DRY RUN (no encoder) records nothing and allocates nothing, but walks
+// the pool exactly as the real calls would, so `bytes` afterwards is what
+// they would hold. The exact tiled decode sizes its passes that way rather
+// than with a formula that could drift from the code it describes.
+struct MetalFlux2Vae::Ops {
+  MetalFlux2Vae& v;
+  ComputeEncoder* enc = nullptr;       // null: dry run
+  const SharedBuffer* col = nullptr;   // im2col band scratch
+  std::size_t col_cap = 0;             // its capacity, ELEMENTS
+  bool use_pool = true;
+  // Smallest free buffer that holds a request, rather than the first.
+  // Tiles of one pass all walk the same op sequence, and first-fit lets a
+  // small request take a large buffer the next large request then lacks.
+  bool best_fit = false;
+  bool alloc_ok = true;
+  std::size_t bytes = 0;               // everything the pool holds
+  std::size_t max_elems = 0;           // its largest single request
+  struct Slot { SharedBuffer buf; std::size_t cap; bool used; };
+  std::deque<Slot> pool;
+
+  Ops(MetalFlux2Vae& vae, ComputeEncoder* e) : v(vae), enc(e) {}
+  bool dry() const { return enc == nullptr; }
+
+  SharedBuffer& alloc(std::size_t elems)
+  {
+    const std::size_t need = elems * 2;
+    max_elems = std::max(max_elems, elems);
+    if (use_pool) {
+      Slot* pick = nullptr;
+      for (auto& s : pool) {
+        if (s.used || s.cap < need || (!dry() && s.buf.empty())) {
+          continue;
+        }
+        if (!best_fit) { pick = &s; break; }
+        if (pick == nullptr || s.cap < pick->cap) { pick = &s; }
+      }
+      if (pick != nullptr) { pick->used = true; return pick->buf; }
+      // Growing: a free buffer too small for this request is dead weight
+      // that the next, larger tile would leave beside its own. Drop its
+      // memory (not the slot -- callers hold references into the deque;
+      // an encoded dispatch still using it keeps it alive until it ran).
+      if (best_fit) {
+        for (auto& s : pool) {
+          if (!s.used && s.cap > 0 && s.cap < need) {
+            s.buf = SharedBuffer{};
+            bytes -= s.cap;
+            s.cap = 0;
+          }
+        }
+      }
+    }
+    pool.push_back(Slot{dry() ? SharedBuffer{}
+                              : v._mc->make_shared_buffer(need),
+                        need, true});
+    bytes += need;
+    if (!dry() && pool.back().buf.empty()) { alloc_ok = false; }
+    return pool.back().buf;
+  }
+  void release(const SharedBuffer& b)
+  {
+    if (!use_pool) { return; }
+    for (auto& s : pool) {
+      if (&s.buf == &b) { s.used = false; return; }
+    }
+  }
+  // Move a pooled buffer out, so it outlives clear(); empty if `b` is not
+  // one of the pool's.
+  SharedBuffer take(const SharedBuffer& b)
+  {
+    for (auto& s : pool) {
+      if (&s.buf == &b) {
+        SharedBuffer out = std::move(s.buf);
+        bytes -= s.cap;
+        s.cap = 0;
+        s.used = true;           // never handed out again
+        return out;
+      }
+    }
+    return {};
+  }
+  void clear() { pool.clear(); bytes = 0; }
+
+  SharedBuffer& conv3x3(const SharedBuffer& in, int H, int W, const Conv& c)
+  {
+    const std::size_t hw = (std::size_t)H * W;
+    SharedBuffer& out = alloc(hw * c.cout);
+    if (dry()) { return out; }
+    // Whichever route runs it: an [H*W, 9*cin] x [9*cin, cout] product.
+    v._flops.gemm((long long)hw, c.cout, 9LL * c.cin);
+    // NAX hardware conv when the shape tiles; else row-tiled im2col + GEMM
+    // (streams the [hw, 9*cin] im2col in bands through `col`).
+    if (v.conv3x3_hw_(*enc, in, c, out, H, W, /*stride=*/1)) { return out; }
+    // Small cout (the final conv to 3 / 2*latent) never satisfies the
+    // hardware conv's cout % 64; a direct pass beats materializing im2col.
+    if (v.conv3x3_small_cout_(*enc, in, c, out, H, W, /*stride=*/1)) {
+      return out;
+    }
+    v.tiled_conv3x3_(*enc, in, out, H, W, c, /*stride=*/1, *col, col_cap);
+    return out;
+  }
+  SharedBuffer& conv1x1(const SharedBuffer& in, std::size_t hw, const Conv& c)
+  {
+    SharedBuffer& out = alloc(hw * c.cout);
+    if (dry()) { return out; }
+    v._flops.gemm((long long)hw, c.cout, c.cin);
+    v.conv_gemm_bias_(*enc, in, c.w, c.b, out, (int)hw, c.cout, c.cin);
+    return out;
+  }
+  // `frozen`: the plane's per-group (mean, inv) [G][2] f32, computed
+  // elsewhere -- the exact tiled decode's whole-plane statistics, applied
+  // to a tile. Null: this buffer's own statistics.
+  SharedBuffer& gnorm(const SharedBuffer& in, std::size_t hw, const GNorm& n,
+                      const SharedBuffer* frozen = nullptr)
+  {
+    SharedBuffer& out = alloc(hw * n.c);
+    if (dry()) { return out; }
+    const int G = v._cfg.norm_groups;
+    if (frozen == nullptr) {
+      v.group_norm_(*enc, in, n.g, n.b, out, (int)hw, n.c, G,
+                    v._cfg.norm_eps);
+      return out;
+    }
+    enc->set_function(v._fn_gn_apply);
+    enc->set_buffer(0, in); enc->set_buffer(1, n.g); enc->set_buffer(2, n.b);
+    enc->set_buffer(3, out); enc->set_buffer(4, *frozen);
+    enc->set_constant(5, n.c); enc->set_constant(6, G);
+    enc->dispatch({(unsigned)n.c, (unsigned)hw, 1}, {256, 1, 1});
+    return out;
+  }
+  void silu(const SharedBuffer& x, std::size_t n)
+  {
+    if (dry()) { return; }
+    enc->set_function(v._fn_mul_sigmoid);
+    enc->set_buffer(0, x); enc->set_buffer(1, x); enc->set_buffer(2, x);
+    enc->set_constant(3, (int)n);
+    enc->dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+  }
+  SharedBuffer& resadd(const SharedBuffer& a, const SharedBuffer& b,
+                       std::size_t n)
+  {
+    SharedBuffer& out = alloc(n);
+    if (dry()) { return out; }
+    enc->set_function(v._fn_residual);
+    enc->set_buffer(0, a); enc->set_buffer(1, b); enc->set_buffer(2, out);
+    enc->set_constant(3, (int)n);
+    enc->dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+    return out;
+  }
+  SharedBuffer& upsample(const SharedBuffer& in, int H, int W, int C)
+  {
+    SharedBuffer& out = alloc((std::size_t)4 * H * W * C);
+    if (dry()) { return out; }
+    const std::size_t rows = (std::size_t)4 * H * W;     // 2H * 2W pixels
+    enc->set_function(v._fn_upsample);
+    enc->set_buffer(0, in); enc->set_buffer(1, out);
+    enc->set_constant(2, H); enc->set_constant(3, W); enc->set_constant(4, C);
+    // 2D grid {C, 4*H*W}: gid = pixel*C + c (a 1D {4*H*W*C} grid overflows
+    // the int index and the grid dimension past ~3K px).
+    enc->dispatch({(unsigned)C, (unsigned)rows, 1}, {256, 1, 1});
+    return out;
+  }
+  void clamp(const SharedBuffer& x, std::size_t n)
+  {
+    if (dry()) { return; }
+    enc->set_function(v._fn_clamp);
+    enc->set_buffer(0, x); enc->set_buffer(1, x);
+    enc->set_constant(2, (int)n); enc->set_constant(3, -1.0f);
+    enc->set_constant(4, 1.0f);
+    enc->dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+  }
+  // Residual input `x` is held live through to the resadd (read twice);
+  // the internal temporaries are released as soon as their consumer is
+  // enqueued. s1 / s2: frozen statistics for norm1 / norm2 (see gnorm).
+  SharedBuffer& resblock(const ResBlock& rb, const SharedBuffer& x, int H,
+                         int W, const SharedBuffer* s1 = nullptr,
+                         const SharedBuffer* s2 = nullptr)
+  {
+    const std::size_t hw = (std::size_t)H * W;
+    SharedBuffer& t = gnorm(x, hw, rb.n1, s1);
+    silu(t, hw * rb.cin);
+    SharedBuffer& t1 = conv3x3(t, H, W, rb.c1);
+    release(t);
+    SharedBuffer& t2 = gnorm(t1, hw, rb.n2, s2);
+    release(t1);
+    silu(t2, hw * rb.cout);
+    SharedBuffer& t3 = conv3x3(t2, H, W, rb.c2);
+    release(t2);
+    if (rb.has_short) {
+      SharedBuffer& h = conv1x1(x, hw, rb.shortcut);
+      SharedBuffer& out = resadd(t3, h, hw * rb.cout);
+      release(t3); release(h);
+      return out;
+    }
+    SharedBuffer& out = resadd(t3, x, hw * rb.cout);
+    release(t3);
+    return out;
+  }
+  SharedBuffer& attention(const Attn& a, const SharedBuffer& x, int H, int W)
+  {
+    const std::size_t hw = (std::size_t)H * W;
+    const int C = a.dim;
+    SharedBuffer& n = gnorm(x, hw, a.n);
+    SharedBuffer& q = conv1x1(n, hw, a.q);
+    SharedBuffer& k = conv1x1(n, hw, a.k);
+    SharedBuffer& vv = conv1x1(n, hw, a.v);
+    release(n);                          // consumed by q, k, v
+    SharedBuffer& att = alloc(hw * C);
+    if (!dry()) {
+      const float scale = 1.0f / std::sqrt((float)C);
+      // The member is chosen ONCE, by measurement, in autotune_mid_attn_.
+      v._flops.attention(1, (long long)hw * (long long)hw, C);
+      v.encode_mid_attn_(
+          *enc, v._attn_pick, q, k, vv, att, hw, C, scale,
+          [&](std::size_t e) -> SharedBuffer& { return alloc(e); },
+          [&](const SharedBuffer& b) { release(b); });
+    }
+    release(q); release(k); release(vv);  // consumed by the sdpa
+    SharedBuffer& p = conv1x1(att, hw, a.proj);
+    release(att);
+    SharedBuffer& out = resadd(p, x, hw * C);
+    release(p);
+    return out;
+  }
+};
+
+void
+MetalFlux2Vae::copy_rect_(ComputeEncoder& enc, const SharedBuffer& src,
+                          int sw, int sy, int sx, const SharedBuffer& dst,
+                          int dw, int dy, int dx, int rh, int rw, int C)
+{
+  if (rh <= 0 || rw <= 0) { return; }
+  enc.set_function(_fn_copy_rect_wide);
+  enc.set_buffer(0, src); enc.set_buffer(1, dst);
+  enc.set_constant(2, (long long)(((std::int64_t)sy * sw + sx) * C));
+  enc.set_constant(3, (long long)(((std::int64_t)dy * dw + dx) * C));
+  enc.set_constant(4, rh); enc.set_constant(5, rw * C);
+  enc.set_constant(6, (long long)sw * C);
+  enc.set_constant(7, (long long)dw * C);
+  enc.dispatch({(unsigned)(rw * C), (unsigned)rh, 1}, {256, 1, 1});
+}
+
+std::vector<MetalFlux2Vae::UpStage>
+MetalFlux2Vae::up_stages_(int h8, int w8) const
+{
+  std::vector<UpStage> st;
+  int H = h8, W = w8;
+  for (const UpBlock& ub : _up_blocks) {
+    for (const ResBlock& rb : ub.resnets) {
+      UpStage s;
+      s.kind = UpStage::kRes; s.rb = &rb;
+      s.H = H; s.W = W; s.cin = rb.cin; s.cout = rb.cout;
+      st.push_back(s);
+    }
+    if (ub.has_up) {
+      UpStage s;
+      s.kind = UpStage::kUp; s.up = &ub.up;
+      s.H = H; s.W = W; s.cin = ub.up_dim; s.cout = ub.up.cout;
+      st.push_back(s);
+      H *= 2; W *= 2;
+    }
+  }
+  UpStage o;
+  o.kind = UpStage::kOut;
+  o.H = H; o.W = W; o.cin = _norm_out.c; o.cout = 3;
+  st.push_back(o);
+  return st;
+}
+
+namespace {
+
+// A half-open pixel rectangle on one plane.
+struct Rect {
+  int y0 = 0, y1 = 0, x0 = 0, x1 = 0;
+  int h() const { return y1 - y0; }
+  int w() const { return x1 - x0; }
+};
+
+// Elementwise work, in multiply-accumulate equivalents per element per
+// pass: a GroupNorm, SiLU or residual moves its plane through memory once,
+// and on these GPUs that costs about as much as ~64 MACs of a conv.
+// Only steers which planes the exact decode keeps; never a correctness
+// input.
+constexpr double kEltMac = 64.0;
+
+}  // namespace
+
+SharedBuffer
+MetalFlux2Vae::decode_exact_(const SharedBuffer& latent, int h8, int w8,
+                             std::size_t budget, std::string* err)
+{
+  auto fail = [&](std::string m) -> SharedBuffer {
+    if (err != nullptr) { *err = std::move(m); }
+    return {};
+  };
+  if (!_fast_gnorm || !_fn_gn_stats_rect.valid() ||
+      !_fn_copy_rect_wide.valid()) {
+    return fail("exact tiled decode: its kernels are unavailable");
+  }
+  MetalCompute* mc = _mc;
+  const int G = _cfg.norm_groups;
+  const float geps = _cfg.norm_eps;
+  const std::vector<UpStage> st = up_stages_(h8, w8);
+  const int N = (int)st.size();
+  const int Hout = st.back().H, Wout = st.back().W;
+  const std::size_t hw8 = (std::size_t)h8 * w8;
+  const auto t_start = std::chrono::steady_clock::now();
+  // Swap and this process's compressed bytes going in, so the log can say
+  // whether the decode stayed in RAM (the whole point of `budget`).
+  const MetalCompute::MemoryBudget mb0 = mc->memory_budget();
+  maybe_tune_conv_(Hout, Wout);
+
+  // Every buffer an op touches stays under 2^31 elements: the elementwise
+  // kernels index with int. Tiles stay well under it, at 2^29, which also
+  // keeps the hardware conv's 2 GB operand in reach.
+  constexpr std::size_t kWholeMaxElems = ((std::size_t)1 << 31) - 1;
+  constexpr std::size_t kTileMaxElems = (std::size_t)1 << 29;
+
+  // The im2col band, as decode() sizes it (a GEMM M-dimension and no more).
+  const std::size_t base_max =
+      (std::size_t)std::max(_cfg.block_out[0], _cfg.block_out[1]);
+  const std::size_t big_cin =
+      _use_hwconv ? (std::size_t)_cfg.block_out[0] : base_max;
+  std::size_t col_cap = kDecodeBandMax / 2;
+  if (_mma_max_m > 0) {
+    col_cap = std::min(col_cap, (std::size_t)_mma_max_m / 2 * 9 * big_cin);
+  }
+  SharedBuffer col = mc->make_shared_buffer(col_cap * 2);
+  if (col.empty()) { return fail("exact tiled decode: band scratch failed"); }
+  int cmax = 0;
+  for (const UpStage& s : st) { cmax = std::max({cmax, s.cin, s.cout}); }
+  SharedBuffer part =
+      mc->make_shared_buffer((std::size_t)kGnBlocks * 2 * cmax * 4);
+  if (part.empty()) { return fail("exact tiled decode: partials failed"); }
+  const std::size_t rgb_bytes = (std::size_t)Hout * Wout * 3 * 2;
+  // Held for the whole decode: the band, the partials, and the picture
+  // twice (the tiles write it interleaved; the readback makes it planar).
+  const std::size_t fixed = col_cap * 2 + part.byte_size() + 2 * rgb_bytes;
+
+  auto plane_bytes = [&](int p) -> std::size_t {
+    return (std::size_t)st[p].H * st[p].W * st[p].cin * 2;
+  };
+
+  // ---- the head, whole: post_quant, conv_in, the mid block -----------
+  // Global attention and every one of its norms over the whole latent.
+  SharedBuffer store;          // plane `s` of the up path, whole
+  {
+    auto head = [&](Ops& ops) -> const SharedBuffer& {
+      const SharedBuffer* x = _post_quant.w.empty()
+                                  ? &latent
+                                  : &ops.conv1x1(latent, hw8, _post_quant);
+      auto step = [&](const SharedBuffer& nx) { ops.release(*x); x = &nx; };
+      step(ops.conv3x3(*x, h8, w8, _conv_in));
+      step(ops.resblock(_mid_res0, *x, h8, w8));
+      step(ops.attention(_mid_attn, *x, h8, w8));
+      step(ops.resblock(_mid_res1, *x, h8, w8));
+      return *x;
+    };
+    // Sized by a dry run of the same calls before anything is allocated.
+    Ops dry(*this, nullptr);
+    head(dry);
+    if (dry.bytes + fixed > budget) {
+      return fail(fmt("exact tiled decode: the mid block needs ~{} MB "
+                      "whole, {} MB available", (dry.bytes + fixed) >> 20,
+                      budget >> 20)());
+    }
+    CommandStream stream = mc->make_command_stream();
+    ComputeEncoder enc = stream.begin_compute();
+    Ops ops(*this, &enc);
+    ops.col = &col; ops.col_cap = col_cap;
+    const SharedBuffer& x = head(ops);
+    enc.end();
+    _flops.flush(stream);
+    std::string ge;
+    if (!ops.alloc_ok || !stream.commit().wait_ok(&ge)) {
+      return fail("exact tiled decode: the mid block failed" +
+                  (ge.empty() ? std::string() : ": " + ge));
+    }
+    store = ops.take(x);
+  }
+  (void)mc->memory_budget_settled();
+
+  // ---- the plan --------------------------------------------------------
+  // Statistics each stage needs: kRes norm1 (its input) and norm2 (after
+  // conv1); kOut its one norm. A TAP is one of them, in stage order.
+  struct Tap { int p; int depth; };
+  std::vector<Tap> taps;
+  for (int p = 0; p < N; ++p) {
+    if (st[p].kind == UpStage::kRes) {
+      taps.push_back({p, 0}); taps.push_back({p, 1});
+    } else if (st[p].kind == UpStage::kOut) {
+      taps.push_back({p, 0});
+    }
+  }
+  const int K = (int)taps.size();
+
+  // Work, in MAC equivalents. `partial` is the part of stage p up to its
+  // depth-1 point (a resnet's conv1, the head's conv_out).
+  auto stage_work = [&](int p) -> double {
+    const UpStage& s = st[p];
+    const double hw = (double)s.H * s.W;
+    switch (s.kind) {
+      case UpStage::kRes:
+        return hw * 9.0 * s.cout * (s.cin + s.cout) +
+               (s.rb->has_short ? hw * s.cin * s.cout : 0.0) +
+               hw * kEltMac * (2.0 * s.cin + 4.0 * s.cout);
+      case UpStage::kUp:
+        return 4.0 * hw * 9.0 * s.cin * s.cout + 4.0 * hw * kEltMac * s.cin;
+      case UpStage::kOut:
+        return hw * 9.0 * s.cin * 3.0 + hw * kEltMac * 3.0 * s.cin;
+    }
+    return 0.0;
+  };
+  auto partial_work = [&](int p) -> double {
+    const UpStage& s = st[p];
+    const double hw = (double)s.H * s.W;
+    if (s.kind == UpStage::kRes) {
+      return hw * 9.0 * s.cin * s.cout + hw * kEltMac * 3.0 * s.cin;
+    }
+    return stage_work(p);
+  };
+  auto chain_work = [&](int s, int t, int depth) -> double {
+    double w = 0.0;
+    for (int q = s; q < t; ++q) { w += stage_work(q); }
+    if (depth == 1) { w += partial_work(t); }
+    return w;
+  };
+  double whole_work = 0.0;
+  for (int p = 0; p < N; ++p) { whole_work += stage_work(p); }
+
+  // The source rect a tile of target rect `r` (plane t, or its depth-1
+  // point) needs from plane s: each 3x3 conv reaches one pixel further, a
+  // nearest upsample halves; clipped to the plane, where the zero padding
+  // IS the whole image's. Aligned outward to 8 where the hardware conv
+  // runs, so its frames tile its 8x8 destination -- and only there: the
+  // alignment hides a halo that is up to 8 source pixels short, so where
+  // nothing needs it the tiles are cut exactly and a short halo shows
+  // (flux2_smoke.vae_decode_exact_tiles_match_whole).
+  const int align = _use_hwconv ? 8 : 1;
+  auto source_rect = [&](int s, int t, int depth, Rect r) -> Rect {
+    auto grow = [](Rect a, int g, int H, int W) {
+      a.y0 = std::max(0, a.y0 - g); a.y1 = std::min(H, a.y1 + g);
+      a.x0 = std::max(0, a.x0 - g); a.x1 = std::min(W, a.x1 + g);
+      return a;
+    };
+    if (depth == 1) { r = grow(r, 1, st[t].H, st[t].W); }
+    for (int q = t - 1; q >= s; --q) {
+      if (st[q].kind == UpStage::kRes) {
+        r = grow(r, 2, st[q].H, st[q].W);
+      } else if (st[q].kind == UpStage::kUp) {
+        r = grow(r, 1, 2 * st[q].H, 2 * st[q].W);
+        r = {r.y0 / 2, (r.y1 + 1) / 2, r.x0 / 2, (r.x1 + 1) / 2};
+      }
+    }
+    r.y0 -= r.y0 % align; r.x0 -= r.x0 % align;
+    r.y1 = std::min(st[s].H, (r.y1 + align - 1) / align * align);
+    r.x1 = std::min(st[s].W, (r.x1 + align - 1) / align * align);
+    return r;
+  };
+
+  // Frozen statistics, one [G][2] (mean, inv) per norm.
+  std::vector<SharedBuffer> s1((std::size_t)N), s2((std::size_t)N);
+  for (int p = 0; p < N; ++p) {
+    if (st[p].kind == UpStage::kUp) { continue; }
+    s1[(std::size_t)p] = mc->make_shared_buffer((std::size_t)G * 2 * 4);
+    if (st[p].kind == UpStage::kRes) {
+      s2[(std::size_t)p] = mc->make_shared_buffer((std::size_t)G * 2 * 4);
+    }
+  }
+
+  // ONE TILE of a pass, from plane s to the target (t, depth). Dry with a
+  // null encoder: then only the pool moves. `store_q` receives plane q's
+  // rows this tile owns; `tap` sums the target over `rt`; `rgb` takes
+  // the tile's picture.
+  struct PassIo {
+    const SharedBuffer* src = nullptr;
+    int q = -1;
+    SharedBuffer* store_q = nullptr;
+    bool tap = false;
+    bool first = true;              // the tap's first tile writes
+    SharedBuffer* rgb = nullptr;
+  };
+  auto run_tile = [&](Ops& ops, int s, int t, int depth, Rect rt,
+                      PassIo& io) {
+    ComputeEncoder* enc = ops.enc;
+    const Rect rs = source_rect(s, t, depth, rt);
+    int fh = rs.h(), fw = rs.w(), oy = rs.y0, ox = rs.x0;
+    SharedBuffer& x0 = ops.alloc((std::size_t)fh * fw * st[s].cin);
+    if (enc != nullptr) {
+      copy_rect_(*enc, *io.src, st[s].W, rs.y0, rs.x0, x0, fw, 0, 0, fh, fw,
+                 st[s].cin);
+    }
+    const SharedBuffer* x = &x0;
+    // The tile's own rows of plane q: the target rect at q's resolution.
+    auto store_at = [&](int q) {
+      if (io.q != q || enc == nullptr) { return; }
+      int k = 0;
+      for (int j = q; j < t; ++j) { k += st[j].kind == UpStage::kUp; }
+      const Rect rq{rt.y0 >> k, rt.y1 >> k, rt.x0 >> k, rt.x1 >> k};
+      copy_rect_(*enc, *x, fw, rq.y0 - oy, rq.x0 - ox, *io.store_q,
+                 st[q].W, rq.y0, rq.x0, rq.h(), rq.w(), st[q].cin);
+    };
+    for (int q = s; q < t; ++q) {
+      store_at(q);
+      const UpStage& sq = st[q];
+      if (sq.kind == UpStage::kRes) {
+        SharedBuffer& nx = ops.resblock(*sq.rb, *x, fh, fw,
+                                        &s1[(std::size_t)q],
+                                        &s2[(std::size_t)q]);
+        ops.release(*x); x = &nx;
+      } else {
+        SharedBuffer& u = ops.upsample(*x, fh, fw, sq.cin);
+        ops.release(*x);
+        fh *= 2; fw *= 2; oy *= 2; ox *= 2;
+        SharedBuffer& c = ops.conv3x3(u, fh, fw, *sq.up);
+        ops.release(u); x = &c;
+      }
+    }
+    store_at(t);
+    const SharedBuffer* tgt = x;
+    int tc = st[t].cin;
+    if (depth == 1) {
+      const std::size_t fhw = (std::size_t)fh * fw;
+      if (st[t].kind == UpStage::kRes) {
+        const ResBlock& rb = *st[t].rb;
+        SharedBuffer& tn = ops.gnorm(*x, fhw, rb.n1, &s1[(std::size_t)t]);
+        ops.silu(tn, fhw * rb.cin);
+        tgt = &ops.conv3x3(tn, fh, fw, rb.c1);
+        ops.release(tn);
+        tc = rb.cout;
+      } else {
+        SharedBuffer& xn =
+            ops.gnorm(*x, fhw, _norm_out, &s1[(std::size_t)t]);
+        ops.silu(xn, fhw * _norm_out.c);
+        tgt = &ops.conv3x3(xn, fh, fw, _conv_out);
+        ops.release(xn);
+        ops.clamp(*tgt, fhw * 3);
+        tc = 3;
+      }
+    }
+    if (enc != nullptr && io.tap) {
+      enc->set_function(_fn_gn_stats_rect);
+      enc->set_buffer(0, *tgt); enc->set_buffer(1, part);
+      enc->set_constant(2, fw); enc->set_constant(3, tc);
+      enc->set_constant(4, rt.y0 - oy); enc->set_constant(5, rt.x0 - ox);
+      enc->set_constant(6, rt.h()); enc->set_constant(7, rt.w());
+      enc->set_constant(8, (int)kGnBlocks);
+      enc->set_constant(9, io.first ? 0 : 1);
+      enc->dispatch({(unsigned)(256 * kGnBlocks), 1, 1}, {256, 1, 1});
+      io.first = false;
+    }
+    if (enc != nullptr && io.rgb != nullptr) {
+      copy_rect_(*enc, *tgt, fw, rt.y0 - oy, rt.x0 - ox, *io.rgb, Wout,
+                 rt.y0, rt.x0, rt.h(), rt.w(), 3);
+    }
+    if (tgt != x) { ops.release(*tgt); }
+    ops.release(*x);
+  };
+
+  // What a pass's tiles hold, at tile side T: a dry run of an INTERIOR
+  // tile, the worst case (halo on every side). 0 when a single buffer
+  // would pass kTileMaxElems.
+  const int env_tile = [] {
+    const char* e = std::getenv("VPIPE_VAE_EXACT_TILE");
+    return e != nullptr ? std::max(0, std::atoi(e)) & ~15 : 0;
+  }();
+  auto tile_bytes = [&](int s, int t, int depth, int T) -> std::size_t {
+    const int TH = st[t].H, TW = st[t].W;
+    Rect r;
+    r.y0 = std::max(0, (TH - T) / 2) & ~15; r.y1 = std::min(TH, r.y0 + T);
+    r.x0 = std::max(0, (TW - T) / 2) & ~15; r.x1 = std::min(TW, r.x0 + T);
+    Ops ops(*this, nullptr);
+    ops.best_fit = true;
+    PassIo io;
+    run_tile(ops, s, t, depth, r, io);
+    return ops.max_elems > kTileMaxElems ? (std::size_t)-1 : ops.bytes;
+  };
+  // Largest tile side (a multiple of 16) whose pass fits in `room`; 0 if
+  // not even the floor does.
+  auto pick_tile = [&](int s, int t, int depth, std::size_t room,
+                       int floor_side) -> int {
+    const int TH = st[t].H, TW = st[t].W;
+    int hi = ((std::max(TH, TW) + 15) / 16) * 16;
+    if (env_tile > 0) { hi = std::min(hi, std::max(16, env_tile)); }
+    int lo = std::min(floor_side, hi);
+    if (tile_bytes(s, t, depth, lo) > room) { return 0; }
+    while (hi - lo > 16) {
+      const int mid = ((lo + hi) / 2) & ~15;
+      if (mid <= lo) { break; }
+      if (tile_bytes(s, t, depth, mid) <= room) { lo = mid; } else { hi = mid; }
+    }
+    return tile_bytes(s, t, depth, hi) <= room ? hi : lo;
+  };
+  // A pass that KEEPS a plane must still leave room for tiles big enough
+  // that the halo is not the work; one that only sums may go smaller.
+  constexpr int kStoreTileFloor = 256, kTileFloor = 64;
+
+  // What running stage p WHOLE holds besides its input (a dry run), or
+  // SIZE_MAX when a buffer would pass the elementwise kernels' int range.
+  auto whole_bytes = [&](int p) -> std::size_t {
+    Ops ops(*this, nullptr);
+    const UpStage& s = st[p];
+    SharedBuffer dummy;
+    const std::size_t hw = (std::size_t)s.H * s.W;
+    if (s.kind == UpStage::kRes) {
+      ops.resblock(*s.rb, dummy, s.H, s.W);
+    } else if (s.kind == UpStage::kUp) {
+      SharedBuffer& u = ops.upsample(dummy, s.H, s.W, s.cin);
+      ops.conv3x3(u, 2 * s.H, 2 * s.W, *s.up);
+    } else {
+      SharedBuffer& xn = ops.gnorm(dummy, hw, _norm_out);
+      ops.conv3x3(xn, s.H, s.W, _conv_out);
+    }
+    if (ops.max_elems > kWholeMaxElems || plane_bytes(p) / 2 > kWholeMaxElems) {
+      return (std::size_t)-1;
+    }
+    return ops.bytes;
+  };
+
+  // ---- choose: the least recompute that fits ---------------------------
+  // State (s, k): plane s is held whole and every statistic before tap k
+  // is known. From it: run stage s WHOLE (its own statistics, as decode()
+  // would) if it fits; take tap k directly when it is plane s's own; or
+  // run tap k's pass from s, optionally keeping a plane q in (s, p_k] of
+  // that pass whole to become the next source. With every tap known, a
+  // final pass from s draws the picture. Memoized over (s, k).
+  enum Move : int { kWhole, kDirect, kPass, kFinal };
+  struct Choice { double cost = -1.0; Move mv = kFinal; int q = -1; };
+  const double kInf = 1e300;
+  std::vector<Choice> memo((std::size_t)(N + 1) * (K + 1));
+  std::vector<std::size_t> wb((std::size_t)N, 0);
+  for (int p = 0; p < N; ++p) { wb[(std::size_t)p] = whole_bytes(p); }
+  auto first_tap_from = [&](int p) {
+    int k = 0;
+    while (k < K && taps[(std::size_t)k].p < p) { ++k; }
+    return k;
+  };
+  std::function<double(int, int)> best = [&](int s, int k) -> double {
+    if (s >= N) { return 0.0; }
+    Choice& c = memo[(std::size_t)s * (K + 1) + k];
+    if (c.cost >= 0.0) { return c.cost; }
+    c.cost = kInf;
+    const std::size_t held = plane_bytes(s) + fixed;
+    auto consider = [&](double v, Move mv, int q) {
+      if (v < c.cost) { c.cost = v; c.mv = mv; c.q = q; }
+    };
+    // Whole: the stage's own statistics, its output the next source.
+    if (wb[(std::size_t)s] != (std::size_t)-1 &&
+        held + wb[(std::size_t)s] <= budget) {
+      const int nk = std::max(k, first_tap_from(s + 1));
+      consider(stage_work(s) + best(s + 1, nk), kWhole, -1);
+    }
+    if (k == K) {
+      // Every statistic known: one pass draws the picture from here.
+      if (held + tile_bytes(s, N - 1, 1, kTileFloor) <= budget) {
+        consider(chain_work(s, N - 1, 1), kFinal, -1);
+      }
+      return c.cost;
+    }
+    const Tap tp = taps[(std::size_t)k];
+    if (tp.depth == 0 && tp.p == s) {
+      consider((double)st[s].H * st[s].W * st[s].cin * kEltMac / 2 +
+               best(s, k + 1), kDirect, -1);
+      return c.cost;
+    }
+    const double w = chain_work(s, tp.p, tp.depth) +
+                     (double)st[tp.p].H * st[tp.p].W * kEltMac;
+    const std::size_t tb = tile_bytes(s, tp.p, tp.depth, kTileFloor);
+    if (tb != (std::size_t)-1 && held + tb <= budget) {
+      consider(w + best(s, k + 1), kPass, -1);
+    }
+    const std::size_t tbs = tile_bytes(s, tp.p, tp.depth, kStoreTileFloor);
+    for (int q = s + 1; q <= tp.p; ++q) {
+      if (tbs == (std::size_t)-1 || held + plane_bytes(q) + tbs > budget) {
+        continue;
+      }
+      consider(w + best(q, k + 1), kPass, q);
+    }
+    return c.cost;
+  };
+  const double plan_cost = best(0, 0);
+  if (!(plan_cost < kInf)) {
+    return fail(fmt("exact tiled decode: no plan fits {} MB", budget >> 20)());
+  }
+
+  // ---- run it ------------------------------------------------------------
+  SharedBuffer rgb_il = mc->make_shared_buffer(rgb_bytes);
+  if (rgb_il.empty()) { return fail("exact tiled decode: output failed"); }
+  int s = 0, k = 0, n_whole = 0, n_pass = 0, n_tiles = 0, n_kept = 0;
+  std::size_t peak_plan = 0;
+  auto reduce_tap = [&](ComputeEncoder& enc, const SharedBuffer& dst, int t,
+                        int depth) {
+    const int C = depth == 1 && st[t].kind == UpStage::kRes ? st[t].cout
+                                                             : st[t].cin;
+    enc.set_function(_fn_gn_reduce);
+    enc.set_buffer(0, part); enc.set_buffer(1, dst);
+    enc.set_constant(2, st[t].H * st[t].W); enc.set_constant(3, C);
+    enc.set_constant(4, G); enc.set_constant(5, (int)kGnBlocks);
+    enc.set_constant(6, geps);
+    enc.dispatch({(unsigned)(256 * G), 1, 1}, {256, 1, 1});
+  };
+  // What this process actually holds on the GPU, sampled at every commit
+  // -- the check on the plan, which otherwise only describes itself.
+  std::size_t peak_seen = 0;
+  const std::size_t graphics0 = mb0.self_graphics;
+  auto commit = [&](CommandStream& stream, const char* what) -> bool {
+    _flops.flush(stream);
+    std::string ge;
+    if (!stream.commit().wait_ok(&ge)) {
+      if (err != nullptr) {
+        *err = std::string("exact tiled decode: ") + what + " failed" +
+               (ge.empty() ? std::string() : ": " + ge);
+      }
+      return false;
+    }
+    const std::size_t g = mc->memory_budget().self_graphics;
+    if (g > graphics0) { peak_seen = std::max(peak_seen, g - graphics0); }
+    return true;
+  };
+  // Between steps that free one working set and allocate the next: the
+  // freed one is still on its way back for up to a second, and holding
+  // both is exactly the overshoot the budget was meant to prevent.
+  auto settle = [&] { (void)mc->memory_budget_settled(); };
+  while (s < N) {
+    const Choice c = memo[(std::size_t)s * (K + 1) + k];
+    if (c.mv == kWhole) {
+      const UpStage& sp = st[s];
+      CommandStream stream = mc->make_command_stream();
+      ComputeEncoder enc = stream.begin_compute();
+      Ops ops(*this, &enc);
+      ops.col = &col; ops.col_cap = col_cap;
+      const std::size_t hw = (std::size_t)sp.H * sp.W;
+      const SharedBuffer* out = nullptr;
+      if (sp.kind == UpStage::kRes) {
+        out = &ops.resblock(*sp.rb, store, sp.H, sp.W);
+      } else if (sp.kind == UpStage::kUp) {
+        SharedBuffer& u = ops.upsample(store, sp.H, sp.W, sp.cin);
+        out = &ops.conv3x3(u, 2 * sp.H, 2 * sp.W, *sp.up);
+        ops.release(u);
+      } else {
+        SharedBuffer& xn = ops.gnorm(store, hw, _norm_out);
+        ops.silu(xn, hw * _norm_out.c);
+        out = &ops.conv3x3(xn, sp.H, sp.W, _conv_out);
+        ops.release(xn);
+        ops.clamp(*out, hw * 3);
+      }
+      enc.end();
+      peak_plan = std::max(peak_plan, plane_bytes(s) + fixed + ops.bytes);
+      if (!ops.alloc_ok) { return fail("exact tiled decode: alloc failed"); }
+      if (!commit(stream, "a whole stage")) { return {}; }
+      if (sp.kind == UpStage::kOut) {
+        rgb_il = ops.take(*out);
+      } else {
+        store = ops.take(*out);
+      }
+      ++n_whole;
+      k = std::max(k, first_tap_from(s + 1));
+      ++s;
+      settle();
+      continue;
+    }
+    if (c.mv == kDirect) {
+      CommandStream stream = mc->make_command_stream();
+      ComputeEncoder enc = stream.begin_compute();
+      enc.set_function(_fn_gn_stats_rect);
+      enc.set_buffer(0, store); enc.set_buffer(1, part);
+      enc.set_constant(2, st[s].W); enc.set_constant(3, st[s].cin);
+      enc.set_constant(4, 0); enc.set_constant(5, 0);
+      enc.set_constant(6, st[s].H); enc.set_constant(7, st[s].W);
+      enc.set_constant(8, (int)kGnBlocks); enc.set_constant(9, 0);
+      enc.dispatch({(unsigned)(256 * kGnBlocks), 1, 1}, {256, 1, 1});
+      reduce_tap(enc, s1[(std::size_t)s], s, 0);
+      enc.end();
+      if (!commit(stream, "a statistics read")) { return {}; }
+      ++k;
+      continue;
+    }
+    // A tiled pass: tap k (or, with k == K, the final picture).
+    const bool final_pass = c.mv == kFinal;
+    const int t = final_pass ? N - 1 : taps[(std::size_t)k].p;
+    const int depth = final_pass ? 1 : taps[(std::size_t)k].depth;
+    const int q = final_pass ? -1 : c.q;
+    std::size_t held = plane_bytes(s) + fixed;
+    SharedBuffer kept;
+    if (q >= 0) {
+      kept = mc->make_shared_buffer(plane_bytes(q));
+      if (kept.empty()) {
+        return fail("exact tiled decode: kept plane failed");
+      }
+      held += plane_bytes(q);
+    }
+    const int T = pick_tile(s, t, depth, budget > held ? budget - held : 0,
+                            q >= 0 ? kStoreTileFloor : kTileFloor);
+    if (T <= 0) { return fail("exact tiled decode: a pass no longer fits"); }
+    PassIo io;
+    io.src = &store; io.q = q; io.store_q = q >= 0 ? &kept : nullptr;
+    io.tap = !final_pass; io.rgb = final_pass ? &rgb_il : nullptr;
+    Ops ops(*this, nullptr);
+    ops.col = &col; ops.col_cap = col_cap; ops.best_fit = true;
+    const int TH = st[t].H, TW = st[t].W;
+    // THE LARGEST TILE FIRST. Tiles at the picture's edge have halo on
+    // fewer sides, so their frames are smaller; run in raster order, the
+    // corner tile sized the pool and every larger tile after it grew a
+    // second set beside the first -- MEASURED on a 16 GB M5 at 4096^2, a
+    // 13 GB pass planned into 7.3 GB. Sized by the same dry run that
+    // planned it, the first tile's buffers serve every tile after it.
+    std::vector<std::pair<std::size_t, Rect>> tiles;
+    for (int y0 = 0; y0 < TH; y0 += T) {
+      for (int x0 = 0; x0 < TW; x0 += T) {
+        const Rect rt{y0, std::min(TH, y0 + T), x0, std::min(TW, x0 + T)};
+        Ops d(*this, nullptr);
+        d.best_fit = true;
+        PassIo none;
+        run_tile(d, s, t, depth, rt, none);
+        tiles.emplace_back(d.bytes, rt);
+      }
+    }
+    std::stable_sort(tiles.begin(), tiles.end(),
+                     [](const auto& a, const auto& b) {
+                       return a.first > b.first;
+                     });
+    for (const auto& tile : tiles) {
+      CommandStream stream = mc->make_command_stream();
+      ComputeEncoder enc = stream.begin_compute();
+      ops.enc = &enc;
+      run_tile(ops, s, t, depth, tile.second, io);
+      enc.end();
+      ops.enc = nullptr;
+      if (!ops.alloc_ok) { return fail("exact tiled decode: alloc failed"); }
+      if (!commit(stream, "a tile")) { return {}; }
+      ++n_tiles;
+    }
+    peak_plan = std::max(peak_plan, held + ops.bytes);
+    ops.clear();
+    if (!final_pass) {
+      CommandStream stream = mc->make_command_stream();
+      ComputeEncoder enc = stream.begin_compute();
+      reduce_tap(enc, depth == 1 ? s2[(std::size_t)t] : s1[(std::size_t)t],
+                 t, depth);
+      enc.end();
+      if (!commit(stream, "a statistics reduce")) { return {}; }
+    }
+    ++n_pass;
+    if (final_pass) { break; }
+    ++k;
+    if (q >= 0) { store = std::move(kept); s = q; ++n_kept; }
+    settle();
+  }
+
+  // Interleaved -> planar, as decode() reads back.
+  SharedBuffer out = mc->make_shared_buffer(rgb_bytes);
+  if (out.empty()) { return fail("exact tiled decode: output failed"); }
+  {
+    const auto* sp = static_cast<const _Float16*>(rgb_il.contents());
+    auto* d = static_cast<_Float16*>(out.contents());
+    const std::size_t hw = (std::size_t)Hout * Wout;
+    for (std::size_t p = 0; p < hw; ++p) {
+      for (int c = 0; c < 3; ++c) {
+        d[(std::size_t)c * hw + p] = sp[p * 3 + c];
+      }
+    }
+  }
+  _report.exact = true;
+  _report.whole_stages = n_whole;
+  _report.passes = n_pass;
+  _report.tiles = n_tiles;
+  _report.kept = n_kept;
+  _report.work = whole_work > 0 ? plan_cost / whole_work : 0.0;
+  if (mc->session() != nullptr) {
+    const MetalCompute::MemoryBudget mb1 = mc->memory_budget();
+    auto grew = [](std::size_t a, std::size_t b) -> long long {
+      return ((long long)b - (long long)a) / (1 << 20);
+    };
+    mc->session()->log_normal(fmt(
+        "FLUX.2 VAE decode: EXACT TILED {}x{} in {} MB -- mid block whole, "
+        "{} stage(s) whole, {} tiled pass(es) over {} tiles, {} plane(s) "
+        "kept, ~{:.2f}x a whole decode's up-path work, peak ~{} MB planned "
+        "/ {} MB measured, {} ms; swap {:+} MB, compressed (this process) "
+        "{:+} MB",
+        Wout, Hout, budget >> 20, n_whole, n_pass, n_tiles, n_kept,
+        whole_work > 0 ? plan_cost / whole_work : 0.0, peak_plan >> 20,
+        peak_seen >> 20,
+        (long long)std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_start).count(),
+        grew(mb0.swap_used, mb1.swap_used),
+        grew(mb0.self_compressed, mb1.self_compressed)));
+  }
+  return out;
+}
+
 SharedBuffer
 MetalFlux2Vae::decode_tiled_(const SharedBuffer& z, int h16, int w16,
                              int tile16, std::string* err)
@@ -1486,6 +2387,7 @@ MetalFlux2Vae::decode_tiled_(const SharedBuffer& z, int h16, int w16,
 SharedBuffer
 MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
 {
+  _report = DecodeReport{};
   auto fail = [&](std::string m) -> SharedBuffer {
     if (err != nullptr) { *err = std::move(m); }
     return {};
@@ -1498,14 +2400,17 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     return fail("input latent smaller than [dit_channels, h16, w16]");
   }
   MetalCompute* mc = _mc;
-  const int G = _cfg.norm_groups;
-  const float geps = _cfg.norm_eps;
   int h8 = h16 * P, w8 = w16 * P;                // latent spatial after unpatch
   const int Hout = h8 * 8, Wout = w8 * 8;        // conv trunk is 8x
 
   std::size_t decode_headroom = 0;   // free working set, for the im2col band cap
+  std::size_t exact_budget = 0;      // non-zero: decode exactly, in tiles
   {
-    const MetalCompute::MemoryBudget mb = mc->memory_budget();
+    // SETTLED: a DiT freed to make room for this decode is still on its
+    // way back to the system for up to a second, and a budget read before
+    // it lands plans the decode into what the DiT left -- MEASURED on a
+    // 16 GB M5 after a 4096^2 FLUX.3 denoise, 284 MB instead of ~8 GB.
+    const MetalCompute::MemoryBudget mb = mc->memory_budget_settled();
     decode_headroom = (mb.recommended != 0) ? mb.headroom : 0;
     const std::size_t need = decode_peak_bytes(h16, w16);
     bool gpu_short = (mb.recommended != 0) && !mb.fits(need);
@@ -1524,26 +2429,19 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
         ram_short = need > budget_override;
       }
     }
-    // Force-tile knob (A/B and testing on a box that would otherwise fit).
+    // Force-tile knobs (A/B and testing on a box that would otherwise fit):
+    // VPIPE_VAE_TILE=<cells> the windowed decode, VPIPE_VAE_EXACT=1 the
+    // exact one.
     int forced = 0;
     if (const char* e = std::getenv("VPIPE_VAE_TILE")) { forced = std::atoi(e); }
-    if (gpu_short || ram_short || forced > 0) {
-      // Fall back to a TILED decode rather than refusing: the peak then tracks
-      // one window, not the output area. See decode_tiled_ for what this costs
-      // numerically (per-window attention). Tiling only helps if the window is
-      // actually smaller than the image -- if the whole latent already fits in
-      // one window and still does not fit in memory, there is nothing to split,
-      // so fail as before (this is also what terminates the recursion, since
-      // decode_tiled_ re-enters decode() per window).
-      // Size the window against the SAME MARGINED budgets the accept tests
-      // above use. fits()/fits_physical() keep 5%/10% back, so sizing against
-      // the raw figures hands back the largest window inside that reserve --
-      // which the window's own decode() then rejects. And because that window
-      // is the whole latent, the recursion has nowhere left to go and the
-      // decode fails outright instead of tiling. MEASURED on a 16 GB box at
-      // 2048x2048: need 7406 MB against 7796 MB reclaimable picked a 92-cell
-      // window, 10% over what fits_physical would accept, and no image above
-      // ~1.5K could decode at all.
+    const bool force_exact = std::getenv("VPIPE_VAE_EXACT") != nullptr;
+    const bool no_tile = std::getenv("VPIPE_VAE_NO_TILE") != nullptr;
+    if (gpu_short || ram_short || forced > 0 || force_exact) {
+      // Tile rather than refuse. Size against the SAME MARGINED budgets the
+      // accept tests above use: fits()/fits_physical() keep 5%/10% back.
+      // MEASURED on a 16 GB box at 2048x2048: sizing against the raw
+      // reclaimable figure picked a window 10% over what fits_physical
+      // accepted, which then refused itself.
       std::size_t budget = (std::size_t)-1;
       if (mb.available_physical != 0) {
         budget = (std::size_t)((double)mb.available_physical * 0.90);
@@ -1553,13 +2451,27 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
         if (gpu < budget) { budget = gpu; }
       }
       if (budget_override != 0) { budget = budget_override; }
-      int tile16 = (forced > 0) ? forced : decode_tile_side_(budget);
-      if (tile16 > 0 && (tile16 < h16 || tile16 < w16) &&
-          std::getenv("VPIPE_VAE_NO_TILE") == nullptr) {
-        return decode_tiled_(z, h16, w16, tile16, err);
+      // EXACT unless asked otherwise (decode_exact_): the same picture
+      // as a whole decode. The WINDOWED decode (decode_tiled_) is an
+      // approximation -- each window's attention and GroupNorm see only
+      // that window, which at small windows shifts the tone -- and stays
+      // for A/B (VPIPE_VAE_TILE, VPIPE_VAE_WINDOWED) and as the last
+      // resort when not even the exact decode's floor fits.
+      const bool windowed =
+          forced > 0 || std::getenv("VPIPE_VAE_WINDOWED") != nullptr;
+      if (!no_tile && !windowed) {
+        exact_budget = budget;
+      } else {
+        // Windowed: tiling only helps if the window is smaller than the
+        // image; a window that is the whole latent and still does not fit
+        // fails below (which also ends decode_tiled_'s recursion).
+        int tile16 = (forced > 0) ? forced : decode_tile_side_(budget);
+        if (tile16 > 0 && (tile16 < h16 || tile16 < w16) && !no_tile) {
+          return decode_tiled_(z, h16, w16, tile16, err);
+        }
       }
     }
-    if (gpu_short) {
+    if (exact_budget == 0 && gpu_short) {
       return fail(fmt(
           "insufficient GPU memory for a {}x{} decode: need ~{} MB, {} MB free "
           "of {} MB working set (lower the resolution or free other resident "
@@ -1569,7 +2481,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     // True-physical-pressure backstop: reclaimable RAM (counting mmap'd/clean
     // weight pages the OS can evict) must also cover the decode, else the GPU
     // command buffer would OOM mid-flight instead of a clean rejection here.
-    if (ram_short) {
+    if (exact_budget == 0 && ram_short) {
       return fail(fmt(
           "insufficient free RAM for a {}x{} decode: need ~{} MB, ~{} MB "
           "reclaimable (close other apps, lower the resolution, or free "
@@ -1605,39 +2517,38 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     }
   }
 
-  // Buffer pool: `alloc` reuses a released buffer of sufficient capacity rather
-  // than allocating a fresh one every op. The VAE is a serial feed-forward
-  // chain (DispatchType::Serial), so reusing a released buffer is safe -- serial
-  // dispatch orders the reuse strictly after the last read of the old contents,
-  // and an in-use buffer is never handed out (so an op's output never aliases a
-  // live input). This bounds the live set to the concurrent working set (~3
-  // top-res buffers) instead of the whole decode, so a 1024^2 decode fits one
-  // command buffer. VPIPE_FLUX2_NO_VAE_POOL disables reuse (then the per-level
-  // command-buffer split below bounds the peak instead).
-  struct Slot { SharedBuffer buf; std::size_t cap; bool used; };
-  std::deque<Slot> pool;
-  bool alloc_ok = true;
+  if (exact_budget != 0) {
+    std::string xerr;
+    SharedBuffer out = decode_exact_(latent, h8, w8, exact_budget, &xerr);
+    if (!out.empty()) { return out; }
+    // Not even the exact decode's floor fits (its mid block runs whole).
+    // The windowed decode is the last resort: a picture with per-window
+    // tone rather than none.
+    latent = SharedBuffer{};
+    const int tile16 = decode_tile_side_(exact_budget);
+    if (mc->session() != nullptr) {
+      mc->session()->warn(fmt(
+          "FLUX.2 VAE decode: {}; falling back to WINDOWED tiles of {} "
+          "latent cells, which see only themselves (expect a tone shift "
+          "between windows)", xerr, tile16));
+    }
+    if (tile16 > 0 && (tile16 < h16 || tile16 < w16)) {
+      return decode_tiled_(z, h16, w16, tile16, err);
+    }
+    return fail(xerr);
+  }
+
+  // Buffer pool (Ops): a released buffer of sufficient capacity is reused
+  // rather than a fresh one allocated every op. The VAE is a serial
+  // feed-forward chain (DispatchType::Serial), so reusing a released buffer
+  // is safe -- serial dispatch orders the reuse strictly after the last read
+  // of the old contents, and an in-use buffer is never handed out (so an
+  // op's output never aliases a live input). This bounds the live set to the
+  // concurrent working set (~3 top-res buffers) instead of the whole decode,
+  // so a 1024^2 decode fits one command buffer. VPIPE_FLUX2_NO_VAE_POOL
+  // disables reuse (then the per-level command-buffer split below bounds
+  // the peak instead).
   const bool use_pool = std::getenv("VPIPE_FLUX2_NO_VAE_POOL") == nullptr;
-  auto alloc = [&](std::size_t e) -> SharedBuffer& {
-    const std::size_t bytes = e * 2;
-    if (use_pool) {
-      for (auto& s : pool) {
-        if (!s.used && !s.buf.empty() && s.cap >= bytes) {
-          s.used = true;
-          return s.buf;
-        }
-      }
-    }
-    pool.push_back(Slot{mc->make_shared_buffer(bytes), bytes, true});
-    if (pool.back().buf.empty()) { alloc_ok = false; }
-    return pool.back().buf;
-  };
-  auto release = [&](const SharedBuffer& b) {
-    if (!use_pool) { return; }
-    for (auto& s : pool) {
-      if (&s.buf == &b) { s.used = false; return; }
-    }
-  };
   // im2col band scratch (ROW-TILED). im2col convs stream their [H*W, 9*cin]
   // expansion in output-row bands so the shared col scratch is bounded to ONE
   // band -- a 1024^2 im2col is otherwise ~2.4 GB (conv_out, 128-ch, even on the
@@ -1701,114 +2612,16 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
   const bool vae_split = std::getenv("VPIPE_FLUX2_NO_VAE_SPLIT") == nullptr;
   const bool vprof = std::getenv("VPIPE_FLUX2_VAE_PROFILE") != nullptr;
   bool split_ok = true;
+  // Outlives the encoder block below: the picture it returns is a pooled
+  // buffer read after the last commit.
+  Ops ops(*this, nullptr);
+  ops.col = &im2col_scratch; ops.col_cap = im2col_cap;
+  ops.use_pool = use_pool;
+  auto release = [&](const SharedBuffer& b) { ops.release(b); };
   _flops.begin();
   {
     ComputeEncoder enc = stream.begin_compute();
-    auto conv3x3 = [&](const SharedBuffer& in, int H, int W,
-                       const Conv& c) -> SharedBuffer& {
-      const std::size_t hw = (std::size_t)H * W;
-      SharedBuffer& out = alloc(hw * c.cout);
-      // Whichever route runs it: an [H*W, 9*cin] x [9*cin, cout] product.
-      _flops.gemm((long long)hw, c.cout, 9LL * c.cin);
-      // NAX hardware conv when the shape tiles; else row-tiled im2col + GEMM
-      // (streams the [hw, 9*cin] im2col in bands through im2col_scratch).
-      if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/1)) { return out; }
-      // Small cout (the final conv to 3 / 2*latent) never satisfies the
-      // hardware conv's cout % 64; a direct pass beats materializing im2col.
-      if (conv3x3_small_cout_(enc, in, c, out, H, W, /*stride=*/1)) {
-        return out;
-      }
-      tiled_conv3x3_(enc, in, out, H, W, c, /*stride=*/1, im2col_scratch,
-                     im2col_cap);
-      return out;
-    };
-    auto conv1x1 = [&](const SharedBuffer& in, std::size_t hw,
-                       const Conv& c) -> SharedBuffer& {
-      SharedBuffer& out = alloc(hw * c.cout);
-      _flops.gemm((long long)hw, c.cout, c.cin);
-      conv_gemm_bias_(enc, in, c.w, c.b, out, (int)hw, c.cout, c.cin);
-      return out;
-    };
-    auto gnorm = [&](const SharedBuffer& in, std::size_t hw, const GNorm& n)
-        -> SharedBuffer& {
-      SharedBuffer& out = alloc(hw * n.c);
-      group_norm_(enc, in, n.g, n.b, out, (int)hw, n.c, G, geps);
-      return out;
-    };
-    auto silu = [&](const SharedBuffer& x, std::size_t n) {
-      enc.set_function(_fn_mul_sigmoid);
-      enc.set_buffer(0, x); enc.set_buffer(1, x); enc.set_buffer(2, x);
-      enc.set_constant(3, (int)n);
-      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
-    };
-    auto resadd = [&](const SharedBuffer& a, const SharedBuffer& b,
-                      std::size_t n) -> SharedBuffer& {
-      SharedBuffer& out = alloc(n);
-      enc.set_function(_fn_residual);
-      enc.set_buffer(0, a); enc.set_buffer(1, b); enc.set_buffer(2, out);
-      enc.set_constant(3, (int)n);
-      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
-      return out;
-    };
-    auto upsample = [&](const SharedBuffer& in, int H, int W, int C)
-        -> SharedBuffer& {
-      SharedBuffer& out = alloc((std::size_t)4 * H * W * C);
-      const std::size_t rows = (std::size_t)4 * H * W;     // 2H * 2W pixels
-      enc.set_function(_fn_upsample);
-      enc.set_buffer(0, in); enc.set_buffer(1, out);
-      enc.set_constant(2, H); enc.set_constant(3, W); enc.set_constant(4, C);
-      // 2D grid {C, 4*H*W}: gid = pixel*C + c (a 1D {4*H*W*C} grid overflows
-      // the int index and the grid dimension past ~3K px).
-      enc.dispatch({(unsigned)C, (unsigned)rows, 1}, {256, 1, 1});
-      return out;
-    };
-    // Residual input `x` is held live through to the resadd (read twice); the
-    // internal temporaries are released as soon as their consumer is enqueued.
-    auto resblock = [&](const ResBlock& rb, const SharedBuffer& x, int H, int W)
-        -> SharedBuffer& {
-      const std::size_t hw = (std::size_t)H * W;
-      SharedBuffer& t = gnorm(x, hw, rb.n1);
-      silu(t, hw * rb.cin);
-      SharedBuffer& t1 = conv3x3(t, H, W, rb.c1);
-      release(t);
-      SharedBuffer& t2 = gnorm(t1, hw, rb.n2);
-      release(t1);
-      silu(t2, hw * rb.cout);
-      SharedBuffer& t3 = conv3x3(t2, H, W, rb.c2);
-      release(t2);
-      if (rb.has_short) {
-        SharedBuffer& h = conv1x1(x, hw, rb.shortcut);
-        SharedBuffer& out = resadd(t3, h, hw * rb.cout);
-        release(t3); release(h);
-        return out;
-      }
-      SharedBuffer& out = resadd(t3, x, hw * rb.cout);
-      release(t3);
-      return out;
-    };
-    auto attention = [&](const Attn& a, const SharedBuffer& x, int H, int W)
-        -> SharedBuffer& {
-      const std::size_t hw = (std::size_t)H * W;
-      const int C = a.dim;
-      SharedBuffer& n = gnorm(x, hw, a.n);
-      SharedBuffer& q = conv1x1(n, hw, a.q);
-      SharedBuffer& k = conv1x1(n, hw, a.k);
-      SharedBuffer& v = conv1x1(n, hw, a.v);
-      release(n);                          // consumed by q, k, v
-      SharedBuffer& att = alloc(hw * C);
-      const float scale = 1.0f / std::sqrt((float)C);
-      // The member is chosen ONCE, by measurement, in autotune_mid_attn_.
-      _flops.attention(1, (long long)hw * (long long)hw, C);
-      encode_mid_attn_(enc, _attn_pick, q, k, v, att, hw, C, scale,
-                       [&](std::size_t n) -> SharedBuffer& { return alloc(n); },
-                       [&](const SharedBuffer& b) { release(b); });
-      release(q); release(k); release(v);  // consumed by the sdpa
-      SharedBuffer& p = conv1x1(att, hw, a.proj);
-      release(att);
-      SharedBuffer& out = resadd(p, x, hw * C);
-      release(p);
-      return out;
-    };
+    ops.enc = &enc;
 
     // Per-section GPU timing (VPIPE_FLUX2_VAE_PROFILE). Like the DiT profiler,
     // `mark` closes the command buffer and waits, so the sections serialize
@@ -1841,10 +2654,8 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
       _flops.flush(stream);
       std::string ge;
       if (!stream.commit().wait_ok(&ge)) { split_ok = false; }
-      for (auto& s : pool) {
-        if (&s.buf == xp) { carry = std::move(s.buf); break; }
-      }
-      pool.clear();
+      if (xp != &carry) { carry = ops.take(*xp); }
+      ops.clear();
       xp = &carry;
       stream = mc->make_command_stream();
       enc = stream.begin_compute();
@@ -1853,45 +2664,42 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     // post_quant_conv is optional (absent on the plain AutoencoderKL).
     const SharedBuffer* x = _post_quant.w.empty()
                                 ? &latent
-                                : &conv1x1(latent, hw8, _post_quant);
+                                : &ops.conv1x1(latent, hw8, _post_quant);
     // Feed-forward chain: after each op, release the activation it just consumed
     // so the pool can reuse that buffer (resblock/attention release their own
     // temporaries internally; each holds its residual input through the resadd).
     auto step = [&](const SharedBuffer& nx) { release(*x); x = &nx; };
-    step(conv3x3(*x, H, W, _conv_in));
+    step(ops.conv3x3(*x, H, W, _conv_in));
     mark(fmt("conv_in {}x{}", H, W)());
-    step(resblock(_mid_res0, *x, H, W));
+    step(ops.resblock(_mid_res0, *x, H, W));
     mark("mid_res0");
-    step(attention(_mid_attn, *x, H, W));
+    step(ops.attention(_mid_attn, *x, H, W));
     mark("mid_attn");
-    step(resblock(_mid_res1, *x, H, W));
+    step(ops.resblock(_mid_res1, *x, H, W));
     mark("mid_res1");
     for (const UpBlock& ub : _up_blocks) {
       const int lvl = (int)(&ub - _up_blocks.data());
-      for (const ResBlock& rb : ub.resnets) { step(resblock(rb, *x, H, W)); }
+      for (const ResBlock& rb : ub.resnets) {
+        step(ops.resblock(rb, *x, H, W));
+      }
       mark(fmt("up{} res x{} {}x{}c{}", lvl, (int)ub.resnets.size(), H, W,
                ub.resnets.empty() ? 0 : ub.resnets.back().cout)());
       if (ub.has_up) {
-        step(upsample(*x, H, W, ub.up_dim));
+        step(ops.upsample(*x, H, W, ub.up_dim));
         H *= 2; W *= 2;
-        step(conv3x3(*x, H, W, ub.up));
+        step(ops.conv3x3(*x, H, W, ub.up));
         mark(fmt("up{} upsample+conv -> {}x{}c{}", lvl, H, W,
                  ub.up.cout)());
       }
       flush(x);            // pool off: bound the working set to ~one up-block
     }
-    SharedBuffer& xn = gnorm(*x, (std::size_t)H * W, _norm_out);
+    SharedBuffer& xn = ops.gnorm(*x, (std::size_t)H * W, _norm_out);
     release(*x);
-    silu(xn, (std::size_t)H * W * _cfg.block_out[0]);
+    ops.silu(xn, (std::size_t)H * W * _cfg.block_out[0]);
     mark(fmt("norm_out+silu {}x{}", H, W)());
-    SharedBuffer& rgb = conv3x3(xn, H, W, _conv_out);
+    SharedBuffer& rgb = ops.conv3x3(xn, H, W, _conv_out);
     release(xn);
-    const int n = H * W * 3;
-    enc.set_function(_fn_clamp);
-    enc.set_buffer(0, rgb); enc.set_buffer(1, rgb);
-    enc.set_constant(2, n); enc.set_constant(3, -1.0f);
-    enc.set_constant(4, 1.0f);
-    enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+    ops.clamp(rgb, (std::size_t)H * W * 3);
     mark(fmt("norm_out+conv_out {}x{}", H, W)());
     rgb_ptr = &rgb;
     if (vprof && mc->session() != nullptr) {
@@ -1906,8 +2714,9 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
           "FLUX.2 VAE decode profile ({}x{} out, GPU {} ms total):{}",
           H, W, (long)tot, body));
     }
+    ops.enc = nullptr;
   }
-  if (!alloc_ok) { return fail("a decode intermediate allocation failed"); }
+  if (!ops.alloc_ok) { return fail("a decode intermediate allocation failed"); }
   if (!split_ok) { return fail("GPU decode ran out of memory at a level "
                                "boundary (lower the resolution)"); }
   std::string gpu_err;

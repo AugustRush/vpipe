@@ -54,11 +54,13 @@ const ConfigKey kAttrs[] = {
           "1920x1152, ~2.5 GB at 512x512 -- and restores clips otherwise",
    .def_str = "auto"},
   {.key = "clip_frames", .type = ConfigType::Int, .required = false,
-   .doc = "when restoring CLIPS: source frames per clip, 8k+1 and at least "
-          "25. Each restores its first clip_frames - 4 (the last four are "
-          "the model's look-ahead). Longer clips cost the overlap less often "
-          "and hold more while they run (41)",
-   .def_int = 41},
+   .doc = "when restoring CLIPS: source frames per clip -- whole chunks, "
+          "8k+1 and at least 25 for FlashVSR-v1.1, 16k+1 for FlashVSR+ "
+          "(rounded up to that). Each restores its first clip_frames - 4 "
+          "(the last four are the model's look-ahead). Longer clips cost "
+          "the overlap less often and hold more while they run (0, the "
+          "default: 41 for v1.1, 49 for FlashVSR+)",
+   .def_int = 0},
   {.key = "blend_frames", .type = ConfigType::Int, .required = false,
    .doc = "when restoring CLIPS: restored frames each clip shares with the "
           "next, which the decode cross-fades from one to the other (a "
@@ -67,8 +69,10 @@ const ConfigKey kAttrs[] = {
    .def_int = 8},
   {.key = "color_fix", .type = ConfigType::Bool, .required = false,
    .doc = "carry each restored frame's source colour statistics, for the "
-          "decode to match its channels to them (AdaIN) -- the colour fix "
-          "the FlashVSR reference applies by default (true)",
+          "decode to match its channels to them (AdaIN). Unset, it follows "
+          "the release's own reference: on for FlashVSR-v1.1, which "
+          "applies it by default, and off for FlashVSR+, whose model holds "
+          "its colour without it",
    .def_bool = true},
 };
 const PortSpec kIports[] = {
@@ -145,16 +149,26 @@ FlashVsrSrcEncoderStage::FlashVsrSrcEncoderStage(
     fail_config(fmt("FlashVsrSrcEncoderStage('{}'): continuity must be "
                     "auto, stream or clips; got '{}'", this->id(), c));
   }
+  // Unset, the colour fix follows the release, which is known only once
+  // the model is: see ensure_loaded_().
+  {
+    // this->: the constructor's own `config` parameter, moved from by
+    // now, shadows the accessor.
+    const FlexData& c = this->config();
+    _color_fix_set = c.is_object() && c.as_object().contains("color_fix");
+  }
   _color_fix = attr_bool("color_fix");
-  _clip_frames = (int)attr_int("clip_frames");
+  _cfg_clip_frames = (int)attr_int("clip_frames");
   _blend_frames = (int)attr_int("blend_frames");
-  if (_clip_frames < 25 || (_clip_frames - 1) % 8 != 0) {
-    fail_config(fmt("FlashVsrSrcEncoderStage('{}'): clip_frames must be 8k+1 "
-                    "and at least 25; got {}", this->id(), _clip_frames));
-  } else if (_blend_frames < 0 || _blend_frames >= _clip_frames - 4) {
-    fail_config(fmt("FlashVsrSrcEncoderStage('{}'): blend_frames must be in "
-                    "[0, clip_frames - 4); got {}", this->id(),
-                    _blend_frames));
+  // The clip's frame rule is the release's, checked at load; what any
+  // release needs is a whole chunk past the look-ahead.
+  if (_cfg_clip_frames != 0 && _cfg_clip_frames < 17) {
+    fail_config(fmt("FlashVsrSrcEncoderStage('{}'): clip_frames must be at "
+                    "least 17, or 0 for the release's own; got {}",
+                    this->id(), _cfg_clip_frames));
+  } else if (_blend_frames < 0) {
+    fail_config(fmt("FlashVsrSrcEncoderStage('{}'): blend_frames must be "
+                    ">= 0; got {}", this->id(), _blend_frames));
   }
 }
 
@@ -260,11 +274,39 @@ FlashVsrSrcEncoderStage::ensure_loaded_()
         "'{}': {}; inert", this->id(), root, err));
     return false;
   }
+  // THE RELEASE SETS THE CADENCE: how many source frames open the
+  // stream and how many each later chunk takes -- 25 then 8 for v1.1, 17
+  // then 16 for FlashVSR+.
+  _sch = genai::flashvsr_schedule(layout);
+  if (!_color_fix_set) { _color_fix = !_sch.is_plus(); }
+  // A clip is whole chunks: rounded UP to the release's rule, so a graph
+  // written for one release runs on the other.
+  _clip_frames = _cfg_clip_frames > 0 ? _cfg_clip_frames
+                                      : (_sch.is_plus() ? 49 : 41);
+  const int aligned = genai::MetalFlashVsrTransformer::align_frames(
+      _sch, std::max(_clip_frames, (int)_sch.frames_through(0)));
+  if (aligned != _clip_frames && _cfg_clip_frames > 0) {
+    session()->info(fmt(
+        "FlashVsrSrcEncoderStage('{}'): clip_frames {} is not whole chunks "
+        "of this release; restoring clips of {}", this->id(), _clip_frames,
+        aligned));
+  }
+  _clip_frames = aligned;
+  if (_blend_frames >= _clip_frames - 4) {
+    session()->warn(fmt(
+        "FlashVsrSrcEncoderStage('{}'): blend_frames {} leaves a {}-frame "
+        "clip nothing of its own; blending {}", this->id(), _blend_frames,
+        _clip_frames, _clip_frames - 5));
+    _blend_frames = _clip_frames - 5;
+  }
   session()->info(fmt(
-      "FlashVsrSrcEncoderStage('{}'): source projection {} wide, {} output "
-      "layer(s), {}x{} pixel unshuffle -- no prompt and no text encoder",
-      this->id(), _proj->config().out_dim, _proj->config().n_out_layers,
-      _proj->config().shuffle_w, _proj->config().shuffle_h));
+      "FlashVsrSrcEncoderStage('{}'): {} source projection, {} wide, {} "
+      "output layer(s), {}x{} pixel unshuffle -- no prompt and no text "
+      "encoder; chunks of {} source frames{}", this->id(),
+      layout.plus ? "FlashVSR+ " + layout.variant : std::string("v1.1"),
+      _proj->config().out_dim, _proj->config().n_out_layers,
+      _proj->config().shuffle_w, _proj->config().shuffle_h,
+      4 * _sch.chunk_latents, _color_fix ? ", colour fix on" : ""));
   return true;
 }
 
@@ -554,9 +596,12 @@ FlashVsrSrcEncoderStage::feed_chunk_(long long origin, int c,
                                      std::string* err)
 {
   // THE REFERENCE'S CALL PATTERN, from `origin`: the opening chunk feeds
-  // frames [0, 25) as seven slices, the first a single frame that seeds
-  // the carries and yields nothing; chunk c >= 1 feeds [8c + 17, 8c + 25)
-  // as two.
+  // a single frame that seeds the carries and yields nothing, then four
+  // frames per latent frame -- frames [0, 25) as seven slices for v1.1,
+  // [0, 17) as five for FlashVSR+; every later chunk feeds four per
+  // latent frame -- v1.1's chunk c [8c + 17, 8c + 25) as two slices,
+  // FlashVSR+'s [16c + 1, 16c + 17) as four. Both releases' references
+  // drive their projection exactly so.
   const std::size_t frame_px = (std::size_t)3 * _sh * _sw;
   auto feed = [&](long long lo, long long hi) {
     int rf = 0;
@@ -564,14 +609,13 @@ FlashVsrSrcEncoderStage::feed_chunk_(long long origin, int c,
         _pending.data() + (std::size_t)(origin + lo - _pend_g0) * frame_px,
         (int)(hi - lo), _sh, _sw, rows, &rf, err);
   };
-  if (c == 0) {
-    for (int j = 0; j < 7; ++j) {
-      if (!feed(std::max(0, j * 4 - 3), j * 4 + 1)) { return false; }
-    }
-    return true;
+  long long b = c == 0 ? 1 : _sch.frames_through(c - 1);
+  if (c == 0 && !feed(0, 1)) { return false; }
+  const int n = c == 0 ? _sch.open_latents : _sch.chunk_latents;
+  for (int j = 0; j < n; ++j, b += 4) {
+    if (!feed(b, b + 4)) { return false; }
   }
-  const long long b = 8LL * c + 17;
-  return feed(b, b + 4) && feed(b + 4, b + 8);
+  return true;
 }
 
 // A STREAM's chunks: every chunk the frames received so far complete.
@@ -585,18 +629,21 @@ FlashVsrSrcEncoderStage::drive_chunks_(
   if (!_open || _received == 0) { return true; }
   if (flush) {
     // Enough chunks that the restored frames reach the last real one:
-    // the opening chunk restores frames [0, 21), chunk c [8c + 13,
-    // 8c + 21), and each reads four frames past what it restores.
-    const int last = _received <= 21
+    // chunk c restores [restored_begin(c), restored_end(c)) -- v1.1's
+    // opening one [0, 21), its later ones eight more each; FlashVSR+'s
+    // [0, 13), then sixteen more -- and reads four frames past that.
+    const long long open_end = _sch.restored_end(0);
+    const long long step = 4LL * _sch.chunk_latents;
+    const int last = _received <= open_end
                          ? 0
-                         : (int)((_received - 21 + 7) / 8);
+                         : (int)((_received - open_end + step - 1) / step);
     if (last < _next_chunk) { return true; }
-    pad_to_(8LL * last + 25);
+    pad_to_(_sch.frames_through(last));
   }
   const long long avail = _received + _padded;
   for (;;) {
     const int c = _next_chunk;
-    const long long end = c == 0 ? 25 : 8LL * c + 25;
+    const long long end = _sch.frames_through(c);
     if (end > avail) { break; }
     if (!feed_chunk_(0, c, rows, err)) { return false; }
     ++_next_chunk;
@@ -637,7 +684,8 @@ FlashVsrSrcEncoderStage::next_clip_(bool flush, std::string* err)
   // need padding for its four frames of look-ahead alone and still leave
   // real frames to the next -- which then needs its tail to blend into.
   const bool last = flush && S + out_len >= _received;
-  const int chunks = (L - 1) / 8 - 2;
+  const int chunks =
+      genai::MetalFlashVsrTransformer::chunks_of(_sch, L);
   std::vector<metal_compute::SharedBuffer> rows;
   _proj->reset();
   for (int c = 0; c < chunks; ++c) {
@@ -707,11 +755,11 @@ FlashVsrSrcEncoderStage::clip_beat_(
     const std::vector<metal_compute::SharedBuffer>& rows, int chunks,
     long long S, long long valid, int head, int tail)
 {
-  if ((int)rows.size() != 2 * chunks + 4) {
+  if ((int)rows.size() != _sch.latents(chunks)) {
     session()->warn(fmt(
         "FlashVsrSrcEncoderStage('{}'): a {}-chunk clip projected {} row "
         "frames, not {}; dropping it", this->id(), chunks, rows.size(),
-        2 * chunks + 4));
+        _sch.latents(chunks)));
     return nullptr;
   }
   auto out = rows_beat_(rows);
@@ -745,10 +793,12 @@ FlashVsrSrcEncoderStage::stream_beat_(
     const std::vector<metal_compute::SharedBuffer>& rows, int chunk0,
     int chunks, bool final_beat)
 {
-  // Six row frames open the stream and every later chunk adds two: a
-  // short count means the projection did not do what the pattern says.
-  const std::size_t want = (std::size_t)(chunk0 == 0 ? 2 * chunks + 4
-                                                     : 2 * chunks);
+  // The opening chunk's row frames (v1.1 six, FlashVSR+ four) and each
+  // later chunk's (two, four): a short count means the projection did
+  // not do what the pattern says.
+  const std::size_t want =
+      (std::size_t)(chunk0 == 0 ? _sch.latents(chunks)
+                                : _sch.chunk_latents * chunks);
   if (rows.size() != want) {
     session()->warn(fmt(
         "FlashVsrSrcEncoderStage('{}'): chunks {}+{} projected {} row "
@@ -759,8 +809,8 @@ FlashVsrSrcEncoderStage::stream_beat_(
   auto out = rows_beat_(rows);
   // The frames these chunks restore, in the stream: [frame0, end), of
   // which the real ones end at the last frame received.
-  const long long frame0 = chunk0 == 0 ? 0 : 8LL * chunk0 + 13;
-  const long long end = 8LL * (chunk0 + chunks - 1) + 21;
+  const long long frame0 = _sch.restored_begin(chunk0);
+  const long long end = _sch.restored_end(chunk0 + chunks - 1);
   const long long valid = std::min(end, _received) - frame0;
   auto o = out->sideband.as_object();
   o.insert_or_assign(genai::flashvsr_stream::kChunk0,

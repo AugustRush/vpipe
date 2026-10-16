@@ -537,7 +537,8 @@ TEST(flashvsr_family, the_plan_holds_the_source_projection)
   // The working set the family books for it at 1080p, nonzero and a
   // fraction of the denoise's own.
   const std::size_t work = FlashVsrLqProj::working_bytes(
-      layout.source, layout.source_prefix, 1152, 1920, 25);
+      layout.source, layout.source_prefix, 1152, 1920,
+      MetalFlashVsrTransformer::latent_frames(25));
   std::printf("  projection working set at 1920x1152 x 25: %.0f MB\n",
               work / 1048576.0);
   EXPECT_TRUE(work > (256u << 20) && work < (2048u << 20));

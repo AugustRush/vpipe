@@ -332,6 +332,7 @@ sweep_table_(size_t* n)
     {"wan2-model-config", "{}", false, nullptr},
     {"minimax-h3-model-config", "{}", false, nullptr},
     {"flux2-model-config", "{}", false, nullptr},
+    {"flux3-model-config", "{}", false, nullptr},
     {"krea2-model-config", "{}", false, nullptr},
     {"boogu-image-model-config", "{}", false, nullptr},
       {"qwen-image-21-model-config", "{}", false, nullptr},

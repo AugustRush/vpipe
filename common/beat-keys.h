@@ -104,6 +104,15 @@ inline constexpr std::string_view kBlendTail = "blend_tail";
 // colour correction a restoration model's reference applies against its
 // own input. Absent: no correction.
 inline constexpr std::string_view kColorRef = "color_ref";
+// The picture's own rectangle on a canvas it was padded out to, as Ints
+// [left, top, right, bottom] in pixels (right and bottom exclusive) -- of
+// the picture, or on a latent of the picture it decodes to.
+// image-resample's `pad_to_grid` sets it; vae-encode carries it to the
+// latent, generate-image to its output when that output takes the
+// reference's size, and vae-decode cuts the decoded picture to it: BFL's
+// single-reference edit, generated on the padded canvas and cropped back.
+// Absent: all of it.
+inline constexpr std::string_view kCropBox = "crop_box";
 
 // The content screen refused the prompt. Bool. Set on the conditioning
 // and carried to the latent, where a decoder emits a refusal card of

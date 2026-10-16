@@ -13,6 +13,7 @@
 // on the VPIPE_BUILD_APPLE_SILICON axis; an inert stub off it.
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/flashvsr/flashvsr-lq-proj.h"
+#include "generative-models/flashvsr/metal-flashvsr-transformer.h"
 #include "stages/model-memory.h"
 #endif
 
@@ -97,12 +98,21 @@ namespace vpipe {
 //              when iport1 is unwired.
 //   continuity ("auto" | "stream" | "clips", default auto) -- see
 //              Continuity.
-//   clip_frames, blend_frames (ints, 41 and 8) -- clips only: source
-//              frames per clip, and restored frames each shares with the
-//              next for the decode to cross-fade (sideband::kBlendHead /
-//              kBlendTail). What SAnodes-Streaming does for ComfyUI.
-//   color_fix  (bool, default true) -- carry each restored frame's
-//              source channel statistics for the decode's colour fix.
+//   clip_frames, blend_frames (ints, 0 and 8) -- clips only: source
+//              frames per clip (0: the release's own, 41 for v1.1 and 49
+//              for FlashVSR+; rounded up to whole chunks), and restored
+//              frames each shares with the next for the decode to
+//              cross-fade (sideband::kBlendHead / kBlendTail). What
+//              SAnodes-Streaming does for ComfyUI.
+//   color_fix  (bool) -- carry each restored frame's source channel
+//              statistics for the decode's colour fix. Unset, the
+//              release's reference decides: on for v1.1, off for
+//              FlashVSR+.
+//
+// BOTH RELEASES. FlashVSR-v1.1 and FlashVSR+ (Turbo, Base) project their
+// source the same way and differ in its cadence -- the frames a chunk
+// takes -- which the loaded checkpoint's schedule supplies
+// (genai::flashvsr_schedule).
 class FlashVsrSrcEncoderStage final
     : public TypedStage<FlashVsrSrcEncoderStage> {
 public:
@@ -224,8 +234,14 @@ private:
   Continuity    _cfg_mode = Continuity::kAuto;
   Continuity    _mode = Continuity::kAuto;
   bool          _color_fix = true;
+  bool          _color_fix_set = false;   // the graph said, either way
+  int           _cfg_clip_frames = 0;     // 0: the release's own
   int           _clip_frames = 41;
   int           _blend_frames = 8;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // The loaded release's cadence; v1.1's until a model loads.
+  genai::MetalFlashVsrTransformer::Schedule _sch;
+#endif
 };
 
 }  // namespace vpipe

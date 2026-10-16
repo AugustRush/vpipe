@@ -615,6 +615,104 @@ TEST(flux2_smoke, vae_decode_auto_tiles_when_short)
   EXPECT_TRUE(tiled_ok);     // and that tiling rescued it
 }
 
+// The EXACT tiled decode (decode_exact_) against the whole one. Same
+// arithmetic but for the f32 summation order inside each GroupNorm's
+// statistics, so the bar is rounding -- the windowed decode above is held
+// to 20 dB. Three plans: a budget that lets planes be kept whole as later
+// sources, a tight one that keeps little and recomputes from the mid block
+// under a 128-pixel tile cap (many tiles, every pass deep), and one with
+// room for every stage whole, which must be BIT-IDENTICAL to decode(). Each
+// asserts the plan it meant to exercise ran: a budget that fits takes the
+// whole decode and compares it to itself.
+TEST(flux2_smoke, vae_decode_exact_tiles_match_whole)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  vpipe::Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+  auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
+  ASSERT_TRUE(vae != nullptr);
+  if (vae == nullptr) { return; }
+
+  const int gh = 48, gw = 40;                    // 768x640, not square
+  const int C = vae->config().dit_channels();
+  SharedBuffer z = mc->make_shared_buffer((std::size_t)C * gh * gw * 2);
+  ASSERT_TRUE(!z.empty());
+  std::mt19937 rng(8642);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto* d = static_cast<_Float16*>(z.contents());
+  for (std::size_t i = 0; i < (std::size_t)C * gh * gw; ++i) {
+    d[i] = (_Float16)nd(rng);
+  }
+  const std::size_t n = (std::size_t)3 * (gh * 16) * (gw * 16);
+  auto decode = [&](std::vector<float>* out) {
+    std::string err;
+    SharedBuffer rgb = vae->decode(z, gh, gw, &err);
+    if (rgb.empty() || rgb.byte_size() < n * 2) {
+      std::printf("[flux2_smoke] decode failed: %s\n", err.c_str());
+      return;
+    }
+    out->resize(n);
+    const auto* p = static_cast<const _Float16*>(rgb.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = (float)p[i]; }
+  };
+  std::vector<float> whole;
+  decode(&whole);
+  ASSERT_TRUE(!whole.empty() && !vae->last_decode().exact);
+  if (whole.empty()) { return; }
+
+  struct Arm { const char* name; int budget_mb; int tile; };
+  const int need_mb = (int)(vae->decode_peak_bytes(gh, gw) >> 20);
+  const Arm arms[] = {
+    {"keeps planes", need_mb / 3, 0},
+    {"tight, 128-px tiles", need_mb / 4, 128},
+    {"keeps nothing, 64-px tiles", need_mb / 5, 64},
+    {"room for all", 1 << 16, 0},
+  };
+  ::setenv("VPIPE_VAE_EXACT", "1", 1);
+  for (const Arm& a : arms) {
+    ::setenv("VPIPE_VAE_BUDGET_MB", std::to_string(a.budget_mb).c_str(), 1);
+    if (a.tile > 0) {
+      ::setenv("VPIPE_VAE_EXACT_TILE", std::to_string(a.tile).c_str(), 1);
+    } else {
+      ::unsetenv("VPIPE_VAE_EXACT_TILE");
+    }
+    std::vector<float> got;
+    decode(&got);
+    const MetalFlux2Vae::DecodeReport rep = vae->last_decode();
+    ASSERT_TRUE(got.size() == whole.size());
+    if (got.size() != whole.size()) { continue; }
+    double se = 0.0, mx = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const double e = (double)got[i] - whole[i];
+      se += e * e;
+      mx = std::max(mx, std::fabs(e));
+    }
+    const double r = rel_l2_(got.data(), whole.data(), n);
+    const double psnr = se > 0.0 ? 10.0 * std::log10(4.0 * n / se) : 99.0;
+    std::printf("[flux2_smoke] VAE exact tiled (%s, %d MB of %d): %d whole, "
+                "%d passes, %d tiles, %d kept, %.2fx work -- rel-L2 %.3g, "
+                "max %.4g, PSNR %.1f dB\n", a.name, a.budget_mb, need_mb,
+                rep.whole_stages, rep.passes, rep.tiles, rep.kept, rep.work,
+                r, mx, psnr);
+    EXPECT_TRUE(rep.exact);
+    if (a.budget_mb >= (1 << 16)) {
+      EXPECT_TRUE(rep.passes == 0);
+      EXPECT_TRUE(se == 0.0);              // every stage whole: identical
+    } else {
+      EXPECT_TRUE(rep.passes > 0 && rep.tiles > rep.passes);
+      EXPECT_TRUE(r < 1e-3);
+    }
+  }
+  ::unsetenv("VPIPE_VAE_EXACT");
+  ::unsetenv("VPIPE_VAE_EXACT_TILE");
+  ::unsetenv("VPIPE_VAE_BUDGET_MB");
+}
+
 // The two-pass group norm must be a pure speedup: same normalization, only
 // split so both passes saturate the GPU. It is not bit-identical (the
 // partials are summed in a different order), so this is a rel-L2 bound -- if
@@ -3790,3 +3888,4 @@ TEST(flux2_smoke, forward_credits_its_flops)
   EXPECT_TRUE(flushed == want);
   EXPECT_TRUE(gpu == flushed);
 }
+

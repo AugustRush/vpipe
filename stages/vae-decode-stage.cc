@@ -1,3 +1,4 @@
+#include "generative-models/flux3/metal-flux3-transformer.h"
 #include "generative-models/shared/accel-settings.h"
 #include "stages/vae-decode-stage.h"
 #include "common/host-report.h"
@@ -133,7 +134,7 @@ const ConfigKey kAttrs[] = {
           "model-select source, or set this key directly, so the DiT "
           "stages keep pointing at the model",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image,"
+   .suggest_db_type = "krea2,krea2-vae,flux2,flux3,qwen-image,"
                       "qwen-image-edit,qwen-image-21,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-ref2va,"
@@ -649,6 +650,14 @@ VaeDecodeStage::ensure_loaded_()
     return;
   }
   const std::string root = resolve_model_dir(session(), _hf_dir);
+  // FLUX.3 in BFL's own layout keeps its VAE as ae.safetensors at the
+  // root: say that, rather than reporting the root's config as a VAE
+  // config with no latent statistics.
+  if (genai::flux3::is_bfl_root_layout(root)) {
+    session()->error(fmt("VaeDecodeStage('{}'): {}; inert", this->id(),
+                         genai::flux3::bfl_root_layout_message(root)));
+    return;
+  }
   // An out-of-tree family gets asked FIRST, and it has to happen here --
   // before the unload verdict and before open_weight_set below. Both of
   // those assume the diffusers layout: resolve_vae_dir returns `root`
@@ -987,6 +996,54 @@ forward_model_name_(const TensorBeatPayload& src, TensorBeat& dst)
   provenance::carry_model_name(src.sideband, dst.sideband);
 }
 
+// BFL's single-reference edit generates on the reference's padded canvas
+// and keeps only the picture: sideband::kCropBox on the latent (from
+// image-resample `pad_to_grid`, through vae-encode and generate-image)
+// says where it sits. Cut the decoded planar [C, H, W] canvas to it. A box
+// that is not a rectangle inside the picture is left alone. True if cut.
+bool
+crop_to_box_(const TensorBeatPayload& lat,
+             std::unique_ptr<TensorBeatPayload>& out)
+{
+  if (!lat.sideband.is_object() || out == nullptr ||
+      out->shape.size() != 3) {
+    return false;
+  }
+  FlexData sb = lat.sideband;            // as_object() is a view: keep it
+  auto so = sb.as_object();
+  if (!so.contains(sideband::kCropBox)) { return false; }
+  FlexData box = so.at(sideband::kCropBox);
+  if (!box.is_array() || box.as_array().size() != 4) { return false; }
+  int b[4];
+  for (int i = 0; i < 4; ++i) {
+    b[i] = (int)box.as_array()[(std::size_t)i].as_int(-1);
+  }
+  const int C = (int)out->shape[0], H = (int)out->shape[1];
+  const int W = (int)out->shape[2];
+  if (b[0] < 0 || b[1] < 0 || b[2] > W || b[3] > H || b[2] <= b[0] ||
+      b[3] <= b[1] || (b[2] - b[0] == W && b[3] - b[1] == H)) {
+    return false;
+  }
+  const int cw = b[2] - b[0], ch = b[3] - b[1];
+  const std::size_t esz = TensorBeat::byte_size_of(out->dtype);
+  const auto src = out->materialize_contiguous();
+  auto cut = std::make_unique<TensorBeatPayload>();
+  cut->dtype = out->dtype;
+  cut->shape = {C, ch, cw};
+  cut->sideband = out->sideband;
+  cut->resize_contiguous((std::size_t)C * ch * cw);
+  for (int c = 0; c < C; ++c) {
+    for (int y = 0; y < ch; ++y) {
+      std::memcpy(cut->bytes_() + (((std::size_t)c * ch + y) * cw) * esz,
+                  src.data() + (((std::size_t)c * H + b[1] + y) * W + b[0])
+                                   * esz,
+                  (std::size_t)cw * esz);
+    }
+  }
+  out = std::move(cut);
+  return true;
+}
+
 // One decoded sample, already mapped to 0..1, into a picture of either
 // dtype: U8 rounded, F16 as it is -- both clamped to 0..1 (NaN to 0), as
 // the reference's PIL conversion clamps.
@@ -1227,6 +1284,12 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         "VaeDecodeStage('{}'): AutoencoderKL decoded + emitted image #{} "
         "[3, {}, {}]",
         this->id(), _images_emitted, H, W));
+    if (crop_to_box_(*tbp, out)) {
+      session()->info(fmt(
+          "VaeDecodeStage('{}'): cut the {}x{} canvas back to the "
+          "reference's {}x{}", this->id(), W, H, out->shape[2],
+          out->shape[1]));
+    }
     forward_model_name_(*tbp, *out);
     if (_unload_idle) { unload_vae_(); }
     co_await ctx.write(0, std::move(out));
@@ -1680,6 +1743,12 @@ VaeDecodeStage::process(RuntimeContext& ctx)
           sb.as_object().insert_or_assign(sideband::kFps,
                                           FlexData::make_real(fps));
           out->sideband = std::move(sb);
+        } else {
+          // A registered family's picture is cut back like a built-in
+          // one's (sideband::kCropBox): the key promises it of
+          // vae-decode, whichever VAE ran -- the family sees the box in
+          // req.sideband but has no reason to know what it means.
+          crop_to_box_(*tbp, out);
         }
         forward_model_name_(*tbp, *out);
         frames.push_back(std::move(out));
@@ -2139,6 +2208,12 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       "[{}, {}, {}]", this->id(), _images_emitted,
       _out_dtype == TensorBeat::DType::F16 ? "F16" : "U8",
       OC == 4 ? "RGBA" : "RGB", OC, H, W));
+  if (crop_to_box_(*tbp, out)) {
+    session()->info(fmt(
+        "VaeDecodeStage('{}'): cut the {}x{} canvas back to the "
+        "reference's {}x{}", this->id(), W, H, out->shape[2],
+        out->shape[1]));
+  }
   forward_model_name_(*tbp, *out);
   if (_unload_idle) { unload_vae_(); }
   co_await ctx.write(0, std::move(out));

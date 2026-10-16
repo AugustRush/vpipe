@@ -39,6 +39,19 @@ namespace vpipe {
 
 namespace {
 
+// The `local_subdir` packaging fact (ModelCatalogEntry::extra): the
+// folder of the download a record names as the model; empty when the
+// entry has none.
+string
+local_subdir_(const ModelCatalogEntry& e)
+{
+  if (!e.extra.is_object()) { return {}; }
+  FlexData extra = e.extra;
+  auto o = extra.as_object();
+  if (!o.contains(catalog_extra::kLocalSubdir)) { return {}; }
+  return string(o.at(catalog_extra::kLocalSubdir).as_string(""));
+}
+
 void
 trim_(string& s)
 {
@@ -653,8 +666,15 @@ ModelFetchStage::process(RuntimeContext& ctx)
       // may have used a different `base_path`, and testing the path this
       // run would compute would then report every file missing and
       // re-download a repo that is entirely present.
-      const fs::path where =
+      fs::path where =
           reg_local_path.empty() ? local_dir : fs::path(reg_local_path);
+      // A record pointing INTO its download (`local_subdir`) pins files
+      // relative to the repository, one level up.
+      const std::string sub = local_subdir_(*entry);
+      if (!sub.empty() && !reg_local_path.empty() &&
+          where.filename() == fs::path(sub).filename()) {
+        where = where.parent_path();
+      }
       for (const string& want : entry->files) {
         std::error_code ec;
         if (!fs::exists(where / want, ec)) { missing.push_back(want); }
@@ -1082,8 +1102,13 @@ ModelFetchStage::process(RuntimeContext& ctx)
   // single *.mlpackage per .tar. Unpack each into <repo>/<name>/ and point
   // the registered local_path at the contained .mlpackage so a stage's
   // model_path / coreml_vision_path resolves straight to a loadable package.
-  // Default (non-archive) entries register the repo dir, as before.
+  // Default (non-archive) entries register the repo dir, as before --
+  // or the FOLDER in it a `local_subdir` entry names as the model.
   string local_path_str = local_dir.string();
+  if (entry != nullptr && !entry->extract_archive) {
+    const string sub = local_subdir_(*entry);
+    if (!sub.empty()) { local_path_str = (local_dir / sub).string(); }
+  }
   if (entry && entry->extract_archive) {
     const string sub = entry->name.empty() ? string("extracted")
                                            : entry->name;

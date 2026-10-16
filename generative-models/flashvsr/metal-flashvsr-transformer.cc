@@ -58,6 +58,16 @@ from_bf16(std::uint16_t h)
   return f;
 }
 
+// The output head's tensor. Wan and v1.1 call it `head.head`, FlashVSR+
+// `head.proj`; the same [out_channels * patch, hidden] linear either way.
+template <class W>
+std::string
+head_name(const W& w, const char* leaf)
+{
+  const std::string wan = std::string("head.head.") + leaf;
+  return w.has(wan) ? wan : std::string("head.proj.") + leaf;
+}
+
 // Read any supported dtype as f32. The denoiser ships F32, but the
 // projection and context beside it are BF16, and one reader for the
 // directory is one place to be wrong.
@@ -193,8 +203,9 @@ struct MetalFlashVsrTransformer::Streaming {
 struct MetalFlashVsrTransformer::WindowCarry {
   std::vector<SharedBuffer> k, v;    // per block
   std::vector<int> valid, oldest;    // per block: the ring state, in slots
-  int windows = 0;                   // the most a carry can hold
-  int cap_windows = 0;               // the ring the slots are indices of
+  // Per block, the ring the slots are indices of; a carry holds that
+  // less one chunk.
+  std::vector<int> caps;
   int next_chunk = -1;               // -1 while a request is rewriting it
   int height = 0, width = 0;
   std::uint64_t seed = 0;
@@ -245,54 +256,159 @@ MetalFlashVsrTransformer::~MetalFlashVsrTransformer()
   if (_streaming) { _streaming->slots.join(); }
 }
 
+// ----------------------------------------------------------- schedule
+
+MetalFlashVsrTransformer::Schedule
+MetalFlashVsrTransformer::Schedule::plus(bool turbo)
+{
+  Schedule s;
+  s.open_latents = 4;
+  s.chunk_latents = 4;
+  s.group_windows = 2;          // the reference's block_size 2
+  s.area_topk = false;
+  s.trim_to_keep = true;
+  s.first_candidate = true;
+  s.f32_rope = true;
+  if (turbo) {
+    // The reference's uniformly spaced "b=25" layout: every layer but
+    // 0, 6, 12, 18 and 24 is a hybrid one.
+    for (int i = 0; i < 30; ++i) {
+      if (i % 6 != 0) { s.sliding_layers.push_back(i); }
+    }
+  }
+  return s;
+}
+
+bool
+MetalFlashVsrTransformer::Schedule::sliding(int layer) const noexcept
+{
+  return std::binary_search(sliding_layers.begin(), sliding_layers.end(),
+                            layer);
+}
+
 // ----------------------------------------------------------- geometry
+
+int
+MetalFlashVsrTransformer::align_frames(const Schedule& s, int frames)
+{
+  // A clip is the opening chunk plus whole later chunks, four source
+  // frames per latent frame and one more to open: 8k+1 for v1.1, 16k+1
+  // for FlashVSR+. Round UP, because rounding down silently delivers
+  // less video than was asked for -- the rule every align here follows.
+  if (frames <= 1) { return 1; }
+  const int step = 4 * s.chunk_latents;
+  const int lead = 4 * (s.open_latents - s.chunk_latents);
+  const int r = ((frames - 1 - lead) % step + step) % step;
+  return r == 0 ? frames : frames + (step - r);
+}
+
+int
+MetalFlashVsrTransformer::latent_frames(const Schedule& s,
+                                        int aligned_frames)
+{
+  // One latent frame per four source frames past the opening one -- but
+  // only once there is a whole opening chunk. For v1.1 that is NOT two
+  // per chunk: the opening chunk emits six, so 2*chunks is four short,
+  // and a caller sizing a latent by that allocates a clip it cannot hold.
+  // Whole chunks only, so a count that is not aligned rounds down to one
+  // that is, as it always did.
+  const int t = (aligned_frames - 1) / 4;
+  if (t < s.open_latents) { return 0; }
+  return t - (t - s.open_latents) % s.chunk_latents;
+}
+
+int
+MetalFlashVsrTransformer::chunks_of(const Schedule& s, int aligned_frames)
+{
+  const int t = latent_frames(s, aligned_frames);
+  return t > 0 ? (t - s.open_latents) / s.chunk_latents + 1 : 0;
+}
+
+int
+MetalFlashVsrTransformer::restored_frames(const Schedule& s,
+                                          int aligned_frames)
+{
+  // The VAE's own expansion of the latent, 4k+1: four short of what the
+  // projection read, which is the look-ahead of the last latent frame.
+  const int t = latent_frames(s, aligned_frames);
+  return t > 0 ? 1 + 4 * (t - 1) : 0;
+}
 
 int
 MetalFlashVsrTransformer::align_frames(int frames)
 {
-  // 8k+1: the denoise consumes eight source frames per chunk. Round UP,
-  // because rounding down silently delivers less video than was asked
-  // for -- the rule every align here follows.
-  if (frames <= 1) { return 1; }
-  const int r = (frames - 1) % 8;
-  return r == 0 ? frames : frames + (8 - r);
+  return align_frames(Schedule::v1_1(), frames);
 }
 
 int
 MetalFlashVsrTransformer::latent_frames(int aligned_frames)
 {
-  // The OPENING chunk emits six latent frames and every later one emits
-  // two, which is not the uniform rule it looks like: 2*chunks is four
-  // frames short, and a caller sizing a latent by that allocates a clip
-  // it cannot hold.
-  const int chunks = (aligned_frames - 1) / 8 - 2;
-  return chunks > 0 ? 2 * chunks + 4 : 0;
+  return latent_frames(Schedule::v1_1(), aligned_frames);
 }
 
 int
 MetalFlashVsrTransformer::restored_frames(int aligned_frames)
 {
-  // Twenty frames go to the warmup that fills the caches and is never
-  // emitted. What comes back is the VAE's own expansion of the latent
-  // above, 4k+1, not eight frames per chunk.
-  const int t = latent_frames(aligned_frames);
-  return t > 0 ? 1 + 4 * (t - 1) : 0;
+  return restored_frames(Schedule::v1_1(), aligned_frames);
+}
+
+int
+MetalFlashVsrTransformer::keep_windows(const Config& cfg, int layer,
+                                       double kv_ratio)
+{
+  const Schedule& s = cfg.schedule;
+  if (s.sliding(layer)) { return s.sliding_keep; }
+  // FlashVSR+ keeps int(kv_ratio) windows and never fewer than one;
+  // v1.1 rounds, and its trim only ever drops one a chunk.
+  if (s.trim_to_keep) { return std::max(1, (int)kv_ratio); }
+  return kv_ratio > 0.0 ? (int)(kv_ratio + 0.5) : 0;
+}
+
+int
+MetalFlashVsrTransformer::layer_ring(const Config& cfg, int layer,
+                                     double kv_ratio)
+{
+  // What the layer keeps and one chunk more -- the attention reads the
+  // whole ring once it fills -- and never less than the opening chunk
+  // writes before anything is trimmed.
+  const Schedule& s = cfg.schedule;
+  return std::max(keep_windows(cfg, layer, kv_ratio) + s.chunk_latents / 2,
+                  s.open_latents / 2);
+}
+
+int
+MetalFlashVsrTransformer::kv_windows(const Config& cfg, double kv_ratio)
+{
+  int most = 0;
+  for (int i = 0; i < cfg.n_layers; ++i) {
+    most = std::max(most, layer_ring(cfg, i, kv_ratio));
+  }
+  return most;
 }
 
 int
 MetalFlashVsrTransformer::kv_windows(double kv_ratio)
 {
-  const int keep = kv_ratio > 0.0 ? (int)(kv_ratio + 0.5) : 0;
-  return std::max(keep + 1, 3);
+  const Config v11;
+  return layer_ring(v11, 0, kv_ratio);
+}
+
+int
+MetalFlashVsrTransformer::ring_windows(const Config& cfg, int frames,
+                                       double kv_ratio)
+{
+  // The opening chunk writes its windows and attends them; only a
+  // SECOND chunk needs the slots past them that the ratio provides for.
+  const Schedule& s = cfg.schedule;
+  return chunks_of(s, align_frames(s, frames)) <= 1
+             ? s.open_latents / 2
+             : kv_windows(cfg, kv_ratio);
 }
 
 int
 MetalFlashVsrTransformer::ring_windows(int frames, double kv_ratio)
 {
-  // The opening chunk writes three windows and attends them; only a
-  // SECOND chunk needs the slot past them that the ratio provides for.
-  const int chunks = (align_frames(frames) - 1) / 8 - 2;
-  return chunks <= 1 ? 3 : kv_windows(kv_ratio);
+  return ring_windows(Config{}, frames, kv_ratio);
 }
 
 std::uint64_t
@@ -312,11 +428,18 @@ std::uint64_t
 MetalFlashVsrTransformer::stream_window_bytes(const Config& cfg, int height,
                                               int width, const Params& prm)
 {
-  // After a request the ring holds at most its capacity less one window:
-  // the trim drops one per chunk, so it is the kv_ratio retained once
-  // that fills, and two after an opening chunk under a ratio below that.
-  return (std::uint64_t)cfg.n_layers *
-         kv_ring_bytes(cfg, height, width, kv_windows(prm.kv_ratio) - 1);
+  // After a request each layer's ring holds at most its capacity less a
+  // chunk: what it keeps once that fills (and for v1.1, whose trim drops
+  // one a chunk, two after an opening chunk under a ratio below that).
+  // Per LAYER, because Turbo's hybrid layers keep one window where the
+  // others keep three -- most of a Turbo stream's saving is here.
+  std::uint64_t b = 0;
+  for (int i = 0; i < cfg.n_layers; ++i) {
+    b += kv_ring_bytes(cfg, height, width,
+                       layer_ring(cfg, i, prm.kv_ratio) -
+                           cfg.schedule.chunk_latents / 2);
+  }
+  return b;
 }
 
 int
@@ -340,18 +463,38 @@ MetalFlashVsrTransformer::blocks_outer(const Config& cfg, int height,
     if (*e != '\0' && std::string(e) != "0") { return false; }
   }
   using U = std::uint64_t;
+  const Schedule& s = cfg.schedule;
   const U tok = (U)(height / 16) * (U)(width / 16);
-  const int T = latent_frames(align_frames(frames));
+  const int T = latent_frames(s, align_frames(s, frames));
+  const int f_max = std::max(s.open_latents, s.chunk_latents);
   // What each order holds that the other does not. Chunk-outer: a window
-  // per block, so n_layers - 1 more of them. Block-outer: the residual
+  // per block, so every ring but the largest. Block-outer: the residual
   // stream and the RoPE tables of every chunk, where chunk-outer holds
-  // one chunk's -- the opening one, six latent frames, is the largest.
-  const U ring = kv_ring_bytes(cfg, height, width,
-                               ring_windows(frames, prm.kv_ratio));
-  const U chunk_extra = (U)(cfg.n_layers - 1) * ring;
+  // one chunk's -- the largest, v1.1's six-frame opening one.
+  const U chunk_extra = kv_rings_bytes_(cfg, height, width, frames, prm) -
+                        kv_ring_bytes(cfg, height, width,
+                                      ring_windows(cfg, frames, prm.kv_ratio));
   const U per_frame = tok * ((U)cfg.hidden * 2 + (U)cfg.head_dim * 4 * 2);
-  const U block_extra = (T > 6 ? (U)(T - 6) : 0) * per_frame;
+  const U block_extra = (T > f_max ? (U)(T - f_max) : 0) * per_frame;
   return block_extra <= chunk_extra;
+}
+
+std::uint64_t
+MetalFlashVsrTransformer::kv_rings_bytes_(const Config& cfg, int height,
+                                          int width, int frames,
+                                          const Params& prm)
+{
+  // A ring per layer, each its own size: one chunk's windows for a clip
+  // of one chunk, else what the layer keeps and a chunk more.
+  const Schedule& s = cfg.schedule;
+  const bool one = chunks_of(s, align_frames(s, frames)) <= 1;
+  std::uint64_t b = 0;
+  for (int i = 0; i < cfg.n_layers; ++i) {
+    b += kv_ring_bytes(cfg, height, width,
+                       one ? s.open_latents / 2
+                           : layer_ring(cfg, i, prm.kv_ratio));
+  }
+  return b;
 }
 
 std::uint64_t
@@ -363,11 +506,10 @@ MetalFlashVsrTransformer::kv_window_bytes(const Config& cfg, int height,
   // It once reported the `kv_ratio` retained windows alone while the
   // forward allocated a window more and a spare K and V per block on top
   // -- 9.6 GB reported against 25.5 GB allocated at 1920x1152.
-  const std::uint64_t ring =
-      kv_ring_bytes(cfg, height, width, ring_windows(frames, prm.kv_ratio));
   return blocks_outer(cfg, height, width, frames, prm)
-             ? ring
-             : ring * (std::uint64_t)cfg.n_layers;
+             ? kv_ring_bytes(cfg, height, width,
+                             ring_windows(cfg, frames, prm.kv_ratio))
+             : kv_rings_bytes_(cfg, height, width, frames, prm);
 }
 
 std::uint64_t
@@ -401,13 +543,16 @@ MetalFlashVsrTransformer::denoise_scratch_bytes(const Config& cfg, int height,
   using U = std::uint64_t;
   const U th = (U)(height / 16), tw = (U)(width / 16);
   const U D = (U)cfg.hidden, NH = (U)cfg.n_heads, HD = (U)cfg.head_dim;
-  const int T = latent_frames(align_frames(frames));
-  // THE OPENING CHUNK is the largest -- three windows, six latent frames
-  // -- and the pool keeps what it grew to for the rest of the clip.
-  const U seq = 6 * th * tw;
+  const Schedule& s = cfg.schedule;
+  const int T = latent_frames(s, align_frames(s, frames));
+  // THE LARGEST CHUNK sizes the pool, which keeps what it grew to for the
+  // rest of the clip: v1.1's opening one (six latent frames, three
+  // windows), or any of FlashVSR+'s four.
+  const U f_max = (U)std::max(s.open_latents, s.chunk_latents);
+  const U seq = f_max * th * tw;
   const U n = seq * D * 2;                            // one [seq, D] bf16
   const U S = (th / 8) * (tw / 8);                    // blocks per window
-  const U cap_blocks = (U)ring_windows(frames, prm.kv_ratio) * S;
+  const U cap_blocks = (U)ring_windows(cfg, frames, prm.kv_ratio) * S;
   const U out_w =
       (U)(cfg.out_channels * cfg.patch_t * cfg.patch_h * cfg.patch_w);
   U b = kv_window_bytes(cfg, height, width, frames, prm);
@@ -416,7 +561,7 @@ MetalFlashVsrTransformer::denoise_scratch_bytes(const Config& cfg, int height,
   if (blocks_outer(cfg, height, width, frames, prm)) {
     // Every chunk's residual stream and RoPE tables; the source rows of
     // one chunk, at block 0; the head's output.
-    const U all = (T > 0 ? (U)T : 6) * th * tw;
+    const U all = (T > 0 ? (U)T : f_max) * th * tw;
     b += all * D * 2 + all * HD * 4 * 2;
     b += n + seq * out_w * 2;
   } else {
@@ -427,7 +572,9 @@ MetalFlashVsrTransformer::denoise_scratch_bytes(const Config& cfg, int height,
   }
   // Routing: block means, scores, the keep map, and the span CSR sized
   // for the ALU entry's 32-query / 16-key tiles -- the finer, larger one.
-  const U nq = 3 * S;
+  // A hybrid layer's band is a second [S, S] map.
+  const U nq = (f_max / 2) * S;
+  if (!s.sliding_layers.empty()) { b += S * S; }
   const U NQ = seq / 32;
   b += NH * (seq / 128) * HD * 2 + NH * cap_blocks * HD * 2;
   b += NH * nq * cap_blocks * 4 + NH * nq * cap_blocks;
@@ -493,9 +640,9 @@ MetalFlashVsrTransformer::config_from_checkpoint(const std::string& dit_dir,
   }
   c.freq_dim = (int)tm->shape[1];
 
-  const auto* hd = w->info("head.head.weight");
+  const auto* hd = w->info(head_name(*w, "weight"));
   if (hd == nullptr || hd->shape.size() != 2) {
-    return fail("head.head.weight missing");
+    return fail("the output head (head.head or head.proj) is missing");
   }
   const int out_patch = (int)hd->shape[0];
   const int patch_vol = c.patch_t * c.patch_h * c.patch_w;
@@ -894,8 +1041,8 @@ MetalFlashVsrTransformer::load_blocks_(WeightSet& w, std::string* err)
   // rather than permuted.
   _patch_w = mat("patch_embedding.weight");
   _patch_b = mat("patch_embedding.bias");
-  _head_w  = mat("head.head.weight");
-  _head_b  = mat("head.head.bias");
+  _head_w  = mat(head_name(w.src(), "weight"));
+  _head_b  = mat(head_name(w.src(), "bias"));
   if (_patch_w.empty() || _head_w.empty()) {
     return fail("patch embedding or output head missing");
   }
@@ -1035,7 +1182,11 @@ struct MetalFlashVsrTransformer::Stream {
     int oldest = 0;                  // the slot holding the oldest of them
   };
   std::vector<Cache> per_block;      // one per block, or one for all
-  int cap_windows = 0;               // ring capacity, temporal windows
+  // Each LAYER's ring capacity in temporal windows, and the largest,
+  // which the buffers are sized by. A layer's ring arithmetic uses its
+  // own: Turbo's hybrid layers run a smaller ring in the same buffer.
+  std::vector<int> layer_cap;
+  int cap_windows = 0;
   int cap_blocks = 0;                // ...in window blocks
   int one_len = 0;                   // window blocks in a steady chunk
   int h = 0, w = 0;                  // the token grid
@@ -1052,6 +1203,7 @@ struct MetalFlashVsrTransformer::Stream {
   // The routing's own buffers, sized once per clip for the largest chunk
   // so nothing is allocated per block.
   metal_compute::SharedBuffer band, p, thr, flags;
+  metal_compute::SharedBuffer band_slide;   // a hybrid layer's band
   // The span path's own buffers: the block-level decision, the CSR
   // offsets and list, and the two parameter blocks attn_steel reads
   // under has_spans.
@@ -1110,6 +1262,34 @@ unpermute_pos(int p, int H, int W, int* f, int* y, int* x)
 
 }  // namespace
 
+int
+MetalFlashVsrTransformer::topk_(int S, int h, int w, const Params& prm) const
+{
+  // v1.1 scales its knob by the frame area, so one value means one
+  // selectivity at every resolution; FlashVSR+ takes it as it is.
+  const double ratio =
+      _cfg.schedule.area_topk
+          ? prm.sparse_ratio * 768.0 * 1280.0 /
+                ((double)(h * 16) * (double)(w * 16))
+          : prm.sparse_ratio;
+  return (int)((double)S * (double)S * ratio) - 1;
+}
+
+int
+MetalFlashVsrTransformer::local_range_(int bi, const Params& prm) const
+{
+  return _cfg.schedule.sliding(bi) ? _cfg.schedule.sliding_local_range
+                                   : prm.local_range;
+}
+
+int
+MetalFlashVsrTransformer::route_groups_(int f) const
+{
+  // The top-k is taken over GROUPS of query blocks, each a run of whole
+  // temporal windows: one window for v1.1, both of a FlashVSR+ chunk.
+  return std::max(1, (f / 2) / std::max(1, _cfg.schedule.group_windows));
+}
+
 void
 MetalFlashVsrTransformer::build_rope_(int f_len, int h, int w, int t_off,
                                       SharedBuffer& cos_out,
@@ -1124,6 +1304,7 @@ MetalFlashVsrTransformer::build_rope_(int f_len, int h, int w, int t_off,
 
   const int pairs = D / 2;
   std::vector<double> pair_freq((std::size_t)pairs);
+  std::vector<float> pair_freq_f((std::size_t)pairs);
   std::vector<int> pair_axis((std::size_t)pairs), pair_off((std::size_t)pairs);
   {
     int base = 0, pair = 0;
@@ -1132,12 +1313,21 @@ MetalFlashVsrTransformer::build_rope_(int f_len, int h, int w, int t_off,
       for (int i = 0; i < Dax / 2; ++i, ++pair) {
         pair_freq[(std::size_t)pair] =
             1.0 / std::pow(theta, (2.0 * i) / (double)Dax);
+        // FlashVSR+'s own spelling, in float32 throughout:
+        // theta ** (-arange(pairs).float() / pairs).
+        pair_freq_f[(std::size_t)pair] = std::pow(
+            (float)theta, -((float)i / (float)(Dax / 2)));
         pair_axis[(std::size_t)pair] = a;
         pair_off[(std::size_t)pair] = base + 2 * i;
       }
       base += Dax;
     }
   }
+  // FlashVSR+ forms each angle as a FLOAT32 product of position and
+  // frequency and only then widens it for the cosine; v1.1 (Wan's table)
+  // is double throughout. A few ulps of the angle at the positions a
+  // long video reaches -- far below bf16, and the reference's arithmetic.
+  const bool f32_angles = _cfg.schedule.f32_rope;
   for (int p = 0; p < seq; ++p) {
     int ff = 0, yy = 0, xx = 0;
     unpermute_pos(p, h, w, &ff, &yy, &xx);
@@ -1149,7 +1339,11 @@ MetalFlashVsrTransformer::build_rope_(int f_len, int h, int w, int t_off,
     const double coord[3] = {(double)(ff + t_off), (double)yy, (double)xx};
     for (int pair = 0; pair < pairs; ++pair) {
       const double ang =
-          coord[pair_axis[(std::size_t)pair]] * pair_freq[(std::size_t)pair];
+          f32_angles
+              ? (double)((float)coord[pair_axis[(std::size_t)pair]] *
+                         pair_freq_f[(std::size_t)pair])
+              : coord[pair_axis[(std::size_t)pair]] *
+                    pair_freq[(std::size_t)pair];
       const float c = (float)std::cos(ang);
       const float sn = (float)std::sin(ang);
       const std::size_t o = (std::size_t)p * D + pair_off[(std::size_t)pair];
@@ -1179,7 +1373,8 @@ std::vector<std::uint8_t>
 MetalFlashVsrTransformer::route_(const std::vector<float>& qm,
                                  const std::vector<float>& km, int Nq, int Nk,
                                  int sq, int nh_blk, int nw_blk, int topk,
-                                 int local_range, int kL, int bq) const
+                                 int local_range, int kL, int bq,
+                                 int first_win) const
 {
   const int H = _cfg.n_heads, HD = _cfg.head_dim;
   const int S = nh_blk * nw_blk;             // spatial blocks per frame pair
@@ -1257,9 +1452,22 @@ MetalFlashVsrTransformer::route_(const std::vector<float>& qm,
       const float thr = sorted[(std::size_t)apply];
       for (int r = 0; r < s1; ++r) {
         const int i = g * s1 + r;
+        bool any = false;
         for (int j = 0; j < Nk; ++j) {
           keep[(std::size_t)i * Nk + j] =
               group[(std::size_t)r * Nk + j] > thr ? 1u : 0u;
+          any = any || keep[(std::size_t)i * Nk + j] != 0u;
+        }
+        // FlashVSR+: a row the threshold left empty keeps its FIRST
+        // candidate in the reference's key order -- the oldest window's
+        // first block inside the band. See flashvsr_route_fallback.
+        if (!any && first_win >= 0) {
+          for (int j = 0; j < S; ++j) {
+            if (band[(std::size_t)(i % S) * S + j] != 0u) {
+              keep[(std::size_t)i * Nk + first_win * S + j] = 1u;
+              break;
+            }
+          }
         }
       }
     }
@@ -1484,7 +1692,7 @@ MetalFlashVsrTransformer::block_self_attention(int bi, const float* x_tokens,
   const int nb = seq / 128;                 // window blocks
   const int nh_blk = h / 8, nw_blk = w / 8;
   const int S = nh_blk * nw_blk;            // = window_size, blocks per pair
-  const int sq = f / 2;                     // temporal windows in the query
+  const int sq = route_groups_(f);          // top-k groups in the query
   const int kL = seq;                       // no cache on this seam
   const int Nk = nb;
 
@@ -1615,15 +1823,11 @@ MetalFlashVsrTransformer::block_self_attention(int bi, const float* x_tokens,
     const auto* r = (const std::uint16_t*)km_buf.contents();
     for (std::size_t i = 0; i < km.size(); ++i) { km[i] = from_bf16(r[i]); }
   }
-  // The reference scales its own knob by the frame area, so one value
-  // means one selectivity at every resolution.
-  const double topk_ratio =
-      prm.sparse_ratio * 768.0 * 1280.0 / ((double)(h * 16) * (w * 16));
-  const int topk = (int)((double)(S * S) * topk_ratio) - 1;
+  const int topk = topk_(S, h, w, prm);
   _seq_for_route = seq;
   const auto flags =
-      route_(qm, km, nb, Nk, sq, nh_blk, nw_blk, topk, prm.local_range, kL,
-             A_BQ);
+      route_(qm, km, nb, Nk, sq, nh_blk, nw_blk, topk, local_range_(bi, prm),
+             kL, A_BQ, _cfg.schedule.first_candidate ? 0 : -1);
   SharedBuffer flag_buf = _mc->make_shared_buffer(flags.size());
   if (flag_buf.empty()) { return fail("flag allocation failed"); }
   std::memcpy(flag_buf.contents(), flags.data(), flags.size());
@@ -1678,7 +1882,7 @@ MetalFlashVsrTransformer::block_self_attention(int bi, const float* x_tokens,
 
 bool
 MetalFlashVsrTransformer::begin_clip_(Stream& st, int h, int w, int f_max,
-                                      int cap_windows, int n_caches,
+                                      bool full, int n_caches,
                                       const Params& prm, std::string* err)
 {
   auto fail = [&](std::string m) {
@@ -1689,13 +1893,26 @@ MetalFlashVsrTransformer::begin_clip_(Stream& st, int h, int w, int f_max,
   const int A_BQ = attn_bq_(), A_BK = attn_bk_();
   const int nh_blk = h / 8, nw_blk = w / 8;
   const int S = nh_blk * nw_blk;
-  // The LARGEST chunk sizes everything per-chunk here: the opening one,
-  // three temporal windows, in every clip generate() runs.
+  // The LARGEST chunk sizes everything per-chunk here: v1.1's opening
+  // one, three temporal windows, or any of FlashVSR+'s two.
   const int wq_max = std::max(1, f_max / 2);
   st.h = h;
   st.w = w;
   st.one_len = S;
-  st.cap_windows = std::max(cap_windows, wq_max);
+  // EACH LAYER'S RING, in windows: what it keeps and a chunk more once a
+  // second chunk can follow, else the one chunk. Turbo's hybrid layers
+  // keep one window where the others keep three, so the rings differ by
+  // layer; the buffers are sized for the largest.
+  st.layer_cap.assign((std::size_t)_cfg.n_layers, wq_max);
+  int most = wq_max;
+  for (int i = 0; i < _cfg.n_layers; ++i) {
+    if (full) {
+      st.layer_cap[(std::size_t)i] =
+          std::max(layer_ring(_cfg, i, prm.kv_ratio), wq_max);
+    }
+    most = std::max(most, st.layer_cap[(std::size_t)i]);
+  }
+  st.cap_windows = most;
   st.cap_blocks = st.cap_windows * S;
   const std::size_t cap_tok = (std::size_t)st.cap_blocks * 128;
   st.per_block.clear();
@@ -1719,6 +1936,15 @@ MetalFlashVsrTransformer::begin_clip_(Stream& st, int h, int w, int f_max,
     st.flags = _mc->make_shared_buffer(
         (std::size_t)NH * ((nq_max * 128 + A_BQ - 1) / A_BQ) *
         ((std::size_t)st.cap_blocks * 128));
+  }
+  // A hybrid layer's own, narrower band.
+  if (!_cfg.schedule.sliding_layers.empty()) {
+    st.band_slide = _mc->make_shared_buffer((std::size_t)S * S);
+    if (st.band_slide.empty()) {
+      return fail("routing buffer allocation failed");
+    }
+    build_band_(nh_blk, nw_blk, _cfg.schedule.sliding_local_range,
+                st.band_slide);
   }
   if (st.band.empty() || st.p.empty() || st.thr.empty() ||
       (!_use_spans && st.flags.empty())) {
@@ -1758,9 +1984,7 @@ MetalFlashVsrTransformer::begin_clip_(Stream& st, int h, int w, int f_max,
   if (st.qm_buf.empty() || st.km_buf.empty() || st.params.empty()) {
     return fail("routing allocation failed");
   }
-  const double topk_ratio =
-      prm.sparse_ratio * 768.0 * 1280.0 / ((double)(h * 16) * (w * 16));
-  st.topk = (int)((double)(S * S) * topk_ratio) - 1;
+  st.topk = topk_(S, h, w, prm);
   st.prof = std::getenv("VPIPE_FVSR_DIT_PROFILE") != nullptr;
   return true;
 }
@@ -1811,18 +2035,28 @@ MetalFlashVsrTransformer::block_(Stream& st, int bi, const Block* wb,
   const int seq = f * h * w;
   const int nb = seq / 128;
   const int S = (h / 8) * (w / 8);              // window blocks per window
-  const int sq = f / 2;
+  const int sq = route_groups_(f);               // the top-k's groups
   const int T = _cfg.text_tokens;
   const int A_BQ = attn_bq_(), A_BK = attn_bk_();
   const int topk = st.topk;
   const std::size_t cap_tok = (std::size_t)st.cap_blocks * 128;
   const std::size_t n_tok = (std::size_t)seq * D;
-  // The Sage objects sized for THIS chunk's shape: the opening chunk's
-  // three windows, or a later chunk's one.
+  // The Sage objects sized for THIS chunk's shape: v1.1's opening
+  // chunk's three windows, or a later chunk's one. FlashVSR+ has one
+  // chunk shape.
+  const Schedule& sch = _cfg.schedule;
+  const bool opening_shape =
+      f == sch.open_latents && sch.open_latents != sch.chunk_latents;
   MetalSageAttention* sage_self =
-      (f > 2 && _sage_open) ? _sage_open.get() : _sage.get();
+      (opening_shape && _sage_open) ? _sage_open.get() : _sage.get();
   MetalSageAttention* sage_cross =
-      (f > 2 && _sage_x_open) ? _sage_x_open.get() : _sage_x.get();
+      (opening_shape && _sage_x_open) ? _sage_x_open.get() : _sage_x.get();
+  // This layer's ring and band: Turbo's hybrid layers run a smaller ring
+  // in the same buffer, against their own 3x3 band.
+  const int cap = bi < (int)st.layer_cap.size()
+                      ? st.layer_cap[(std::size_t)bi] : st.cap_windows;
+  const SharedBuffer& band =
+      sch.sliding(bi) && !st.band_slide.empty() ? st.band_slide : st.band;
   if (cache_idx < 0 || cache_idx >= (int)st.per_block.size()) {
     return fail("no key/value window for this block");
   }
@@ -1909,22 +2143,30 @@ MetalFlashVsrTransformer::block_(Stream& st, int bi, const Block* wb,
   const Block& b = wb != nullptr ? *wb : fb;
   auto& cache = st.per_block[(std::size_t)cache_idx];
   // THE WINDOW IS A RING of whole temporal windows. This chunk's keys
-  // go into the slot after the newest -- once the ring is full, the one
-  // the last trim released -- so nothing is ever shifted, and every
+  // go into the slots after the newest -- once the ring is full, the
+  // ones the last trim released -- so nothing is ever shifted, and every
   // attention still reads a VALID PREFIX: the ring is either filling
   // from slot 0 or entirely full. The ORDER of the keys is free to
   // change because nothing reads it: they are cached after RoPE at
   // their absolute temporal positions, the routing thresholds a group
   // rather than ranking positions, and the span list is ordered by
   // slot, which is all the kernel asks.
-  const int nwin = nb / st.one_len;              // 3 opening, 1 steady
-  const int slot = (cache.oldest + cache.valid) % st.cap_windows;
-  if (nb % st.one_len != 0 || slot + nwin > st.cap_windows ||
-      (cache.oldest != 0 && cache.valid + nwin != st.cap_windows)) {
+  //
+  // A chunk of SEVERAL windows may WRAP. FlashVSR+ writes two a chunk
+  // into a ring of five (three kept and the chunk), so from the third
+  // chunk on its pair straddles the end: the first window goes to the
+  // last slot and the second to slot 0. The ring is full whenever that
+  // happens, so the prefix is still the whole ring.
+  const int nwin = nb / st.one_len;              // v1.1 3 then 1; + 2
+  const int slot = (cache.oldest + cache.valid) % cap;
+  if (nb % st.one_len != 0 || nwin > cap ||
+      (cache.oldest == 0 ? cache.valid + nwin > cap
+                         : cache.valid + nwin != cap)) {
     return fail("key/value window layout broken");
   }
-  const int held = slot * st.one_len * 128;      // where this chunk goes
-  const int kL = (cache.valid + nwin) * st.one_len * 128;
+  const int head_win = std::min(nwin, cap - slot);   // before the wrap
+  const int win_tok = st.one_len * 128;
+  const int kL = (cache.valid + nwin) * win_tok;
 
   // FIVE SCRATCH TENSORS A BLOCK. One encoder runs its dispatches in
   // the order they were encoded, so a tensor is free for reuse the
@@ -2061,16 +2303,27 @@ MetalFlashVsrTransformer::block_(Stream& st, int bi, const Block* wb,
     enc.set_constant(4, HD);
     enc.dispatch({(unsigned)HD, (unsigned)NH, (unsigned)seq},
                  {(unsigned)HD, 1, 1});
-    append_cache_(enc, k, cache.k, NH, seq, HD, cap_tok, held);
-    append_cache_(enc, v, cache.v, NH, seq, HD, cap_tok, held);
+    append_cache_(enc, k, cache.k, NH, seq, HD, cap_tok, slot * win_tok,
+                  0, head_win * win_tok);
+    append_cache_(enc, v, cache.v, NH, seq, HD, cap_tok, slot * win_tok,
+                  0, head_win * win_tok);
+    if (head_win < nwin) {
+      append_cache_(enc, k, cache.k, NH, seq, HD, cap_tok, 0,
+                    head_win * win_tok, (nwin - head_win) * win_tok);
+      append_cache_(enc, v, cache.v, NH, seq, HD, cap_tok, 0,
+                    head_win * win_tok, (nwin - head_win) * win_tok);
+    }
 
     psplit(t_prep);
     blockmean_(enc, q, qm_buf, HD, seq, 128, NH, nb);
     blockmean_(enc, cache.k, km_buf, HD, (int)cap_tok, 128, NH, Nk);
-    route_gpu_(enc, qm_buf, km_buf, st.band, st.p, st.thr, st.flags, nb, Nk,
+    route_gpu_(enc, qm_buf, km_buf, band, st.p, st.thr, st.flags, nb, Nk,
                sq, S, topk, kL, NQ, A_BQ);
     if (_use_spans) {
-      build_spans_(enc, st, nb, Nk, sq, NQ, A_BQ);
+      // The oldest window in the reference's key order is the ring's
+      // oldest slot -- or, with nothing cached, this chunk's first.
+      build_spans_(enc, st, band, nb, Nk, sq, NQ, A_BQ,
+                   sch.first_candidate ? cache.oldest : -1);
     }
     // VPIPE_FVSR_DENSE_ATTN: keep every key block, to measure what the
     // sparsity actually BUYS in time. has_block_mask is a per-key
@@ -2238,7 +2491,7 @@ MetalFlashVsrTransformer::block_(Stream& st, int bi, const Block* wb,
   // ---- the ring now holds this chunk too; trim to kv_ratio windows.
   kL_last = kL;
   cache.valid += nwin;
-  trim_cache_(st, cache_idx, prm);
+  trim_cache_(st, cache_idx, bi, prm);
   cx.release_all();
   return true;
 }
@@ -2357,8 +2610,7 @@ MetalFlashVsrTransformer::forward_chunk_(Stream& st, int f, int h, int w,
 
   // A seam's lone chunk: a window per block at the ratio's capacity.
   if (st.per_block.empty() &&
-      !begin_clip_(st, h, w, f, kv_windows(prm.kv_ratio), _cfg.n_layers, prm,
-                   err)) {
+      !begin_clip_(st, h, w, f, /*full=*/true, _cfg.n_layers, prm, err)) {
     return false;
   }
   if (st.h != h || st.w != w ||
@@ -2402,19 +2654,24 @@ MetalFlashVsrTransformer::forward_chunk_(Stream& st, int f, int h, int w,
 }
 
 
-// Drop the oldest window when the cache is over its limit. The reference
-// drops exactly ONE window per chunk, never more, and the count it
-// compares is in TEMPORAL WINDOWS rather than blocks or tokens.
+// Drop the oldest windows when the cache is over its limit, counted in
+// TEMPORAL WINDOWS rather than blocks or tokens. v1.1's reference drops
+// exactly ONE window per chunk, never more; FlashVSR+'s keeps the last
+// `keep` (its chunk is two windows, so it drops two).
 void
-MetalFlashVsrTransformer::trim_cache_(Stream& st, int bi, const Params& prm)
+MetalFlashVsrTransformer::trim_cache_(Stream& st, int cache_idx, int bi,
+                                      const Params& prm)
 {
-  Stream::Cache& cache = st.per_block[(std::size_t)bi];
-  const int keep = prm.kv_ratio > 0.0 ? (int)(prm.kv_ratio + 0.5) : 0;
-  if (st.cap_windows <= 0 || cache.valid <= keep) { return; }
-  // The oldest window's slot is RELEASED, not emptied: the next chunk
+  Stream::Cache& cache = st.per_block[(std::size_t)cache_idx];
+  const int keep = keep_windows(_cfg, bi, prm.kv_ratio);
+  const int cap = bi < (int)st.layer_cap.size()
+                      ? st.layer_cap[(std::size_t)bi] : st.cap_windows;
+  if (cap <= 0 || cache.valid <= keep) { return; }
+  // The oldest windows' slots are RELEASED, not emptied: the next chunk
   // writes there. Nothing moves, so there is no GPU work and no spare.
-  cache.oldest = (cache.oldest + 1) % st.cap_windows;
-  --cache.valid;
+  const int drop = _cfg.schedule.trim_to_keep ? cache.valid - keep : 1;
+  cache.oldest = (cache.oldest + drop) % cap;
+  cache.valid -= drop;
 }
 
 // THE SLOTS ARE KEPT, not just the windows. The attention reads a ring
@@ -2436,13 +2693,18 @@ MetalFlashVsrTransformer::carry_window_(Stream& st, int cache_idx, int bi,
   }
   WindowCarry& cr = *_carry;
   Stream::Cache& cache = st.per_block[(std::size_t)cache_idx];
-  if (st.cap_windows != cr.cap_windows) {
+  // Per LAYER: the slots are indices of that layer's own ring, and
+  // Turbo's hybrid layers run a smaller one.
+  const int cap = bi < (int)st.layer_cap.size()
+                      ? st.layer_cap[(std::size_t)bi] : st.cap_windows;
+  if (bi >= (int)cr.caps.size() || cap != cr.caps[(std::size_t)bi]) {
     return fail("the carried window is from a ring of another capacity");
   }
+  const int windows = cap - _cfg.schedule.chunk_latents / 2;
   const int NH = _cfg.n_heads, HD = _cfg.head_dim;
   const std::size_t win_tok = (std::size_t)st.one_len * 128;
   const std::size_t cap_tok = (std::size_t)st.cap_blocks * 128;
-  const std::size_t keep_tok = (std::size_t)cr.windows * win_tok;
+  const std::size_t keep_tok = (std::size_t)windows * win_tok;
   if ((int)cr.k.size() != _cfg.n_layers) {
     cr.k.clear();
     cr.v.clear();
@@ -2460,7 +2722,7 @@ MetalFlashVsrTransformer::carry_window_(Stream& st, int cache_idx, int bi,
     cache.valid = cr.valid[(std::size_t)bi];
     cache.oldest = cr.oldest[(std::size_t)bi];
   } else {
-    if (cache.valid > cr.windows) {
+    if (cache.valid > windows) {
       return fail("the ring holds more windows than a carry keeps");
     }
     if (ck.empty() || cv.empty()) {
@@ -2477,7 +2739,7 @@ MetalFlashVsrTransformer::carry_window_(Stream& st, int cache_idx, int bi,
       ComputeEncoder enc = stream.begin_compute();
       const std::size_t n = win_tok * HD;
       for (int i = 0; i < cache.valid; ++i) {
-        const int slot = (cache.oldest + i) % st.cap_windows;
+        const int slot = (cache.oldest + i) % cap;
         for (int hh = 0; hh < NH; ++hh) {
           const std::size_t ring_off =
               ((std::size_t)hh * cap_tok + (std::size_t)slot * win_tok) * HD;
@@ -2511,19 +2773,22 @@ MetalFlashVsrTransformer::carry_window_(Stream& st, int cache_idx, int bi,
   return true;
 }
 
-// Copy a contiguous [heads, seq, head_dim] block into a cache slab of a
-// different stride, at token offset `held`.
+// Copy tokens [src_tok0, src_tok0 + n_tok) of each head of a contiguous
+// [heads, seq, head_dim] block into a cache slab of a different stride,
+// at token offset `held` -- one piece of a chunk, so a chunk that wraps
+// the ring is two calls.
 void
 MetalFlashVsrTransformer::append_cache_(ComputeEncoder& enc,
                                         const SharedBuffer& src,
                                         const SharedBuffer& dst, int NH,
                                         int seq, int HD, std::size_t cap_tok,
-                                        int held)
+                                        int held, int src_tok0, int n_tok)
 {
-  const std::size_t n = (std::size_t)seq * HD;
+  const std::size_t n = (std::size_t)n_tok * HD;
   for (int hh = 0; hh < NH; ++hh) {
     enc.set_function(_fn_copy);
-    enc.set_buffer(0, src, (std::size_t)hh * n * 2);
+    enc.set_buffer(0, src,
+                   ((std::size_t)hh * seq + (std::size_t)src_tok0) * HD * 2);
     enc.set_buffer(1, dst,
                    ((std::size_t)hh * cap_tok * HD +
                     (std::size_t)held * HD) * 2);
@@ -2661,6 +2926,108 @@ MetalFlashVsrTransformer::route_gpu_(ComputeEncoder& enc,
 //
 // The GPU is the one that matches the REFERENCE's precision: PyTorch
 // computed these scores in f32 too, so the host's double was the outlier.
+// Test seam: the BLOCK-LEVEL routing decision the production path makes
+// for one block over one cacheless chunk -- the GPU scores, softmax,
+// threshold and keep map, with the block's own band, the release's top-k
+// and grouping, and FlashVSR+'s empty-row fallback -- as [H, Nq, Nk]
+// bytes, 1 = attended. It is the reference's own block mask, so it can be
+// compared to one entry for entry, where an attention output or a latent
+// would hide a near-threshold rule behind bf16 noise.
+bool
+MetalFlashVsrTransformer::route_blocks(int bi, const float* x_tokens, int f,
+                                       int h, int w, int t_off,
+                                       const Params& prm,
+                                       std::vector<std::uint8_t>* keep,
+                                       std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  if (x_tokens == nullptr || keep == nullptr || !ensure_kernels_(err)) {
+    return fail("no tokens or kernels");
+  }
+  if (bi < 0 || bi >= (int)_blocks.size()) { return fail("no such block"); }
+  const Block& b = _blocks[(std::size_t)bi];
+  const int D = _cfg.hidden, NH = _cfg.n_heads, HD = _cfg.head_dim;
+  const int seq = f * h * w, nb = seq / 128;
+  const int nh_blk = h / 8, nw_blk = w / 8, S = nh_blk * nw_blk;
+  const int sq = route_groups_(f), kL = seq, Nk = nb, A_BQ = 32;
+  const int NQ = (seq + A_BQ - 1) / A_BQ;
+  const std::size_t n_tok = (std::size_t)seq * D;
+
+  SharedBuffer rcos = _mc->make_shared_buffer((std::size_t)seq * HD * 4);
+  SharedBuffer rsin = _mc->make_shared_buffer((std::size_t)seq * HD * 4);
+  if (rcos.empty() || rsin.empty()) { return fail("rope allocation"); }
+  build_rope_(f, h, w, t_off, rcos, rsin);
+  SharedBuffer x = _mc->make_shared_buffer(n_tok * 2);
+  if (x.empty()) { return fail("token allocation"); }
+  {
+    auto* pt = (std::uint16_t*)x.contents();
+    for (std::size_t i = 0; i < n_tok; ++i) { pt[i] = to_bf16(x_tokens[i]); }
+  }
+  Stream st;
+  st.one_len = S;
+  st.p = _mc->make_shared_buffer((std::size_t)NH * nb * Nk * 4);
+  st.thr = _mc->make_shared_buffer((std::size_t)NH * sq * 4);
+  st.keep = _mc->make_shared_buffer((std::size_t)NH * nb * Nk);
+  st.qb_off = _mc->make_shared_buffer((std::size_t)NH * (NQ + 1) * 4);
+  st.qb_blocks = _mc->make_shared_buffer(
+      (std::size_t)NH * NQ * Nk * (128 / attn_bk_()) * 4);
+  SharedBuffer qm = _mc->make_shared_buffer((std::size_t)NH * nb * HD * 2);
+  SharedBuffer km = _mc->make_shared_buffer((std::size_t)NH * Nk * HD * 2);
+  SharedBuffer band = _mc->make_shared_buffer((std::size_t)S * S);
+  if (st.p.empty() || st.thr.empty() || st.keep.empty() ||
+      st.qb_off.empty() || st.qb_blocks.empty() || qm.empty() ||
+      km.empty() || band.empty()) {
+    return fail("routing allocation failed");
+  }
+  build_band_(nh_blk, nw_blk, local_range_(bi, prm), band);
+  const int topk = topk_(S, h, w, prm);
+
+  FwdCtx cx;
+  {
+    CommandStream stream = _mc->make_command_stream();
+    ComputeEncoder enc = stream.begin_compute();
+    cx.enc = &enc;
+    SharedBuffer& y  = cx.alloc(_mc, n_tok);
+    SharedBuffer& q  = cx.alloc(_mc, n_tok);
+    SharedBuffer& k  = cx.alloc(_mc, n_tok);
+    SharedBuffer& qp = cx.alloc(_mc, n_tok);
+    SharedBuffer& kp = cx.alloc(_mc, n_tok);
+    SharedBuffer& qh = cx.alloc(_mc, n_tok);
+    SharedBuffer& kh = cx.alloc(_mc, n_tok);
+    if (!cx.alloc_ok) { return fail("scratch allocation failed"); }
+    enc.set_function(_fn_ln_mod);
+    enc.set_buffer(0, x);
+    enc.set_buffer(1, b.mod, (std::size_t)1 * D * 2);
+    enc.set_buffer(2, b.mod, 0);
+    enc.set_buffer(3, y);
+    enc.set_constant(4, D); enc.set_constant(5, _cfg.norm_eps);
+    enc.dispatch({256, (unsigned)seq, 1}, {256, 1, 1});
+    gemm_(enc, y, b.q1, b.q1b, q, seq, D, D);
+    gemm_(enc, y, b.k1, b.k1b, k, seq, D, D);
+    rms_(enc, q, b.qn1, q, seq, D);
+    rms_(enc, k, b.kn1, k, seq, D);
+    permute_(enc, q, qp, f, h, w, D, false);
+    permute_(enc, k, kp, f, h, w, D, false);
+    trope_(enc, qp, qh, rcos, rsin, NH, seq, HD);
+    trope_(enc, kp, kh, rcos, rsin, NH, seq, HD);
+    blockmean_(enc, qh, qm, HD, seq, 128, NH, nb);
+    blockmean_(enc, kh, km, HD, kL, 128, NH, Nk);
+    route_gpu_(enc, qm, km, band, st.p, st.thr, SharedBuffer{}, nb, Nk, sq,
+               S, topk, kL, NQ, A_BQ);
+    build_spans_(enc, st, band, nb, Nk, sq, NQ, A_BQ,
+                 _cfg.schedule.first_candidate ? 0 : -1);
+    enc.end();
+    std::string ge;
+    if (!stream.commit().wait_ok(&ge)) { return fail("routing failed: " + ge); }
+  }
+  const auto* kp = (const std::uint8_t*)st.keep.contents();
+  keep->assign(kp, kp + (std::size_t)NH * nb * Nk);
+  return true;
+}
+
 bool
 MetalFlashVsrTransformer::route_compare(const float* x_tokens, int f, int h,
                                         int w, int t_off, const Params& prm,
@@ -2679,7 +3046,7 @@ MetalFlashVsrTransformer::route_compare(const float* x_tokens, int f, int h,
   const int D = _cfg.hidden, NH = _cfg.n_heads, HD = _cfg.head_dim;
   const int seq = f * h * w, nb = seq / 128;
   const int nh_blk = h / 8, nw_blk = w / 8, S = nh_blk * nw_blk;
-  const int sq = f / 2, kL = seq, Nk = nb, A_BQ = 32;
+  const int sq = route_groups_(f), kL = seq, Nk = nb, A_BQ = 32;
   const int NQ = (seq + A_BQ - 1) / A_BQ;
   const std::size_t n_tok = (std::size_t)seq * D;
 
@@ -2706,11 +3073,8 @@ MetalFlashVsrTransformer::route_compare(const float* x_tokens, int f, int h,
       flags.empty()) {
     return fail("routing allocation failed");
   }
-  build_band_(nh_blk, nw_blk, prm.local_range, band);
-
-  const double topk_ratio =
-      prm.sparse_ratio * 768.0 * 1280.0 / ((double)(h * 16) * (w * 16));
-  const int topk = (int)((double)(S * S) * topk_ratio) - 1;
+  build_band_(nh_blk, nw_blk, local_range_(0, prm), band);
+  const int topk = topk_(S, h, w, prm);
 
   {
     CommandStream stream = _mc->make_command_stream();
@@ -2760,7 +3124,7 @@ MetalFlashVsrTransformer::route_compare(const float* x_tokens, int f, int h,
   std::vector<std::uint8_t> host;
   if (std::getenv("VPIPE_FVSR_NO_HOST_ROUTE") == nullptr) {
     host = route_(qmf, kmf, nb, Nk, sq, nh_blk, nw_blk, topk,
-                  prm.local_range, kL, A_BQ);
+                  local_range_(0, prm), kL, A_BQ);
   } else {
     host.assign((std::size_t)NH * NQ * kL, 0u);
     const auto* gp = (const std::uint8_t*)flags.contents();
@@ -2782,8 +3146,10 @@ MetalFlashVsrTransformer::route_compare(const float* x_tokens, int f, int h,
 // thread -- the array is a couple of thousand entries and has to be
 // globally monotonic across heads), then the list itself.
 void
-MetalFlashVsrTransformer::build_spans_(ComputeEncoder& enc, Stream& st, int Nq,
-                                       int Nk, int sq, int NQ, int bq)
+MetalFlashVsrTransformer::build_spans_(ComputeEncoder& enc, Stream& st,
+                                       const SharedBuffer& band, int Nq,
+                                       int Nk, int sq, int NQ, int bq,
+                                       int first_win)
 {
   const int H = _cfg.n_heads;
   const int s1 = (sq > 0) ? Nq / sq : Nq;
@@ -2797,6 +3163,17 @@ MetalFlashVsrTransformer::build_spans_(ComputeEncoder& enc, Stream& st, int Nq,
   enc.set_buffer(0, st.p); enc.set_buffer(1, st.thr); enc.set_buffer(2, st.keep);
   enc.set_constant(3, Nq); enc.set_constant(4, Nk); enc.set_constant(5, s1);
   enc.dispatch({(unsigned)Nk, (unsigned)Nq, (unsigned)H}, {32, 1, 1});
+
+  // A row the threshold left EMPTY would be a 0/0 softmax in the span
+  // kernel -- a NaN row every later block spreads. FlashVSR+ keeps its
+  // first candidate there, as its reference does.
+  if (first_win >= 0) {
+    enc.set_function(_fn_rt_fallback);
+    enc.set_buffer(0, st.keep); enc.set_buffer(1, band);
+    enc.set_constant(2, Nq); enc.set_constant(3, Nk);
+    enc.set_constant(4, st.one_len); enc.set_constant(5, first_win);
+    enc.dispatch({(unsigned)Nq, (unsigned)H, 1}, {32, 1, 1});
+  }
 
   enc.set_function(_fn_sp_off);
   enc.set_buffer(0, st.keep); enc.set_buffer(1, st.qb_off);
@@ -2839,8 +3216,10 @@ MetalFlashVsrTransformer::generate(const Request& req,
     return fail("a continuing request names its chunks; it has no opening "
                 "chunk for a frame count to describe");
   }
-  if (req.chunks <= 0 && align_frames(req.frames) != req.frames) {
-    return fail("frame count must be 8k+1");
+  const Schedule& sch = _cfg.schedule;
+  if (req.chunks <= 0 && align_frames(sch, req.frames) != req.frames) {
+    return fail(fmt("frame count must be {}k+{}", 4 * sch.chunk_latents,
+                    1 + 4 * (sch.open_latents % sch.chunk_latents))());
   }
   if (!ensure_kernels_(err)) { return false; }
 
@@ -2848,18 +3227,20 @@ MetalFlashVsrTransformer::generate(const Request& req,
   const int h8 = req.height / 8, w8 = req.width / 8;
   const int th = h8 / 2, tw = w8 / 2;
   const int chunks =
-      req.chunks > 0 ? req.chunks : (req.frames - 1) / 8 - 2;
+      req.chunks > 0 ? req.chunks : chunks_of(sch, req.frames);
   if (chunks <= 0) {
     return fail(fmt("a clip of {} frames is all warmup; {} are needed before "
-                    "anything is restored", req.frames, 8 * 3 + 1)());
+                    "anything is restored", req.frames,
+                    sch.frames_through(0))());
   }
   // The latent frames this request holds, and where the first of them
-  // sits in the STREAM: the opening chunk is six of them, every later
-  // chunk two, so a continuation starting at chunk c begins at 4 + 2c.
-  const int T = cont ? 2 * chunks : 2 * chunks + 4;
-  const int g0 = cont ? 4 + 2 * req.chunk0 : 0;
+  // sits in the STREAM: v1.1's opening chunk is six of them and every
+  // later one two, so a continuation starting at chunk c begins at
+  // 4 + 2c; FlashVSR+'s are four each, so it begins at 4c.
+  const int T = cont ? sch.chunk_latents * chunks : sch.latents(chunks);
+  const int g0 = cont ? sch.latents(req.chunk0) : 0;
   // The clip-shaped frame count the memory rules are written in.
-  const int frames_eq = 8 * chunks + 17;
+  const int frames_eq = (int)sch.frames_through(chunks - 1);
   const std::size_t plane = (std::size_t)h8 * w8;
 
   // A CONTINUATION takes what the stream opened with; anything else is a
@@ -2929,23 +3310,11 @@ MetalFlashVsrTransformer::generate(const Request& req,
                     req.row_frames, want_rf)());
   }
 
-  // A stream's ring is always the ratio's full capacity, because the
-  // slots a carried window goes back into are indices of it -- a one-
-  // chunk opening would otherwise size a ring of three, and the request
-  // after it would have nowhere consistent to put them.
+  // A stream's rings are always the ratio's full capacity, because the
+  // slots a carried window goes back into are indices of them -- a one-
+  // chunk opening would otherwise size a ring of one chunk, and the
+  // request after it would have nowhere consistent to put them.
   const bool stream = cont || req.keep_window;
-  const int cap_windows = stream ? kv_windows(req.params.kv_ratio)
-                                 : ring_windows(req.frames,
-                                                req.params.kv_ratio);
-  if (req.keep_window && !_carry) {
-    _carry = std::make_unique<WindowCarry>();
-    _carry->windows = kv_windows(req.params.kv_ratio) - 1;
-    _carry->cap_windows = cap_windows;
-    _carry->height = req.height;
-    _carry->width = req.width;
-    _carry->seed = seed;
-    _carry->params = req.params;
-  }
   // Until this request succeeds the carry is half rewritten, and nothing
   // may continue from it.
   if (_carry) { _carry->next_chunk = -1; }
@@ -2953,16 +3322,30 @@ MetalFlashVsrTransformer::generate(const Request& req,
   if (_streaming) { _streaming->slots.begin_forward(); }
   const bool outer = blocks_outer(_cfg, req.height, req.width, frames_eq,
                                   req.params);
-  if (!begin_clip_(st, th, tw, cont ? 2 : 6, cap_windows,
+  // The largest chunk this request runs: a continuation has no opening.
+  const int f_max = cont ? sch.chunk_latents
+                         : std::max(sch.open_latents, sch.chunk_latents);
+  if (!begin_clip_(st, th, tw, f_max, stream || chunks > 1,
                    outer ? 1 : _cfg.n_layers, req.params, err)) {
     return false;
   }
+  if (req.keep_window && !_carry) {
+    _carry = std::make_unique<WindowCarry>();
+    _carry->caps = st.layer_cap;
+    _carry->height = req.height;
+    _carry->width = req.width;
+    _carry->seed = seed;
+    _carry->params = req.params;
+  }
   // Chunk `ci` of this request: its size, its RoPE offset in the stream,
-  // and where its latent frames start in this request's own tensors.
-  auto chunk_f = [&](int ci) { return req.chunk0 + ci == 0 ? 6 : 2; };
+  // and where its latent frames start in this request's own tensors. The
+  // offset is the chunk's first latent frame in the whole stream.
+  auto chunk_f = [&](int ci) {
+    return req.chunk0 + ci == 0 ? sch.open_latents : sch.chunk_latents;
+  };
   auto chunk_t = [&](int ci) {
     const int c = req.chunk0 + ci;
-    return c == 0 ? 0 : 4 + 2 * c;
+    return c == 0 ? 0 : sch.latents(c);
   };
   bool ok = false;
   if (outer) {
@@ -3312,6 +3695,7 @@ MetalFlashVsrTransformer::ensure_kernels_(std::string* err)
   _fn_rt_keep    = _lib_route.function("flashvsr_route_keep");
   _fn_sp_off     = _lib_route.function("flashvsr_span_offsets");
   _fn_sp_emit    = _lib_route.function("flashvsr_span_emit");
+  _fn_rt_fallback = _lib_route.function("flashvsr_route_fallback");
   // Spans by default: they SKIP where the mask only masks. The mask
   // path is kept for the A/B that established that.
   _use_spans = std::getenv("VPIPE_FVSR_MASK_ATTN") == nullptr &&
@@ -3332,7 +3716,7 @@ MetalFlashVsrTransformer::ensure_kernels_(std::string* err)
       !_fn_copy.valid() || !_fn_sdpa.valid() ||
       !_fn_rt_scores.valid() || !_fn_rt_softmax.valid() ||
       !_fn_rt_thresh.valid() || !_fn_rt_flags.valid() ||
-      !_fn_gemm_bm64.valid()) {
+      !_fn_rt_fallback.valid() || !_fn_gemm_bm64.valid()) {
     return fail("flashvsr denoiser kernels failed to validate");
   }
   return true;

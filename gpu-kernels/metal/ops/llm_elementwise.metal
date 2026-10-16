@@ -2330,6 +2330,28 @@ kernel void copy_rect_f16(
   out[dst_off + r * dst_stride + c] = src[src_off + r * src_stride + c];
 }
 
+// copy_rect_f16 with 64-bit offsets and strides, on a 2D grid. A whole
+// channel-last plane of a 4096^2 VAE decode holds 4.3G elements (256
+// channels), past any int offset; the exact tiled decode copies tiles out
+// of such planes and their interiors back in.
+// 0:src 1:out 2:src_off 3:dst_off 4:rows 5:row_elems 6:src_stride
+// 7:dst_stride (all ELEMENTS). Grid {row_elems, rows}.
+kernel void copy_rect_wide_f16(
+    const device VPIPE_ELT* src        [[buffer(0)]],
+    device VPIPE_ELT*       out        [[buffer(1)]],
+    constant long&          src_off    [[buffer(2)]],
+    constant long&          dst_off    [[buffer(3)]],
+    constant int&           rows       [[buffer(4)]],
+    constant int&           row_elems  [[buffer(5)]],
+    constant long&          src_stride [[buffer(6)]],
+    constant long&          dst_stride [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if ((int)gid.x >= row_elems || (int)gid.y >= rows) { return; }
+  const long r = (long)gid.y, c = (long)gid.x;
+  out[dst_off + r * dst_stride + c] = src[src_off + r * src_stride + c];
+}
+
 // ---- a key / value cache in 8 bits (TaoMate-H3's clean K/V) -------------
 //
 // Head-major planes [heads, rows, D], D a multiple of 64, stored as 8-bit
@@ -4461,6 +4483,56 @@ kernel void group_norm_apply_f16(
   const float iv = stats[2 * g + 1];
   out[idx] = VPIPE_ELT((float(x[idx]) - m) * iv * float(gamma[c])
                        + float(beta[c]));
+}
+
+// group_norm_chan_stats_f16 over a RECTANGLE of a channel-last [*, W, C]
+// plane, optionally ADDING to the partials already there. A plane too
+// large to hold whole is computed tile by tile; each tile contributes the
+// sums of the rows it owns, and group_norm_group_stats_f32 then reduces
+// the accumulated partials exactly as it does a whole plane's (pass the
+// whole plane's pixel count as `rows`). Block b sums rect pixels
+// [b*chunk, (b+1)*chunk) in raster order; indices are 64-bit, since a
+// whole 4096^2 plane is past 2^31 elements.
+//   0:x 1:part(f32)[NB][2*C] 2:W 3:C 4:y0 5:x0 6:rh 7:rw 8:NB 9:accumulate
+//   grid {256*NB}, tg {256}.
+kernel void group_norm_chan_stats_rect_f16(
+    const device VPIPE_ELT* x    [[buffer(0)]],
+    device float*           part [[buffer(1)]],
+    constant int&           W    [[buffer(2)]],
+    constant int&           C    [[buffer(3)]],
+    constant int&           y0   [[buffer(4)]],
+    constant int&           x0   [[buffer(5)]],
+    constant int&           rh   [[buffer(6)]],
+    constant int&           rw   [[buffer(7)]],
+    constant int&           NB   [[buffer(8)]],
+    constant int&           acc  [[buffer(9)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 ltid [[thread_position_in_threadgroup]],
+    uint3 tptg [[threads_per_threadgroup]])
+{
+  const int  b    = (int)tgid.x;
+  const uint lid  = ltid.x;
+  const uint tgsz = tptg.x;
+  const long npx  = (long)rh * (long)rw;
+  const long chunk = (npx + NB - 1) / NB;
+  const long plo = (long)b * chunk;
+  const long phi = min(plo + chunk, npx);
+  for (int c0 = 0; c0 < C; c0 += (int)tgsz) {
+    const int c = c0 + (int)lid;
+    if (c >= C) { break; }
+    float s = 0.0f, sq = 0.0f;
+    long y = (long)y0 + plo / rw;
+    int  xi = (int)(plo % rw);
+    for (long p = plo; p < phi; ++p) {
+      const long px = y * (long)W + (long)(x0 + xi);
+      const float v = float(x[px * (long)C + (long)c]);
+      s += v; sq += v * v;
+      if (++xi == rw) { xi = 0; ++y; }
+    }
+    device float* ps = part + (long)b * 2 * (long)C + (long)c;
+    if (acc != 0) { ps[0] += s; ps[C] += sq; }
+    else          { ps[0] = s;  ps[C] = sq; }
+  }
 }
 
 // ---- direct 3x3 convolution for a SMALL output-channel count -----------

@@ -214,8 +214,14 @@ FlashVsrLqProj::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   m->_cfg.hidden2 = m->_conv2->cout;
   m->_cfg.in_channels = m->_conv1->cin / (m->_cfg.shuffle_h * m->_cfg.shuffle_w);
 
-  m->_gamma1 = m->load_vec_(w, prefix + "norm1.gamma");
-  m->_gamma2 = m->load_vec_(w, prefix + "norm2.gamma");
+  // v1.1 names the channel norms' scale `gamma`, FlashVSR+ `weight` --
+  // the same [C, 1, 1, 1] tensor.
+  auto norm = [&](const char* n) {
+    const std::string g = prefix + n + ".gamma";
+    return m->load_vec_(w, w.has(g) ? g : prefix + n + ".weight");
+  };
+  m->_gamma1 = norm("norm1");
+  m->_gamma2 = norm("norm2");
   if (m->_gamma1.empty() || m->_gamma2.empty()) {
     return fail("lq_proj norm gammas missing");
   }
@@ -357,9 +363,9 @@ FlashVsrLqProj::weight_bytes(const std::string& source,
 std::size_t
 FlashVsrLqProj::working_bytes(const std::string& source,
                               const std::string& prefix, int height,
-                              int width, int frames)
+                              int width, int row_frames)
 {
-  if (height <= 0 || width <= 0 || frames <= 0) { return 0; }
+  if (height <= 0 || width <= 0 || row_frames < 0) { return 0; }
   auto ws = WeightSet::open(source, nullptr);
   if (ws == nullptr) { return 0; }
   const auto* c1 = ws->src().info(prefix + "conv1.weight");
@@ -386,12 +392,10 @@ FlashVsrLqProj::working_bytes(const std::string& source,
   const U conv1 = 2 * kOut1 * hw * C1 * 2;               // and its norm
   const U conv2 = 2 * kOut2 * hw * C2 * 2;
   const U carries = (U)kCarry * hw * (C0 + C1) * 2;
-  // The clip's row frames, one per four source frames past the warmup --
-  // the latent's own count -- held as they come and then copied into the
-  // beat.
-  const int chunks = (frames - 1) / 8 - 2;
-  const U row_frames = chunks > 0 ? (U)(2 * chunks + 4) : 0;
-  const U rows = 2 * row_frames * hw * out * 2;
+  // The clip's row frames -- the latent's own count, which the caller
+  // knows from the release's schedule -- held as they come and then
+  // copied into the beat.
+  const U rows = 2 * (U)row_frames * hw * out * 2;
   return band + src + unshuffled + conv1 + conv2 + carries + rows;
 }
 

@@ -1166,3 +1166,103 @@ TEST(runtime_lora, block_diagonal_tells_a_converted_fusion_from_a_trained_one)
   EXPECT_TRUE(untouched);
   fs::remove(pc, ec); fs::remove(pt, ec);
 }
+
+// THE 2 GB LINE. The second GEMM accumulates scale * (x A^T) B^T INTO the
+// projection's own output, and on the matrix-core route a tile past 2^31
+// BYTES of any operand stores nothing -- with the stream reporting
+// success. A 4096^2 FLUX.3 feed-forward's output is [65616, 18432] bf16,
+// 2.42 GB: unbanded, every row past ~58254 kept the base result and lost
+// the adapter. Rows on both sides of the line are checked against the
+// arithmetic; on a GPU without matrix cores this runs the steel route,
+// which has no such line, and passes for that reason.
+TEST(runtime_lora, the_adapter_reaches_rows_past_the_2gb_line)
+{
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  // Rank 128: the accumulating second GEMM takes the matrix-core tile
+  // only from there (route_b_); below it, steel -- which has no line,
+  // and a rank-8 version of this test passed on the unbanded code.
+  const int M = 65616, N = 18432, K = 3072, R = 128;
+  auto bf = [](float f) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  auto fl = [](std::uint16_t h) {
+    const std::uint32_t u = (std::uint32_t)h << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  auto val = [](std::size_t i, unsigned s) {
+    const std::uint32_t h = (std::uint32_t)(i * 2654435761u) ^ (s * 40503u);
+    return ((float)(h % 2001u) - 1000.0f) / 1000.0f;
+  };
+  metal_compute::SharedBuffer x =
+      mc->make_shared_buffer((std::size_t)M * K * 2);
+  metal_compute::SharedBuffer y =
+      mc->make_shared_buffer((std::size_t)M * N * 2);
+  genai::lora::Factors f;
+  f.rank = R;
+  f.a = mc->make_shared_buffer((std::size_t)R * K * 2);
+  f.b = mc->make_shared_buffer((std::size_t)N * R * 2);
+  ASSERT_TRUE(!x.empty() && !y.empty() && !f.a.empty() && !f.b.empty());
+  if (x.empty() || y.empty() || f.a.empty() || f.b.empty()) { return; }
+  auto* xp = static_cast<std::uint16_t*>(x.contents());
+  auto* ap = static_cast<std::uint16_t*>(f.a.contents());
+  auto* bp = static_cast<std::uint16_t*>(f.b.contents());
+  for (std::size_t i = 0; i < (std::size_t)M * K; ++i) {
+    xp[i] = bf(val(i, 1));
+  }
+  for (std::size_t i = 0; i < (std::size_t)R * K; ++i) {
+    ap[i] = bf(0.02f * val(i, 2));
+  }
+  for (std::size_t i = 0; i < (std::size_t)N * R; ++i) {
+    bp[i] = bf(val(i, 3));
+  }
+  std::memset(y.contents(), 0, (std::size_t)M * N * 2);
+
+  genai::lora::Applier app;
+  ASSERT_TRUE(app.init(mc, /*allow_mma=*/true));
+  ASSERT_TRUE(app.ensure_scratch((std::size_t)M * R));
+  {
+    metal_compute::CommandStream st = mc->make_command_stream();
+    metal_compute::ComputeEncoder enc = st.begin_compute();
+    app.apply(enc, x, 0, f, y, 0, M, N, K, 1.0f, 64, 0);
+    enc.end();
+    std::string err;
+    ASSERT_TRUE(st.commit().wait_ok(&err));
+  }
+  const auto* yp = static_cast<const std::uint16_t*>(y.contents());
+  // The line in ROWS of y: 2^31 bytes / (N * 2).
+  const int line = (int)((((std::size_t)1 << 31) - 1) / ((std::size_t)N * 2));
+  int checked = 0, past = 0, bad = 0;
+  for (int m : {0, 1234, line - 1, line, line + 1, 60000, 63333, M - 1}) {
+    double t[R];
+    for (int j = 0; j < R; ++j) {
+      double s = 0.0;
+      for (int k = 0; k < K; ++k) {
+        s += (double)fl(xp[(std::size_t)m * K + k]) *
+             (double)fl(ap[(std::size_t)j * K + k]);
+      }
+      t[j] = fl(bf((float)s));                 // t is kept in bf16
+    }
+    for (int n : {0, 777, 9216, N - 1}) {
+      double want = 0.0;
+      for (int j = 0; j < R; ++j) {
+        want += t[j] * (double)fl(bp[(std::size_t)n * R + j]);
+      }
+      const double got = fl(yp[(std::size_t)m * N + n]);
+      ++checked;
+      if (m >= line) { ++past; }
+      if (std::fabs(got - want) > 0.02 * std::fabs(want) + 0.02) { ++bad; }
+    }
+  }
+  std::printf("[runtime_lora] %s route, %d x %d output (%.2f GB): %d of %d "
+              "sampled outputs wrong (%d past the 2 GB line at row %d)\n",
+              mc->supports_matrix_cores() ? "matrix-core" : "steel", M, N,
+              (double)M * N * 2 / 1e9, bad, checked, past, line);
+  EXPECT_TRUE(past > 0);
+  EXPECT_TRUE(bad == 0);
+}

@@ -1,3 +1,4 @@
+#include "generative-models/flux3/metal-flux3-transformer.h"
 #include "generative-models/shared/accel-settings.h"
 #include "stages/vae-encode-stage.h"
 #include "common/beat-keys.h"
@@ -231,7 +232,7 @@ const ConfigKey kAttrs[] = {
           "model iport overrides it. May also name a STANDALONE VAE "
           "(krea2-vae), whose encoder half is used the same way",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image,"
+   .suggest_db_type = "krea2,krea2-vae,flux2,flux3,qwen-image,"
                       "qwen-image-edit,qwen-image-21,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-image-vae,vosr",
@@ -538,6 +539,11 @@ VaeEncodeStage::ensure_loaded_()
     return;
   }
   const std::string root = resolve_model_dir(session(), _hf_dir);
+  if (genai::flux3::is_bfl_root_layout(root)) {
+    session()->error(fmt("VaeEncodeStage('{}'): {}; inert", this->id(),
+                         genai::flux3::bfl_root_layout_message(root)));
+    return;
+  }
   // Idle-unload decision (auto: the DiT + text encoder of this same pipeline are
   // resident during a run, so size the box against THEIR weights -- the VAE's
   // own are small, it is the decode working set that has to fit beside them).
@@ -1084,6 +1090,22 @@ VaeEncodeStage::process(RuntimeContext& ctx)
   }
   auto out = encode_one_(*tb, in->describe());
   if (!out) { co_return; }
+  // A picture padded out to a canvas (image-resample `pad_to_grid`) says
+  // where it sits on it; the latent of that canvas carries the box on, in
+  // the same pixels -- so only when the picture is encoded at its own
+  // size, since a target_width/height letterbox would move it.
+  if (tb->shape.size() == 3 && !(_target_w > 0 && _target_h > 0) &&
+      tb->sideband.is_object()) {
+    FlexData sb = tb->sideband;          // as_object() is a view: keep it
+    auto so = sb.as_object();
+    if (so.contains(sideband::kCropBox)) {
+      if (!out->sideband.is_object()) {
+        out->sideband = FlexData::make_object();
+      }
+      out->sideband.as_object().insert_or_assign(
+          sideband::kCropBox, so.at(sideband::kCropBox));
+    }
+  }
   if (_unload_idle && !_batch) { unload_vae_(); }
   co_await ctx.write(0, std::move(out));
 }

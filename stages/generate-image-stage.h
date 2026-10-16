@@ -20,6 +20,7 @@
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
 #include "generative-models/boogu/metal-boogu-transformer.h"
 #include "generative-models/z-image/metal-z-image-transformer.h"
+#include "generative-models/flux3/metal-flux3-transformer.h"
 #include "generative-models/vosr/metal-vosr-transformer.h"
 #include "stages/generation-input.h"
 #include "stages/latent-preview.h"
@@ -241,8 +242,10 @@ private:
   // Stamp the generating model onto a latent beat's sideband. The chain
   // generate-image -> vae-decode -> save-image carries it through so a saved
   // file can record WHAT produced it (save-image writes it into EXIF
-  // Software). Merges into any sideband already present.
-  void tag_model_(TensorBeat& tb) const;
+  // Software). Merges into any sideband already present. And when the
+  // latent is a single reference's padded canvas, that reference's
+  // sideband::kCropBox, for vae-decode to cut the picture back to.
+  void tag_output_(TensorBeat& tb) const;
 
   std::string _hf_dir;
   std::string _dit_dir;
@@ -523,6 +526,10 @@ private:
   struct RefLatent {
     std::vector<float> chw;
     int c = 0, h = 0, w = 0;
+    // sideband::kCropBox off the latent's beat: the picture's rectangle on
+    // the canvas it was padded to (image-resample `pad_to_grid`). Null:
+    // none.
+    FlexData crop_box;
     bool empty() const { return chw.empty(); }
   };
   // What each reference INPUT holds: ref_latent0 / ref_latent1, then
@@ -602,6 +609,31 @@ private:
       const metal_compute::SharedBuffer& txt_pos, int n_real,
       const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
       int gen_h, int gen_w,
+      const std::function<void(const std::vector<float>&)>& emit_step) const;
+
+  // ---- FLUX.3 Image Klein ---------------------------------------------
+  std::unique_ptr<genai::MetalFlux3Transformer> _flux3_dit;
+  std::string _flux3_dit_dir;
+  bool _flux3_stream = false;
+  // The sampler the CHECKPOINT states (<root>/config.json `sampler`):
+  // the schedule's alpha (6.93) and its step count (16 for the distilled
+  // Klein). Read at load, because the two Klein checkpoints differ here
+  // and in nothing a transformer config says.
+  double _flux3_alpha = 6.93;
+  int _flux3_steps = 16;
+  // flux3-model-config's `alpha`: 0 = no opinion (the checkpoint's own).
+  // Reset per launch with the other parsed model-config values.
+  double _flux3_alpha_cfg = 0.0;
+  bool load_flux3_dit_();
+  void free_flux3_dit_for_decode_(int gen_w, int gen_h);
+  // Text (+ references) -> the packed latent, unpacked to [128, H/16,
+  // W/16]: the flow map's own loop -- each step hands the DiT the time
+  // it jumps TO, which FlowSampler's denoise callback has no way to
+  // pass.
+  std::vector<float> generate_flux3_(
+      const metal_compute::SharedBuffer& text, int n_rows, int gen_h,
+      int gen_w, const std::vector<RefLatent>& refs,
+      const std::vector<float>* init_packed,
       const std::function<void(const std::vector<float>&)>& emit_step) const;
 
   // The conditioning -> unpacked-latent forward: fuse the tapped text

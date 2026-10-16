@@ -2,6 +2,7 @@
 #include "stages/audio-video/image-resample-stage.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/tensor-beat.h"
+#include "common/beat-keys.h"
 #include "common/flex-data.h"
 #include "common/job.h"
 #include "common/session.h"
@@ -834,4 +835,213 @@ TEST(image_resample_stage, float_samples_are_not_clamped) {
     EXPECT_TRUE(bmax > 1.4f);
     EXPECT_TRUE(lmin < 0.0f);
   }
+}
+
+// ---- pad_to_grid / crop_to_grid: FLUX.3's reference fits ----------------
+
+namespace {
+
+// One planar [3,H,W] u8 frame that says where each sample came from:
+// plane 0 holds the row, plane 1 the column, plane 2 a constant -- so a
+// padded or cropped output can be checked pixel by pixel against the
+// source position numpy's np.pad would have taken it from.
+class WhereSource : public TypedStage<WhereSource> {
+public:
+  static constexpr const char* kTypeName = "ut-resample-src-where";
+  using TypedStage::TypedStage;
+  int H = 0, W = 0;
+  Job process(RuntimeContext& ctx) override
+  {
+    if (_sent) { ctx.signal_done(); co_return; }
+    _sent = true;
+    TensorBeat tb;
+    tb.dtype = TensorBeat::DType::U8;
+    tb.shape = { 3, H, W };
+    tb.resize_contiguous(static_cast<size_t>(3) * H * W);
+    uint8_t* d = tb.as_u8();
+    for (int y = 0; y < H; ++y) {
+      for (int x = 0; x < W; ++x) {
+        const size_t i = static_cast<size_t>(y) * W + x;
+        d[i] = static_cast<uint8_t>(y);
+        d[static_cast<size_t>(H) * W + i] = static_cast<uint8_t>(x);
+        d[static_cast<size_t>(2) * H * W + i] = 7;
+      }
+    }
+    co_await ctx.write(0, make_payload<TensorBeatPayload>(tb));
+  }
+private:
+  bool _sent = false;
+};
+
+vector<TensorBeat> run_where(Session& sess, int H, int W, FlexData cfg)
+{
+  auto pl = std::make_unique<Pipeline>("p", &sess);
+  auto s = std::make_unique<WhereSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  s->H = H; s->W = W;
+  s->allocate_oports(1);
+  auto* src = static_cast<WhereSource*>(pl->insert_stage(std::move(s)));
+  auto rs = std::make_unique<ImageResampleStage>(
+      &sess, "rs", vector<InEdge>{ { src, 0 } }, std::move(cfg));
+  auto* rst = static_cast<ImageResampleStage*>(
+      pl->insert_stage(std::move(rs)));
+  auto sk = std::make_unique<Sink>(
+      &sess, "sink", vector<InEdge>{ { rst, 0 } }, FlexData::make_object());
+  auto* sink = static_cast<Sink*>(pl->insert_stage(std::move(sk)));
+  PipelineRuntime rt(pl.get(), &sess);
+  if (!rt.launch()) { return {}; }
+  rt.wait_idle();
+  rt.stop();
+  return sink->out();
+}
+
+FlexData grid_cfg(const char* fit, int max_pixels = 0)
+{
+  FlexData c = FlexData::make_object();
+  c.as_object().insert("fit", FlexData::make_string(fit));
+  if (max_pixels > 0) {
+    c.as_object().insert("max_pixels", FlexData::make_int(max_pixels));
+  }
+  return c;
+}
+
+std::vector<int64_t> crop_box_of(const TensorBeat& t)
+{
+  std::vector<int64_t> v;
+  if (!t.sideband.is_object()) { return v; }
+  FlexData sb = t.sideband;                  // as_object() is a view
+  auto o = sb.as_object();
+  if (!o.contains(sideband::kCropBox)) { return v; }
+  FlexData box = o.at(sideband::kCropBox);
+  for (const FlexData& e : box.as_array()) { v.push_back(e.as_int(-1)); }
+  return v;
+}
+
+}  // namespace
+
+// The geometry, against BFL's own reference_canvas and
+// prepare_multi_reference (flux3/pipeline.py) for the same sizes --
+// including the 0.995 step-down (4000x3000), the side clamp (5000x100),
+// the 64-pixel floor (30x20) and Python's round-half-to-even.
+TEST(image_resample_stage, grid_fits_match_bfl)
+{
+  Session sess;
+  ImageResampleStage one(&sess, "one", {}, grid_cfg("pad_to_grid"));
+  ImageResampleStage many(&sess, "many", {},
+                          grid_cfg("crop_to_grid", 1024 * 1024));
+  ASSERT_TRUE(one.fit_mode() == 4 && many.fit_mode() == 5);
+  struct Want { int w, h; int fw, fh, cw, ch, x0, y0;
+                int mw, mh, mcw, mch, mx, my; };
+  const Want cases[] = {
+    {1000, 750, 1000, 750, 1008, 752, 4, 1, 1000, 750, 992, 736, 4, 7},
+    {4000, 3000, 2341, 1756, 2352, 1760, 5, 2, 1182, 886, 1168, 880, 7, 3},
+    {6000, 4000, 2496, 1664, 2496, 1664, 0, 0, 1254, 836, 1248, 832, 3, 2},
+    {1023, 767, 1023, 767, 1024, 768, 0, 0, 1023, 767, 1008, 752, 7, 7},
+    {30, 20, 30, 20, 64, 64, 17, 22, 30, 20, 16, 16, 7, 2},
+    {5000, 100, 4096, 82, 4096, 96, 0, 7, 5000, 100, 4992, 96, 4, 2},
+    {2049, 2047, 2039, 2037, 2048, 2048, 4, 5, 1024, 1023, 1024, 1008, 0, 7},
+    {3000, 2001, 2495, 1664, 2496, 1664, 0, 0, 1253, 836, 1248, 832, 2, 2},
+    {17, 40, 17, 40, 64, 64, 23, 12, 17, 40, 16, 32, 0, 4},
+  };
+  for (const Want& c : cases) {
+    const auto g = one.grid_fit(c.w, c.h);
+    const auto m = many.grid_fit(c.w, c.h);
+    const bool ok1 = g.fit_w == c.fw && g.fit_h == c.fh && g.out_w == c.cw
+                     && g.out_h == c.ch && g.x0 == c.x0 && g.y0 == c.y0;
+    const bool ok2 = m.fit_w == c.mw && m.fit_h == c.mh && m.out_w == c.mcw
+                     && m.out_h == c.mch && m.x0 == c.mx && m.y0 == c.my;
+    if (!ok1 || !ok2) {
+      std::printf("[grid] %dx%d: pad %dx%d on %dx%d at (%d,%d); crop %dx%d "
+                  "-> %dx%d at (%d,%d)\n", c.w, c.h, g.fit_w, g.fit_h,
+                  g.out_w, g.out_h, g.x0, g.y0, m.fit_w, m.fit_h, m.out_w,
+                  m.out_h, m.x0, m.y0);
+    }
+    EXPECT_TRUE(ok1);
+    EXPECT_TRUE(ok2);
+  }
+  // Smaller than a grid cell: nothing to crop to.
+  EXPECT_TRUE(many.grid_fit(4096, 1).out_w == 0);
+}
+
+// The pad itself, against np.pad: `reflect` when the picture's shorter
+// side is longer than the grid (a 30x20 picture on its 64x64 canvas,
+// where the 22-row pads are longer than the 20 rows and keep mirroring),
+// `symmetric` otherwise (12x40). Positions are numpy's.
+TEST(image_resample_stage, pad_to_grid_mirrors_as_numpy)
+{
+  Session sess;
+  struct At { int y, x, sy, sx; };
+  struct Case { int H, W; std::vector<int64_t> box; std::vector<At> at; };
+  const Case cases[] = {
+    {20, 30, {17, 22, 47, 42},
+     {{0, 0, 16, 17}, {0, 63, 16, 12}, {63, 0, 3, 17}, {63, 63, 3, 12},
+      {21, 16, 1, 1}, {22, 17, 0, 0}, {41, 46, 19, 29}, {42, 47, 18, 28},
+      {5, 50, 17, 25}, {60, 10, 0, 7}}},
+    {12, 40, {12, 26, 52, 38},
+     {{0, 0, 1, 11}, {63, 63, 10, 28}, {25, 11, 0, 0}, {26, 12, 0, 0},
+      {37, 51, 11, 39}, {38, 52, 11, 39}}},
+  };
+  for (const Case& c : cases) {
+    auto out = run_where(sess, c.H, c.W, grid_cfg("pad_to_grid"));
+    ASSERT_TRUE(out.size() == 1);
+    if (out.size() != 1) { continue; }
+    const TensorBeat& t = out[0];
+    ASSERT_TRUE(t.shape == (std::vector<int64_t>{ 3, 64, 64 }));
+    EXPECT_TRUE(crop_box_of(t) == c.box);
+    const auto px = t.materialize_contiguous();
+    int bad = 0;
+    for (const At& a : c.at) {
+      const size_t i = static_cast<size_t>(a.y) * 64 + a.x;
+      if (px[i] != a.sy || px[4096 + i] != a.sx || px[8192 + i] != 7) {
+        std::printf("[pad] %dx%d at (%d,%d): got (%d,%d) want (%d,%d)\n",
+                    c.W, c.H, a.y, a.x, px[i], px[4096 + i], a.sy, a.sx);
+        ++bad;
+      }
+    }
+    EXPECT_TRUE(bad == 0);
+  }
+}
+
+// crop_to_grid cuts the centre out unscaled when the picture is under the
+// cap, and publishes no box (there is nothing to cut back). A picture that
+// already fits pad_to_grid's canvas exactly is passed through, also boxless.
+TEST(image_resample_stage, crop_to_grid_cuts_the_centre)
+{
+  Session sess;
+  auto out = run_where(sess, 37, 40, grid_cfg("crop_to_grid", 1 << 20));
+  ASSERT_TRUE(out.size() == 1);
+  if (out.size() == 1) {
+    const TensorBeat& t = out[0];
+    ASSERT_TRUE(t.shape == (std::vector<int64_t>{ 3, 32, 32 }));
+    const auto px = t.materialize_contiguous();
+    // (40 - 32) / 2 = 4 columns and (37 - 32) / 2 = 2 rows in.
+    EXPECT_TRUE(px[0] == 2 && px[1024] == 4);
+    EXPECT_TRUE(px[31 * 32 + 31] == 33 && px[1024 + 31 * 32 + 31] == 35);
+    EXPECT_TRUE(crop_box_of(t).empty());
+  }
+  auto same = run_where(sess, 64, 80, grid_cfg("pad_to_grid"));
+  ASSERT_TRUE(same.size() == 1);
+  if (same.size() == 1) {
+    EXPECT_TRUE(same[0].shape == (std::vector<int64_t>{ 3, 64, 80 }));
+    EXPECT_TRUE(crop_box_of(same[0]).empty());
+  }
+}
+
+// A picture past the cap is RESAMPLED to the fit first (Lanczos, as BFL's
+// PIL resize), then padded: 4000x3000 -> 2341x1756 on 2352x1760.
+TEST(image_resample_stage, pad_to_grid_resamples_past_the_cap)
+{
+  Session sess;
+  auto out = run_resample(sess, 3000, 4000, TensorBeat::DType::U8, 90.0f,
+                          grid_cfg("pad_to_grid"));
+  ASSERT_TRUE(out.size() == 1);
+  if (out.size() != 1) { return; }
+  ASSERT_TRUE(out[0].shape == (std::vector<int64_t>{ 3, 1760, 2352 }));
+  EXPECT_TRUE(crop_box_of(out[0]) ==
+              (std::vector<int64_t>{ 5, 2, 2346, 1758 }));
+  // A flat picture stays flat through the resample and the mirror.
+  const auto px = out[0].materialize_contiguous();
+  int off = 0;
+  for (size_t i = 0; i < px.size(); i += 997) { off += px[i] != 90; }
+  EXPECT_TRUE(off == 0);
 }

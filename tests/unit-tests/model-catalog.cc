@@ -1519,3 +1519,47 @@ TEST(model_catalog, ministral3_present_with_vision) {
   EXPECT_FALSE(has_(in, "audio"));
   EXPECT_TRUE(out.size() == 1 && out[0] == "text");
 }
+
+// FlashVSR+ publishes Turbo and Base as FOLDERS of one repository around
+// files they share, and the folder is the model -- the two are the same
+// tensors and differ only in how the family drives them. So each entry
+// pins its own folder's two files plus the shared ones, registers under
+// its own key, and names its folder as `local_subdir`, which is what
+// model-fetch registers as the record's local_path.
+TEST(model_catalog, flashvsr_plus_variants_register_their_folders) {
+  const auto cands = catalog_all_by_path("ruchangyao/FlashVSR_plus");
+  ASSERT_TRUE(cands.size() == 2);
+  if (cands.size() != 2) { return; }
+  std::vector<std::string> subs, names;
+  for (const ModelCatalogEntry* e : cands) {
+    EXPECT_TRUE(e->model_type == "flashvsr");
+    FlexData extra = e->extra;
+    ASSERT_TRUE(extra.is_object() &&
+                extra.as_object().contains(catalog_extra::kLocalSubdir));
+    if (!extra.is_object() ||
+        !extra.as_object().contains(catalog_extra::kLocalSubdir)) {
+      return;
+    }
+    const std::string sub(
+        extra.as_object().at(catalog_extra::kLocalSubdir).as_string(""));
+    subs.push_back(sub);
+    names.push_back(e->name);
+    auto pinned = [&](const std::string& f) {
+      return std::find(e->files.begin(), e->files.end(), f) != e->files.end();
+    };
+    EXPECT_TRUE(pinned(sub + "/dit.safetensors"));
+    EXPECT_TRUE(pinned(sub + "/lq_proj_in.safetensors"));
+    EXPECT_TRUE(pinned("Wan2.1_VAE.pth") && pinned("config.json"));
+    // The other variant's weights are not this one's download.
+    const std::string other = sub == "turbo" ? "base" : "turbo";
+    EXPECT_FALSE(pinned(other + "/dit.safetensors"));
+    // The fixed context is not in the repository; it is v1.1's.
+    ASSERT_TRUE(e->companion_files.size() == 1);
+    if (e->companion_files.size() == 1) {
+      EXPECT_TRUE(e->companion_files[0].file == "posi_prompt.pth");
+    }
+  }
+  std::sort(subs.begin(), subs.end());
+  EXPECT_TRUE(subs == (std::vector<std::string>{"base", "turbo"}));
+  EXPECT_TRUE(names[0] != names[1] && !names[0].empty() && !names[1].empty());
+}

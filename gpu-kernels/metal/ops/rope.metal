@@ -474,6 +474,54 @@ kernel void transpose_rope_pair_ftab_f16(
   out[ob + 1] = VPIPE_ELT(x1 * s + x2 * c);
 }
 
+// transpose_rope_pair_ftab with the per-head RMSNorm FUSED in front of it:
+// reads TOKEN-major in[(t*H+h)*D + d], normalizes the head in f32
+// (x * rsqrt(mean(x^2) + eps) * gamma), rotates its interleaved pairs with
+// token t's f32 table, and writes HEAD-major out[(h*T+t)*D + d] -- ONE
+// rounding to the storage type, where a norm pass then a rope pass rounds
+// twice. FLUX.3's reference (and diffusers', which keeps norm_q/norm_k in
+// fp32 for this reason) does exactly that, and the second rounding is not
+// free there: a few late joint blocks attend sharply enough that q/k
+// precision shows up in the velocity. One simdgroup per (t, h).
+//   0:in 1:out 2:cos 3:sin 4:gamma[D] 5:H 6:T 7:D 8:eps
+//   grid {32, T, H}, tg {32, 1, 1}.
+kernel void transpose_rms_rope_pair_ftab_f16(
+    const device VPIPE_ELT* in    [[buffer(0)]],
+    device VPIPE_ELT*       out   [[buffer(1)]],
+    const device float*     cosb  [[buffer(2)]],
+    const device float*     sinb  [[buffer(3)]],
+    const device VPIPE_ELT* gamma [[buffer(4)]],
+    constant int&           H     [[buffer(5)]],
+    constant int&           T     [[buffer(6)]],
+    constant int&           D     [[buffer(7)]],
+    constant float&         eps   [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint  lid [[thread_index_in_simdgroup]])
+{
+  const int t = (int)tid.y;
+  const int h = (int)tid.z;
+  if (t >= T || h >= H) { return; }
+  const uint ib = ((uint)t * (uint)H + (uint)h) * (uint)D;
+  float acc = 0.0f;
+  for (int i = (int)lid; i < D; i += 32) {
+    const float v = float(in[ib + i]);
+    acc += v * v;
+  }
+  acc = simd_sum(acc);
+  const float inv = rsqrt(acc / (float)D + eps);
+  const uint ob = ((uint)h * (uint)T + (uint)t) * (uint)D;
+  const uint cb = (uint)t * (uint)D;
+  for (int p = (int)lid; p < D / 2; p += 32) {
+    const int d = 2 * p;
+    const float x1 = float(in[ib + d]) * inv * float(gamma[d]);
+    const float x2 = float(in[ib + d + 1]) * inv * float(gamma[d + 1]);
+    const float c = cosb[cb + d];
+    const float s = sinb[cb + d];
+    out[ob + d]     = VPIPE_ELT(x1 * c - x2 * s);
+    out[ob + d + 1] = VPIPE_ELT(x1 * s + x2 * c);
+  }
+}
+
 // transpose_rope_pair_ftab with a PADDED output head-dim: reads TOKEN-major
 // in[(t*H+h)*D + 2i(,+1)], applies token t's interleaved-pair rope, and writes
 // HEAD-major out[(h*T+t)*Dp + 2i(,+1)] with the [D, Dp) tail ZEROED. The pad

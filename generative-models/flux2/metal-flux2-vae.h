@@ -110,6 +110,19 @@ class MetalFlux2Vae {
   // as each command buffer retires. For a test to hold against shapes.
   const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
 
+  // How the last decode() ran, for a test to assert the path it meant to
+  // exercise actually ran (a budget that fits takes the whole decode and
+  // proves nothing about tiling).
+  struct DecodeReport {
+    bool exact = false;          // decode_exact_ drew the picture
+    int whole_stages = 0;        // up-path stages it ran whole
+    int passes = 0;              // tiled passes (statistics + the picture)
+    int tiles = 0;               // tiles over all passes
+    int kept = 0;                // planes kept whole as a later source
+    double work = 0.0;           // up-path work over a whole decode's
+  };
+  const DecodeReport& last_decode() const noexcept { return _report; }
+
   const Config& config() const { return _cfg; }
 
  private:
@@ -187,6 +200,7 @@ class MetalFlux2Vae {
   // Encoder path (loaded only when with_encoder).
   bool _has_encoder = false;
   GpuFlopsTally _flops;   // see gpu_flops()
+  DecodeReport _report;   // see last_decode()
   Conv _enc_conv_in;                // 3 -> block_out[0]
   std::vector<DownStage> _enc_down;
   ResBlock _enc_mid_res0, _enc_mid_res1;
@@ -413,12 +427,16 @@ class MetalFlux2Vae {
   // bounds the peak at one window regardless of output size.
   //
   // This is NOT numerically identical to a whole-image decode: the mid-block
-  // attention is GLOBAL, so per-window attention sees only its own window, and
-  // the convolutions see zero padding at window edges rather than real
-  // neighbours. The overlap cross-fade hides the conv seam; the attention
-  // difference is real and is why tiling stays a FALLBACK, entered only when
-  // the whole-image decode does not fit (or VPIPE_VAE_TILE forces it).
-  // VPIPE_VAE_NO_TILE restores the old hard failure.
+  // attention is GLOBAL, so per-window attention sees only its own window,
+  // every GroupNorm normalizes by the window's statistics, and the
+  // convolutions see zero padding at window edges rather than real
+  // neighbours. The overlap cross-fade hides the conv seam; the rest shifts
+  // each window's tone -- MEASURED at 4096^2 against a 128-cell window,
+  // 12-cell windows read 26.7 dB with R +3.0 / B -1.9 levels. So a decode
+  // that does not fit takes decode_exact_ below; this is the A/B
+  // (VPIPE_VAE_TILE=<cells>, VPIPE_VAE_WINDOWED=1) and the last resort when
+  // not even the exact decode's floor fits. VPIPE_VAE_NO_TILE turns both off
+  // (a decode that does not fit fails).
   static constexpr int kTileMin16 = 8;      // smallest useful latent window
   static constexpr int kTileOvNum = 1;      // overlap = 1/4 of the window
   static constexpr int kTileOvDen = 4;
@@ -435,6 +453,48 @@ class MetalFlux2Vae {
       const metal_compute::SharedBuffer& z, int h16, int w16, int tile16,
       std::string* err);
   metal_compute::ComputeFunction _fn_softmax_rows, _fn_transpose;
+
+  // The decoder's ops over one compute encoder and a pool of reusable
+  // buffers, shared by the whole decode and the exact tiled one so the two
+  // cannot route an op differently. Defined in the .cc.
+  struct Ops;
+
+  // EXACT TILED decode: the same arithmetic as a whole-image decode, in
+  // bounded memory. Only two things in the decoder are global -- the mid
+  // block's attention and every GroupNorm's statistics -- and everything
+  // else is local (3x3 convs, 1x1s, pointwise ops, a nearest upsample).
+  // So the mid block runs WHOLE at the latent's size (64x smaller than the
+  // picture at patch 2), and each up-path GroupNorm whose input is too big
+  // to hold is given its whole-plane statistics by a pass over tiles that
+  // only sums; with every statistic known ahead of time, the rest is a
+  // local operator, and a tile with enough halo is exactly the whole
+  // image's. A plane that fits is kept whole and becomes the next pass's
+  // source, so a pass recomputes only back to it; plan_exact_ picks which
+  // planes to keep, for the least recompute inside `budget`. Differs from
+  // decode() only in f32 summation order inside the statistics.
+  // `latent` is the unpatchified, un-whitened [h8*w8, latent] map.
+  // Empty with *err set when even its floor does not fit.
+  metal_compute::SharedBuffer decode_exact_(
+      const metal_compute::SharedBuffer& latent, int h8, int w8,
+      std::size_t budget, std::string* err);
+  // One stage of the up path: a resnet, an upsampler (nearest 2x + its
+  // 3x3), or the output head (GroupNorm, SiLU, conv_out). Plane p is
+  // stage p's input, H x W x cin.
+  struct UpStage {
+    enum Kind { kRes, kUp, kOut };
+    Kind kind = kRes;
+    const ResBlock* rb = nullptr;   // kRes
+    const Conv* up = nullptr;       // kUp
+    int H = 0, W = 0, cin = 0, cout = 0;
+  };
+  std::vector<UpStage> up_stages_(int h8, int w8) const;
+  // Rect copy with 64-bit offsets; per-rect GroupNorm channel sums.
+  metal_compute::ComputeFunction _fn_copy_rect_wide, _fn_gn_stats_rect;
+  // A rect copy between channel-last planes of widths sw / dw (pixels).
+  void copy_rect_(metal_compute::ComputeEncoder& enc,
+                  const metal_compute::SharedBuffer& src, int sw, int sy,
+                  int sx, const metal_compute::SharedBuffer& dst, int dw,
+                  int dy, int dx, int rh, int rw, int C);
 
   metal_compute::ComputeLibrary _lib_convhw;
   metal_compute::ComputeFunction _fn_conv_hw_s1, _fn_conv_hw_s2;

@@ -1,0 +1,203 @@
+{
+  "id": "flashvsr-plus-upscale-1920x1088",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "ruchangyao/FlashVSR_plus-turbo"
+      }
+    },
+    {
+      "id": "load-video",
+      "type": "load-video",
+      "iports": [],
+      "config": {
+        "input_url": "low-quality.mp4",
+        "enable_audio": false
+      }
+    },
+    {
+      "id": "video-to-rgb",
+      "type": "video-to-rgb",
+      "iports": [
+        {
+          "src": "load-video",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_dtype": "u8",
+        "hwaccel": "auto",
+        "oport_capacity": 2
+      }
+    },
+    {
+      "id": "upscale-in",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "video-to-rgb",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 1920,
+        "height": 1152,
+        "fit": "stretch",
+        "algorithm": "bicubic"
+      }
+    },
+    {
+      "id": "temporal-stack",
+      "type": "temporal-stack",
+      "iports": [
+        {
+          "src": "upscale-in",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "mode": "video",
+        "group_size": 24,
+        "overlap": 0,
+        "max_mb": 512
+      }
+    },
+    {
+      "id": "flashvsr-src-encoder",
+      "type": "flashvsr-src-encoder",
+      "iports": [
+        {
+          "src": "temporal-stack",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "generate-video",
+      "type": "generate-video",
+      "iports": [
+        {
+          "src": "flashvsr-src-encoder",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 1920,
+        "height": 1152,
+        "frames": 49,
+        "seed": 0,
+        "unload_when_idle": "auto"
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "squeeze-out",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 1920,
+        "height": 1088,
+        "fit": "stretch",
+        "algorithm": "lanczos"
+      }
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "squeeze-out",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "fps": 24
+      }
+    },
+    {
+      "id": "load-audio",
+      "type": "load-audio",
+      "iports": [],
+      "config": {
+        "input_url": "low-quality.mp4"
+      }
+    },
+    {
+      "id": "audio-to-pcm",
+      "type": "audio-to-pcm",
+      "iports": [
+        {
+          "src": "load-audio",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_sample_rate": 32000,
+        "channels": 2,
+        "chunk_duration_s": 10.0,
+        "max_chunk_duration_s": 30.0
+      }
+    },
+    {
+      "id": "save-video",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        },
+        {
+          "src": "audio-to-pcm",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "flashvsr-plus-1920x1088.mp4",
+        "enable_video": true,
+        "enable_audio": true,
+        "video_bitrate": 6400000,
+        "video_gop_size": 48,
+        "audio_bitrate": 192000,
+        "muxer_options": {
+          "movflags": "+faststart"
+        }
+      }
+    }
+  ],
+  "subpipelines": []
+}

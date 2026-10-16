@@ -20,7 +20,10 @@ class I8GemmContext;        // generative-models/shared/i8-gemm.h
 class MetalSageAttention;   // generative-models/shared/metal-sage-attention.h
 struct MmaSplitK;           // generative-models/shared/mma-splitk.h
 
-// FlashVSR-v1.1: the one-step, streaming 4x video super-resolution DiT.
+// FlashVSR-v1.1 and FlashVSR+ (Turbo, Base): the one-step, streaming 4x
+// video super-resolution DiT. The two releases are this one transformer
+// driven by different schedules (see Schedule); the comments below speak
+// in v1.1's numbers where the schedule decides them.
 //
 // The denoiser is Wan 2.1-T2V-1.3B's transformer, tensor for tensor: 30
 // blocks at 1536 wide, 12 heads x head_dim 128, an UNGATED 8960 feed-
@@ -47,11 +50,12 @@ struct MmaSplitK;           // generative-models/shared/mma-splitk.h
 //     port nor an optional conditioning port. What arrives here is
 //     `Request::rows`.
 //
-//   * IT DENOISES IN CHUNKS AGAINST A KV CACHE. One forward covers 2
-//     latent frames, not the clip, and attends over its own tokens plus
-//     a window of previous chunks held per block. The first chunk is
-//     the exception at 6 latent frames with no cache behind it. So the
-//     unit of work is a chunk and the loop that walks them lives HERE,
+//   * IT DENOISES IN CHUNKS AGAINST A KV CACHE. One forward covers a
+//     chunk of latent frames, not the clip, and attends over its own
+//     tokens plus a window of previous chunks held per block -- v1.1's
+//     chunks are 2 latent frames after an opening one of 6 with no cache
+//     behind it, FlashVSR+'s are 4 throughout. So the unit of work is
+//     a chunk and the loop that walks them lives HERE,
 //     for the reason VOSR's flow loop lives in its transformer: the
 //     chunking, the projection's own causal cadence and the cache
 //     window are one mechanism, and a caller driving chunks would have
@@ -82,6 +86,63 @@ struct MmaSplitK;           // generative-models/shared/mma-splitk.h
 // such a driver would call into.
 class MetalFlashVsrTransformer {
  public:
+  // HOW A RELEASE DRIVES THE STACK. FlashVSR-v1.1 and FlashVSR+ ship the
+  // same Wan 2.1-T2V-1.3B transformer, tensor for tensor, and differ only
+  // in how they stream it -- which no tensor says, so the family sets it
+  // from the checkpoint's layout. Every row is silent when wrong: the
+  // other release's rule produces a latent of the right shape.
+  //
+  //                    v1.1                     FlashVSR+
+  //   chunks           6 latent frames, then 2  4, every chunk
+  //   top-k            ratio * 768*1280 / (HW)  ratio (2.5), unscaled
+  //   top-k group      one temporal window      the whole chunk
+  //   cache trim       one window per chunk     down to the kept count
+  //   empty query row  left empty               its first candidate
+  //   RoPE angles      double                   f32 product, as the
+  //                                             reference computes them
+  //   hybrid layers    --                       Turbo: 25 of 30 attend a
+  //                                             3x3 band, keep one window
+  struct Schedule {
+    int  open_latents  = 6;     // the opening chunk's latent frames
+    int  chunk_latents = 2;     // ...every later chunk's
+    // Temporal windows (two latent frames each) one top-k group spans.
+    int  group_windows = 1;
+    bool area_topk     = true;
+    bool trim_to_keep  = false;
+    bool first_candidate = false;
+    bool f32_rope      = false;
+    // Turbo's hybrid layers, ascending; empty for v1.1 and Base.
+    std::vector<int> sliding_layers;
+    int  sliding_local_range = 3;
+    int  sliding_keep        = 1;
+
+    static Schedule v1_1() { return Schedule{}; }
+    static Schedule plus(bool turbo);
+    bool is_plus() const noexcept { return !area_topk; }
+    bool sliding(int layer) const noexcept;
+    // Latent frames a request of `chunks` holds, from the opening chunk.
+    int latents(int chunks) const noexcept
+    {
+      return chunks > 0 ? open_latents + chunk_latents * (chunks - 1) : 0;
+    }
+    // Source frames the projection reads through chunk `c` (from 0):
+    // the opening frame alone, then four per latent frame.
+    long long frames_through(int c) const noexcept
+    {
+      return 1 + 4LL * latents(c + 1);
+    }
+    // Restored frames, as the decode numbers them, that chunk `c` ends
+    // at: four short of what it read, the look-ahead.
+    long long restored_end(int c) const noexcept
+    {
+      return frames_through(c) - 4;
+    }
+    long long restored_begin(int c) const noexcept
+    {
+      return c == 0 ? 0 : restored_end(c - 1);
+    }
+  };
+
   struct Config {
     int   n_heads      = 12;
     int   head_dim     = 128;
@@ -101,6 +162,10 @@ class MetalFlashVsrTransformer {
     // The constant this checkpoint was distilled at. Not a knob: the
     // modulation vectors baked at load are only correct for this one.
     float timestep     = 1000.0f;
+    // How the release streams the stack; see Schedule. No tensor says
+    // it, so config_from_checkpoint() leaves v1.1's and the family sets
+    // it from the layout.
+    Schedule schedule;
 
     // ---- acceleration: opt-in, independent, decided at load ----------
     //
@@ -134,15 +199,24 @@ class MetalFlashVsrTransformer {
   // What a caller chooses per generation. Separate from Config, which
   // is what the checkpoint IS.
   struct Params {
-    // LCSA. `sparse_ratio` is the reference's own knob and is scaled by
-    // the frame area exactly as its scripts scale it, so the same value
-    // means the same selectivity at every resolution; 1.5 is faster and
-    // 2.0 is more stable. `local_range` is the always-exact spatial
-    // band in window blocks, 9 for sharper detail and 11 for stability.
-    // `kv_ratio` is the retained cache in CHUNKS.
+    // LCSA. `sparse_ratio` is the reference's own knob, in its own
+    // release's terms: v1.1 scales it by the frame area exactly as its
+    // scripts do, so the same value means the same selectivity at every
+    // resolution (2.0; 1.5 is faster), while FlashVSR+ takes it as is
+    // (2.5) -- defaults() picks the release's. `local_range` is the
+    // always-exact spatial band in window blocks, 9 for sharper detail
+    // and 11 for stability; Turbo's hybrid layers keep their own 3.
+    // `kv_ratio` is the retained cache in temporal windows.
     double sparse_ratio = 2.0;
     double kv_ratio     = 3.0;
     int    local_range  = 11;
+
+    static Params defaults(const Schedule& s)
+    {
+      Params p;
+      if (s.is_plus()) { p.sparse_ratio = 2.5; }
+      return p;
+    }
   };
 
   // Read the geometry out of the checkpoint's own tensor shapes.
@@ -183,14 +257,20 @@ class MetalFlashVsrTransformer {
 
   ~MetalFlashVsrTransformer();
 
-  // Frame counts this model can chunk. The denoise consumes 8 source
-  // frames per chunk after a 20-frame warmup, so a clip must be 8k+1
-  // and yields 8*((F-1)/8 - 2) restored frames. Rounding is UP for the
-  // reason every align rule here rounds up: down silently delivers less
-  // video than was asked for.
+  // Frame counts a schedule can chunk: the opening frame, then four
+  // source frames per latent frame, in whole chunks -- 8k+1 for v1.1
+  // (which needs 25 before anything is restored) and 16k+1 for
+  // FlashVSR+. A clip restores all but its last four frames, the
+  // look-ahead. Rounding is UP for the reason every align rule here
+  // rounds up: down silently delivers less video than was asked for.
+  static int  align_frames(const Schedule& s, int frames);
+  // Latent frames a clip yields. NOT 2 per chunk for v1.1: the opening
+  // chunk emits six, so it is 2*chunks + 4.
+  static int  latent_frames(const Schedule& s, int aligned_frames);
+  static int  chunks_of(const Schedule& s, int aligned_frames);
+  static int  restored_frames(const Schedule& s, int aligned_frames);
+  // ...the same three for v1.1's schedule.
   static int  align_frames(int frames);
-  // Latent frames a clip yields. NOT 2 per chunk: the opening chunk
-  // emits six, so it is 2*chunks + 4.
   static int  latent_frames(int aligned_frames);
   static int  restored_frames(int aligned_frames);
   // Output width and height must both be multiples of 128: the window
@@ -232,9 +312,9 @@ class MetalFlashVsrTransformer {
     // request's first chunk. 0 opens the stream -- the opening chunk is
     // this request's first, and `frames` (or `chunks`) says how many
     // follow. Above 0 the request CONTINUES the one before it: its rows
-    // hold its own chunks only, two row frames each, `chunks` says how
-    // many, and every block attends the key/value window the previous
-    // request left. `keep_window` is what leaves one: each block's
+    // hold its own chunks only (Schedule::chunk_latents row frames each),
+    // `chunks` says how many, and every block attends the key/value
+    // window the previous request left. `keep_window` is what leaves one: each block's
     // window survives the call, for a request starting at the chunk this
     // one ended before.
     //
@@ -250,8 +330,8 @@ class MetalFlashVsrTransformer {
   };
 
   // Returns the whitened latent [16, T, H/8, W/8] that vae-decode takes,
-  // with T = 2*chunks. False means it warned through `err` and produced
-  // nothing.
+  // T being the request's latent frames (Schedule::latents for an opening
+  // one). False means it warned through `err` and produced nothing.
   bool generate(const Request& req, std::vector<float>* latent,
                 std::vector<int>* shape, std::string* err = nullptr);
 
@@ -261,12 +341,21 @@ class MetalFlashVsrTransformer {
   // the weights at 768x1408.
   std::uint64_t resident_bytes() const noexcept;
 
-  // The key/value window's capacity in temporal windows: the `kv_ratio`
-  // retained plus the one being attended, and never fewer than the three
-  // the OPENING chunk writes before anything is trimmed.
-  static int kv_windows(double kv_ratio);
+  // The temporal windows layer `layer` keeps after a chunk: the ratio's
+  // (Turbo's hybrid layers keep one whatever it says).
+  static int keep_windows(const Config& cfg, int layer, double kv_ratio);
+  // The ring that layer runs in: what it keeps and one chunk more, and
+  // never fewer than the OPENING chunk writes before anything is
+  // trimmed -- three windows for v1.1, two for FlashVSR+.
+  static int layer_ring(const Config& cfg, int layer, double kv_ratio);
+  // The largest ring of any layer, which is what one buffer serving the
+  // stack is sized by.
+  static int kv_windows(const Config& cfg, double kv_ratio);
   // ...for a clip of `frames`: a clip of ONE chunk never holds more than
-  // that chunk's three windows, whatever the ratio.
+  // that chunk's windows, whatever the ratio.
+  static int ring_windows(const Config& cfg, int frames, double kv_ratio);
+  // The same two for v1.1's schedule.
+  static int kv_windows(double kv_ratio);
   static int ring_windows(int frames, double kv_ratio);
 
   // THE ORDER generate() runs the stack in, and the one memory decision
@@ -365,6 +454,12 @@ class MetalFlashVsrTransformer {
   bool route_compare(const float* x_tokens, int f, int h, int w, int t_off,
                      const Params& params, std::size_t* n_flags,
                      std::size_t* n_diff, std::string* err);
+  // The block-level routing decision the production path makes for block
+  // `bi` over one cacheless chunk: [H, Nq, Nk] bytes, 1 = attended -- the
+  // reference's own block mask, comparable entry for entry.
+  bool route_blocks(int bi, const float* x_tokens, int f, int h, int w,
+                    int t_off, const Params& params,
+                    std::vector<std::uint8_t>* keep, std::string* err);
   // One chunk through the FIRST `n_blocks` blocks, returning the residual
   // stream. The seam that lets a failure be attributed to a block rather
   // than to the stack.
@@ -375,6 +470,12 @@ class MetalFlashVsrTransformer {
 
  private:
   MetalFlashVsrTransformer() = default;
+
+  // Every layer's own ring at this geometry, summed: what the chunk-
+  // outer order allocates.
+  static std::uint64_t kv_rings_bytes_(const Config& cfg, int height,
+                                       int width, int frames,
+                                       const Params& params);
 
   struct Block;
   struct Stream;   // the per-block KV window, live for one generate()
@@ -398,10 +499,19 @@ class MetalFlashVsrTransformer {
   bool load_blocks_(WeightSet& w, std::string* err);
   // The routing decision, on the host from GPU-reduced block means.
   std::vector<std::uint8_t>
+  // `first_win`, when not -1, is the ring slot of the oldest window in
+  // the key order: a row the top-k left empty keeps its first candidate
+  // there (FlashVSR+).
   route_(const std::vector<float>& qm, const std::vector<float>& km, int Nq,
          int Nk, int sq, int nh_blk, int nw_blk, int topk, int local_range,
-         int kL, int bq) const;
+         int kL, int bq, int first_win = -1) const;
   int _seq_for_route = 0;   // the query length route_ is expanding for
+  // The routing's knobs, as this release spells them: the top-k at a
+  // geometry, layer `bi`'s band, and the top-k groups of an f-frame
+  // chunk.
+  int topk_(int S, int h, int w, const Params& prm) const;
+  int local_range_(int bi, const Params& prm) const;
+  int route_groups_(int f) const;
   void build_band_(int nh_blk, int nw_blk, int local_range,
                    metal_compute::SharedBuffer& out) const;
   void route_gpu_(metal_compute::ComputeEncoder& enc,
@@ -436,7 +546,7 @@ class MetalFlashVsrTransformer {
   metal_compute::ComputeLibrary  _lib_sdpa, _lib_route;
   metal_compute::ComputeFunction _fn_rt_scores, _fn_rt_softmax,
                                  _fn_rt_thresh, _fn_rt_flags, _fn_rt_keep,
-                                 _fn_sp_off, _fn_sp_emit;
+                                 _fn_sp_off, _fn_sp_emit, _fn_rt_fallback;
   bool _use_spans = true;
   // Query tiles routed to no key block during the last generate(); see
   // forward_chunk_.
@@ -446,12 +556,17 @@ class MetalFlashVsrTransformer {
   std::uint64_t empty_query_tiles() const noexcept { return _empty_tiles; }
 
  private:
-  void build_spans_(metal_compute::ComputeEncoder& enc, Stream& st, int Nq,
-                    int Nk, int sq, int NQ, int bq);
-  // Size the clip's state: `n_caches` key/value windows of `cap_windows`
-  // each, and every per-chunk buffer for the largest chunk, `f_max`
-  // latent frames.
-  bool begin_clip_(Stream& st, int h, int w, int f_max, int cap_windows,
+  // The span list, from the block-level keep map. `first_win` >= 0 also
+  // gives a row the top-k left empty its first candidate (FlashVSR+),
+  // in the window at that ring slot, inside `band`.
+  void build_spans_(metal_compute::ComputeEncoder& enc, Stream& st,
+                    const metal_compute::SharedBuffer& band, int Nq, int Nk,
+                    int sq, int NQ, int bq, int first_win);
+  // Size the clip's state: `n_caches` key/value rings, each layer's for
+  // the chunks after the first too when `full` (a stream, or a clip of
+  // more than one chunk), and every per-chunk buffer for the largest
+  // chunk, `f_max` latent frames.
+  bool begin_clip_(Stream& st, int h, int w, int f_max, bool full,
                    int n_caches, const Params& prm, std::string* err);
   // The RoPE tables of a chunk, in `st.rope[slot]`, rebuilt only when the
   // slot held another chunk's.
@@ -552,7 +667,8 @@ class MetalFlashVsrTransformer {
   void append_cache_(metal_compute::ComputeEncoder& enc,
                      const metal_compute::SharedBuffer& src,
                      const metal_compute::SharedBuffer& dst, int NH, int seq,
-                     int HD, std::size_t cap_tok, int held);
+                     int HD, std::size_t cap_tok, int held, int src_tok0,
+                     int n_tok);
   // One chunk through the whole stack, then the head: the chunk-outer
   // order, and the test seams' path.
   bool forward_chunk_(Stream& st, int f, int h, int w, int t_off,
@@ -563,9 +679,10 @@ class MetalFlashVsrTransformer {
                       metal_compute::SharedBuffer* noise_out,
                       const Request& req, int max_blocks,
                       std::vector<float>* x_out, std::string* err);
-  // Trim block `bi`'s cache. Takes the Stream and an index rather than
-  // the Cache itself: the nested type is not complete here.
-  void trim_cache_(Stream& st, int bi, const Params& params);
+  // Trim the ring `cache_idx`, which layer `bi` is running in. Takes the
+  // Stream and an index rather than the Cache itself: the nested type is
+  // not complete here.
+  void trim_cache_(Stream& st, int cache_idx, int bi, const Params& params);
   bool unpatchify_(const metal_compute::SharedBuffer& tokens, int T, int h8,
                    int w8, std::vector<float>* out, std::string* err);
 

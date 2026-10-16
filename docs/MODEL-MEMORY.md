@@ -618,7 +618,7 @@ Coverage, and what each family's plan-time bound is actually worth:
 
 | family | declares from | revised by | bound vs truth |
 |---|---|---|---|
-| FLUX.2 | `AutoencoderKLFlux2`, `block_out` ×14 | generate-image, vae-decode | exact |
+| FLUX.2, FLUX.3 | `AutoencoderKLFlux2`, `block_out` ×14 | generate-image, vae-decode | exact |
 | Boogu | `AutoencoderKL`, `block_out` ×14 | generate-image, vae-decode | exact |
 | Z-Image | `AutoencoderKL`, `block_out` ×14 | generate-image, vae-decode | exact |
 | Krea-2 | `AutoencoderKLQwenImage`, `base_dim` ×27 | generate-image, vae-decode | exact |
@@ -777,6 +777,25 @@ at floors stands in for both.
 What is granted is then **declared into the scratch ledger**, so it
 reaches `phase_peak()` and every peer that sizes after it. A grant
 nobody could see would be the same bug one layer further in.
+
+### Reading the box right after a free
+
+A transient that frees one model to make room for another — a DiT dropped
+for its VAE decode — and then reads `memory_budget()` reads too early.
+macOS returns a released Metal buffer's pages **asynchronously**: the
+device's allocated size drops at once, the process's graphics footprint
+tens to hundreds of milliseconds later, and the system's free and wired
+counts after that. MEASURED on a 16 GB M5: 2 GB back in ~45 ms, 8 GB in
+~1.1 s. A decode sized in that window sees none of what was freed — after
+a 4096² FLUX.3 denoise, 284 MB of a box that had ~8 GB coming.
+
+Read it with `memory_budget_settled()` instead. It returns at once when
+nothing is on its way back (the graphics footprint is within 256 MB of
+the allocated size), and otherwise waits — at most `timeout_ms`, 3 s by
+default — for the footprint to stop falling and the system's wired count
+to fall by what it gave back. Waiting for the footprint to reach the
+allocated size would be wrong: graphics memory that is not a Metal
+buffer (a CoreML model, a video frame's IOSurface) never returns.
 
 ---
 

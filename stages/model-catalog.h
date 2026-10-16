@@ -20,6 +20,7 @@ class FlexData;
 // the field.
 namespace catalog_extra {
 inline constexpr std::string_view kUrlFiles = "url_files";
+inline constexpr std::string_view kLocalSubdir = "local_subdir";
 }  // namespace catalog_extra
 
 // One downloadable model in the internal HuggingFace catalogue.
@@ -135,6 +136,13 @@ struct ModelCatalogEntry {
   //              so the registry record pins them. Build it with
   //              catalog_url_files_extra(); read it with
   //              catalog_url_files().
+  //   local_subdir  string -- the record points INTO the download: the
+  //              registered local_path is <repo dir>/<local_subdir>, and
+  //              `files` are still relative to the repo. For a repository
+  //              that publishes several models as FOLDERS beside files
+  //              they share (FlashVSR+'s turbo/ and base/ around one VAE),
+  //              where the folder is the model and a consumer handed the
+  //              repository root could not tell which one was meant.
   FlexData extra;
 
   std::string name;         // registration key + extract subdir (when several

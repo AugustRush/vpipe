@@ -14,6 +14,16 @@ namespace vpipe {
 
 namespace {
 
+// An `extra` holding `local_subdir` (see ModelCatalogEntry::extra).
+FlexData
+local_subdir_extra_(const char* sub)
+{
+  FlexData extra = FlexData::make_object();
+  extra.as_object().insert_or_assign(catalog_extra::kLocalSubdir,
+                                     FlexData::make_string(sub));
+  return extra;
+}
+
 // The models that ship WITH vpipe. `model_catalog()` below returns this
 // followed by whatever plugins contributed; see register_catalog_entries.
 const std::vector<ModelCatalogEntry>&
@@ -646,6 +656,39 @@ builtin_catalog_()
      .model_type = "yue2-vae",
      .files = {"config.json", "model.safetensors", "LICENSE"},
      .needs_tokenizer_json = false},
+    // ---- BS-RoFormer (music source separation) -----------------------
+    // The audio-separate stage's hf_dir (model_type "bs-roformer"): an
+    // MSST checkpoint -- a torch .ckpt beside the YAML describing it.
+    // pcunwa publishes the "Resurrection" pair from ONE repository, a
+    // vocals model and an instrumental one side by side, so each entry
+    // pins its own two files and registers under its own key: the
+    // download directory is shared and the record says which model it
+    // is. 51M parameters, f32 on disk (204 MB), held f16.
+    //
+    // NO LICENSE: the repository carries no model card and no license
+    // tag (checked 2025-07-31 / 2026-10-15). It is catalogued so it can
+    // be fetched; nothing of it ships with vpipe.
+    {.family = "BS-RoFormer", .version = "Resurrection",
+     .param_class = "51M", .variant = "vocals (pcunwa, no license)",
+     .hf_path = "pcunwa/BS-Roformer-Resurrection",
+     .model_type = "bs-roformer",
+     .files = {"BS-Roformer-Resurrection.ckpt",
+               "BS-Roformer-Resurrection-Config.yaml"},
+     .needs_tokenizer_json = false,
+     .name = "pcunwa/BS-Roformer-Resurrection-vocals"},
+    // The instrumental twin: its target is the accompaniment ("other"),
+    // at hop 441 and 1700-frame chunks where the vocals model has 512
+    // and 1536 -- so its `stem` port is the instrumental and its
+    // `residual` the vocals.
+    {.family = "BS-RoFormer", .version = "Resurrection",
+     .param_class = "51M",
+     .variant = "instrumental (pcunwa, no license)",
+     .hf_path = "pcunwa/BS-Roformer-Resurrection",
+     .model_type = "bs-roformer",
+     .files = {"BS-Roformer-Resurrection-Inst.ckpt",
+               "BS-Roformer-Resurrection-Inst-Config.yaml"},
+     .needs_tokenizer_json = false,
+     .name = "pcunwa/BS-Roformer-Resurrection-inst"},
     // ---- Krea (text-to-image diffusion) ------------------------------
     // Krea-2-Turbo: a flow-matching (rectified-flow) text-to-image model,
     // model_type "krea2". Diffusers-layout repo with per-component
@@ -1427,6 +1470,53 @@ builtin_catalog_()
      .parent_model_type = "flux2",
      .files = {"taef2.safetensors"},
      .needs_tokenizer_json = false},
+    // ---- FLUX.3 Image Klein (text + up to 10 references -> image) -------
+    // black-forest-labs/flux-3-image-klein: a 5.6B flow-map DiT (16 steps,
+    // no CFG) in three token modes -- image, reference images, text --
+    // each with its own 5 blocks, then 28 joint blocks. Sub-models:
+    //   text_encoder/ = Qwen3-VL-4B-Instruct, used for text only; 8 hidden
+    //     states (layers 4, 8, .., 32) concatenated -> 20480 per token.
+    //   transformer/  = Flux3Transformer2DModel (bf16, 11.1 GB).
+    //   vae/          = FLUX.2's AutoencoderKLFlux2, stored F32.
+    // `files` pins the diffusers subfolders plus the ROOT config.json,
+    // which carries what no transformer config says: the sampler's alpha
+    // and step count and the prompt's token cap. SKIPPED: the root
+    // model.safetensors and ae.safetensors (BFL's own copies of the same
+    // transformer and VAE, ~11.4 GB) and variants/ (an FP8 transformer and
+    // a Blackwell-only NVFP4 one). GATED: accept the FLUX Kommunity
+    // License on the repo page, then give model-fetch a token.
+    {.family = "FLUX", .version = "3 Image Klein", .param_class = "5.6B",
+     .variant = "distilled bf16 (black-forest-labs, gated)",
+     .hf_path = "black-forest-labs/flux-3-image-klein",
+     .model_type = "flux3",
+     .inputs = {"text", "image"},
+     .outputs = {"image"},
+     .files = {"config.json",
+               "modular_model_index.json",
+               "LICENSE.md",
+               "NOTICE.md",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002"
+               ".safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00002.safetensors",
+               "text_encoder/model-00002-of-00002.safetensors",
+               "text_encoder/tokenizer.json",
+               "text_encoder/tokenizer_config.json",
+               "text_encoder/chat_template.json",
+               "text_encoder/vocab.json",
+               "text_encoder/merges.txt",
+               "text_encoder/preprocessor_config.json",
+               "text_encoder/video_preprocessor_config.json",
+               "text_encoder/LICENSE",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors"},
+     .needs_tokenizer_json = false},
     // A model whose CODE is out of tree has its catalogue rows out of
     // tree too -- its plugin registers them with register_catalog_entries
     // -- or the browser offers a checkpoint nothing in the process can
@@ -1571,6 +1661,51 @@ builtin_catalog_()
                           .file = "posi_prompt.pth",
                           .dest = "posi_prompt.pth"}},
      .needs_tokenizer_json = false},
+    // FlashVSR+ (OpenImagingLab, arXiv 2610.17552; Apache-2.0): v1.1's
+    // successor, the SAME Wan 2.1-T2V-1.3B transformer and source
+    // projection retrained (RY-DMD), streamed four latent frames a chunk.
+    // One repository publishes two variants as FOLDERS -- turbo/ and
+    // base/, each a dit.safetensors and an lq_proj_in.safetensors, F32 --
+    // around the Wan2.1_VAE.pth they share (byte-identical to v1.1's).
+    // They are the same tensors and differ only in how the stack is
+    // driven: Turbo's "hybrid attention" runs 25 of its 30 layers on a
+    // 3x3 band with one window kept, which is the variant's whole point
+    // and something no tensor says. So each entry registers the FOLDER
+    // (`local_subdir`): the folder is the model, and the family reads the
+    // variant off its name.
+    //
+    // The context is not in this repository either: the reference keeps
+    // it in its GitHub repo (prompt_tensor/posi_prompt.pth), and it is
+    // BYTE-IDENTICAL to v1.1's (sha256 4601107a11e4e11a..., checked
+    // 2026-10-15), so it comes from the same companion. The
+    // reference's default decoder, TCDecoder.ckpt, is not fetched:
+    // nothing here runs it; the Wan VAE is its documented alternative.
+    {.family = "FlashVSR+", .version = "1.0", .param_class = "1.3B",
+     .variant = "Turbo, hybrid attention (OpenImagingLab)",
+     .hf_path = "ruchangyao/FlashVSR_plus",
+     .model_type = "flashvsr",
+     .inputs = {"video"}, .outputs = {"video"},
+     .files = {"config.json", "turbo/dit.safetensors",
+               "turbo/lq_proj_in.safetensors", "Wan2.1_VAE.pth"},
+     .companion_files = {{.repo = "deAPI-ai/flashvsr-v1-1",
+                          .file = "posi_prompt.pth",
+                          .dest = "posi_prompt.pth"}},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_("turbo"),
+     .name = "ruchangyao/FlashVSR_plus-turbo"},
+    {.family = "FlashVSR+", .version = "1.0", .param_class = "1.3B",
+     .variant = "Base, sparse attention (OpenImagingLab)",
+     .hf_path = "ruchangyao/FlashVSR_plus",
+     .model_type = "flashvsr",
+     .inputs = {"video"}, .outputs = {"video"},
+     .files = {"config.json", "base/dit.safetensors",
+               "base/lq_proj_in.safetensors", "Wan2.1_VAE.pth"},
+     .companion_files = {{.repo = "deAPI-ai/flashvsr-v1-1",
+                          .file = "posi_prompt.pth",
+                          .dest = "posi_prompt.pth"}},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_("base"),
+     .name = "ruchangyao/FlashVSR_plus-base"},
     // ---- Wan (text+image -> VIDEO diffusion) --------------------------
     // Wan2.2-I2V-A14B (Wan-AI): the first VIDEO model here, and the first
     // that outputs anything but text / images / audio. Same diffusers
@@ -2436,8 +2571,11 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     set({"text"}, {"audio"});
   } else if (mt == "yue2-vae") {
     set({"audio"}, {"audio"});
+  } else if (mt == "bs-roformer") {
+    // A source separator: music in, one source and its complement out.
+    set({"audio"}, {"audio"});
   } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit"
-             ) {
+             || mt == "flux3") {
     set({"text", "image"}, {"image"});
   } else if (mt == "qwen-image") {
     // The text-to-image half of the Qwen-Image family: no reference

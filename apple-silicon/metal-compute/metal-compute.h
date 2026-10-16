@@ -10,9 +10,11 @@
 #include "apple-silicon/metal-compute/texture.h"
 #include "common/session-member.h"
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <string_view>
+#include <thread>
 
 #include "common/vpipe-api.h"
 
@@ -306,6 +308,56 @@ public:
     FlexData extra;
   };
   MemoryBudget memory_budget() const noexcept;
+  // memory_budget() once the GPU memory this process has just FREED is
+  // back. macOS returns a released buffer's pages asynchronously: the
+  // device's allocated size drops at once, this process's graphics
+  // footprint tens to hundreds of milliseconds later, and the system's
+  // free and wired counts after that. MEASURED on a 16 GB M5: 2 GB back
+  // in ~45 ms, 8 GB in ~1.1 s -- so a decision taken straight after a
+  // large free (a DiT dropped to make room for its VAE decode) saw none of
+  // it, and planned a 4096^2 decode into 284 MB. Waits only while the
+  // footprint says something is still on its way back, at most
+  // `timeout_ms`; otherwise this is memory_budget().
+  //
+  // INLINE, deliberately: it is a loop over memory_budget(), and defined
+  // here it adds no host symbol, so a plugin that calls it still loads on
+  // every ABI-8 host (an out-of-line method would fail its dlopen on a
+  // host built before it, ahead of any feature check).
+  MemoryBudget memory_budget_settled(int timeout_ms = 3000) const noexcept
+  {
+    MemoryBudget b = memory_budget();
+    // What this process still has in its graphics footprint beyond the
+    // device's allocated size is memory released and not yet returned --
+    // or graphics memory that is not a Metal buffer at all (a CoreML
+    // model, a video frame's IOSurface), which never "returns". So wait
+    // for the footprint to STOP FALLING, not to reach the allocated size,
+    // and then for the system's wired count to fall by what it gave back.
+    constexpr std::size_t kSlack = (std::size_t)256 << 20;
+    constexpr std::size_t kStep = (std::size_t)16 << 20;
+    if (b.self_graphics == 0 || b.self_graphics <= b.allocated + kSlack) {
+      return b;
+    }
+    const std::size_t g0 = b.self_graphics, wired0 = b.wired;
+    std::size_t g_prev = g0;
+    int still = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - t0 <
+           std::chrono::milliseconds(timeout_ms)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      b = memory_budget();
+      const bool ledger_done =
+          b.self_graphics <= b.allocated + kSlack ||
+          (b.self_graphics + kStep >= g_prev && ++still >= 5);
+      if (b.self_graphics + kStep < g_prev) { still = 0; }
+      g_prev = b.self_graphics;
+      if (!ledger_done) { continue; }
+      // The ledger is through; the system's counts follow it.
+      const std::size_t back =
+          g0 > b.self_graphics ? g0 - b.self_graphics : 0;
+      if (back < kSlack || b.wired + back / 10 * 9 <= wired0) { break; }
+    }
+    return b;
+  }
 
   // Allocate a `byte_size`-byte MTL::Buffer in Shared storage mode
   // (CPU and GPU share the same UMA address). Returns an empty
