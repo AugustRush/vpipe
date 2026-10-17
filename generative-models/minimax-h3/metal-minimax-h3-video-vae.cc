@@ -8,6 +8,7 @@
 #include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/shared/tuned-answers.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 
@@ -1948,13 +1949,23 @@ MetalMiniMaxH3VideoVae::c3_tune_(const Conv3d& c, int Ti, int H, int W,
   // trial reads `_es.b` and writes `_es.c`: `_es.a` holds this encode's
   // input. Their contents are garbage, which a timing does not mind.
   const int ti = std::min(Ti, 3);
-  const int pick = autotune_vote(kC3Cands, /*rounds=*/3, /*reps=*/1,
-      [&](int i) {
-        return autotune_time(_mc, 1, [&](ComputeEncoder& enc) {
-          c3_dispatch_(enc, c, i, _es.b, ti, H, W, _es.c, stride_t,
-                       stride_s, nullptr);
+  // Kept for the session (tuned-answers.h): the encoder is loaded again
+  // for every clip it encodes, at the same few shapes.
+  KernelTuningCache* const answers = tuning_cache(_mc);
+  const TuneKey key = TuneKey("h3-vvae-c3/1")("stride_t", stride_t)
+      ("stride_s", stride_s)("cin", c.cin)("cout", c.cout)("H", H)
+      ("W", W)("frames", ti);
+  int pick = -1;
+  if (!find_tuned(answers, key, pick) || pick < 0 || pick >= kC3Cands) {
+    pick = autotune_vote(kC3Cands, /*rounds=*/3, /*reps=*/1,
+        [&](int i) {
+          return autotune_time(_mc, 1, [&](ComputeEncoder& enc) {
+            c3_dispatch_(enc, c, i, _es.b, ti, H, W, _es.c, stride_t,
+                         stride_s, nullptr);
+          });
         });
-      });
+    store_tuned(answers, key, pick);
+  }
   _c3_tuned.push_back(C3Tune{stride_s, c.cin, c.cout, H, W, pick});
   if (_mc->session() != nullptr) {
     const std::string nm = kC3Names[pick];
@@ -2249,6 +2260,7 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
   // flips these decisions automatically instead of needing this comment to
   // be re-read.
   if (_use_mma2 && _splitk.enabled) {
+    KernelTuningCache* const answers = tuning_cache(_mc);
     int tt = T, hh = H, ww = W;
     for (const EncLevel& lv : _enc_levels) {
       for (const EncResnet& r : lv.res) {
@@ -2277,12 +2289,24 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
           // measuring them together would confound them. Same order the DiT
           // tuner uses.
           bool have = false;
+          int wt = -1;
           for (const TileTune& t : _tile_tuned) {
-            if (t.N == N && t.K == K && t.M == M) { have = true; break; }
+            if (t.N == N && t.K == K && t.M == M) {
+              have = true;
+              wt = t.wide ? 1 : 0;
+              break;
+            }
           }
-          if (!have) {
+          // Both answers kept for the session (tuned-answers.h), under
+          // the GEMM's shape and its weight's format.
+          const std::string wfmt = cv->l.quantized
+              ? "w" + std::to_string(cv->l.bits) : std::string("dense");
+          const TuneKey tkey = TuneKey("h3-vvae-tile/1")("fmt", wfmt)
+              ("N", N)("K", K)("M", M);
+          if (!have &&
+              (!find_tuned(answers, tkey, wt) || wt < 0 || wt > 1)) {
             _splitk.bypass = true;
-            const int wt = autotune_vote(2, /*rounds=*/3, /*reps_for_us=*/1,
+            wt = autotune_vote(2, /*rounds=*/3, /*reps_for_us=*/1,
                 [&](int i) {
                   _force_tile = (i == 0) ? 1 : 2;
                   const double t = autotune_time(_mc, 1, run);
@@ -2290,9 +2314,12 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
                   return t;
                 });
             _splitk.bypass = false;
-            _tile_tuned.push_back(TileTune{N, K, M, wt == 1});
+            store_tuned(answers, tkey, wt);
           }
-          _splitk.tune(_mc, K, N, M, run);
+          if (!have) { _tile_tuned.push_back(TileTune{N, K, M, wt == 1}); }
+          _splitk.tune(_mc, K, N, M, run,
+                       "h3-vvae/1 fmt=" + wfmt + " tile=" +
+                           std::to_string(wt));
         }
       }
       if (lv.space > 1) { hh = (hh - 2) / 2 + 1; ww = (ww - 2) / 2 + 1; }

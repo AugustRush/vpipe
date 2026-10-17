@@ -720,6 +720,10 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/mma-tile.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/mma-splitk.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/i8-gemm.h
+        # The session's kept answers every tuner above files and reads
+        # (kernel-tuning/1): a plugin's tuner skips what the session has
+        # already measured.
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/tuned-answers.h
         DESTINATION include/generative-models/shared)
     # Sol-Attn, for the same reason i8-gemm.h is here: it is an
     # ACCELERATION TIER a DiT opts into, not a model. It needs no weights

@@ -1909,6 +1909,97 @@ TEST(minimax_h3_lora, runtime_adapter_survives_i8_gemm)
   EXPECT_TRUE(moved_i8 > 0.5 * moved_bf && moved_i8 < 2.0 * moved_bf);
 }
 
+// THE SIGNED LAYOUT, PER CALL, on a real quantized pack: this family keeps
+// the checkpoint's codes and takes the int8 GEMM through gemm_affine,
+// which now converts them to the signed layout per call
+// (I8GemmContext::gemm_affine). Against the unsigned kernel it replaced
+// (VPIPE_I8_SIGNED=0), measured from the dense (i8 off) forward over 4
+// blocks: int8 must be ENGAGED in both arms (they move the velocity),
+// and the signed one held within a gross-error bar of the unsigned --
+// this velocity moves 3.7e-3 for one verified GEMM kernel against
+// another (runtime_adapter_routes_agree), so the two arms rank nothing
+// finer. Env: VPIPE_MINIMAX_H3_QUANT_DIT (a model-quantize'd DiT).
+TEST(minimax_h3_lora, signed_per_call_matches_unsigned)
+{
+  const char* qd = std::getenv("VPIPE_MINIMAX_H3_QUANT_DIT");
+  if (qd == nullptr || *qd == '\0') { return; }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(qd, cfg, &cerr)) {
+    return;
+  }
+  cfg.n_layers = 4;
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 16, 40, 24, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, 0.3125f, 0.5f, 1.0f, &uniq, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k) * 0.5f;
+    }
+    return v;
+  };
+  const metal_compute::SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const metal_compute::SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+  auto arm = [&](bool i8, bool sgn, std::vector<float>* out) {
+    if (!sgn) { ::setenv("VPIPE_I8_SIGNED", "0", 1); }
+    MetalMiniMaxH3Transformer::Config c = cfg;
+    c.i8_gemm = i8;
+    auto m = MetalMiniMaxH3Transformer::load(qd, mc, c, false);
+    ::unsetenv("VPIPE_I8_SIGNED");
+    if (m == nullptr) { return false; }
+    m->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kMma128);
+    MetalMiniMaxH3Transformer::Step step;
+    step.video = &vb;  step.audio = &ab;  step.text = &tb;
+    step.layout = &L;  step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    std::string ferr;
+    const auto v = m->forward(step, &ferr);
+    if (v.empty()) {
+      std::printf("[minimax_h3_lora] forward: %s\n", ferr.c_str());
+      return false;
+    }
+    const std::size_t n = (std::size_t)n_video * cfg.video_patch_elems();
+    out->resize(n);
+    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = from_bf16_(p[i]); }
+    return true;
+  };
+  std::vector<float> dense, uns, sig;
+  ASSERT_TRUE(arm(false, true, &dense));
+  ASSERT_TRUE(arm(true, false, &uns));
+  ASSERT_TRUE(arm(true, true, &sig));
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      num += d * d;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+  const double ru = rel(uns, dense), rs = rel(sig, dense);
+  std::printf("[minimax_h3_lora] signed per call | vs the dense forward: "
+              "unsigned %.3e, signed %.3e; signed vs unsigned %.3e\n", ru,
+              rs, rel(sig, uns));
+  EXPECT_TRUE(ru > 1e-4 && rs > 1e-4);   // int8 engaged in both arms
+  EXPECT_TRUE(rs <= 1.25 * ru);
+}
+
 // A baked schedule and a runtime adapter, together.
 //
 // They meet on the AdaLN projection, which is the one module both want.

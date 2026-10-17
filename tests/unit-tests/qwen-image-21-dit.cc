@@ -33,6 +33,7 @@
 #include <unistd.h>
 #include "stages/model-memory.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +41,7 @@
 #include <chrono>
 #include <fstream>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 #include <thread>
@@ -788,6 +790,240 @@ TEST(qwen_image_21_dit, cache_refuses_a_different_geometry)
 // one destination and no prefetch, and it is where a read issued into
 // the block currently in use shows up -- as a GPU fault mid-stack
 // rather than as a wrong answer.
+// THE SIGNED INT8 LAYOUT on a real quantized pack
+// (VPIPE_QWEN_IMAGE21_QUANT_DIT at a model-quantize'd DiT; i8_gemm on; M5
+// only), as flux2_smoke.signed_layout_matches_native: every arm --
+// preloaded, streamed through the slots, streamed without them, promoted
+// -- BYTE-IDENTICAL, and within a gross-error bar of the route this
+// family took before (dequant + requant; VPIPE_I8_SIGNED=0) in distance
+// from the dense (i8 off) forward. One joint sequence -- this model has
+// no separate text stream -- at three lengths, one per route a signed
+// weight takes:
+// 1280 target rows + 64 prompt (the int8 GEMM), 64 + 8 (the signed
+// dequant into matmul2d, under the int8 floor) and 32 + 8 (the steel
+// tiles through the signed dequant, under the matmul2d tile's).
+TEST(qwen_image_21_dit, signed_layout_matches_native)
+{
+  const char* qd = std::getenv("VPIPE_QWEN_IMAGE21_QUANT_DIT");
+  if (qd == nullptr || *qd == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  MetalQwenImage21Transformer::Config cfg;
+  Q21D_REQUIRE(MetalQwenImage21Transformer::Config::read_dims(qd, &cfg));
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  struct Geo { int gh, gw, TS; };
+  for (const Geo& g : {Geo{32, 40, 64}, Geo{8, 8, 8}, Geo{4, 8, 8}}) {
+    const int gh = g.gh, gw = g.gw, TS = g.TS;
+    std::vector<std::uint8_t> slot((std::size_t)TS, 0);
+    slot.resize((std::size_t)TS + (std::size_t)(gh * gw / 4), 1);
+    const std::vector<qi21::ImgBlock> blocks = {{1, gh, gw}};
+    qi21::Layout lay;
+    std::string lerr;
+    Q21D_REQUIRE(qi21::build_layout(slot, {}, blocks, &lay, &lerr));
+    auto rnd = [&](std::size_t n, unsigned seed) {
+      metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+      if (b.empty()) { return b; }
+      auto* d = static_cast<std::uint16_t*>(b.contents());
+      unsigned st = seed;
+      for (std::size_t i = 0; i < n; ++i) {
+        st = st * 1664525u + 1013904223u;
+        const float v =
+            ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.5f;
+        std::uint32_t u;
+        std::memcpy(&u, &v, 4);
+        d[i] = (std::uint16_t)(u >> 16);
+      }
+      return b;
+    };
+    bool engaged = true;
+    auto run = [&](bool sgn, bool i8, bool stream, bool grow, bool slots,
+                   const std::string& dir = std::string()) {
+      std::vector<std::uint16_t> v;
+      std::unique_ptr<Env> e1, e2;
+      if (!sgn) { e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0"); }
+      if (!slots) {
+        e2 = std::make_unique<Env>("VPIPE_QWEN_IMAGE21_NO_SLOTS", "1");
+      }
+      MetalQwenImage21Transformer::Config c = cfg;
+      c.i8_gemm = i8;
+      auto m = MetalQwenImage21Transformer::load(dir.empty() ? qd : dir, mc,
+                                                 c, stream);
+      if (m == nullptr) { return v; }
+      if (dir.empty() && m->signed_layout() != (sgn && i8)) {
+        engaged = false;
+      }
+      m->set_residency_reserve(grow ? (4ull << 30) : 0);
+      if (grow) { m->set_residency_schedule(4); }
+      metal_compute::SharedBuffer lat =
+          rnd((std::size_t)lay.image_len * cfg.in_channels, 11u);
+      metal_compute::SharedBuffer txt =
+          rnd((std::size_t)slot.size() * cfg.txt_dim, 22u);
+      if (lat.empty() || txt.empty()) { return v; }
+      MetalQwenImage21Transformer::Request req;
+      req.latents = &lat;
+      req.txt = &txt;
+      req.layout = &lay;
+      req.timestep = 0.75f;
+      std::string ferr;
+      metal_compute::SharedBuffer out;
+      for (int it = 0; it < (grow ? 2 : 1); ++it) {
+        out = m->forward(req, &ferr);
+      }
+      if (grow && m->resident_block_count() == 0) { engaged = false; }
+      const std::size_t n = (std::size_t)lay.target_len * cfg.out_channels;
+      if (out.empty() || out.byte_size() < n * 2) { return v; }
+      const auto* d = static_cast<const std::uint16_t*>(out.contents());
+      v.assign(d, d + n);
+      return v;
+    };
+    const auto dense = run(false, false, false, false, true);
+    const auto nat = run(false, true, false, false, true);
+    const auto pre = run(true, true, false, false, true);
+    const auto str = run(true, true, true, false, true);
+    const auto flat = run(true, true, true, false, false);
+    const auto grown = run(true, true, true, true, true);
+    EXPECT_TRUE(engaged);
+    Q21D_REQUIRE(!pre.empty() && nat.size() == pre.size() &&
+                 dense.size() == pre.size());
+    auto f = [](std::uint16_t h) {
+      const std::uint32_t u = (std::uint32_t)h << 16;
+      float x;
+      std::memcpy(&x, &u, 4);
+      return (double)x;
+    };
+    auto rel = [&](const std::vector<std::uint16_t>& a,
+                   const std::vector<std::uint16_t>& b) {
+      double n2 = 0, d2 = 0;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        n2 += (f(a[i]) - f(b[i])) * (f(a[i]) - f(b[i]));
+        d2 += f(b[i]) * f(b[i]);
+      }
+      return std::sqrt(n2 / d2);
+    };
+    const double rs = rel(pre, dense), rn = rel(nat, dense);
+    // The yardstick, where the bf16 checkpoint is at hand: how far the
+    // pack itself (dense, i8 off) sits from the weights it quantized.
+    const std::string bdir = dit_dir_();
+    if (!bdir.empty()) {
+      const auto orig = run(false, false, false, false, true, bdir);
+      if (orig.size() == pre.size()) {
+        std::printf("[qwen_image_21_dit]   vs the bf16 checkpoint: the "
+                    "pack %.3e, signed %.3e, unsigned %.3e\n",
+                    rel(dense, orig), rel(pre, orig), rel(nat, orig));
+      }
+    }
+    std::printf("[qwen_image_21_dit] signed layout, %d+%d rows: vs the "
+                "dense forward signed %.3e, unsigned %.3e; streamed %s, no "
+                "slots %s, promoted %s\n", gh * gw, TS, rs, rn,
+                str == pre ? "IDENTICAL" : "DIFFERENT",
+                flat == pre ? "IDENTICAL" : "DIFFERENT",
+                grown == pre ? "IDENTICAL" : "DIFFERENT");
+    EXPECT_TRUE(str == pre);
+    EXPECT_TRUE(flat == pre);
+    EXPECT_TRUE(grown == pre);
+    // A GROSS-ERROR guard, not a ranking: on random inputs this forward
+    // is chaotic -- QI21's dense forward moved 4.8e-2 for a per-weight
+    // change of 5e-5 (gemm_i8.signed_dequant_on_a_real_pack: both
+    // dequants 7.3e-3 from the bf16 weights, equal to four digits) -- so
+    // two equally accurate routes land a few percent apart either way.
+    // gemm_i8.signed_layout_matches_oracle is the accuracy statement; a
+    // misread layout is O(1) here.
+    // Under the int8 floor the old route is the dense one, exactly.
+    if (rn > 0.0) { EXPECT_TRUE(rs <= 1.25 * rn); }
+  }
+}
+
+// THE SIGNED LAYOUT'S WORTH in the Qwen-Image-2.1 forward, i8_gemm on, at
+// 1024^2 (4096 target rows + a 42-token prompt), preloaded. Arms: bf16
+// (VPIPE_QWEN_IMAGE21_TEST_MODEL_PATH's transformer/), the quantized pack
+// (VPIPE_QWEN_IMAGE21_QUANT_DIT) signed, and the pack on the route it took
+// before (dequant + requant, VPIPE_I8_SIGNED=0). Each arm warms two
+// forwards and keeps the median of three; the arms rotate through
+// VPIPE_QWEN_IMAGE21_SIGNED_BENCH_ROUNDS rounds, reversed every other one.
+// VPIPE_QWEN_IMAGE21_SIGNED_BENCH=1 runs it.
+TEST(qwen_image_21_dit, signed_layout_forward)
+{
+  const char* qd = std::getenv("VPIPE_QWEN_IMAGE21_QUANT_DIT");
+  const std::string bdir = dit_dir_();
+  if (qd == nullptr || *qd == '\0' || bdir.empty() ||
+      std::getenv("VPIPE_QWEN_IMAGE21_SIGNED_BENCH") == nullptr) {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  int rounds = 3;
+  if (const char* e = std::getenv("VPIPE_QWEN_IMAGE21_SIGNED_BENCH_ROUNDS")) {
+    rounds = std::max(1, std::atoi(e));
+  }
+  MetalQwenImage21Transformer::Config cfg;
+  Q21D_REQUIRE(MetalQwenImage21Transformer::Config::read_dims(qd, &cfg));
+  std::vector<std::uint8_t> slot(42, 0);
+  slot.resize(42 + 1024, 1);
+  const std::vector<qi21::ImgBlock> blocks = {{1, 64, 64}};
+  qi21::Layout lay;
+  std::string lerr;
+  Q21D_REQUIRE(qi21::build_layout(slot, {}, blocks, &lay, &lerr));
+  struct Arm { const char* name; std::string dir; bool sgn; };
+  const Arm arms[] = {{"bf16", bdir, true},
+                      {"w8 signed", qd, true},
+                      {"w8 requant", qd, false}};
+  std::vector<std::vector<double>> per(3);
+  for (int r = 0; r < rounds; ++r) {
+    for (int k = 0; k < 3; ++k) {
+      const int a = (r % 2 == 0) ? k : 2 - k;
+      if (!arms[a].sgn) { ::setenv("VPIPE_I8_SIGNED", "0", 1); }
+      MetalQwenImage21Transformer::Config c = cfg;
+      c.i8_gemm = true;
+      auto m = MetalQwenImage21Transformer::load(arms[a].dir, mc, c, false);
+      ::unsetenv("VPIPE_I8_SIGNED");
+      Q21D_REQUIRE(m != nullptr);
+      metal_compute::SharedBuffer lat = mc->make_shared_buffer(
+          (std::size_t)lay.image_len * cfg.in_channels * 2);
+      metal_compute::SharedBuffer txt = mc->make_shared_buffer(
+          slot.size() * (std::size_t)cfg.txt_dim * 2);
+      Q21D_REQUIRE(!lat.empty() && !txt.empty());
+      std::memset(lat.contents(), 0x3c, lat.byte_size());
+      std::memset(txt.contents(), 0x3c, txt.byte_size());
+      MetalQwenImage21Transformer::Request req;
+      req.latents = &lat;
+      req.txt = &txt;
+      req.layout = &lay;
+      req.timestep = 0.75f;
+      std::string ferr;
+      for (int w = 0; w < 2; ++w) {
+        Q21D_REQUIRE(!m->forward(req, &ferr).empty());
+      }
+      std::vector<double> t;
+      for (int i = 0; i < 3; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        Q21D_REQUIRE(!m->forward(req, &ferr).empty());
+        t.push_back(std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count());
+      }
+      std::sort(t.begin(), t.end());
+      per[(std::size_t)a].push_back(t[1]);
+      std::printf("[qwen_image_21_dit] round %d %-10s %7.1f ms/forward "
+                  "(signed layout %s)\n", r, arms[a].name, t[1],
+                  m->signed_layout() ? "on" : "off");
+    }
+  }
+  double mean[3] = {0, 0, 0};
+  for (int a = 0; a < 3; ++a) {
+    for (double v : per[(std::size_t)a]) { mean[a] += v / rounds; }
+  }
+  for (int a = 0; a < 3; ++a) {
+    std::printf("[qwen_image_21_dit]   %-10s %7.1f ms (mean of %d)  %.3fx "
+                "bf16\n", arms[a].name, mean[a], rounds, mean[0] / mean[a]);
+  }
+}
+
 TEST(qwen_image_21_dit, streamed_matches_preloaded)
 {
   const char* g = std::getenv("VPIPE_QWEN_IMAGE21_GOLDEN");

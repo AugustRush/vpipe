@@ -879,6 +879,160 @@ kernel void quant_f16_u8_row_g64(
   }
 }
 
+// THE SIGNED-CODE LAYOUT of an affine weight: q ^ 0x80 per byte (w8) or
+// q ^ 0x8 per nibble (w4), which two's complement reads as q - 128 /
+// q - 8, and the zero point moved to match, b' = b + 128 s / 8 s. Both
+// halves are exact in real arithmetic and the codes are exact in fact;
+// only b' is rounded, once, to the element type. The int8 GEMM over this
+// layout (gemm_i8s_*) runs on the signed matrix pipe with no -128*Q
+// term, which is what makes a w8 pack at least as fast as bf16 under
+// i8_gemm (see I8GemmContext::gemm_signed).
+//
+// One thread per (group, channel): its 64 codes (16 words of w8, 8 of
+// w4) and its zero point. `codes_out` may BE `codes_in` and `zb` may be
+// `biases` -- each thread reads its own words and entry before writing
+// them -- so a caller-owned buffer converts in place.
+//   0:codes_in(u32) 1:scales 2:biases 3:codes_out(u32) 4:zb 5:K 6:N
+//   grid (threads) {K/64, N, 1}
+template <int BITS>
+static inline void affine_to_signed_impl(
+    const device uint32_t* cin, const device VPIPE_ELT* scales,
+    const device VPIPE_ELT* biases, device uint32_t* cout,
+    device VPIPE_ELT* zb, int K, int N, uint2 gid)
+{
+  const int g = (int)gid.x, n = (int)gid.y;
+  const int G = K / 64;
+  if (n >= N || g >= G) { return; }
+  constexpr int W = BITS == 8 ? 16 : 8;            // words per group
+  constexpr uint32_t FLIP = BITS == 8 ? 0x80808080u : 0x88888888u;
+  constexpr float OFF = BITS == 8 ? 128.0f : 8.0f;
+  const int64_t at = (int64_t)n * (K / (32 / BITS)) + g * W;
+  for (int i = 0; i < W; ++i) { cout[at + i] = cin[at + i] ^ FLIP; }
+  const int64_t gi = (int64_t)n * G + g;
+  zb[gi] = (VPIPE_ELT)((float)biases[gi] + OFF * (float)scales[gi]);
+}
+
+kernel void affine_to_signed_w8g64(
+    const device uint32_t*  cin    [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    device uint32_t*        cout   [[buffer(3)]],
+    device VPIPE_ELT*       zb     [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  affine_to_signed_impl<8>(cin, scales, biases, cout, zb, K, N, gid);
+}
+
+kernel void affine_to_signed_w4g64(
+    const device uint32_t*  cin    [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    device uint32_t*        cout   [[buffer(3)]],
+    device VPIPE_ELT*       zb     [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  affine_to_signed_impl<4>(cin, scales, biases, cout, zb, K, N, gid);
+}
+
+// Dequant of the signed layout: w = s * code + b', code read as int8
+// (w8) or as a sign-extended nibble (w4). Same contract and grid as
+// affine_dequant_w8g64 / _w4g64, with buffer 2 the zero point b'.
+kernel void affine_dequant_w8g64s(
+    const device uint32_t*  w      [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* zb     [[buffer(2)]],
+    device VPIPE_ELT*       ydeq   [[buffer(3)]],
+    const constant int& K [[buffer(4)]],
+    const constant int& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int word = (int)gid.x;
+  const int n    = (int)gid.y;
+  if (n >= N || word >= (K >> 2)) { return; }
+  const int k0 = word << 2;
+  const int g = n * (K / DQ_GROUP) + (k0 / DQ_GROUP);
+  const float s = (float)scales[g];
+  const float b = (float)zb[g];
+  const uint32_t packed = w[(int64_t)n * (K >> 2) + word];
+  VPIPE_ELT out[4];
+  for (int i = 0; i < 4; ++i) {
+    const int q = (int)(char)((packed >> (8 * i)) & 0xffu);
+    out[i] = (VPIPE_ELT)(s * (float)q + b);
+  }
+  *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(ydeq + (int64_t)n * K + k0) =
+      vec<VPIPE_ELT, 4>(out[0], out[1], out[2], out[3]);
+}
+
+kernel void affine_dequant_w4g64s(
+    const device uint32_t*  w      [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* zb     [[buffer(2)]],
+    device VPIPE_ELT*       ydeq   [[buffer(3)]],
+    const constant int& K [[buffer(4)]],
+    const constant int& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int word = (int)gid.x;
+  const int n    = (int)gid.y;
+  if (n >= N || word >= (K >> 3)) { return; }
+  const int k0 = word << 3;
+  const int g = n * (K / DQ_GROUP) + (k0 / DQ_GROUP);
+  const float s = (float)scales[g];
+  const float b = (float)zb[g];
+  const uint32_t packed = w[(int64_t)n * (K >> 3) + word];
+  VPIPE_ELT out[8];
+  for (int i = 0; i < 8; ++i) {
+    const int q = (int)((packed >> (4 * i)) & 0xfu);
+    out[i] = (VPIPE_ELT)(s * (float)(q >= 8 ? q - 16 : q) + b);
+  }
+  device VPIPE_ELT* dst = ydeq + (int64_t)n * K + k0;
+  *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(dst) =
+      vec<VPIPE_ELT, 4>(out[0], out[1], out[2], out[3]);
+  *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(dst + 4) =
+      vec<VPIPE_ELT, 4>(out[4], out[5], out[6], out[7]);
+}
+
+// SIGNED twin of quant_f16_u8_row_g64, for the signed-code GEMM
+// (gemm_i8q_*): the symmetric int8 code as it is, its per-(row, group)
+// scale, and u = scale * sum(codes) in the element type -- the operand
+// of that GEMM's zero-point matmul. K % 64 == 0.
+//   0:x[M,K] 1:q[M,K] i8 2:scales[M,K/64] 3:u[M,K/64] 4:K
+//   dispatch (threads): {256, M, 1}, tg {256, 1, 1}
+kernel void quant_f16_i8s_row_g64(
+    const device VPIPE_ELT* x      [[buffer(0)]],
+    device char*            q      [[buffer(1)]],
+    device VPIPE_ELT*       scales [[buffer(2)]],
+    device VPIPE_ELT*       u      [[buffer(3)]],
+    const constant int& K     [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int row = (int)tgid.y;
+  const int G = K / 64;
+  for (int g = (int)sgid; g < G; g += 8) {
+    const int64_t at = (int64_t)row * K + g * 64 + (int)lane * 2;
+    const vec<VPIPE_ELT, 2> h =
+        *reinterpret_cast<const device vec<VPIPE_ELT, 2>*>(x + at);
+    float am = max(fabs((float)h.x), fabs((float)h.y));
+    am = simd_max(am);
+    const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+    const int qx = clamp((int)rint((float)h.x * inv), -127, 127);
+    const int qy = clamp((int)rint((float)h.y * inv), -127, 127);
+    *reinterpret_cast<device char2*>(q + at) = char2((char)qx, (char)qy);
+    const int sum = simd_sum(qx + qy);
+    if (lane == 0) {
+      const VPIPE_ELT sc = (VPIPE_ELT)(am * (1.0f / 127.0f));
+      scales[(int64_t)row * G + g] = sc;
+      u[(int64_t)row * G + g] = (VPIPE_ELT)((float)sc * (float)sum);
+    }
+  }
+}
+
 // Per-(channel, 64-group) sums of an affine weight's codes, for the
 // native GEMM's offset correction (see gemm_u8q_impl). One thread per
 // group: 16 words of 4 bytes (w8) or 8 words of 8 nibbles (w4). Sums

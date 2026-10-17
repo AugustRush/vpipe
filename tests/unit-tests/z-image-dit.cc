@@ -41,6 +41,7 @@
 #include <atomic>
 #include <map>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -437,6 +438,115 @@ TEST(z_image_dit, matches_reference_on_a_small_model)
 // A STREAMED stack must be bit-identical to a preloaded one. Every one
 // of these ports rebuilds something after the read, and a wrong
 // permutation is silent.
+// THE SIGNED INT8 LAYOUT on a real quantized pack (VPIPE_Z_IMAGE_QUANT_DIT
+// at a model-quantize'd DiT; i8_gemm on; M5 only), as flux2_smoke.signed_
+// layout_matches_native: every arm -- preloaded, streamed through the
+// slots, streamed without them, promoted -- BYTE-IDENTICAL, and within a
+// gross-error bar of the route this family took before (dequant +
+// requant; VPIPE_I8_SIGNED=0) in distance from the dense (i8 off)
+// forward. 1280 image rows; a
+// 64-token caption (its refiner on the signed dequant into matmul2d,
+// under the int8 floor) and an 8-token one (the steel tiles through the
+// signed dequant).
+TEST(z_image_dit, signed_layout_matches_native)
+{
+  const char* qd = std::getenv("VPIPE_Z_IMAGE_QUANT_DIT");
+  if (qd == nullptr || *qd == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  MetalZImageTransformer::Config cfg;
+  ZI_REQUIRE(MetalZImageTransformer::Config::read_dims(qd, &cfg));
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int gh = 32, gw = 40;
+  for (int TS : {64, 8}) {
+    zimage::Layout lay;
+    std::string lerr;
+    ZI_REQUIRE(zimage::build_layout(gh, gw, TS, &lay, &lerr));
+    std::vector<float> img((std::size_t)lay.img_tokens * cfg.patch_dim());
+    std::vector<float> cap((std::size_t)TS * cfg.cap_dim);
+    unsigned st = 20261016u;
+    auto rnd = [&]() {
+      st = st * 1664525u + 1013904223u;
+      return ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f);
+    };
+    for (float& v : img) { v = rnd(); }
+    for (float& v : cap) { v = rnd(); }
+    bool engaged = true;
+    auto run = [&](bool sgn, bool i8, bool stream, bool grow, bool slots) {
+      std::vector<float> out;
+      std::unique_ptr<Env> e1, e2;
+      if (!sgn) { e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0"); }
+      if (!slots) {
+        e2 = std::make_unique<Env>("VPIPE_Z_IMAGE_NO_SLOTS", "1");
+      }
+      MetalZImageTransformer::Config c = cfg;
+      c.i8_gemm = i8;
+      auto m = MetalZImageTransformer::load(qd, mc, c, stream);
+      if (m == nullptr) { return out; }
+      if (m->signed_layout() != (sgn && i8)) { engaged = false; }
+      m->set_residency_reserve(grow ? (4ull << 30) : 0);
+      if (grow) { m->set_residency_schedule(4); }
+      metal_compute::SharedBuffer lat = to_bf16_(mc, img);
+      metal_compute::SharedBuffer cb = to_bf16_(mc, cap);
+      MetalZImageTransformer::Request req;
+      req.latents = &lat;
+      req.cap = &cb;
+      req.layout = &lay;
+      req.timestep = 0.75f;
+      std::string e;
+      metal_compute::SharedBuffer v;
+      for (int it = 0; it < (grow ? 2 : 1); ++it) { v = m->forward(req, &e); }
+      if (grow && m->resident_block_count() == 0) { engaged = false; }
+      const std::size_t n = (std::size_t)lay.img_tokens * cfg.patch_dim();
+      if (v.empty() || v.byte_size() < n * 2) { return out; }
+      const auto* p = static_cast<const std::uint16_t*>(v.contents());
+      out.resize(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint32_t u = (std::uint32_t)p[i] << 16;
+        std::memcpy(&out[i], &u, 4);
+      }
+      return out;
+    };
+    const auto dense = run(false, false, false, false, true);
+    const auto nat = run(false, true, false, false, true);
+    const auto pre = run(true, true, false, false, true);
+    const auto str = run(true, true, true, false, true);
+    const auto flat = run(true, true, true, false, false);
+    const auto grown = run(true, true, true, true, true);
+    EXPECT_TRUE(engaged);
+    ZI_REQUIRE(!pre.empty() && nat.size() == pre.size() &&
+               dense.size() == pre.size());
+    auto same = [&](const std::vector<float>& a) {
+      return a.size() == pre.size() &&
+             std::memcmp(a.data(), pre.data(), a.size() * 4) == 0;
+    };
+    const double rs = rel_l2_(pre, dense), rn = rel_l2_(nat, dense);
+    std::printf("[z_image_dit] signed layout, cap %d: vs the dense forward "
+                "signed %.3e, unsigned %.3e; streamed %s, no slots %s, "
+                "promoted %s\n", TS, rs, rn,
+                same(str) ? "IDENTICAL" : "DIFFERENT",
+                same(flat) ? "IDENTICAL" : "DIFFERENT",
+                same(grown) ? "IDENTICAL" : "DIFFERENT");
+    EXPECT_TRUE(same(str));
+    EXPECT_TRUE(same(flat));
+    EXPECT_TRUE(same(grown));
+    // A GROSS-ERROR guard, not a ranking: on random inputs this forward
+    // is chaotic -- QI21's dense forward moved 4.8e-2 for a per-weight
+    // change of 5e-5 (gemm_i8.signed_dequant_on_a_real_pack: both
+    // dequants 7.3e-3 from the bf16 weights, equal to four digits) -- so
+    // two equally accurate routes land a few percent apart either way.
+    // gemm_i8.signed_layout_matches_oracle is the accuracy statement; a
+    // misread layout is O(1) here.
+    EXPECT_TRUE(rs <= 1.25 * rn);
+  }
+}
+
 TEST(z_image_dit, streamed_matches_preloaded)
 {
   const Golden G = load_golden_();

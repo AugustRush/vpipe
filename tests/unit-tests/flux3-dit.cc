@@ -31,6 +31,7 @@
 #include "generative-models/train/lora-params.h"
 #include "generative-models/weight-set.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -39,6 +40,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -453,6 +455,181 @@ golden_text_(const fs::path& g, const std::string& key, int* rows)
 }
 
 }  // namespace
+
+// THE SIGNED INT8 LAYOUT on a real quantized pack (VPIPE_FLUX3_QUANT_DIT at
+// a model-quantize'd DiT; i8_gemm on; M5 only), as flux2_smoke.signed_
+// layout_matches_native: every arm -- preloaded, streamed through the
+// slots, streamed without them, promoted -- BYTE-IDENTICAL, and within a
+// gross-error bar of the route this family took before (dequant +
+// requant; VPIPE_I8_SIGNED=0) in distance from the dense (i8 off)
+// forward. 1280 image rows; an
+// 80-row text stream (the signed dequant into matmul2d in its own mode
+// blocks) and an 8-row one (the steel tiles through the signed dequant).
+TEST(flux3_dit, signed_layout_matches_native)
+{
+  const std::string qd = env_("VPIPE_FLUX3_QUANT_DIT");
+  if (qd.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  MetalFlux3Transformer::Config cfg;
+  F3_REQUIRE(MetalFlux3Transformer::Config::read_dims(qd, &cfg));
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int gh = 32, gw = 40;
+  for (int TS : {80, 8}) {
+    std::vector<float> img((std::size_t)gh * gw * cfg.in_channels);
+    std::vector<float> txt((std::size_t)TS * cfg.joint_dim);
+    unsigned st = 20261016u;
+    auto rnd = [&]() {
+      st = st * 1664525u + 1013904223u;
+      return ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f);
+    };
+    for (float& v : img) { v = rnd(); }
+    for (float& v : txt) { v = rnd(); }
+    bool engaged = true;
+    auto run = [&](bool sgn, bool i8, bool stream, bool grow, bool slots) {
+      std::vector<float> out;
+      std::unique_ptr<Env> e1, e2;
+      if (!sgn) { e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0"); }
+      if (!slots) { e2 = std::make_unique<Env>("VPIPE_FLUX3_NO_SLOTS", "1"); }
+      MetalFlux3Transformer::Config c = cfg;
+      c.i8_gemm = i8;
+      auto m = MetalFlux3Transformer::load(qd, mc, c, stream);
+      if (m == nullptr) { return out; }
+      if (m->signed_layout() != (sgn && i8)) { engaged = false; }
+      m->set_residency_reserve(grow ? (4ull << 30) : 0);
+      if (grow) { m->set_residency_schedule(4); }
+      SharedBuffer lat = to_bf16_(mc, img);
+      SharedBuffer tb = to_bf16_(mc, txt);
+      MetalFlux3Transformer::Request req;
+      req.latents = &lat;
+      req.grid_h = gh;
+      req.grid_w = gw;
+      req.text = &tb;
+      req.text_rows = TS;
+      req.t = 0.75f;
+      req.t_next = 0.5f;
+      std::string e;
+      SharedBuffer v;
+      for (int it = 0; it < (grow ? 2 : 1); ++it) { v = m->forward(req, &e); }
+      if (grow && m->resident_block_count() == 0) { engaged = false; }
+      const std::size_t n = (std::size_t)gh * gw * cfg.in_channels;
+      if (v.empty() || v.byte_size() < n * 2) { return out; }
+      const auto* p = static_cast<const std::uint16_t*>(v.contents());
+      out.resize(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint32_t u = (std::uint32_t)p[i] << 16;
+        std::memcpy(&out[i], &u, 4);
+      }
+      return out;
+    };
+    const auto dense = run(false, false, false, false, true);
+    const auto nat = run(false, true, false, false, true);
+    const auto pre = run(true, true, false, false, true);
+    const auto str = run(true, true, true, false, true);
+    const auto flat = run(true, true, true, false, false);
+    const auto grown = run(true, true, true, true, true);
+    EXPECT_TRUE(engaged);
+    F3_REQUIRE(!pre.empty() && nat.size() == pre.size() &&
+               dense.size() == pre.size());
+    auto same = [&](const std::vector<float>& a) {
+      return a.size() == pre.size() &&
+             std::memcmp(a.data(), pre.data(), a.size() * 4) == 0;
+    };
+    const double rs = rel_l2_(pre, dense), rn = rel_l2_(nat, dense);
+    std::printf("[flux3_dit] signed layout, txt %d: vs the dense forward "
+                "signed %.3e, unsigned %.3e; streamed %s, no slots %s, "
+                "promoted %s\n", TS, rs, rn,
+                same(str) ? "IDENTICAL" : "DIFFERENT",
+                same(flat) ? "IDENTICAL" : "DIFFERENT",
+                same(grown) ? "IDENTICAL" : "DIFFERENT");
+    EXPECT_TRUE(same(str));
+    EXPECT_TRUE(same(flat));
+    EXPECT_TRUE(same(grown));
+    // A GROSS-ERROR guard, not a ranking: on random inputs this forward
+    // is chaotic -- QI21's dense forward moved 4.8e-2 for a per-weight
+    // change of 5e-5 (gemm_i8.signed_dequant_on_a_real_pack: both
+    // dequants 7.3e-3 from the bf16 weights, equal to four digits) -- so
+    // two equally accurate routes land a few percent apart either way.
+    // gemm_i8.signed_layout_matches_oracle is the accuracy statement; a
+    // misread layout is O(1) here.
+    EXPECT_TRUE(rs <= 1.25 * rn);
+  }
+}
+
+// THE SIGNED LAYOUT'S WORTH in the FLUX.3 forward, i8_gemm on, at 1024^2
+// (4096 image rows + 80 text), preloaded. Arms: bf16
+// (VPIPE_FLUX3_TEST_MODEL_PATH's transformer/), the quantized pack
+// (VPIPE_FLUX3_QUANT_DIT) signed, and the pack on the route it took before
+// (dequant + requant, VPIPE_I8_SIGNED=0). Each arm warms two forwards and
+// keeps the median of three; five rounds, reversed every other one.
+// VPIPE_FLUX3_SIGNED_BENCH=1 runs it.
+TEST(flux3_dit, signed_layout_forward)
+{
+  const std::string qd = env_("VPIPE_FLUX3_QUANT_DIT");
+  const std::string bdir = dit_dir_();
+  if (qd.empty() || bdir.empty() || env_("VPIPE_FLUX3_SIGNED_BENCH").empty()) {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  MetalFlux3Transformer::Config cfg;
+  F3_REQUIRE(MetalFlux3Transformer::Config::read_dims(qd, &cfg));
+  const int gh = 64, gw = 64, TS = 80, rounds = 5;
+  const std::vector<float> img((std::size_t)gh * gw * cfg.in_channels,
+                               0.25f);
+  const std::vector<float> txt((std::size_t)TS * cfg.joint_dim, 0.25f);
+  struct Arm { const char* name; std::string dir; bool sgn; };
+  const Arm arms[] = {{"bf16", bdir, true},
+                      {"w8 signed", qd, true},
+                      {"w8 requant", qd, false}};
+  double mean[3] = {0, 0, 0};
+  for (int r = 0; r < rounds; ++r) {
+    for (int k = 0; k < 3; ++k) {
+      const int a = (r % 2 == 0) ? k : 2 - k;
+      if (!arms[a].sgn) { ::setenv("VPIPE_I8_SIGNED", "0", 1); }
+      MetalFlux3Transformer::Config c = cfg;
+      c.i8_gemm = true;
+      auto m = MetalFlux3Transformer::load(arms[a].dir, mc, c, false);
+      ::unsetenv("VPIPE_I8_SIGNED");
+      F3_REQUIRE(m != nullptr);
+      SharedBuffer lat = to_bf16_(mc, img);
+      SharedBuffer tb = to_bf16_(mc, txt);
+      MetalFlux3Transformer::Request req;
+      req.latents = &lat;
+      req.grid_h = gh;
+      req.grid_w = gw;
+      req.text = &tb;
+      req.text_rows = TS;
+      req.t = 0.75f;
+      req.t_next = 0.5f;
+      std::string e;
+      for (int w = 0; w < 2; ++w) { F3_REQUIRE(!m->forward(req, &e).empty()); }
+      std::vector<double> t;
+      for (int i = 0; i < 3; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        F3_REQUIRE(!m->forward(req, &e).empty());
+        t.push_back(std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count());
+      }
+      std::sort(t.begin(), t.end());
+      mean[a] += t[1] / rounds;
+      std::printf("[flux3_dit] round %d %-10s %7.1f ms/forward (signed "
+                  "layout %s)\n", r, arms[a].name, t[1],
+                  m->signed_layout() ? "on" : "off");
+    }
+  }
+  for (int a = 0; a < 3; ++a) {
+    std::printf("[flux3_dit]   %-10s %7.1f ms (mean of %d)  %.3fx bf16\n",
+                arms[a].name, mean[a], rounds, mean[0] / mean[a]);
+  }
+}
 
 TEST(flux3_dit, real_forward_matches_reference)
 {

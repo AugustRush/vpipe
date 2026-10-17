@@ -361,6 +361,43 @@ TEST(resumable_fetch, a_dropped_transfer_resumes_where_it_stopped) {
   srv.stop();
 }
 
+// A caller counting several files as one (model-fetch's whole-download
+// report) is told each file's bytes as they arrive -- the prefix a
+// resumed attempt starts from included, so a dropped transfer's count
+// never goes back to zero -- up to the file's size.
+TEST(resumable_fetch, a_file_tells_its_caller_its_bytes_resumed_included) {
+  ensure_curl_global_init();
+  const string body = blob_(200000);
+  BlobServer   srv(body);
+  ASSERT_TRUE(srv.start());
+  TempDir dir;
+  const fs::path dest = dir.path() / "blob.bin";
+  srv.cut_after(120000, 1);          // the first attempt dies mid-body
+
+  FileDigest want;
+  want.size = body.size();
+  {
+    const fs::path ref = dir.path() / "ref.bin";
+    write_file_(ref, body);
+    string err;
+    ASSERT_TRUE(file_digest_hex(ref, false, want.sha256, err));
+  }
+  vector<uint64_t> seen;
+  FetchRequest     req = req_(srv.url(), want);
+  req.on_bytes = [&](uint64_t got) { seen.push_back(got); };
+  long   status = 0;
+  string err;
+  ASSERT_TRUE(fetch_file(nullptr, req, opts_(2), dest, status, err,
+                         nullptr));
+  EXPECT_TRUE(srv.requests() == 2);
+  ASSERT_TRUE(!seen.empty());
+  // The second attempt counts on from what the first wrote: without the
+  // prefix it would start again at 0 (out of order) and end at 80000.
+  EXPECT_TRUE(std::is_sorted(seen.begin(), seen.end()));
+  EXPECT_TRUE(seen.back() == body.size());
+  srv.stop();
+}
+
 // A server that answers a ranged request with the whole object would
 // otherwise have its body appended to the prefix already on disk,
 // producing a file longer than the original that no checksum saves.

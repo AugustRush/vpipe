@@ -7,6 +7,7 @@
 #include "generative-models/model-loader.h"
 #include "generative-models/shared/kernel-autotune.h"
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/shared/tuned-answers.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/compute-library.h"
@@ -1713,6 +1714,29 @@ MetalGemmaModel::tune_decode_attn_(TuningReport& rep)
   const bool sliding_ok = (Ds % 128 == 0);
   if (!global_ok && !sliding_ok) { return; }
 
+  // What this session measured for these dims before (tuned-answers.h).
+  // The defaults the margins are judged against and the locks go in the
+  // key: they decide what the probe may move. The kernel is named by its
+  // pipeline state, which MetalCompute keeps for the session.
+  KernelTuningCache* const answers = tuning_cache(_mc);
+  const TuneKey key = TuneKey("gemma-decode-attn/1")("Hq", Hq)("Hkv", Hkv)
+      ("Dg", Dg)("Ds", Ds)("win", c.sliding_window)
+      ("split", _gtile_split)("kps", _gtile_kps)
+      ("split_locked", split_locked)("kps_locked", kps_locked)
+      ("fn", std::to_string(
+          (std::uintptr_t)_fn_sdpa_gqa_vec.mtl_pso()));
+  {
+    std::vector<int> kept;
+    if (find_tuned(answers, key, kept) && kept.size() == 2) {
+      if (!split_locked) { _gtile_split = kept[0]; }
+      if (!kps_locked) { _gtile_kps = kept[1]; }
+      rep.add("gemma-decode-attn", 0.0,
+              "split=" + std::to_string(_gtile_split) + "/kps=" +
+                  std::to_string(_gtile_kps) + ", the session's");
+      return;
+    }
+  }
+
   // Synthetic q[Hq,D] attends a contiguous KV pool [Hkv,cap,D]. Buffers sized
   // for the largest regime (global D, long T_kv, sp cap 256 -- matching the
   // decode partials below); uninitialised values are fine (timing only).
@@ -1853,6 +1877,7 @@ MetalGemmaModel::tune_decode_attn_(TuningReport& rep)
   const double ms = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - t0).count() * 1e3;
   rep.add("gemma-decode-attn", ms, detail);
+  store_tuned(answers, key, std::vector<int>{_gtile_split, _gtile_kps});
   if (log) {
     std::fprintf(stderr, "[gemma] decode-attn tuning %.0fms -> %s\n", ms,
                  detail.c_str());

@@ -205,6 +205,9 @@ class MetalZImageTransformer {
   void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
+  // Whether the block projections run in the signed int8 layout (see
+  // _sgn) -- what a test asserts before it compares anything.
+  bool signed_layout() const { return _sgn; }
   std::size_t release_resident_blocks(std::size_t bytes);
   std::uint64_t resident_bytes() const;
 
@@ -268,6 +271,10 @@ class MetalZImageTransformer {
     metal_compute::SharedBuffer codes, scales, qbias; // affine quant
     bool quantized = false;
     int  bits = 0;
+    // codes/qbias are in the SIGNED layout (I8GemmContext::gemm_signed):
+    // q ^ 0x80 / 0x8 and b' = b + 128 s / 8 s. Only the int8 route and
+    // the signed dequant read it; see _sgn.
+    bool sgn = false;
     bool empty() const { return quantized ? codes.empty() : w.empty(); }
   };
 
@@ -301,7 +308,21 @@ class MetalZImageTransformer {
   std::string mod_prefix_(int i) const;
   std::string ctx_prefix_(int i) const;
 
-  QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r);
+  // `sign`: a BLOCK projection that runs at the sequence's rows, which
+  // takes the signed layout when _sgn is set. The model-level linears
+  // and each block's adaLN run at a row or two and stay as the
+  // checkpoint has them.
+  QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r,
+                   bool sign = false);
+  // Convert a quantized weight the model OWNS (a refilled slot) to the
+  // signed layout in place, and say so on it. False touches nothing.
+  bool sign_(QWeight& w) const;
+  // A signed weight as a DENSE one, dequantized into _w_deq -- for the
+  // routes that do not read the layout. `w` itself when it is not
+  // signed; null when the scratch cannot be had.
+  const QWeight* signed_dense_(metal_compute::ComputeEncoder& enc,
+                               const QWeight& w, QWeight& view, int N,
+                               int K) const;
   metal_compute::SharedBuffer to_elt_(WeightSet& ws, const std::string& name,
                                       Retain r);
   bool load_block_(WeightSet& ws, const std::string& pre, bool with_ada,
@@ -431,6 +452,13 @@ class MetalZImageTransformer {
   // actually installed.
   static constexpr int kStopDrainBlocks = 4;
   mutable metal_compute::SharedBuffer _w_deq;
+  // THE SIGNED-CODE LAYOUT for the blocks' quantized projections: with
+  // i8_gemm on a matrix-core box they run int8 x int8 off the layout
+  // (I8GemmContext::gemm_signed), where they took dequant + requant.
+  // Converted once: at load into the entries the set keeps, after every
+  // refill in the slot. OFF under the ANE tiers, whose stagers read the
+  // codes unsigned. VPIPE_I8_SIGNED=0 for the A/B.
+  bool _sgn = false;
   std::unique_ptr<MetalSageAttention> _sage;
   std::unique_ptr<MetalSolAttention> _sol;
   // perf-flops: GEMMs and attention counted as encoded, credited at

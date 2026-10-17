@@ -140,6 +140,37 @@ public:
               int max_frames, int shrink, Frames* out, std::string* err,
               const std::function<bool()>& cancel = {});
 
+  // ---- a decoder that STANDS IN FOR THE VAE -------------------------------
+  //
+  // Some decoders built from these blocks are not previews but THE decode
+  // (FlashVSR's tiny decoder): their input is more than the latent -- the
+  // clip being restored rides along as extra channels of the first conv --
+  // their output is kept in full precision, and a long video is decoded a
+  // piece at a time as ONE pass. decode_stream() is that form.
+  //
+  // A STREAM carries every MemBlock's memory and the raw-frame count from
+  // one call to the next, so its pieces decode to exactly what one call
+  // over the whole latent makes; the trim (kLeading's first frames) applies
+  // once, at the stream's start. A default-constructed Stream opens one.
+  struct Stream {
+    long long latent_frames = 0;   // latent frames decoded so far
+    long long frames = 0;          // ...and kept frames emitted
+  };
+  // Latent frame t's input to the first conv, channel-LAST: [h * w] pixels
+  // of `stride` f16 channels each, of which the first info().latent_channels
+  // are the caller's -- through the TAEHV clamp, tanh(x / 3) * 3, when
+  // clamps_input() -- and the rest are padding the decoder has zeroed.
+  using Input = std::function<bool(int t, _Float16* hwc, int stride)>;
+  // A kept frame: its index in the stream, and its picture planar f32
+  // [image_channels, H, W] as the network leaves it (a TAE's ~[0, 1],
+  // NOT clamped) -- the decoder's own buffer, the sink's to work on in
+  // place until it returns. Returning false stops the decode, with no
+  // error.
+  using FrameSink = std::function<bool(long long frame, float* chw)>;
+  bool clamps_input() const noexcept { return _clamp_input; }
+  bool decode_stream(int T, int h, int w, Trim trim, const Input& input,
+                     const FrameSink& sink, Stream* stream, std::string* err);
+
   // What the decoder holds: weights plus the scratch of the last geometry
   // it decoded.
   std::size_t resident_bytes() const noexcept;
@@ -262,6 +293,21 @@ private:
   bool build_kernels_(std::string* err);
   bool ensure_scratch_(int h, int w);
 
+  // The decode both forms run: latent frames [0, T) of a stream whose
+  // first is its latent frame `t0` (the memories zeroed only when t0 is
+  // 0), at most `want` kept frames. `input` fills each frame's first-conv
+  // input; `emit` takes each kept frame's head output, channel-last f16
+  // [head pixels][head channels], in order -- returning false stops the
+  // decode, which then returns false with no error, as `cancel` does.
+  bool core_(int T, int h, int w, Trim trim, long long t0, int want,
+             const Input& input,
+             const std::function<bool(const _Float16*)>& emit,
+             const std::function<bool()>& cancel, std::string* err);
+  // The most latent frames one commit of core_ takes -- what `_in_all`
+  // holds -- by the same loop, counting.
+  static int frames_per_commit_(int T, int tu, Trim trim, long long t0,
+                                int per_commit, int want);
+
   // Encode op `i` onward for one frame held in `x` at `H` x `W`. `raw` is
   // the raw frame index this path will land on once every TGrow below
   // has split it; `emit` says whether that raw frame is kept.
@@ -351,8 +397,9 @@ private:
   // The mid-block pool's scratch, when a block has one.
   metal_compute::SharedBuffer _pool_a, _pool_b, _pooled, _gn_part,
       _gn_stats;
-  // The whole clip's latent, uploaded once; frame t is copied into `_in`
-  // on the GPU when its turn comes.
+  // One commit's latent frames as the first conv reads them, written by
+  // the host before the commit; frame t is copied into `_in` on the GPU
+  // when its turn comes.
   metal_compute::SharedBuffer _in_all;
   metal_compute::SharedBuffer _head;
   std::size_t _head_frame = 0;   // elements per head slot

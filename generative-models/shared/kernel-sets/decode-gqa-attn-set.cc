@@ -4,6 +4,7 @@
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "generative-models/shared/tuned-answers.h"
 
 #include <chrono>
 #include <cmath>
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 namespace vpipe::genai {
 
@@ -158,6 +160,25 @@ DecodeGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
     if (std::atoi(e) == 0) { return; }
   }
   const bool log = std::getenv("VPIPE_QWEN_AUTOTUNE_LOG") != nullptr;
+  // What this session measured for these dims before -- the helper is
+  // loaded again whenever something else needed its memory
+  // (tuned-answers.h). Kernel and split per regime.
+  KernelTuningCache* const answers = tuning_cache(mc);
+  const TuneKey key = TuneKey("decode-gqa-attn/1")("D", D)("Hq", Hq)
+      ("Hkv", Hkv)("bf16", _use_bf16);
+  std::vector<int> kept;
+  if (find_tuned(answers, key, kept) && kept.size() == 2 * kRegimes) {
+    std::string detail;
+    for (int ri = 0; ri < kRegimes; ++ri) {
+      _kernel[ri] = kept[(std::size_t)(2 * ri)] != 0 ? 1 : 0;
+      _split[ri] = kept[(std::size_t)(2 * ri + 1)];
+      if (!detail.empty()) { detail += "/"; }
+      detail += std::string(_kernel[ri] ? "vec2@" : "kbl@")
+              + std::to_string(_split[ri]);
+    }
+    rep.add("decode-attn", 0.0, detail + ", the session's");
+    return;
+  }
   const int page_tokens = 512;
   const float scale = 1.0f / std::sqrt((float)D);
 
@@ -236,6 +257,12 @@ DecodeGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
   const double ms = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - t_all).count() * 1e3;
   rep.add("decode-attn", ms, detail);
+  std::vector<int> answer;
+  for (int ri = 0; ri < kRegimes; ++ri) {
+    answer.push_back(_kernel[ri]);
+    answer.push_back(_split[ri]);
+  }
+  store_tuned(answers, key, answer);
   if (log) {
     std::fprintf(stderr, "[qwen] decode-attn tuning %.0fms -> %s\n", ms,
                  detail.c_str());

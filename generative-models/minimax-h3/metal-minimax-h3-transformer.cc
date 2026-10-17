@@ -11,6 +11,7 @@
 #include "generative-models/shared/streamed-refill.h"
 #include "generative-models/shared/kernel-autotune.h"
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/shared/tuned-answers.h"
 #include "generative-models/shared/dit-gpu-progress.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
@@ -3397,7 +3398,7 @@ MetalMiniMaxH3Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
   // Accelerated mode, NATIVE: the int8 activation against the checkpoint's
   // own codes, before any dequant exists. A shape it declines falls
   // through to the dequant + requant form below, nothing encoded.
-  if (_i8 && l.quantized &&
+  if (_i8 && l.quantized && _quant_group == 64 &&
       _i8->gemm_affine(enc, x, x_off, l.codes, l.scales, l.qbias, l.bits, y,
                        y_off, M, N, K)) {
     return true;
@@ -3777,7 +3778,37 @@ MetalMiniMaxH3Transformer::tune_attn_tile_(int seq, bool dense)
   }
   if (std::getenv("VPIPE_H3_NO_ATTN_TILE_AUTOTUNE") != nullptr) {
     _attn_tile_latched = true;              // BQ 64 stands, unmeasured
+    return;
   }
+  // What an earlier load of this model measured at a length like this
+  // one (tuned-answers.h): the probe's six blocks run half of them on the
+  // losing tile, so a model reloaded for every clip lost that each time.
+  // A HALF-OCTAVE band of the length, not the length: the tiles' ranking
+  // moves slowly with it (BQ 128 gained 1.13x at 19k rows and 1.22x at
+  // 100k on an M5 Pro), so clips of a similar size share one answer.
+  int kept = 0;
+  if (find_tuned(tuning_cache(_mc), attn_tile_key_(seq), kept) &&
+      (kept == 64 || kept == 128)) {
+    _attn_bq = kept;
+    _attn_tile_latched = true;
+    if (_mc->session() != nullptr) {
+      _mc->session()->log_debug(fmt(
+          "MetalMiniMaxH3Transformer: attention query tile -> BQ {} (the "
+          "session's answer for {} rows)", _attn_bq, seq));
+    }
+    return;
+  }
+  _attn_tile_seq = seq;
+}
+
+TuneKey
+MetalMiniMaxH3Transformer::attn_tile_key_(int seq) const
+{
+  const int band = seq > 0 ? (int)std::floor(2.0 * std::log2((double)seq))
+                           : 0;
+  return TuneKey("h3-attn-tile/1")("heads", _cfg.n_heads)
+      ("head_dim", _cfg.head_dim)("stream", (int)_stream_blocks)
+      ("seq_band", band);
 }
 
 // The tile the NEXT main block runs. Advances the probe only when a sample
@@ -3824,6 +3855,9 @@ MetalMiniMaxH3Transformer::note_attn_tile_(double block_ms)
   const double m64 = median(0), m128 = median(1);
   _attn_bq = (m128 > 0.0 && m128 < m64) ? 128 : 64;
   _attn_tile_latched = true;
+  if (_attn_tile_seq > 0) {
+    store_tuned(tuning_cache(_mc), attn_tile_key_(_attn_tile_seq), _attn_bq);
+  }
   if (_mc != nullptr && _mc->session() != nullptr) {
     _mc->session()->log_normal(fmt(
         "MetalMiniMaxH3Transformer: attention query tile -> BQ {} (per-block "
@@ -3890,11 +3924,38 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
       GemmRoute::kMma128x256Tn2,
   };
 
+  // THE SESSION'S ANSWERS (tuned-answers.h). Every load of this model --
+  // a host unloads it between clips -- measured all of the below again:
+  // 2.8 s on an M5 Pro at 832x480, 12-16 s on the plain M5, before the
+  // first block reported anything. A route is filed per shape under
+  // everything that decides which arms run and what they cost: the
+  // projection's shape and weight format, the rows timed, the tiles built
+  // (steel twins, matmul2d, tn2), the mma floor, the i8 group the mma arms
+  // go through (gemm_mma_ tries int8 first), and the pruning switch.
+  KernelTuningCache* const answers = tuning_cache(_mc);
+  static const bool kNoPrune =
+      std::getenv("VPIPE_H3_TUNE_NO_PRUNE") != nullptr;
+  const std::string sig =
+      "qmm_tile=" + std::to_string(_qmm_tile) +
+      " mma2=" + std::to_string((int)_use_mma2) +
+      " tn2=" + std::to_string((int)_fn_dense_mma_tn2.valid()) +
+      " mma_min_m=" + std::to_string(_mma_min_m) +
+      " i8=" + std::to_string(_i8 ? _i8->group() : 0) +
+      " prune=" + std::to_string((int)!kNoPrune);
+  auto weight_format = [&](const Linear& l) {
+    if (l.quantized) {
+      return "w" + std::to_string(l.bits) + "g" +
+             std::to_string(_quant_group);
+    }
+    if (l.is_fp8()) { return "f8_" + std::to_string((int)l.f8); }
+    return std::string("dense");
+  };
 
   std::vector<QmmTune> tuned;
   std::string detail;
   int tune_rows = 0;
   std::size_t n_pruned = 0;
+  int n_measured = 0, n_kept = 0;
   const auto t0 = std::chrono::steady_clock::now();
   for (const Shape& sh : shapes) {
     if (skip_fc1 && sh.N == 2 * F) { continue; }
@@ -3992,9 +4053,27 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
     // VPIPE_H3_TUNE_NO_PRUNE=1 measures every candidate, which is how to
     // check that the pruned arms were not deciding anything. MEASURED
     // here: 16.7 s against 11.9, same routes.
-    static const bool kNoPrune =
-        std::getenv("VPIPE_H3_TUNE_NO_PRUNE") != nullptr;
-    if (!kNoPrune && cands.size() > 2) {
+    //
+    // The session may already hold this shape's answer: then none of it
+    // runs. The kept route must still be one of this shape's candidates
+    // -- it always is under the same key; the check costs nothing and
+    // keeps a bad entry from naming a kernel that cannot run here.
+    const std::string wfmt = weight_format(*sh.l);
+    const TuneKey rkey = TuneKey("h3-dit-route/1")("tiles", sig)
+        ("fmt", wfmt)("rows", key)("tune_m", tune_m)
+        ("N", sh.N)("K", sh.K);
+    int kept = -1;
+    bool have = find_tuned(answers, rkey, kept);
+    if (have) {
+      have = false;
+      for (GemmRoute r : cands) { have = have || (int)r == kept; }
+    }
+    if (have) {
+      ++n_kept;
+    } else {
+      ++n_measured;
+    }
+    if (!have && !kNoPrune && cands.size() > 2) {
       std::vector<double> warm(cands.size(), 0.0);
       bool timed = true;
       for (std::size_t i = 0; i < cands.size() && timed; ++i) {
@@ -4012,10 +4091,14 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
       }
     }
 
-    const int w = autotune_vote((int)cands.size(), /*rounds=*/2,
-        /*reps_for_us=*/1,
-        [&](int i) { return time_route(cands[(std::size_t)i]); });
-    const GemmRoute win = cands[(std::size_t)w];
+    GemmRoute win = (GemmRoute)kept;
+    if (!have) {
+      const int w = autotune_vote((int)cands.size(), /*rounds=*/2,
+          /*reps_for_us=*/1,
+          [&](int i) { return time_route(cands[(std::size_t)i]); });
+      win = cands[(std::size_t)w];
+      store_tuned(answers, rkey, (int)win);
+    }
     tuned.push_back(QmmTune{sh.N, sh.K, win});
     if (!detail.empty()) { detail += " "; }
     detail += std::string(sh.name) + "=" + route_name_(win);
@@ -4033,6 +4116,10 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
       dispatch_row_bands_(enc, xin, 0, *sh.l, yout, 0, tune_m, sh.N, sh.K,
                           win);
     };
+    // What `run_route` encodes, for the split tuners' session keys: they
+    // see a closure, not the route, the format or the rows it times.
+    const std::string caller = "h3-dit/1 " + sig + " fmt=" + wfmt +
+        " route=" + route_name_(win) + " tune_m=" + std::to_string(tune_m);
     // WHICH SPLIT TO TUNE FOLLOWS FROM WHICH ARM WILL RUN. gemm_ tries
     // the int8 GEMM before MmaSplitK, so on a shape int8 accepts the
     // dense split never runs -- and tuning it there would compare
@@ -4040,16 +4127,19 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
     // mutually exclusive for exactly that reason, not merely by taste.
     if (_i8 && _i8->accepts(tune_m, sh.N, sh.K) &&
         _i8->split_available()) {
-      const int sp = _i8->tune(_mc, sh.K, sh.N, M, run_route);
+      const int sp = _i8->tune(_mc, sh.K, sh.N, M, run_route, caller);
       if (sp > 0) { detail += "+i8split" + std::to_string(sp); }
     } else if (route_is_mma_(win)) {
-      const int sp = _splitk.tune(_mc, sh.K, sh.N, M, run_route);
+      const int sp = _splitk.tune(_mc, sh.K, sh.N, M, run_route, caller);
       if (sp > 0) { detail += "+split" + std::to_string(sp); }
     }
   }
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
-  ++_qmm_tune_count;
+  // A set the session answered whole was not measured: the count is of
+  // measurements (qmm_tune_count's contract), and a test reads it so. A
+  // set whose every shape had one candidate counts, as it always did.
+  if (n_measured > 0 || n_kept == 0) { ++_qmm_tune_count; }
   // Bounded: a pathological caller sweeping sequence lengths must not
   // grow this without limit, and the oldest entry is the one least
   // likely to come back.
@@ -4063,8 +4153,9 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
   if (_mc->session() != nullptr) {
     _mc->session()->log_debug(fmt(
         "[h3-dit] qmm autotune for {} rows, timed over {}: {} "
-        "({:.0f} ms, {} arm(s) pruned on the warm pass)",
-        M, tune_rows, detail, ms, n_pruned));
+        "({:.0f} ms, {} arm(s) pruned on the warm pass; {} shape(s) "
+        "measured, {} from the session's answers)",
+        M, tune_rows, detail, ms, n_pruned, n_measured, n_kept));
   }
 }
 

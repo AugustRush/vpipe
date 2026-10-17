@@ -24,13 +24,16 @@
 #include "stages/model-quantize-stage.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -580,6 +583,200 @@ TEST(krea2_dit_quant, streaming_forward_matches_nonstreaming)
   std::printf("[krea2_dit_quant] streaming vs one-stream velocity rel-L2 = "
               "%.2e\n", r);
   EXPECT_TRUE(r < 1e-4);   // identical math; segmented commits don't change it
+}
+
+// THE SIGNED INT8 LAYOUT on a real quantized pack (VPIPE_KREA2_DIT_DIR at a
+// model-quantize'd DiT; i8_gemm on; M5 only), as flux2_smoke.signed_
+// layout_matches_native: converted in the entries a preloaded block keeps,
+// in a streamed read and in a refilled slot, copied by promotion -- so
+// every arm is BYTE-IDENTICAL to the preloaded one -- and within a
+// gross-error bar of the unsigned native route in distance from the
+// dense (i8 off) forward.
+// 1280 image rows; a 64-row text stream (the signed dequant into
+// matmul2d, under the int8 floor) and an 8-row one (the steel tiles
+// through the signed dequant).
+TEST(krea2_dit_quant, signed_layout_matches_native)
+{
+  const char* ddir = std::getenv("VPIPE_KREA2_DIT_DIR");
+  if (ddir == nullptr || *ddir == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  // The split tuner acts between forwards and would make the promoted
+  // arm's second forward a different reassociation: splits off.
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int gh = 32, gw = 40, img_seq = gh * gw;
+  for (int TS : {64, 8}) {
+    bool engaged = true;
+    auto run = [&](bool sgn, bool i8, bool stream, bool grow, bool slots) {
+      std::unique_ptr<Env> e1, e2;
+      if (!sgn) { e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0"); }
+      if (!slots) { e2 = std::make_unique<Env>("VPIPE_KREA2_NO_SLOTS", "1"); }
+      MetalKrea2Transformer::Config cfg;
+      cfg.i8_gemm = i8;
+      std::vector<float> v;
+      auto m = MetalKrea2Transformer::load(ddir, mc, cfg, stream);
+      if (!m) { return v; }
+      if (m->signed_layout() != (sgn && i8)) { engaged = false; }
+      m->set_residency_reserve(grow ? (4ull << 30) : 0);
+      if (grow) { m->set_residency_schedule(4); }
+      const int HID = cfg.hidden, IC = cfg.in_channels;
+      SharedBuffer fused = mc->make_shared_buffer((std::size_t)TS * HID * 2);
+      SharedBuffer lat = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
+      std::mt19937 rng(20261016);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      { auto* d = static_cast<_Float16*>(fused.contents());
+        for (std::size_t i = 0; i < (std::size_t)TS * HID; ++i) {
+          d[i] = (_Float16)nd(rng);
+        } }
+      { auto* d = static_cast<_Float16*>(lat.contents());
+        for (std::size_t i = 0; i < (std::size_t)img_seq * IC; ++i) {
+          d[i] = (_Float16)nd(rng);
+        } }
+      SharedBuffer out;
+      for (int it = 0; it < (grow ? 2 : 1); ++it) {
+        out = m->forward_dit(fused, TS, lat, img_seq, gh, gw, 0.5f, -1);
+      }
+      if (grow && m->resident_block_count() == 0) { engaged = false; }
+      if (out.empty()) { return v; }
+      const auto* p = static_cast<const _Float16*>(out.contents());
+      v.resize((std::size_t)img_seq * IC);
+      for (std::size_t i = 0; i < v.size(); ++i) { v[i] = (float)p[i]; }
+      return v;   // m freed here: one model resident at a time
+    };
+    const std::vector<float> dense = run(false, false, false, false, true);
+    const std::vector<float> nat = run(false, true, false, false, true);
+    const std::vector<float> pre = run(true, true, false, false, true);
+    const std::vector<float> str = run(true, true, true, false, true);
+    const std::vector<float> flat = run(true, true, true, false, false);
+    const std::vector<float> grown = run(true, true, true, true, true);
+    EXPECT_TRUE(engaged);
+    ASSERT_TRUE(!pre.empty() && nat.size() == pre.size() &&
+                dense.size() == pre.size());
+    if (pre.empty() || nat.size() != pre.size()) { continue; }
+    auto same = [&](const std::vector<float>& a) {
+      return a.size() == pre.size() &&
+             std::memcmp(a.data(), pre.data(), a.size() * 4) == 0;
+    };
+    const double rs = rel_l2q_(pre.data(), dense.data(), pre.size());
+    const double rn = rel_l2q_(nat.data(), dense.data(), pre.size());
+    std::printf("[krea2_dit_quant] signed layout, txt %d: vs the dense "
+                "forward signed %.3e, native %.3e; streamed %s, no slots "
+                "%s, promoted %s\n", TS, rs, rn,
+                same(str) ? "IDENTICAL" : "DIFFERENT",
+                same(flat) ? "IDENTICAL" : "DIFFERENT",
+                same(grown) ? "IDENTICAL" : "DIFFERENT");
+    EXPECT_TRUE(same(str));
+    EXPECT_TRUE(same(flat));
+    EXPECT_TRUE(same(grown));
+    // A GROSS-ERROR guard, not a ranking: on random inputs this forward
+    // is chaotic -- QI21's dense forward moved 4.8e-2 for a per-weight
+    // change of 5e-5 (gemm_i8.signed_dequant_on_a_real_pack: both
+    // dequants 7.3e-3 from the bf16 weights, equal to four digits) -- so
+    // two equally accurate routes land a few percent apart either way.
+    // gemm_i8.signed_layout_matches_oracle is the accuracy statement; a
+    // misread layout is O(1) here.
+    EXPECT_TRUE(rs <= 1.25 * rn);
+  }
+}
+
+// THE SIGNED LAYOUT'S WORTH in the Krea-2 forward, i8_gemm on, at 1024^2
+// (4096 image rows + 512 text). Arms: the quantized pack
+// (VPIPE_KREA2_DIT_DIR) signed and native (VPIPE_I8_SIGNED=0), both
+// preloaded; and, where a box cannot hold the bf16 DiT, both formats
+// STREAMED (VPIPE_KREA2_TEST_MODEL_PATH's transformer/ and the pack, no
+// residency) so they meet on equal terms. Each arm warms two forwards and
+// keeps the median of VPIPE_KREA2_SIGNED_BENCH_ITERS; the arms rotate
+// through VPIPE_KREA2_SIGNED_BENCH_ROUNDS rounds, reversed every other
+// one. VPIPE_KREA2_SIGNED_BENCH=1 runs it.
+TEST(krea2_dit_quant, signed_layout_forward)
+{
+  const char* ddir = std::getenv("VPIPE_KREA2_DIT_DIR");
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (ddir == nullptr || *ddir == '\0' ||
+      std::getenv("VPIPE_KREA2_SIGNED_BENCH") == nullptr) {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  auto env_int = [](const char* k, int d) {
+    const char* e = std::getenv(k);
+    return e != nullptr ? std::max(1, std::atoi(e)) : d;
+  };
+  const int iters = env_int("VPIPE_KREA2_SIGNED_BENCH_ITERS", 3);
+  const int rounds = env_int("VPIPE_KREA2_SIGNED_BENCH_ROUNDS", 2);
+  const int gh = 64, gw = 64, img_seq = gh * gw, TS = 512;
+  struct Arm { std::string name, dir; bool sgn, stream; };
+  std::vector<Arm> arms = {
+      {"w8 signed", ddir, true, false},
+      {"w8 native", ddir, false, false},
+      {"w8 signed, streamed", ddir, true, true},
+  };
+  if (root != nullptr && *root != '\0') {
+    arms.push_back({"bf16, streamed", std::string(root) + "/transformer",
+                    true, true});
+  }
+  const int A = (int)arms.size();
+  std::vector<std::vector<double>> med((std::size_t)A);
+  for (int r = 0; r < rounds; ++r) {
+    for (int k = 0; k < A; ++k) {
+      const int a = (r % 2 == 0) ? k : A - 1 - k;
+      const Arm& arm = arms[(std::size_t)a];
+      if (!arm.sgn) { ::setenv("VPIPE_I8_SIGNED", "0", 1); }
+      MetalKrea2Transformer::Config cfg;
+      cfg.i8_gemm = true;
+      auto m = MetalKrea2Transformer::load(arm.dir, mc, cfg, arm.stream);
+      ::unsetenv("VPIPE_I8_SIGNED");
+      ASSERT_TRUE(m != nullptr);
+      if (!m) { return; }
+      m->set_residency_reserve(0);
+      const int HID = cfg.hidden, IC = cfg.in_channels;
+      SharedBuffer fused = mc->make_shared_buffer((std::size_t)TS * HID * 2);
+      SharedBuffer lat = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
+      std::mt19937 rng(0);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      { auto* d = static_cast<_Float16*>(fused.contents());
+        for (std::size_t i = 0; i < (std::size_t)TS * HID; ++i) {
+          d[i] = (_Float16)nd(rng);
+        } }
+      { auto* d = static_cast<_Float16*>(lat.contents());
+        for (std::size_t i = 0; i < (std::size_t)img_seq * IC; ++i) {
+          d[i] = (_Float16)nd(rng);
+        } }
+      for (int w = 0; w < 2; ++w) {
+        ASSERT_TRUE(!m->forward_dit(fused, TS, lat, img_seq, gh, gw, 0.5f,
+                                    -1).empty());
+      }
+      std::vector<double> t;
+      for (int i = 0; i < iters; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        SharedBuffer out =
+            m->forward_dit(fused, TS, lat, img_seq, gh, gw, 0.5f, -1);
+        t.push_back(std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count());
+        ASSERT_TRUE(!out.empty());
+      }
+      std::sort(t.begin(), t.end());
+      med[(std::size_t)a].push_back(t[t.size() / 2]);
+      std::printf("[krea2_dit_quant] round %d %-20s %8.1f ms/forward "
+                  "(signed layout %s)\n", r, arm.name.c_str(),
+                  t[t.size() / 2], m->signed_layout() ? "on" : "off");
+    }
+  }
+  std::printf("[krea2_dit_quant] 1024^2, %d+%d rows, medians over %d "
+              "rounds:\n", img_seq, TS, rounds);
+  for (int a = 0; a < A; ++a) {
+    std::vector<double> v = med[(std::size_t)a];
+    std::sort(v.begin(), v.end());
+    std::printf("[krea2_dit_quant]   %-20s %8.1f ms\n",
+                arms[(std::size_t)a].name.c_str(), v[v.size() / 2]);
+  }
 }
 
 // The streaming forward's cooperative-stop hook makes forward_dit bail early

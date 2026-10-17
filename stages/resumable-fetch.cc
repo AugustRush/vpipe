@@ -79,6 +79,9 @@ struct ProgressCtx {
   // only what THIS transfer moved, so a resumed shard would otherwise
   // draw a bar that restarts at zero two thirds of the way in.
   const curl_off_t* base = nullptr;
+  // The caller's count of the file (FetchRequest::on_bytes), told what
+  // the report is.
+  const std::function<void(std::uint64_t)>* on_bytes = nullptr;
 };
 
 // libcurl CURLOPT_XFERINFOFUNCTION. Pushes the raw byte counts every
@@ -91,7 +94,7 @@ progress_cb_(void* p, curl_off_t dltotal, curl_off_t dlnow,
 {
   auto* c = static_cast<ProgressCtx*>(p);
   if (c && c->cancel && (*c->cancel)()) { return 1; }   // abort transfer
-  if (!c || !c->progress) {
+  if (!c || (!c->progress && !c->on_bytes)) {
     return 0;
   }
   const curl_off_t base = c->base ? *c->base : 0;
@@ -104,6 +107,8 @@ progress_cb_(void* p, curl_off_t dltotal, curl_off_t dlnow,
   const auto total = dltotal <= 0
       ? std::uint64_t{0}
       : static_cast<std::uint64_t>(dltotal + base);
+  if (c->on_bytes) { (*c->on_bytes)(now); }
+  if (!c->progress) { return 0; }
   // Before the headers land there is no total, so report just what has
   // arrived -- "1.2 GB / 0.0 B" would read as a broken denominator.
   c->progress->update(now, total,
@@ -504,7 +509,7 @@ fetch_file(const SessionContextIntf* s, const FetchRequest& req,
     if (transfer && !req.xet.hash.empty() && o.xet_streams > 0) {
       string xerr;
       if (xet_fetch(s, req.xet, token, o, part, want.size, xerr, progress,
-                    cancel)) {
+                    cancel, req.on_bytes ? &req.on_bytes : nullptr)) {
         transfer = false;
       } else if (cancel && (*cancel)()) {
         err = "canceled";
@@ -535,6 +540,7 @@ fetch_file(const SessionContextIntf* s, const FetchRequest& req,
       pctx.progress = progress;
       pctx.cancel   = cancel;
       pctx.base     = &have;
+      pctx.on_bytes = req.on_bytes ? &req.on_bytes : nullptr;
       PerformOpts po;
       po.verify_tls  = o.verify_tls;
       po.stall_s     = o.stall_s;
@@ -542,7 +548,8 @@ fetch_file(const SessionContextIntf* s, const FetchRequest& req,
       status = 0;
       const CURLcode rc =
           curl_perform_(url, token, po, &write_to_sink_, &sink, &status,
-                        (progress || cancel) ? &pctx : nullptr);
+                        (progress || cancel || pctx.on_bytes) ? &pctx
+                                                              : nullptr);
       sink.ofs.close();
       if (rc != CURLE_OK || status < 200 || status >= 300) {
         err = rc != CURLE_OK ? string(curl_easy_strerror(rc))

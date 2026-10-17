@@ -86,6 +86,9 @@ struct FlashVsrLayout {
   std::string context;         // ...the fixed context's
   std::string context_name;    // its tensor name
   std::string vae;             // the VAE, or empty when absent
+  // The reference's TINY decoder, TCDecoder.ckpt -- the same file for both
+  // releases, beside the VAE -- or empty when absent (FlashVsrTinyDecoder).
+  std::string tiny_decoder;
   bool        published = false;
   // FlashVSR+, and which variant: "turbo" or "base", empty when nothing
   // says (refused at load rather than guessed).
@@ -127,18 +130,21 @@ inline constexpr std::string_view kChunks = "flashvsr_chunks";
 }  // namespace flashvsr_stream
 
 // What a stream HOLDS between beats at this output geometry: every
-// denoiser block's retained key/value windows, and the VAE decode's
-// causal carries over the whole plane (a carried decode does not tile).
-// 0 when the checkpoint cannot be read.
+// denoiser block's retained key/value windows, and the decode's carries
+// -- the VAE's causal carries over the whole plane (a carried decode does
+// not tile), or with `tiny` the tiny decoder's whole scratch, which it
+// keeps between calls. 0 when the checkpoint cannot be read.
 std::size_t flashvsr_stream_bytes(const std::string& root, int width,
-                                  int height, double kv_ratio = 3.0);
+                                  int height, double kv_ratio = 3.0,
+                                  bool tiny = false);
 // Whether this box can restore a stream at this geometry: the stream's
-// carries, the denoiser at its streaming floor, the projection, and a
-// whole-plane decode's working set, with kStreamHeadroom to spare,
-// against TOTAL RAM (VPIPE_RAM_LIMIT_MB), so every stage that asks
-// answers alike. `need` gets the figure. True when RAM is unknown.
+// carries, the denoiser at its streaming floor, the projection, and the
+// decode's working set -- a whole-plane VAE decode, or with `tiny` the
+// tiny decoder (when the checkpoint has one) -- with kStreamHeadroom to
+// spare, against TOTAL RAM (VPIPE_RAM_LIMIT_MB), so every stage that
+// asks answers alike. `need` gets the figure. True when RAM is unknown.
 bool flashvsr_stream_fits(const std::string& root, int width, int height,
-                          std::size_t* need = nullptr);
+                          std::size_t* need = nullptr, bool tiny = false);
 
 class FlashVsrVideoFamily final : public VideoModelFamily {
  public:

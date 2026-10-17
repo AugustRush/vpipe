@@ -938,6 +938,28 @@ ModelFetchStage::process(RuntimeContext& ctx)
   // reads the same as one that did both.
   uint64_t checked     = 0;
   uint64_t unchecked   = 0;
+  // The WHOLE download as one report, beside each big file's: a host or
+  // a user reading the per-file bars sees a percentage restart at every
+  // shard and nothing of the small files, and no report knows how much
+  // is left -- the files not started yet are in none. The listing does
+  // know: every file's size, the ones already on disk counted as done,
+  // a file being fetched as far as it has come (its resumed prefix
+  // included). Named "download <repo>" -- not a file's name -- so a
+  // reader can tell it from the per-file reports. Only with more than
+  // one file: one is its own whole.
+  uint64_t whole = 0;
+  for (const HfFile& f : files) { whole += f.size; }
+  UiProgress whole_bar;
+  uint64_t   whole_done = 0;      // the files finished, or present
+  if (files.size() > 1 && whole > 0) {
+    whole_bar = s->open_progress(fmt("download {}", hf_path)());
+    whole_bar.update(0, whole, human_bytes(0) + " / " + human_bytes(whole));
+  }
+  auto tell_whole = [&](uint64_t done) {
+    done = std::min(done, whole);
+    whole_bar.update(done, whole,
+                     human_bytes(done) + " / " + human_bytes(whole));
+  };
   FlexData files_arr = FlexData::make_array();
   for (size_t i = 0; i < files.size(); ++i) {
     if (ctx.stop_requested()) {
@@ -955,6 +977,8 @@ ModelFetchStage::process(RuntimeContext& ctx)
       s->info(fmt("  [{}/{}] {} ({}) -- present, skip",
                   i + 1, files.size(), f.path, human_bytes(f.size)));
       ++skipped;
+      whole_done += f.size;
+      tell_whole(whole_done);
       continue;
     }
     s->info(fmt("  [{}/{}] {} ({}) ...",
@@ -976,6 +1000,13 @@ ModelFetchStage::process(RuntimeContext& ctx)
     freq.want.size    = f.size;
     freq.want.sha256  = f.sha256;
     freq.want.git_oid = f.git_oid;
+    // This file's bytes into the whole: the transfer's threads call it,
+    // `whole_done` fixed while they do.
+    if (whole_bar) {
+      freq.on_bytes = [&, base = whole_done](uint64_t got) {
+        tell_whole(base + got);
+      };
+    }
     // A repo that publishes a xet hash can be rebuilt from the content
     // store instead of streamed, which is many ranges at once rather
     // than one. Only worth the extra round trips on a big file -- and
@@ -995,6 +1026,8 @@ ModelFetchStage::process(RuntimeContext& ctx)
     }
     ++downloaded;
     if (fc == FileCheck::Ok) { ++checked; } else { ++unchecked; }
+    whole_done += f.size;
+    tell_whole(whole_done);
   }
   s->info(fmt("ModelFetchStage('{}'): {} file(s) ({} downloaded, {} "
               "already present), {} total",

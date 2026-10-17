@@ -119,6 +119,7 @@ set(LOCAL_SOURCES
   flashvsr/flashvsr-lq-proj.cc
   flashvsr/metal-flashvsr-transformer.cc
   flashvsr/flashvsr-family.cc
+  flashvsr/flashvsr-tiny-decoder.cc
   vosr/metal-dinov2-encoder.cc
   vosr/metal-vosr-transformer.cc
   wan/metal-wan-vae.cc
@@ -232,6 +233,7 @@ set(LOCAL_HEADERS
   flashvsr/flashvsr-lq-proj.h
   flashvsr/metal-flashvsr-transformer.h
   flashvsr/flashvsr-family.h
+  flashvsr/flashvsr-tiny-decoder.h
   vosr/metal-dinov2-encoder.h
   vosr/metal-vosr-transformer.h
   wan/metal-wan-vae.h

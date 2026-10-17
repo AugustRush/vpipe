@@ -1585,18 +1585,28 @@ TEST(yue2, nar_tiers_bench)
   std::vector<float> ref = read_raw_<float>(dir / "lat_dense.f32");
   for (const Arm& arm : arms) {
     // The int8 context reads its split rule at construction, which
-    // set_accel does: K >= 0 puts every shape past the cliff, so each
-    // untuned shape takes S=2 and the tuner weighs every width. Restore
-    // the caller's setting straight after.
+    // set_accel does: K >= 0 puts every shape past the cliff and the
+    // untuned split at 2, so each untuned shape takes S=2 and the tuner
+    // weighs every width. Restore the caller's settings straight after.
     const char* had = std::getenv("VPIPE_I8_SPLIT_MIN_K");
     const std::string saved = had != nullptr ? had : "";
-    if (arm.i8_old) { ::setenv("VPIPE_I8_SPLIT_MIN_K", "0", 1); }
+    const char* had_u = std::getenv("VPIPE_I8_UNTUNED_SPLIT");
+    const std::string saved_u = had_u != nullptr ? had_u : "";
+    if (arm.i8_old) {
+      ::setenv("VPIPE_I8_SPLIT_MIN_K", "0", 1);
+      ::setenv("VPIPE_I8_UNTUNED_SPLIT", "2", 1);
+    }
     ASSERT_TRUE(m->set_accel(arm.a, &err));
     if (arm.i8_old) {
       if (had != nullptr) {
         ::setenv("VPIPE_I8_SPLIT_MIN_K", saved.c_str(), 1);
       } else {
         ::unsetenv("VPIPE_I8_SPLIT_MIN_K");
+      }
+      if (had_u != nullptr) {
+        ::setenv("VPIPE_I8_UNTUNED_SPLIT", saved_u.c_str(), 1);
+      } else {
+        ::unsetenv("VPIPE_I8_UNTUNED_SPLIT");
       }
     }
     std::vector<float> lat;

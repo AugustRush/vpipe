@@ -1,4 +1,5 @@
 #include "generative-models/qwen-image/qwen-image21-trainer.h"
+#include "generative-models/shared/i8-gemm.h"
 
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "common/vpipe-format.h"
@@ -290,6 +291,15 @@ QwenImage21Trainer::dense_(ComputeEncoder& enc, const QWeight& w, int N,
     return d != nullptr ? &d->w : nullptr;
   }
   if (!w.quantized) { return &w.w; }
+  // A block projection in the signed int8 layout dequantizes through its
+  // own kernel (the affine one would read the flipped codes as unsigned).
+  if (w.sgn) {
+    return _m->_i8 != nullptr &&
+                   _m->_i8->encode_dequant_signed(enc, w.codes, w.scales,
+                                                  w.qbias, w.bits, _deq, N,
+                                                  K)
+               ? &_deq : nullptr;
+  }
   const metal_compute::ComputeFunction& dq =
       w.bits == 8 ? _fn_deq8 : _fn_deq4;
   if (!dq.valid()) { return nullptr; }

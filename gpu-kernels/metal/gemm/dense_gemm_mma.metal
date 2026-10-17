@@ -2167,19 +2167,28 @@ GI8_U8Q_ENTRY(gemm_u8q_w4g64_s2, 4, 2, false, 0)
 GI8_U8Q_ENTRY(gemm_u8q_w8g64_s4, 8, 4, false, 0)
 GI8_U8Q_ENTRY(gemm_u8q_w8g64_s2, 8, 2, false, 0)
 
-// (c) WHAT A SIGNED CODE FORMAT WOULD GIVE: the same kernel over int8 x
-// int8 / int8 x int4b with NO offset -- codes stored as q ^ 0x80 (bytes)
-// or q ^ 0x8 (nibbles), which two's complement reads as q - 128 / q - 8,
-// and the bias adjusted to b' = b + 128*s / 8*s. No -128*Q term, no u8
-// offset, the fastest MMA. Measured here as a kernel; the format change
-// it needs in the loaders is a separate decision.
-template <int BITS, bool UB_MMA>
+// (c) THE SIGNED-CODE LAYOUT (affine_to_signed_* in affine_dequant):
+// the same kernel over int8 x int8 / int8 x int4b with NO offset --
+// codes stored as q ^ 0x80 (bytes) or q ^ 0x8 (nibbles), which two's
+// complement reads as q - 128 / q - 8, and the zero point moved to b' =
+// b + 128*s / 8*s. No -128*Q term, no u8 offset, the fastest MMA; the
+// only work past g64rs's is the zero-point matmul sum_g u[m,g] * b'[n,g]
+// (u = a * sum(xq), quant_f16_i8s_row_g64). MEASURED on the M5 Pro, the
+// whole route a caller pays (gemm_i8.w8_against_bf16_routes, 4096 rows,
+// FLUX.2 / Z-Image / FLUX.3 projection shapes, splits off): w8 1.03-
+// 1.06x of a bf16 weight under i8 (requant + g64rs), where the unsigned
+// native route ran 0.95-1.00x.
+//   0:xq[M,K] i8  1:codes  2:as[M,G]  3:ws[N,G]  4:zb[N,G] (b')
+//   5:u[M,G]  6:y (f32 planes for _sk)  7:K 8:N 9:M  10:bias
+//   11:has_bias (_sk: 10:gpp)   grid as the g64rs kernels.
+template <int BITS, bool UB_MMA, bool SPLIT = false>
 static inline void gemm_i8q_impl(
     const device int8_t* xq, const device uchar* codes,
     const device VPIPE_ELT* as, const device VPIPE_ELT* ws,
     const device VPIPE_ELT* wb, const device VPIPE_ELT* uf,
     device VPIPE_ELT* y, threadgroup int* Ss, int K, int N, int M,
-    uint3 tgid, uint lid)
+    uint3 tgid, uint lid, const device VPIPE_ELT* bias = nullptr,
+    int has_bias = 0, device float* planes = nullptr, int gpp = 0)
 {
   constexpr int BM = 64, BN = 64, SG = 4, CAP = 32, KC = 64, STRIP = 8;
   constexpr int NR = UB_MMA ? 1 : 2, NC = UB_MMA ? 1 : 2;
@@ -2213,13 +2222,18 @@ static inline void gemm_i8q_impl(
   float facc[CAP];
 #pragma clang loop unroll(full)
   for (int i = 0; i < CAP; ++i) { facc[i] = 0.0f; }
-  for (int g0 = 0; g0 < G; g0 += STRIP) {
+  int gbeg = 0, gend = G;
+  if constexpr (SPLIT) {
+    gbeg = (int)tgid.z * gpp;
+    gend = min(G, gbeg + gpp);
+  }
+  for (int g0 = gbeg; g0 < gend; g0 += STRIP) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int e = (int)lid; e < STRIP * SW; e += SG * 32) {
       const int sidx = e / SW, r = e - sidx * SW;
       const int g = g0 + sidx;
       float v = 0.0f;
-      if (g < G) {
+      if (g < gend) {
         if (r < NR * BM) {
           const int gm = m0 + (r < BM ? r : r - BM);
           if (gm < M) {
@@ -2240,7 +2254,7 @@ static inline void gemm_i8q_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int sidx = 0; sidx < STRIP; ++sidx) {
       const int g = g0 + sidx;
-      if (g >= G) { break; }
+      if (g >= gend) { break; }
       auto mX = tX.slice(g * KC, m0);
       auto mW = tW.slice(g * KC, n0);
       op.run(mX, mW, cP);
@@ -2258,7 +2272,9 @@ static inline void gemm_i8q_impl(
       }
     }
   }
-  if constexpr (UB_MMA) {
+  // The zero-point term over ALL groups, so under a split it belongs to
+  // plane 0 alone (the fold is a plain sum of the planes).
+  if (UB_MMA && (!SPLIT || tgid.z == 0)) {
     using TU = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
     TU tU(const_cast<device VPIPE_ELT*>(uf), dextents<int32_t, 2>(G, M));
     TU tB(const_cast<device VPIPE_ELT*>(wb), dextents<int32_t, 2>(G, N));
@@ -2282,7 +2298,13 @@ static inline void gemm_i8q_impl(
   for (int i = 0; i < CAP; ++i) {
     const int gn = n0 + (int)lc[i], gm = m0 + (int)lr[i];
     if (gm < M && gn < N) {
-      y[(int64_t)gm * N + gn] = (VPIPE_ELT)facc[i];
+      float v = facc[i];
+      if constexpr (SPLIT) {
+        planes[((int64_t)tgid.z * M + gm) * N + gn] = v;
+      } else {
+        if (has_bias != 0) { v += (float)bias[gn]; }
+        y[(int64_t)gm * N + gn] = (VPIPE_ELT)v;
+      }
     }
   }
 }
@@ -2307,6 +2329,55 @@ static inline void gemm_i8q_impl(
   }
 GI8_I8Q_ENTRY(gemm_i8q_w8g64s, 8, true)
 GI8_I8Q_ENTRY(gemm_i8q_w4g64s, 4, true)
+
+// The production entries I8GemmContext::gemm_signed binds: + a per-column
+// bias, and the split-K twins (planes folded by splitk_fold_*).
+#define GI8_I8S_ENTRY(NAME, BITS)                                        \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device uchar* codes [[buffer(1)]],                           \
+      const device VPIPE_ELT* as [[buffer(2)]],                          \
+      const device VPIPE_ELT* ws [[buffer(3)]],                          \
+      const device VPIPE_ELT* zb [[buffer(4)]],                          \
+      const device VPIPE_ELT* uf [[buffer(5)]],                          \
+      device VPIPE_ELT* y [[buffer(6)]],                                 \
+      const constant int& K [[buffer(7)]],                              \
+      const constant int& N [[buffer(8)]],                              \
+      const constant int& M [[buffer(9)]],                              \
+      const device VPIPE_ELT* bias [[buffer(10)]],                       \
+      const constant int& has_bias [[buffer(11)]],                      \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ss[8 * 128];                                         \
+    gemm_i8q_impl<BITS, true>(xq, codes, as, ws, zb, uf, y, Ss, K, N, M, \
+                              tgid, lid, bias, has_bias);                \
+  }
+
+#define GI8_I8S_SK(NAME, BITS)                                           \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device uchar* codes [[buffer(1)]],                           \
+      const device VPIPE_ELT* as [[buffer(2)]],                          \
+      const device VPIPE_ELT* ws [[buffer(3)]],                          \
+      const device VPIPE_ELT* zb [[buffer(4)]],                          \
+      const device VPIPE_ELT* uf [[buffer(5)]],                          \
+      device float* planes [[buffer(6)]],                                \
+      const constant int& K [[buffer(7)]],                              \
+      const constant int& N [[buffer(8)]],                              \
+      const constant int& M [[buffer(9)]],                              \
+      const constant int& gpp [[buffer(10)]],                           \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ss[8 * 128];                                         \
+    gemm_i8q_impl<BITS, true, true>(xq, codes, as, ws, zb, uf, nullptr,  \
+                                    Ss, K, N, M, tgid, lid, nullptr, 0,  \
+                                    planes, gpp);                        \
+  }
+
+GI8_I8S_ENTRY(gemm_i8s_w8g64, 8)
+GI8_I8S_ENTRY(gemm_i8s_w4g64, 4)
+GI8_I8S_SK(gemm_i8s_w8g64_sk, 8)
+GI8_I8S_SK(gemm_i8s_w4g64_sk, 4)
 
 // THE UNSIGNED MMA CEILINGS: the kaccr loop over uint8 x uint8 and
 // uint8 x uint4, raw multiply_accumulate into a cooperative i32 tensor
@@ -2520,6 +2591,10 @@ DGV_STUB(gemm_u8q_w8g64_cm_sk)
 DGV_STUB(gemm_u8q_w4g64_cm_sk)
 DGV_STUB(gemm_i8q_w8g64s)
 DGV_STUB(gemm_i8q_w4g64s)
+DGV_STUB(gemm_i8s_w8g64)
+DGV_STUB(gemm_i8s_w4g64)
+DGV_STUB(gemm_i8s_w8g64_sk)
+DGV_STUB(gemm_i8s_w4g64_sk)
 DGV_STUB(gemm_u8q_w4g64_s4)
 DGV_STUB(gemm_u8q_w4g64_s2)
 DGV_STUB(gemm_u8q_w8g64_s4)

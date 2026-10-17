@@ -4,6 +4,7 @@
 
 #include "generative-models/shared/riffle-rows.h"
 #include "generative-models/shared/i8-gemm.h"
+#include "generative-models/shared/signed-affine.h"
 #include "generative-models/shared/dit-gpu-progress.h"
 
 #include "common/flex-data.h"
@@ -124,7 +125,7 @@ MetalFlux2Transformer::elt_(WeightSet& ws, const std::string& nm, Retain r)
 
 MetalFlux2Transformer::QWeight
 MetalFlux2Transformer::load_qw_(WeightSet& ws, const std::string& name,
-                                Retain r)
+                                Retain r, bool sign)
 {
   QWeight qw;
   const MetalLlamaWeights& wts = ws.src();
@@ -148,6 +149,47 @@ MetalFlux2Transformer::load_qw_(WeightSet& ws, const std::string& name,
     // them F16->bf16 via to_f16_ (which emits bf16). Mirrors the QIE quant path.
     const auto res = _mmap_weights ? WeightSet::Residency::Mapped
                                    : WeightSet::Residency::Copied;
+    // THE SIGNED LAYOUT, converted where the bytes are first the model's
+    // own: in the builder of the entries the set keeps for a retained
+    // block (so nothing unsigned stays cached beside them), in place in
+    // a streamed read. Owned copies either way -- a mapped view could not
+    // be written.
+    if (sign && _sgn && _i8 && _i8->signed_available(qw.bits)) {
+      const std::string cn = name + ".weight", bn = name + ".biases";
+      const auto cp = WeightSet::Residency::Copied;
+      qw.scales = elt_(ws, name + ".scales", r);
+      if (r == Retain::Streamed) {
+        qw.codes = ws.stream_tensor(cn, _mc, cp);
+        qw.qbias = ws.stream_derived(
+            [&]() { return to_f16_(ws.src(), _mc, bn); });
+        qw.sgn = !qw.codes.empty() && !qw.scales.empty() &&
+                 genai::to_signed_affine(qw.codes, qw.scales, qw.qbias,
+                                         qw.bits, /*bf16=*/true);
+      } else {
+        const int bits = qw.bits;
+        qw.codes = ws.derived(std::string(kKey) + "sgn|" + cn, [&]() {
+          SharedBuffer c = ws.read(cn, _mc, cp);
+          return !c.empty() && genai::to_signed_codes(c, bits)
+                     ? std::move(c) : SharedBuffer{};
+        });
+        if (!qw.scales.empty()) {
+          qw.qbias = ws.derived(std::string(kKey) + "sgn|" + bn, [&]() {
+            SharedBuffer b = to_f16_(ws.src(), _mc, bn);
+            return !b.empty() && genai::to_signed_zero_points(
+                                     qw.scales, b, bits, /*bf16=*/true)
+                       ? std::move(b) : SharedBuffer{};
+          });
+        }
+        qw.sgn = !qw.codes.empty() && !qw.qbias.empty();
+      }
+      if (qw.sgn) {
+        qw.quantized = true;
+        return qw;
+      }
+      // Not convertible: the unsigned layout below, as if never asked.
+      qw.codes = {}; qw.scales = {}; qw.qbias = {};
+      qw.sgn = false;
+    }
     qw.codes = r == Retain::Streamed
                    ? ws.stream_tensor(name + ".weight", _mc, res)
                    : ws.tensor(name + ".weight", _mc, res);
@@ -216,22 +258,22 @@ MetalFlux2Transformer::load_double_(WeightSet& ws,
                                     const std::string& pre, DoubleBlock& b,
                                     Retain r)
 {
-  b.q  = load_qw_(ws, pre + "attn.to_q", r);
-  b.k  = load_qw_(ws, pre + "attn.to_k", r);
-  b.v  = load_qw_(ws, pre + "attn.to_v", r);
-  b.o  = load_qw_(ws, pre + "attn.to_out.0", r);
-  b.aq = load_qw_(ws, pre + "attn.add_q_proj", r);
-  b.ak = load_qw_(ws, pre + "attn.add_k_proj", r);
-  b.av = load_qw_(ws, pre + "attn.add_v_proj", r);
-  b.ao = load_qw_(ws, pre + "attn.to_add_out", r);
+  b.q  = load_qw_(ws, pre + "attn.to_q", r, true);
+  b.k  = load_qw_(ws, pre + "attn.to_k", r, true);
+  b.v  = load_qw_(ws, pre + "attn.to_v", r, true);
+  b.o  = load_qw_(ws, pre + "attn.to_out.0", r, true);
+  b.aq = load_qw_(ws, pre + "attn.add_q_proj", r, true);
+  b.ak = load_qw_(ws, pre + "attn.add_k_proj", r, true);
+  b.av = load_qw_(ws, pre + "attn.add_v_proj", r, true);
+  b.ao = load_qw_(ws, pre + "attn.to_add_out", r, true);
   b.qn  = elt_(ws, pre + "attn.norm_q.weight", r);
   b.kn  = elt_(ws, pre + "attn.norm_k.weight", r);
   b.aqn = elt_(ws, pre + "attn.norm_added_q.weight", r);
   b.akn = elt_(ws, pre + "attn.norm_added_k.weight", r);
-  b.ff_in   = load_qw_(ws, pre + "ff.linear_in", r);
-  b.ff_out  = load_qw_(ws, pre + "ff.linear_out", r);
-  b.cff_in  = load_qw_(ws, pre + "ff_context.linear_in", r);
-  b.cff_out = load_qw_(ws, pre + "ff_context.linear_out", r);
+  b.ff_in   = load_qw_(ws, pre + "ff.linear_in", r, true);
+  b.ff_out  = load_qw_(ws, pre + "ff.linear_out", r, true);
+  b.cff_in  = load_qw_(ws, pre + "ff_context.linear_in", r, true);
+  b.cff_out = load_qw_(ws, pre + "ff_context.linear_out", r, true);
   if (_cfg.double_ff_hidden == 0 && b.ff_in.n > 0) {
     _cfg.double_ff_hidden = b.ff_in.n;
   }
@@ -292,8 +334,8 @@ MetalFlux2Transformer::load_single_(WeightSet& ws,
                                     const std::string& pre, SingleBlock& b,
                                     Retain r, bool keep_split)
 {
-  b.qkv_mlp = load_qw_(ws, pre + "attn.to_qkv_mlp_proj", r);
-  b.o  = load_qw_(ws, pre + "attn.to_out", r);
+  b.qkv_mlp = load_qw_(ws, pre + "attn.to_qkv_mlp_proj", r, true);
+  b.o  = load_qw_(ws, pre + "attn.to_out", r, true);
   b.qn = elt_(ws, pre + "attn.norm_q.weight", r);
   b.kn = elt_(ws, pre + "attn.norm_k.weight", r);
   if (_cfg.single_mlp_in == 0 && b.qkv_mlp.n > 0) {
@@ -478,6 +520,8 @@ MetalFlux2Transformer::split_single_(SingleBlock& b) const
     one(b.qkv_mlp.codes, b.qkv.codes, b.mlp_gu.codes);
     one(b.qkv_mlp.scales, b.qkv.scales, b.mlp_gu.scales);
     one(b.qkv_mlp.qbias, b.qkv.qbias, b.mlp_gu.qbias);
+    // A slice and a permutation of the raw projection, so in its layout.
+    b.qkv.sgn = b.mlp_gu.sgn = b.qkv_mlp.sgn;
   } else {
     one(b.qkv_mlp.w, b.qkv.w, b.mlp_gu.w);
   }
@@ -500,6 +544,7 @@ MetalFlux2Transformer::clone_double_(const DoubleBlock& src, DoubleBlock& dst,
   };
   const auto qw = [&](const QWeight& s, QWeight& d) {
     d.quantized = s.quantized; d.bits = s.bits; d.n = s.n; d.k = s.k;
+    d.sgn = s.sgn;
     one(s.w, d.w); one(s.codes, d.codes);
     one(s.scales, d.scales); one(s.qbias, d.qbias);
   };
@@ -527,6 +572,7 @@ MetalFlux2Transformer::clone_single_(const SingleBlock& src, SingleBlock& dst,
   };
   const auto qw = [&](const QWeight& s, QWeight& d) {
     d.quantized = s.quantized; d.bits = s.bits; d.n = s.n; d.k = s.k;
+    d.sgn = s.sgn;
     one(s.w, d.w); one(s.codes, d.codes);
     one(s.scales, d.scales); one(s.qbias, d.qbias);
   };
@@ -552,6 +598,39 @@ MetalFlux2Transformer::rebuild_one_(const std::string& nm, P how)
   return elt_(*_ws, nm, Retain::Streamed);
 }
 
+bool
+MetalFlux2Transformer::sign_(QWeight& w) const
+{
+  // A weight this model keeps unsigned (a dense one, the layout off) has
+  // nothing to do. A signed one in a slot was just REFILLED raw, whatever
+  // its flag says from the build, so it converts unconditionally.
+  if (!w.quantized || !_sgn || !_i8 || !_i8->signed_available(w.bits)) {
+    return true;
+  }
+  if (!genai::to_signed_affine(w.codes, w.scales, w.qbias, w.bits,
+                               /*bf16=*/true)) {
+    return false;
+  }
+  w.sgn = true;
+  return true;
+}
+
+const SharedBuffer*
+MetalFlux2Transformer::dequant_signed_(ComputeEncoder& enc, const QWeight& w,
+                                       int N, int K)
+{
+  const std::size_t need = (std::size_t)N * K * 2;
+  if (_w_deq.empty() || _w_deq.byte_size() < need) {
+    _w_deq = _mc->make_shared_buffer(need);
+    if (_w_deq.empty()) { return nullptr; }
+  }
+  if (!_i8 || !_i8->encode_dequant_signed(enc, w.codes, w.scales, w.qbias,
+                                          w.bits, _w_deq, N, K)) {
+    return nullptr;
+  }
+  return &_w_deq;
+}
+
 void
 MetalFlux2Transformer::configure_slots_()
 {
@@ -575,6 +654,14 @@ MetalFlux2Transformer::configure_slots_()
     o.bytes = [](const DoubleBlock& b) { return double_bytes_(b); };
     o.empty = [](const DoubleBlock& b) { return b.q.empty(); };
     o.post_refill = [this](int, DoubleBlock& b) {
+      // Every quantized projection just landed RAW; the signed layout
+      // is position-independent, so it converts before or after the
+      // riffle alike. On the reader thread, under the GPU's work.
+      for (QWeight* w : {&b.q, &b.k, &b.v, &b.o, &b.aq, &b.ak, &b.av,
+                         &b.ao, &b.ff_in, &b.ff_out, &b.cff_in,
+                         &b.cff_out}) {
+        if (!sign_(*w)) { return false; }
+      }
       if (!_fuse_ff) { return true; }
       return riffle_rows_(b.ff_in) && riffle_rows_(b.cff_in);
     };
@@ -602,7 +689,11 @@ MetalFlux2Transformer::configure_slots_()
     };
     o.bytes = [](const SingleBlock& b) { return single_bytes_(b); };
     o.empty = [](const SingleBlock& b) { return b.o.empty(); };
-    o.post_refill = [this](int, SingleBlock& b) { return split_single_(b); };
+    o.post_refill = [this](int, SingleBlock& b) {
+      // The raw projection first: split_single_ copies its bytes, and
+      // its layout, into the fused halves.
+      return sign_(b.qkv_mlp) && sign_(b.o) && split_single_(b);
+    };
     _single_slots.set_weight_set(_ws.get());
     _single_slots.configure(_mc, std::move(o),
                             "MetalFlux2Transformer(single)",
@@ -1159,6 +1250,20 @@ MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
       }
     }
   }
+  // THE SIGNED LAYOUT for the block projections (see _sgn): decided
+  // here, after the fused-SwiGLU choice and before any block loads. Its
+  // GEMM runs only on the matrix-core route, and two readers of the codes
+  // assume them unsigned -- the ANE tier's stager (armed when the config
+  // carries a session) and the fused-SwiGLU steel qmm.
+  m->_sgn = m->_i8 && m->_use_mma2 && !m->_fuse_ff && m->_quant_bits > 0 &&
+            m->_quant_group == 64 &&
+            cfg.session == nullptr &&
+            (m->_i8->signed_available(8) || m->_i8->signed_available(4));
+  if (m->_sgn && mc->session() != nullptr) {
+    mc->session()->info(fmt(
+        "MetalFlux2Transformer: the quantized block projections take the "
+        "signed int8 layout"));
+  }
   m->_lib_attn = mc->load_library("attn_steel");
   m->_attn_params = mc->make_shared_buffer(sizeof(SteelAttnParams));
   m->_steel_attn_ok = m->_lib_attn.valid() && !m->_attn_params.empty()
@@ -1464,7 +1569,7 @@ MetalFlux2Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
 {
   // Matrix-core matmul2d only when present, M amortizes the 128-row tile, and
   // N is non-degenerate (the M=1 conditioning GEMMs stay on steel).
-  if (!_use_mma2 || M < _mma_min_m || N < 16) { return false; }
+  if (!_use_mma2 || N < 16) { return false; }
   // And decline a shape whose operands would not survive the tiles'
   // 32-bit addressing: past 2^31 BYTES on ANY operand the mma tiles stop
   // storing, silently. DECLINING rather than banding is deliberate here.
@@ -1479,13 +1584,27 @@ MetalFlux2Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
   // Accelerated mode, NATIVE: the int8 activation against the checkpoint's
   // own codes, before any dequant exists. A shape it declines falls
   // through to the dequant + requant form below, nothing encoded.
-  if (_i8 && w.quantized &&
+  // A signed weight's int8 GEMM, before the matmul2d tile's row gate:
+  // its floor is the int8 route's own (I8GemmContext::signed_accepts --
+  // 1024 rows, or lower by VPIPE_I8_SIGNED_MIN_M, which it then beats
+  // the dequant + matmul2d below at).
+  if (_i8 && w.quantized && w.sgn &&
+      _i8->gemm_signed(enc, x, xe, w.codes, w.scales, w.qbias, w.bits, y,
+                       ye, M, N, K)) {
+    return true;
+  }
+  if (M < _mma_min_m) { return false; }
+  if (_i8 && w.quantized && !w.sgn && _quant_group == 64 &&
       _i8->gemm_affine(enc, x, xe, w.codes, w.scales, w.qbias, w.bits, y,
                        ye, M, N, K)) {
     return true;
   }
   const SharedBuffer* wdense;
-  if (w.quantized) {
+  if (w.quantized && w.sgn) {
+    // Below the int8 floor: the signed layout's own dequant.
+    wdense = dequant_signed_(enc, w, N, K);
+    if (wdense == nullptr) { return false; }
+  } else if (w.quantized) {
     const metal_compute::ComputeFunction& dq =
         (w.bits == 8) ? _fn_dequant8 : _fn_dequant4;
     if (!dq.valid()) { return false; }
@@ -2439,7 +2558,16 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
           return;
         }
         int bm = 32, bn = 32;                    // 32x32 base tile
-        if (w.quantized) {
+        // A signed weight off the matrix-core route (a shape gemm_mma_
+        // declines: a row or two, or past the 2 GB band) has no steel
+        // qmm that reads its layout: dequantize it and take the dense
+        // tile instead.
+        const SharedBuffer* wsd = nullptr;
+        if (w.quantized && w.sgn) {
+          wsd = self->dequant_signed_(*e, w, N, K);
+          if (wsd == nullptr) { return; }
+        }
+        if (w.quantized && wsd == nullptr) {
           // BM128 tile once M amortizes the 128-row re-use (the DiT block GEMMs
           // at high res, M = seq >= 1024); small-M keeps the base tile.
           const bool huge = self->_qmm_tile >= 1 && M >= 1024
@@ -2462,9 +2590,10 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
           } else if (M >= 128 && self->_gemm_tile == 2) {
             f = &self->_fn_gemm_bm64bn64; bm = 64; bn = 64;
           }
+          const SharedBuffer& wd = wsd != nullptr ? *wsd : w.w;
           e->set_function(*f);
-          e->set_buffer(0, x, xe * 2); e->set_buffer(1, w.w);
-          e->set_buffer(2, w.w);
+          e->set_buffer(0, x, xe * 2); e->set_buffer(1, wd);
+          e->set_buffer(2, wd);
           e->set_buffer(3, y, ye * 2);
           e->set_constant(4, K); e->set_constant(5, N); e->set_constant(6, M);
           e->set_constant(7, 0);

@@ -5360,3 +5360,34 @@ kernel void swiglu_split_gate_first_f16(
   out[gid] = VPIPE_ELT(v * (g / (1.0f + exp(-g))));
 }
 
+
+// One level of the WAVELET COLOUR FIX's low-pass (FlashVSR+'s reference
+// colour correction): a 3x3 Gaussian [1 2 1]^T [1 2 1] / 16 with its taps
+// `d` pixels apart, the edge replicated -- the reference's F.pad(
+// "replicate") then a dilated conv2d. Levels 1, 2, 4, 8, 16 in sequence
+// leave a picture's low frequencies. F32 throughout, in either library:
+// the fix works on decoded frames in [-1, 1], not on a model's tensors.
+//
+//   0:x [C, H, W] f32  1:y [C, H, W] f32  2:H 3:W 4:d.  grid {W, H, C}.
+kernel void wavelet_blur_f32(
+    const device float* x [[buffer(0)]],
+    device float*       y [[buffer(1)]],
+    constant int&       H [[buffer(2)]],
+    constant int&       W [[buffer(3)]],
+    constant int&       d [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  if (gid.x >= (uint)W || gid.y >= (uint)H) { return; }
+  const ulong plane = (ulong)H * (uint)W;
+  const device float* p = x + (ulong)gid.z * plane;
+  const float k[3] = {0.25f, 0.5f, 0.25f};
+  float acc = 0.0f;
+  for (int i = -1; i <= 1; ++i) {
+    const int yy = clamp((int)gid.y + i * d, 0, H - 1);
+    for (int j = -1; j <= 1; ++j) {
+      const int xx = clamp((int)gid.x + j * d, 0, W - 1);
+      acc += (k[i + 1] * k[j + 1]) * p[(ulong)yy * (uint)W + (uint)xx];
+    }
+  }
+  y[(ulong)gid.z * plane + (ulong)gid.y * (uint)W + gid.x] = acc;
+}

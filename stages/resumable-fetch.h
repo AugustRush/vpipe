@@ -115,6 +115,12 @@ struct FetchRequest {
   std::string token;    // bearer token; "" for a public repo
   FileDigest  want;     // what the repo published about the bytes
   XetSource   xet;      // optional; empty hash -> plain download only
+  // Optional: the file's bytes so far, the resumed prefix included,
+  // wherever `progress` is driven -- for a caller counting SEVERAL files
+  // as one (a repo's whole download), which one report a file cannot
+  // say. Called from the transfer's threads (the Xet path's workers too),
+  // so it must be safe to call from any of them.
+  std::function<void(std::uint64_t)> on_bytes;
 };
 
 // How a fetch is bounded end to end.

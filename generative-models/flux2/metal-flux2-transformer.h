@@ -381,6 +381,9 @@ class MetalFlux2Transformer {
   void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
+  // Whether the block projections run in the signed int8 layout (see
+  // _sgn) -- what a test asserts before it compares anything.
+  bool signed_layout() const { return _sgn; }
   // Hand back at least `bytes` of promoted blocks. Never touches the
   // returns what was actually freed.
   std::size_t release_resident_blocks(std::size_t bytes);
@@ -465,6 +468,10 @@ class MetalFlux2Transformer {
     bool quantized = false;
     int  bits = 0;                                     // 4 | 8 (per-weight)
     int  n = 0, k = 0;                                 // out, in dims
+    // codes/qbias are in the SIGNED layout (I8GemmContext::gemm_signed):
+    // q ^ 0x80 / 0x8 and b' = b + 128 s / 8 s. Only the int8 route and
+    // the signed dequant read it; see _sgn.
+    bool sgn = false;
     bool empty() const { return quantized ? codes.empty() : w.empty(); }
   };
 
@@ -502,7 +509,20 @@ class MetalFlux2Transformer {
   // whole DiT back in RAM on the box least able to hold it.
   enum class Retain { Cached, Streamed };
 
-  QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r);
+  // `sign`: a BLOCK projection, which takes the signed layout when _sgn
+  // is set; the model-level linears run at a row or two and stay as the
+  // checkpoint has them.
+  QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r,
+                   bool sign = false);
+  // Convert a quantized weight the model OWNS (a refilled slot) to the
+  // signed layout in place, and say so on it. False touches nothing.
+  bool sign_(QWeight& w) const;
+  // The dense [N, K] operand of a signed weight, dequantized into
+  // _w_deq: for the routes the int8 GEMM declines. Null when the
+  // scratch cannot be had.
+  const metal_compute::SharedBuffer*
+  dequant_signed_(metal_compute::ComputeEncoder& enc, const QWeight& w,
+                  int N, int K);
   // bf16 view of a checkpoint tensor. Cached ones go through the weight
   // set so a second model over this checkpoint shares them; streamed
   // ones are rebuilt per forward and retained by nobody.
@@ -717,6 +737,16 @@ class MetalFlux2Transformer {
       _fn_qmm_swiglu4_bm64_rs_a16, _fn_qmm_swiglu8_bm64_rs_a16, _fn_swiglu_rs;
   bool _fuse_ff = false;
   bool _ff_acc16 = true;
+  // THE SIGNED-CODE LAYOUT for the blocks' quantized projections: with
+  // i8_gemm on a matrix-core box they run int8 x int8 off the layout
+  // (I8GemmContext::gemm_signed) instead of the unsigned native route --
+  // 1.01-1.09x a bf16 weight under i8 per GEMM, where the native route
+  // ran 0.90-1.02x (gemm_i8.w8_against_bf16_routes, M5 Pro). Converted
+  // once: at load into the entries the set keeps, after every refill in
+  // the slot. OFF where something else reads the codes: the ANE tier's
+  // stager and the fused-SwiGLU steel qmm both assume them unsigned.
+  // VPIPE_I8_SIGNED=0 for the A/B.
+  bool _sgn = false;
 
   // ---- runtime LoRA ------------------------------------------------
   //

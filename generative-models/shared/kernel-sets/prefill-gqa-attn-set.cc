@@ -3,6 +3,7 @@
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/compute-library.h"
+#include "generative-models/shared/tuned-answers.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -305,6 +307,36 @@ PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
     if (std::atoi(e) == 0) { return; }
   }
   const bool log = std::getenv("VPIPE_QWEN_AUTOTUNE_LOG") != nullptr;
+  // What this session measured for these dims and members before
+  // (tuned-answers.h): the head-dim-128 probe is 1.2 s on an M5, paid
+  // again by every model loaded after its memory was taken back.
+  int have_mask = 0;
+  for (int m = 0; m < kMembers; ++m) { have_mask |= _have[m] ? 1 << m : 0; }
+  KernelTuningCache* const answers = tuning_cache(mc);
+  const TuneKey key = TuneKey("prefill-gqa-attn/1")("D", D)("Hq", Hq)
+      ("Hkv", Hkv)("members", have_mask)("nax_bf16", _nax_bf16)
+      ("steel", steel_ok)("min_n", min_n());
+  std::vector<int> kept;
+  if (find_tuned(answers, key, kept) && kept.size() == kRegimes) {
+    bool ok = true;
+    for (int v : kept) { ok = ok && v >= 0 && v < kMembers && _have[v]; }
+    if (ok) {
+      std::string detail;
+      for (int ri = 0; ri < kRegimes; ++ri) {
+        _member[ri] = kept[(std::size_t)ri];
+        // Said as the probe says it: the regimes it would have timed.
+        if (ri < regime_of(min_n())) { continue; }
+        if (ri == kVeryLong && !_have[kNax] && !_have[kNaxSplit]) {
+          continue;
+        }
+        if (!detail.empty()) { detail += "/"; }
+        detail += std::string(kName[_member[ri]]) + "@"
+                + std::to_string(kRegimeN[ri]);
+      }
+      rep.add("prefill-attn", 0.0, detail + ", the session's");
+      return;
+    }
+  }
   const int page_tokens = 512;
   const float scale = 1.0f / std::sqrt((float)D);
 
@@ -402,6 +434,8 @@ PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
   const double ms = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - t_all).count() * 1e3;
   rep.add("prefill-attn", ms, detail);
+  store_tuned(answers, key,
+              std::vector<int>(std::begin(_member), std::end(_member)));
   if (log) {
     std::fprintf(stderr, "[qwen] prefill-attn tuning %.0fms -> %s\n", ms,
                  detail.c_str());

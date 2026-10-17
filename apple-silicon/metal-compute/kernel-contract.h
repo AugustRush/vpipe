@@ -150,6 +150,19 @@ inline constexpr ToolkitKernel kToolkitKernels[] = {
   {"dense_gemm_mma", "gemm_u8q_w8g64_cm_sk"},
   {"llm_elementwise", "splitk_fold_f32_f16"},
   {"llm_elementwise", "splitk_fold_bias_f32_f16"},
+  // The signed-code layout (I8GemmContext::gemm_signed): its activation
+  // quantizer, the conversion, its dequant and its GEMM. A toolkit on a
+  // host older than these finds them invalid and keeps the unsigned
+  // route (signed_available() is false), so nothing requires them.
+  {"affine_dequant", "quant_f16_i8s_row_g64"},
+  {"affine_dequant", "affine_to_signed_w4g64"},
+  {"affine_dequant", "affine_to_signed_w8g64"},
+  {"affine_dequant", "affine_dequant_w4g64s"},
+  {"affine_dequant", "affine_dequant_w8g64s"},
+  {"dense_gemm_mma", "gemm_i8s_w4g64"},
+  {"dense_gemm_mma", "gemm_i8s_w4g64_sk"},
+  {"dense_gemm_mma", "gemm_i8s_w8g64"},
+  {"dense_gemm_mma", "gemm_i8s_w8g64_sk"},
   // SageAttention's quantization (shared/metal-sage-attention.h).
   {"sage_quant", "sage_k_sum_chunk"},
   {"sage_quant", "sage_k_mean_reduce"},

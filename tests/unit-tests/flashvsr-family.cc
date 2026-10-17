@@ -483,14 +483,23 @@ TEST(flashvsr_family, source_encoder_surface)
     EXPECT_TRUE(std::string(sp->iports[0].name) == "source");
     EXPECT_TRUE(std::string(sp->iports[1].name) == "model");
   }
-  ASSERT_TRUE(sp->oports.size() == 1);
-  if (sp->oports.size() == 1) {
+  // The conditioning, and -- appended, so the first keeps its index --
+  // the source pictures the wavelet colour fix reads in vae-decode.
+  ASSERT_TRUE(sp->oports.size() == 2);
+  if (sp->oports.size() == 2) {
     EXPECT_TRUE(std::string(sp->oports[0].name) == "conditioning");
     // The TAG is the whole compatibility check against generate-video's
     // conditioning iport: the composer offers the connection only if it
     // matches, and that match is what lets this stage replace a text
     // conditioner with no change to the stage it feeds.
     EXPECT_TRUE(port_tags_compatible("conditioning", sp->oports[0].tags));
+    EXPECT_TRUE(std::string(sp->oports[1].name) == "color_reference");
+  }
+  // ...and vae-decode's matching input, appended after its model port.
+  const StageSpec* vd = StageRegistry::get().spec("vae-decode");
+  ASSERT_TRUE(vd != nullptr && vd->iports.size() == 3);
+  if (vd != nullptr && vd->iports.size() == 3) {
+    EXPECT_TRUE(std::string(vd->iports[2].name) == "color_reference");
   }
 
   // ...and an INSTANCE HAS THEM. The spec only describes the ports; the

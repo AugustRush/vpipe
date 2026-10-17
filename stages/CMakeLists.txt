@@ -49,6 +49,7 @@ set(LOCAL_SOURCES
   audio-vae-decode-stage.cc
   audio-vae-encode-stage.cc
   vae-decode-stage.cc
+  wavelet-color-fix.cc
   vae-encode-stage.cc
   video-ref-encoder-stage.cc
   model-catalog.cc

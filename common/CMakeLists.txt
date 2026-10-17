@@ -89,6 +89,7 @@ set(LOCAL_HEADERS
   session-config.h
   session-member.h
   plugins-root.h
+  kernel-tuning-cache.h
   session.h
   static-file-server.h
   stdio-ui-delegate.h

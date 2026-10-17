@@ -23,6 +23,8 @@
 
 #include "interfaces/service-req.h"
 
+#include <cstdint>
+#include <string>
 #include <string_view>
 
 #include "common/vpipe-api.h"
@@ -30,6 +32,42 @@
 VPIPE_API_BEGIN
 
 namespace vpipe {
+
+// The answers a session's kernel tuners MEASURED, kept for the session
+// (feature kernel-tuning/1). A tuner times its candidates on this GPU
+// and keeps the winner on the object that tuned -- a model instance --
+// so a model loaded again, or a second model with the same shapes, used
+// to measure all of it again: a video DiT's GEMM routes took 3-16 s of
+// every load. Filed here under a key that names everything the answer
+// depends on (the tuner, its shape, the kernels it chose among, its own
+// settings), a tuner asks first and measures only what is missing.
+//
+// A SERVICE, found by id, not a method on MetalCompute: a plugin's
+// toolkit copy asks for it through find_service, which every ABI-8 host
+// answers -- one without the cache answers null and the tuner measures
+// as before. Nothing about it is required of a plugin.
+//
+// Answers are opaque text (the toolkit writes integers); keys are
+// compared whole. Session-scoped and in memory: what a GPU measured
+// once is not carried across sessions or to disk. Safe to call
+// concurrently.
+class KernelTuningCache {
+public:
+  virtual ~KernelTuningCache() = default;
+
+  // The answer filed under `key`, into `answer`; false when none is.
+  virtual bool find(std::string_view key, std::string& answer) const = 0;
+
+  // File `answer` under `key`, replacing any answer there.
+  virtual void store(std::string_view key, std::string_view answer) = 0;
+
+  struct Stats {
+    std::uint64_t entries = 0;
+    std::uint64_t hits    = 0;   // find() answered
+    std::uint64_t misses  = 0;   // find() had nothing: a tuner measured
+  };
+  virtual Stats stats() const = 0;
+};
 
 class CoreMLModelManager;
 class FFmpegLibraries;
@@ -141,11 +179,19 @@ public:
   {
     return service<metal_compute::MetalCompute>();
   }
+
+  // The session's kernel-tuning answers (KernelTuningCache above). Null
+  // when the session keeps none: an older host, or the session config's
+  // `kernel_tuning.cache` false (VPIPE_TUNING_CACHE=0 too).
+  KernelTuningCache* kernel_tuning_cache() const
+  {
+    return service<KernelTuningCache>();
+  }
 };
 
-// Ids for the five services the core session provides. Named here, in
-// one place, so a consumer (including a plugin) resolves them by type
-// and never spells a string at a call site.
+// Ids for the services the core session provides. Named here, in one
+// place, so a consumer (including a plugin) resolves them by type and
+// never spells a string at a call site.
 template <> struct ServiceId<FFmpegLibraries> {
   static constexpr std::string_view value = "vpipe.ffmpeg/1";
 };
@@ -160,6 +206,9 @@ template <> struct ServiceId<genai::GenerativeModelManager> {
 };
 template <> struct ServiceId<metal_compute::MetalCompute> {
   static constexpr std::string_view value = "vpipe.metal-compute/1";
+};
+template <> struct ServiceId<KernelTuningCache> {
+  static constexpr std::string_view value = "vpipe.kernel-tuning/1";
 };
 
 // State a dependency on a service by TYPE, so a stage never spells an

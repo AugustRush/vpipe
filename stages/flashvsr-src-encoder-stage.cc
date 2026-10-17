@@ -2,6 +2,7 @@
 
 #include "common/beat-keys.h"
 #include "common/flex-data.h"
+#include "common/oport-policy.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
@@ -31,6 +32,10 @@ namespace {
 
 constexpr unsigned kSourcePort = 0;
 constexpr unsigned kModelPort  = 1;
+constexpr unsigned kPicturePort = 1;
+// Beats the pictures output holds before this stage waits for vae-decode:
+// a beat's colour-fix pictures and its decoder's, for a couple of beats.
+constexpr unsigned kPictureDepth = 4;
 
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
@@ -68,12 +73,54 @@ const ConfigKey kAttrs[] = {
           "cuts hard. Each costs a frame restored twice (8)",
    .def_int = 8},
   {.key = "color_fix", .type = ConfigType::Bool, .required = false,
-   .doc = "carry each restored frame's source colour statistics, for the "
-          "decode to match its channels to them (AdaIN). Unset, it follows "
-          "the release's own reference: on for FlashVSR-v1.1, which "
-          "applies it by default, and off for FlashVSR+, whose model holds "
-          "its colour without it",
+   .doc = "correct each restored frame's colour toward its source frame "
+          "(color_fix_method says how). Unset, it follows the release's "
+          "own reference: on for FlashVSR-v1.1, which applies its fix by "
+          "default, and off for FlashVSR+, whose fix is opt-in (its --cf)",
    .def_bool = true},
+  {.key = "color_fix_method", .type = ConfigType::String, .required = false,
+   .doc = "auto | adain | wavelet. `adain`: each channel's mean and spread "
+          "moved to the source frame's -- v1.1's fix, six numbers a frame "
+          "on the sideband. `wavelet`: the frame's LOW FREQUENCIES taken "
+          "from the source picture, its detail kept -- FlashVSR+'s fix, "
+          "which corrects a cast where it is; the pictures travel to "
+          "vae-decode on this stage's color_reference output, which must be "
+          "wired to vae-decode's color_reference input. `auto` (default): "
+          "the release's own, adain for v1.1 and wavelet for FlashVSR+",
+   .def_str = "auto"},
+  {.key = "wavelet_levels", .type = ConfigType::Int, .required = false,
+   .doc = "the wavelet fix's levels: low-pass passes of a 3x3 Gaussian "
+          "with taps 1, 2, 4, ... pixels apart. More moves coarser colour "
+          "only (5, the reference's)",
+   .def_int = 5},
+  {.key = "decoder", .type = ConfigType::String, .required = false,
+   .doc = "auto | vae | tiny: what vae-decode decodes the restored latents "
+          "with. `vae`: the Wan VAE. `tiny`: the reference's tiny decoder "
+          "(TCDecoder.ckpt beside the model), a small TAEHV decoder that "
+          "reads the source pictures beside each latent -- several times "
+          "faster than the VAE and a fraction of its memory, which lets a "
+          "smaller box restore a source as one stream. Its pictures travel "
+          "on this stage's color_reference output, which must be wired to "
+          "vae-decode's color_reference input. `auto` (default): the "
+          "release's own -- tiny for FlashVSR+ when the file is there, the "
+          "VAE for v1.1",
+   .def_str = "auto"},
+  {.key = "temporal_compression", .type = ConfigType::Int,
+   .required = false,
+   .doc = "source frames per latent frame: 4 (default), 2 or 1. Below 4 "
+          "every source frame but the first is fed to the model 2 or 4 "
+          "times, so fast motion gets more latent frames, and the decode "
+          "merges each run back into one frame -- FlashVSR+'s "
+          "large-motion option, at 2x or 4x the denoise and decode work",
+   .def_int = 4},
+  {.key = "temporal_merge", .type = ConfigType::String, .required = false,
+   .doc = "how the decode merges a run of repeated frames back: gaussian "
+          "(default; weights over the run, temporal_sigma wide) or first "
+          "(the run's first frame)",
+   .def_str = "gaussian"},
+  {.key = "temporal_sigma", .type = ConfigType::Real, .required = false,
+   .doc = "the gaussian merge's width, in frames of the run (1.0)",
+   .def_real = 1.0},
 };
 const PortSpec kIports[] = {
   {.name = "source",
@@ -104,6 +151,15 @@ const PortSpec kOports[] = {
           "colour reference",
    .type = &typeid(TensorBeatPayload),
    .tags = "conditioning", .clock_group = 0},
+  {.name = "color_reference",
+   .doc = "the source pictures a conditioning beat's decode needs, planar "
+          "U8 [n, 3, H, W], right after it: those it restores, for the "
+          "WAVELET colour fix, then those its decode covers, for the TINY "
+          "decoder. Wire it to vae-decode's color_reference input; written "
+          "only when one of the two runs and this is wired. It waits for "
+          "vae-decode a few beats deep, so the source cannot run ahead of "
+          "the restoration",
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "flashvsr-src-encoder",
@@ -135,6 +191,11 @@ FlashVsrSrcEncoderStage::FlashVsrSrcEncoderStage(
   // conditioning onward -- the shipped flashvsr-restore one included --
   // is refused at pipeline_from_spec before anything loads.
   allocate_oports(spec().oports.size());
+  // The pictures are a frame's worth each at the output size, and nothing
+  // else paces this stage: without backpressure it would decode the whole
+  // source ahead of the restoration and queue it here.
+  set_oport_policy(kPicturePort,
+                   {kPictureDepth, OverrunPolicy::Backpressure});
   // Deferred validation: constructors never throw here, so a bad config
   // is recorded and the runtime skips the stage at launch.
   _hf_dir = attr_str("hf_dir");
@@ -169,6 +230,66 @@ FlashVsrSrcEncoderStage::FlashVsrSrcEncoderStage(
   } else if (_blend_frames < 0) {
     fail_config(fmt("FlashVsrSrcEncoderStage('{}'): blend_frames must be "
                     ">= 0; got {}", this->id(), _blend_frames));
+  }
+  const std::string m = attr_str("color_fix_method");
+  if (m.empty() || m == "auto") {
+    _cfg_method = ColorFix::kAuto;
+  } else if (m == "adain") {
+    _cfg_method = ColorFix::kAdain;
+  } else if (m == "wavelet") {
+    _cfg_method = ColorFix::kWavelet;
+  } else {
+    fail_config(fmt("FlashVsrSrcEncoderStage('{}'): color_fix_method must "
+                    "be auto, adain or wavelet; got '{}'", this->id(), m));
+  }
+  const std::string d = attr_str("decoder");
+  if (d.empty() || d == "auto") {
+    _cfg_decoder = Decoder::kAuto;
+  } else if (d == "vae") {
+    _cfg_decoder = Decoder::kVae;
+  } else if (d == "tiny") {
+    _cfg_decoder = Decoder::kTiny;
+  } else {
+    fail_config(fmt("FlashVsrSrcEncoderStage('{}'): decoder must be auto, "
+                    "vae or tiny; got '{}'", this->id(), d));
+  }
+  _wavelet_levels = (int)attr_int("wavelet_levels");
+  if (_wavelet_levels < 1 || _wavelet_levels > 12) {
+    fail_config(fmt("FlashVsrSrcEncoderStage('{}'): wavelet_levels must be "
+                    "in [1, 12]; got {}", this->id(), _wavelet_levels));
+  }
+  // THE MERGE WEIGHTS, the reference's own: a gaussian over the run's
+  // positions centred on its middle, normalised -- or the first frame.
+  _tc = (int)attr_int("temporal_compression");
+  if (_tc != 4 && _tc != 2 && _tc != 1) {
+    fail_config(fmt("FlashVsrSrcEncoderStage('{}'): temporal_compression "
+                    "must be 4, 2 or 1; got {}", this->id(), _tc));
+    _tc = 4;
+  }
+  _r = 4 / _tc;
+  const std::string merge = attr_str("temporal_merge");
+  const double sigma = attr_real("temporal_sigma");
+  if (merge != "gaussian" && merge != "first" && !merge.empty()) {
+    fail_config(fmt("FlashVsrSrcEncoderStage('{}'): temporal_merge must be "
+                    "gaussian or first; got '{}'", this->id(), merge));
+  } else if (!(sigma > 0.0)) {
+    fail_config(fmt("FlashVsrSrcEncoderStage('{}'): temporal_sigma must be "
+                    "> 0; got {}", this->id(), sigma));
+  } else if (_r > 1) {
+    _merge_w.assign((std::size_t)_r, 0.0f);
+    if (merge == "first") {
+      _merge_w[0] = 1.0f;
+    } else {
+      // In f32, as the reference computes them.
+      float sum = 0.0f;
+      for (int k = 0; k < _r; ++k) {
+        const float x =
+            ((float)k - (float)(_r - 1) / 2.0f) / (float)sigma;
+        _merge_w[(std::size_t)k] = std::exp(-0.5f * (x * x));
+        sum += _merge_w[(std::size_t)k];
+      }
+      for (float& w : _merge_w) { w /= sum; }
+    }
   }
 }
 
@@ -239,6 +360,8 @@ FlashVsrSrcEncoderStage::reset_run_state()
   reset_stream_();
   _mode = Continuity::kAuto;
   _overlap_noted = false;
+  _refs_noted = false;
+  _tiny_noted = false;
 }
 
 bool
@@ -278,7 +401,33 @@ FlashVsrSrcEncoderStage::ensure_loaded_()
   // stream and how many each later chunk takes -- 25 then 8 for v1.1, 17
   // then 16 for FlashVSR+.
   _sch = genai::flashvsr_schedule(layout);
+  // THE COLOUR FIX the release's reference applies: v1.1 its AdaIN, by
+  // default; FlashVSR+ its wavelet one, only when asked (--cf).
   if (!_color_fix_set) { _color_fix = !_sch.is_plus(); }
+  _method = !_color_fix ? ColorFix::kOff
+          : _cfg_method != ColorFix::kAuto
+              ? _cfg_method
+              : (_sch.is_plus() ? ColorFix::kWavelet : ColorFix::kAdain);
+  // THE DECODER the release's reference uses by default: FlashVSR+'s tiny
+  // one, when its file came with the model; v1.1's VAE.
+  if (_cfg_decoder == Decoder::kTiny && layout.tiny_decoder.empty()) {
+    session()->warn(fmt(
+        "FlashVsrSrcEncoderStage('{}'): decoder `tiny` asks for {} beside "
+        "the model and '{}' has none; decoding with the VAE", this->id(),
+        "TCDecoder.ckpt", root));
+  }
+  _tiny = !layout.tiny_decoder.empty() &&
+          (_cfg_decoder == Decoder::kTiny ||
+           (_cfg_decoder == Decoder::kAuto && _sch.is_plus()));
+  if (_cfg_decoder == Decoder::kAuto && _sch.is_plus() &&
+      layout.tiny_decoder.empty()) {
+    // A download from before the catalogue pinned it.
+    session()->info(fmt(
+        "FlashVsrSrcEncoderStage('{}'): FlashVSR+ decodes with its tiny "
+        "decoder by default, and {} is not beside '{}'; decoding with the "
+        "VAE (fetching the model again adds it)", this->id(),
+        "TCDecoder.ckpt", root));
+  }
   // A clip is whole chunks: rounded UP to the release's rule, so a graph
   // written for one release runs on the other.
   _clip_frames = _cfg_clip_frames > 0 ? _cfg_clip_frames
@@ -292,21 +441,31 @@ FlashVsrSrcEncoderStage::ensure_loaded_()
         aligned));
   }
   _clip_frames = aligned;
-  if (_blend_frames >= _clip_frames - 4) {
+  // A clip restores (clip_frames - 4) / r source frames past the first
+  // clip's lead; it must keep at least one of them its own.
+  const int restores = (_clip_frames - 4) / _r;
+  if (_blend_frames >= restores) {
     session()->warn(fmt(
         "FlashVsrSrcEncoderStage('{}'): blend_frames {} leaves a {}-frame "
-        "clip nothing of its own; blending {}", this->id(), _blend_frames,
-        _clip_frames, _clip_frames - 5));
-    _blend_frames = _clip_frames - 5;
+        "clip (restoring {} source frames) nothing of its own; blending {}",
+        this->id(), _blend_frames, _clip_frames, restores, restores - 1));
+    _blend_frames = restores - 1;
   }
   session()->info(fmt(
       "FlashVsrSrcEncoderStage('{}'): {} source projection, {} wide, {} "
       "output layer(s), {}x{} pixel unshuffle -- no prompt and no text "
-      "encoder; chunks of {} source frames{}", this->id(),
+      "encoder; chunks of {} source frames{}{}{}", this->id(),
       layout.plus ? "FlashVSR+ " + layout.variant : std::string("v1.1"),
       _proj->config().out_dim, _proj->config().n_out_layers,
       _proj->config().shuffle_w, _proj->config().shuffle_h,
-      4 * _sch.chunk_latents, _color_fix ? ", colour fix on" : ""));
+      4 * _sch.chunk_latents,
+      _method == ColorFix::kAdain     ? ", AdaIN colour fix"
+      : _method == ColorFix::kWavelet ? ", wavelet colour fix"
+                                      : "",
+      _r > 1 ? fmt(", temporal compression {} (each source frame fed {} "
+                   "times, merged back by the decode)", _tc, _r)()
+             : std::string(),
+      _tiny ? ", the tiny decoder" : ""));
   return true;
 }
 
@@ -346,6 +505,32 @@ FlashVsrSrcEncoderStage::process(RuntimeContext& ctx)
     ensure_loaded_();
   }
 
+  // The wavelet fix's and the tiny decoder's pictures go out beside the
+  // rows, and only where vae-decode will read them.
+  _refs_wired = ctx.has_consumers(kPicturePort);
+  if (_tiny && !_refs_wired && !_tiny_noted && _proj != nullptr) {
+    _tiny_noted = true;
+    const auto m = fmt(
+        "FlashVsrSrcEncoderStage('{}'): the tiny decoder reads the source "
+        "pictures this stage sends on its color_reference output, and "
+        "nothing is wired to it; vae-decode decodes with the VAE",
+        this->id());
+    if (_cfg_decoder == Decoder::kTiny) {
+      session()->warn(m);
+    } else {
+      session()->info(m);
+    }
+  }
+  if (_method == ColorFix::kWavelet && !_refs_wired && !_refs_noted &&
+      _proj != nullptr) {
+    _refs_noted = true;
+    session()->warn(fmt(
+        "FlashVsrSrcEncoderStage('{}'): the wavelet colour fix needs this "
+        "stage's color_reference output wired to vae-decode's "
+        "color_reference input; nothing is, so the source restores "
+        "without a colour fix", this->id()));
+  }
+
   auto cb = co_await ctx.read(kSourcePort);
   if (!cb) {
     // THE END OF THE SOURCE. What is still owed is restored now: every
@@ -360,7 +545,9 @@ FlashVsrSrcEncoderStage::process(RuntimeContext& ctx)
             this->id(), err));
       }
       for (auto& b : beats) {
-        co_await ctx.write(0, std::move(b));
+        co_await ctx.write(0, std::move(b.rows));
+        if (b.refs) { co_await ctx.write(kPicturePort, std::move(b.refs)); }
+        if (b.cond) { co_await ctx.write(kPicturePort, std::move(b.cond)); }
         ++_emitted;
       }
       reset_stream_();
@@ -408,11 +595,15 @@ FlashVsrSrcEncoderStage::process(RuntimeContext& ctx)
     if (_cfg_mode != Continuity::kAuto) {
       _mode = _cfg_mode;
     } else {
+      // ...with the decode it will run: the tiny decoder's carries are a
+      // fraction of the VAE's whole-plane ones.
       const std::string root = resolve_model_dir(session(), _hf_dir);
       std::size_t need = 0;
-      const bool fits = genai::flashvsr_stream_fits(root, W, H, &need);
+      const bool fits =
+          genai::flashvsr_stream_fits(root, W, H, &need, tiny_on_());
       _mode = fits ? Continuity::kStream : Continuity::kClips;
-      const std::size_t carry = genai::flashvsr_stream_bytes(root, W, H);
+      const std::size_t carry =
+          genai::flashvsr_stream_bytes(root, W, H, 3.0, tiny_on_());
       const std::size_t ram = model_memory::phys_ram();
       if (fits) {
         session()->info(fmt(
@@ -437,7 +628,9 @@ FlashVsrSrcEncoderStage::process(RuntimeContext& ctx)
     std::string err;
     auto beats = drain_(/*flush=*/true, &err);
     for (auto& b : beats) {
-      co_await ctx.write(0, std::move(b));
+      co_await ctx.write(0, std::move(b.rows));
+      if (b.refs) { co_await ctx.write(kPicturePort, std::move(b.refs)); }
+      if (b.cond) { co_await ctx.write(kPicturePort, std::move(b.cond)); }
       ++_emitted;
     }
     reset_stream_();
@@ -469,9 +662,21 @@ FlashVsrSrcEncoderStage::process(RuntimeContext& ctx)
   }
   for (int i = skip; i < frames; ++i) {
     const std::uint8_t* px = bytes.data() + (std::size_t)i * frame_px;
-    _pending.insert(_pending.end(), px, px + frame_px);
-    if (_color_fix) { _stats.push_back(frame_stats_(px, H, W)); }
-    ++_received;
+    // EXPANDED: the source's first frame once, every later one r times
+    // (temporal compression below 4) -- the reference's own expansion.
+    const int copies = _src_received == 0 ? 1 : _r;
+    for (int k = 0; k < copies; ++k) {
+      _pending.insert(_pending.end(), px, px + frame_px);
+    }
+    _received += copies;
+    ++_src_received;
+    // ...while what is restored is the source, a frame each.
+    if (_method == ColorFix::kAdain) {
+      _stats.push_back(frame_stats_(px, H, W));
+    }
+    if ((_method == ColorFix::kWavelet || _tiny) && _refs_wired) {
+      _pics.emplace_back(px, px + frame_px);
+    }
   }
   if (skip < frames) {
     const std::uint8_t* last =
@@ -487,29 +692,30 @@ FlashVsrSrcEncoderStage::process(RuntimeContext& ctx)
     reset_stream_();
   }
   for (auto& b : beats) {
-    co_await ctx.write(0, std::move(b));
+    co_await ctx.write(0, std::move(b.rows));
+    if (b.refs) { co_await ctx.write(kPicturePort, std::move(b.refs)); }
+    if (b.cond) { co_await ctx.write(kPicturePort, std::move(b.cond)); }
     ++_emitted;
   }
 }
 
-std::vector<std::unique_ptr<TensorBeatPayload>>
+std::vector<FlashVsrSrcEncoderStage::Out>
 FlashVsrSrcEncoderStage::drain_(bool flush, std::string* err)
 {
-  std::vector<std::unique_ptr<TensorBeatPayload>> out;
+  std::vector<Out> out;
   if (_mode == Continuity::kStream) {
     std::vector<metal_compute::SharedBuffer> rows;
     int c0 = 0, n = 0;
     if (!drive_chunks_(flush, &rows, &c0, &n, err)) { return out; }
     if (n > 0) {
-      if (auto b = stream_beat_(rows, c0, n, flush)) {
-        out.push_back(std::move(b));
-      }
+      Out b = stream_beat_(rows, c0, n, flush);
+      if (b.rows) { out.push_back(std::move(b)); }
     }
     return out;
   }
   for (;;) {
-    auto b = next_clip_(flush, err);
-    if (!b) { break; }
+    Out b = next_clip_(flush, err);
+    if (!b.rows) { break; }
     out.push_back(std::move(b));
   }
   return out;
@@ -524,11 +730,13 @@ FlashVsrSrcEncoderStage::reset_stream_()
   _pending.shrink_to_fit();
   _pend_g0 = 0;
   _received = 0;
+  _src_received = 0;
   _padded = 0;
   _next_chunk = 0;
   _last_frame.clear();
   _stats.clear();
-  _stats_g0 = 0;
+  _pics.clear();
+  _rec_g0 = 0;
   _clip_s = 0;
   _covered = 0;
   _clips = 0;
@@ -581,12 +789,25 @@ FlashVsrSrcEncoderStage::drop_before_(long long g)
                        (std::ptrdiff_t)(n * (long long)frame_px));
     _pend_g0 += n;
   }
-  if (g > _stats_g0) {
-    const long long n =
-        std::min<long long>(g - _stats_g0, (long long)_stats.size());
-    _stats.erase(_stats.begin(), _stats.begin() + (std::ptrdiff_t)n);
-    _stats_g0 += n;
+  drop_records_before_(src_of_(g));
+}
+
+void
+FlashVsrSrcEncoderStage::drop_records_before_(long long s)
+{
+  if (s <= _rec_g0) { return; }
+  const long long n = s - _rec_g0;
+  if (!_stats.empty()) {
+    _stats.erase(_stats.begin(),
+                 _stats.begin() + (std::ptrdiff_t)std::min<long long>(
+                                      n, (long long)_stats.size()));
   }
+  if (!_pics.empty()) {
+    _pics.erase(_pics.begin(),
+                _pics.begin() + (std::ptrdiff_t)std::min<long long>(
+                                    n, (long long)_pics.size()));
+  }
+  _rec_g0 = s;
 }
 
 bool
@@ -667,17 +888,22 @@ FlashVsrSrcEncoderStage::drive_chunks_(
 // cross-fade them -- the same frames twice, cold and warm, which turns a
 // cut into a transition. That is what a box too small for a stream gets;
 // it costs blend + 4 frames of every clip twice.
-std::unique_ptr<TensorBeatPayload>
+FlashVsrSrcEncoderStage::Out
 FlashVsrSrcEncoderStage::next_clip_(bool flush, std::string* err)
 {
-  if (!_open || _received == 0) { return nullptr; }
+  if (!_open || _received == 0) { return {}; }
   const int L = _clip_frames;
   const long long S = _clip_s;
-  const long long out_len = L - 4;
+  // What a clip restores, in decoded (expanded) frames: all but its four
+  // of look-ahead -- cut back, after the source's first frame, to WHOLE
+  // RUNS of r, so the next clip starts on a run and no merge straddles a
+  // cut. With no temporal compression nothing is cut.
+  const long long lead = S == 0 ? 1 : 0;
+  const long long out_len = lead + ((L - 4 - lead) / _r) * _r;
   if (_received + _padded < S + L) {
     // Not here yet -- unless the source has ended and some of it is
     // still unrestored, in which case its end is padded.
-    if (!flush || _received <= _covered) { return nullptr; }
+    if (!flush || _received <= _covered) { return {}; }
     pad_to_(S + L);
   }
   // LAST only if its restored frames reach the source's end. A clip can
@@ -689,18 +915,19 @@ FlashVsrSrcEncoderStage::next_clip_(bool flush, std::string* err)
   std::vector<metal_compute::SharedBuffer> rows;
   _proj->reset();
   for (int c = 0; c < chunks; ++c) {
-    if (!feed_chunk_(S, c, &rows, err)) { return nullptr; }
+    if (!feed_chunk_(S, c, &rows, err)) { return {}; }
   }
   const long long valid = std::min(S + out_len, _received) - S;
-  const int head = _clips > 0 ? (int)(_covered - S) : 0;
+  // The cross-fade counts SOURCE frames: what the decode emits.
+  const int head = _clips > 0 ? (int)((_covered - S) / _r) : 0;
   // Whether a clip follows: one does whenever restored frames remain past
   // this one's end, which a clip that ran on real frames cannot know yet
   // -- it says so, and the decode lets the frames go if none comes.
   const int tail = last ? 0 : _blend_frames;
-  auto out = clip_beat_(rows, chunks, S, valid, head, tail);
+  Out out = clip_beat_(rows, chunks, S, valid, head, tail);
   ++_clips;
   _covered = S + out_len;
-  _clip_s = S + out_len - _blend_frames;
+  _clip_s = S + out_len - (long long)_blend_frames * _r;
   drop_before_(_clip_s);
   if (last) {
     // Nothing is owed past this clip; the padding is done with.
@@ -739,7 +966,7 @@ FlashVsrSrcEncoderStage::color_refs_(long long frame0, long long n) const
 {
   FlexData refs = FlexData::make_array();
   for (long long f = frame0; f < frame0 + n; ++f) {
-    const long long i = f - _stats_g0;
+    const long long i = f - _rec_g0;
     if (i < 0 || i >= (long long)_stats.size()) { break; }
     FlexData one = FlexData::make_array();
     for (float v : _stats[(std::size_t)i].v) {
@@ -751,6 +978,82 @@ FlashVsrSrcEncoderStage::color_refs_(long long frame0, long long n) const
 }
 
 std::unique_ptr<TensorBeatPayload>
+FlashVsrSrcEncoderStage::pictures_(long long s0, long long n,
+                                   const char* what) const
+{
+  const std::size_t frame_px = (std::size_t)3 * _sh * _sw;
+  const long long i0 = s0 - _rec_g0;
+  if (n <= 0 || i0 < 0 || i0 + n > (long long)_pics.size()) {
+    session()->warn(fmt(
+        "FlashVsrSrcEncoderStage('{}'): source frames {}..{} are no longer "
+        "held for {}; this beat goes without", this->id(), s0, s0 + n - 1,
+        what));
+    return nullptr;
+  }
+  auto p = std::make_unique<TensorBeatPayload>();
+  p->dtype = TensorBeat::DType::U8;
+  p->shape = {(std::int64_t)n, 3, _sh, _sw};
+  p->resize_contiguous((std::size_t)n * frame_px);
+  for (long long k = 0; k < n; ++k) {
+    std::memcpy(p->as_u8() + (std::size_t)k * frame_px,
+                _pics[(std::size_t)(i0 + k)].data(), frame_px);
+  }
+  p->sideband = FlexData::make_object();
+  return p;
+}
+
+void
+FlashVsrSrcEncoderStage::finish_beat_(long long e0, long long valid,
+                                      long long decoded, long long s0,
+                                      long long n, Out* out) const
+{
+  auto o = out->rows->sideband.as_object();
+  // How many DECODED frames are real; the decode trims to them first.
+  o.insert_or_assign(sideband::kValidFrames,
+                     FlexData::make_int((std::int64_t)std::max(0LL, valid)));
+  // ...then merges each run of r back into a source frame, the source's
+  // first frame (fed once) passing alone.
+  if (_r > 1) {
+    FlexData w = FlexData::make_array();
+    for (float x : _merge_w) {
+      w.as_array().push_back(FlexData::make_real(x));
+    }
+    o.insert_or_assign(sideband::kMergeWeights, w);
+    o.insert_or_assign(sideband::kMergeLead,
+                       FlexData::make_int(e0 == 0 ? 1 : 0));
+  }
+  if (_method == ColorFix::kAdain) {
+    o.insert_or_assign(sideband::kColorRef, color_refs_(s0, n));
+  } else if (_method == ColorFix::kWavelet && _refs_wired && n > 0) {
+    // The source pictures of the frames this beat restores, for the
+    // decode's wavelet fix: one beat beside this one.
+    out->refs = pictures_(s0, n, "the wavelet colour fix");
+    if (out->refs) {
+      o.insert_or_assign(sideband::kColorRefFrames,
+                         FlexData::make_int((std::int64_t)n));
+      o.insert_or_assign(sideband::kColorRefLevels,
+                         FlexData::make_int(_wavelet_levels));
+    }
+  }
+  if (tiny_on_() && decoded > 0) {
+    // THE TINY DECODER's pictures: the source of every frame this beat's
+    // decode covers -- past the frames it restores, to the end of its last
+    // latent frame, the source's last frame standing in for its padding.
+    // One per SOURCE frame; the decode maps its expanded frames onto them
+    // by the merge's own rule.
+    const long long last =
+        std::min(src_of_(e0 + decoded - 1), _src_received - 1);
+    const long long m = last - s0 + 1;
+    out->cond = pictures_(s0, m, "the tiny decoder");
+    if (out->cond) {
+      o.insert_or_assign(sideband::kDecoder, FlexData::make_string("tiny"));
+      o.insert_or_assign(sideband::kDecoderCondFrames,
+                         FlexData::make_int((std::int64_t)m));
+    }
+  }
+}
+
+FlashVsrSrcEncoderStage::Out
 FlashVsrSrcEncoderStage::clip_beat_(
     const std::vector<metal_compute::SharedBuffer>& rows, int chunks,
     long long S, long long valid, int head, int tail)
@@ -760,35 +1063,35 @@ FlashVsrSrcEncoderStage::clip_beat_(
         "FlashVsrSrcEncoderStage('{}'): a {}-chunk clip projected {} row "
         "frames, not {}; dropping it", this->id(), chunks, rows.size(),
         _sch.latents(chunks)));
-    return nullptr;
+    return {};
   }
-  auto out = rows_beat_(rows);
-  auto o = out->sideband.as_object();
+  Out out;
+  out.rows = rows_beat_(rows);
+  auto o = out.rows->sideband.as_object();
   // A clip is a stream of its own, opened and ended in one beat.
   o.insert_or_assign(genai::flashvsr_stream::kChunk0, FlexData::make_int(0));
   o.insert_or_assign(genai::flashvsr_stream::kChunks,
                      FlexData::make_int(chunks));
   o.insert_or_assign(sideband::kStreamContinues, FlexData::make_bool(false));
   o.insert_or_assign(sideband::kStreamFinal, FlexData::make_bool(true));
-  o.insert_or_assign(sideband::kValidFrames,
-                     FlexData::make_int((std::int64_t)valid));
   if (head > 0) {
     o.insert_or_assign(sideband::kBlendHead, FlexData::make_int(head));
   }
   if (tail > 0) {
     o.insert_or_assign(sideband::kBlendTail, FlexData::make_int(tail));
   }
-  if (_color_fix) {
-    o.insert_or_assign(sideband::kColorRef, color_refs_(S, valid));
-  }
+  const long long s0 = src_of_(S);
+  const long long n = src_of_(S + valid) - s0;
+  // The decode covers every latent frame of the clip: 4T - 3 frames.
+  finish_beat_(S, valid, 4LL * _sch.latents(chunks) - 3, s0, n, &out);
   session()->log_debug(fmt(
       "FlashVsrSrcEncoderStage('{}'): clip {} restores frames {}..{} "
-      "(blend {} in, {} out)", this->id(), _clips, S, S + valid - 1, head,
+      "(blend {} in, {} out)", this->id(), _clips, s0, s0 + n - 1, head,
       tail));
   return out;
 }
 
-std::unique_ptr<TensorBeatPayload>
+FlashVsrSrcEncoderStage::Out
 FlashVsrSrcEncoderStage::stream_beat_(
     const std::vector<metal_compute::SharedBuffer>& rows, int chunk0,
     int chunks, bool final_beat)
@@ -804,15 +1107,21 @@ FlashVsrSrcEncoderStage::stream_beat_(
         "FlashVsrSrcEncoderStage('{}'): chunks {}+{} projected {} row "
         "frames, not {}; dropping them", this->id(), chunk0, chunks,
         rows.size(), want));
-    return nullptr;
+    return {};
   }
-  auto out = rows_beat_(rows);
-  // The frames these chunks restore, in the stream: [frame0, end), of
-  // which the real ones end at the last frame received.
+  Out out;
+  out.rows = rows_beat_(rows);
+  // The frames these chunks restore, in the stream: [frame0, end)
+  // decoded, of which the real ones end at the last frame received --
+  // and as the SOURCE, [s0, s0 + n). A chunk ends on a whole run of r
+  // (four frames a latent frame, past the source's first), so the two
+  // timelines agree at every cut.
   const long long frame0 = _sch.restored_begin(chunk0);
   const long long end = _sch.restored_end(chunk0 + chunks - 1);
-  const long long valid = std::min(end, _received) - frame0;
-  auto o = out->sideband.as_object();
+  const long long valid = std::max(0LL, std::min(end, _received) - frame0);
+  const long long s0 = src_of_(frame0);
+  const long long n = src_of_(frame0 + valid) - s0;
+  auto o = out.rows->sideband.as_object();
   o.insert_or_assign(genai::flashvsr_stream::kChunk0,
                      FlexData::make_int(chunk0));
   o.insert_or_assign(genai::flashvsr_stream::kChunks,
@@ -820,29 +1129,14 @@ FlashVsrSrcEncoderStage::stream_beat_(
   o.insert_or_assign(sideband::kStreamContinues,
                      FlexData::make_bool(chunk0 > 0));
   o.insert_or_assign(sideband::kStreamFinal, FlexData::make_bool(final_beat));
-  o.insert_or_assign(sideband::kValidFrames,
-                     FlexData::make_int((std::int64_t)std::max(0LL, valid)));
-  if (_color_fix) {
-    o.insert_or_assign(sideband::kColorRef, color_refs_(frame0, valid));
-    // What has been restored no longer needs its statistics.
-    drop_before_stats_(end);
-  }
+  finish_beat_(frame0, valid, end - frame0, s0, n, &out);
+  // What has been restored no longer needs its records.
+  drop_records_before_(src_of_(end));
   session()->log_debug(fmt(
-      "FlashVsrSrcEncoderStage('{}'): stream chunks {}..{} -> frames "
-      "{}..{}{}", this->id(), chunk0, chunk0 + chunks - 1, frame0,
-      frame0 + valid - 1, final_beat ? " (final)" : ""));
+      "FlashVsrSrcEncoderStage('{}'): stream chunks {}..{} -> source frames "
+      "{}..{}{}", this->id(), chunk0, chunk0 + chunks - 1, s0, s0 + n - 1,
+      final_beat ? " (final)" : ""));
   return out;
-}
-
-void
-FlashVsrSrcEncoderStage::drop_before_stats_(long long g)
-{
-  if (g > _stats_g0) {
-    const long long n =
-        std::min<long long>(g - _stats_g0, (long long)_stats.size());
-    _stats.erase(_stats.begin(), _stats.begin() + (std::ptrdiff_t)n);
-    _stats_g0 += n;
-  }
 }
 
 #else   // !VPIPE_BUILD_APPLE_SILICON

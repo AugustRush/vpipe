@@ -3731,6 +3731,17 @@ const STRINGS = {
   'port.vae-decode.model': ['',
       '可选的共享模型引用，来自 model-select 源；覆盖 hf_dir 配置',
       '可選的共享模型參照，來自 model-select 來源；覆寫 hf_dir 設定'],
+  'port.vae-decode.color_reference': ['',
+      '可选，源图：平面 [n, 3, H, W]（U8、F16 或 F32），潜变量的边带每声明'
+      + '一组就对应一拍——先是 `color_ref_frames`，供 wavelet 颜色校正使用；'
+      + '再是 `decoder_cond_frames`，供在潜变量旁读取源图的小型解码器使用'
+      + '（FlashVSR 的小型解码器，此时由它代替 VAE 解码）——且只为这些读取。'
+      + '即 flashvsr-src-encoder 的 color_reference 输出',
+      '可選，來源圖：平面 [n, 3, H, W]（U8、F16 或 F32），潛變量的邊帶每宣'
+      + '告一組就對應一拍——先是 `color_ref_frames`，供 wavelet 色彩校正使用'
+      + '；再是 `decoder_cond_frames`，供在潛變量旁讀取來源圖的小型解碼器使'
+      + '用（FlashVSR 的小型解碼器，此時由它代替 VAE 解碼）——且只為這些讀取'
+      + '。即 flashvsr-src-encoder 的 color_reference 輸出'],
   'port.vae-decode.image': ['',
       '解码出的平面 U8 RGB TensorBeat [3, H, W]。视频潜变量按帧逐个发出节拍'
       + '，而不是发一个片段形状的张量，每个节拍的边带都带有 {frame, frames,'
@@ -4635,12 +4646,62 @@ const STRINGS = {
       + '做交叉淡化（升餘弦），讓切口成為過渡而不是跳變；0 表示硬切。每一個'
       + '影格都要多修復一次（8）'],
   'cfg.flashvsr-src-encoder.color_fix': ['',
-      '为每个修复出的帧带上其源帧的颜色统计，供解码按它们匹配各通道（'
-      + 'AdaIN）。不填时跟随该版本自己的参考实现：FlashVSR-v1.1 默认施加，开'
-      + '启；FlashVSR+ 的模型无需它也能保持颜色，关闭',
-      '為每個修復出的影格帶上其來源影格的色彩統計，供解碼按它們匹配各'
-      + '通道（AdaIN）。不填時跟隨該版本自己的參考實作：FlashVSR-v1.1 預設施'
-      + '加，開啟；FlashVSR+ 的模型無需它也能保持色彩，關閉'],
+      '把每个修复出的帧的颜色向其源帧校正（方式见 color_fix_method）。'
+      + '不填时跟随该版本自己的参考实现：FlashVSR-v1.1 默认施加其校正，开启'
+      + '；FlashVSR+ 的校正需要手动开启（其 --cf），关闭',
+      '把每個修復出的影格的色彩向其來源影格校正（方式見 color_fix_method）'
+      + '。不填時跟隨該版本自己的參考實作：FlashVSR-v1.1 預設施加其校正，開'
+      + '啟；FlashVSR+ 的校正需要手動開啟（其 --cf），關閉'],
+  'cfg.flashvsr-src-encoder.color_fix_method': ['',
+      'auto | adain | wavelet。`adain`：把每个通道的均值和离散度移到源'
+      + '帧的值——v1.1 的校正，每帧六个数放在边带上。`wavelet`：从源图取帧的'
+      + '低频部分，保留其自身细节——FlashVSR+ 的校正，色偏在哪里就在哪里校正'
+      + '；源图经本 stage 的 color_reference 输出送到 vae-decode，该输出必须'
+      + '接到 vae-decode 的 color_reference 输入。`auto`（默认）：该版本自己'
+      + '的方式，v1.1 用 adain，FlashVSR+ 用 wavelet',
+      'auto | adain | wavelet。`adain`：把每個通道的平均值與離散度移到'
+      + '來源影格的值——v1.1 的校正，每格六個數放在邊帶上。`wavelet`：從來源'
+      + '圖取影格的低頻部分，保留其自身細節——FlashVSR+ 的校正，色偏在哪裡就'
+      + '在哪裡校正；來源圖經本 stage 的 color_reference 輸出送到 vae-decode，'
+      + '該輸出必須接到 vae-decode 的 color_reference 輸入。`auto`（預設）：'
+      + '該版本自己的方式，v1.1 用 adain，FlashVSR+ 用 wavelet'],
+  'cfg.flashvsr-src-encoder.wavelet_levels': ['',
+      'wavelet 校正的层数：对 3x3 高斯做低通的次数，抽头间距依次为 1、'
+      + '2、4……像素。层数越多，只移动越粗的颜色（5，参考实现的取值）',
+      'wavelet 校正的層數：對 3x3 高斯做低通的次數，抽頭間距依次為 1、'
+      + '2、4……像素。層數越多，只移動越粗的色彩（5，參考實作的取值）'],
+  'cfg.flashvsr-src-encoder.decoder': ['',
+      'auto | vae | tiny：vae-decode 用什么解码修复出的潜变量。`vae`：Wan '
+      + 'VAE。`tiny`：参考实现的小型解码器（模型旁的 TCDecoder.ckpt），一个'
+      + '在每个潜变量旁读取源图的小型 TAEHV 解码器——比 VAE 快数倍、内存只'
+      + '需其一小部分，使较小的机器也能把源当作一条流来修复。源图经本 stage '
+      + '的 color_reference 输出送出，该输出必须接到 vae-decode 的 '
+      + 'color_reference 输入。`auto`（默认）：该版本自己的选择——FlashVSR+ '
+      + '在有该文件时用 tiny，v1.1 用 VAE',
+      'auto | vae | tiny：vae-decode 用什麼解碼修復出的潛變量。`vae`：Wan '
+      + 'VAE。`tiny`：參考實作的小型解碼器（模型旁的 TCDecoder.ckpt），一個'
+      + '在每個潛變量旁讀取來源圖的小型 TAEHV 解碼器——比 VAE 快數倍、記憶體'
+      + '只需其一小部分，使較小的機器也能把來源當作一條串流來修復。來源圖經本'
+      + ' stage 的 color_reference 輸出送出，該輸出必須接到 vae-decode 的 '
+      + 'color_reference 輸入。`auto`（預設）：該版本自己的選擇——FlashVSR+ '
+      + '在有該檔案時用 tiny，v1.1 用 VAE'],
+  'cfg.flashvsr-src-encoder.temporal_compression': ['',
+      '每个潜变量帧对应的源帧数：4（默认）、2 或 1。低于 4 时，除第一'
+      + '帧外每个源帧送入模型 2 或 4 次，让快速运动得到更多潜变量帧，解码再'
+      + '把每组重复帧合并回一帧——FlashVSR+ 的大运动选项，代价是 2 倍或 4 倍'
+      + '的去噪与解码工作量',
+      '每個潛變量影格對應的來源影格數：4（預設）、2 或 1。低於 4 時，'
+      + '除第一格外每個來源影格送入模型 2 或 4 次，讓快速運動得到更多潛變量'
+      + '影格，解碼再把每組重複影格合併回一格——FlashVSR+ 的大運動選項，代價'
+      + '是 2 倍或 4 倍的去噪與解碼工作量'],
+  'cfg.flashvsr-src-encoder.temporal_merge': ['',
+      '解码把一组重复帧合并回一帧的方式：gaussian（默认；在组内按位置'
+      + '加权，宽度为 temporal_sigma）或 first（取组内第一帧）',
+      '解碼把一組重複影格合併回一格的方式：gaussian（預設；在組內按位'
+      + '置加權，寬度為 temporal_sigma）或 first（取組內第一格）'],
+  'cfg.flashvsr-src-encoder.temporal_sigma': ['',
+      'gaussian 合并的宽度，以组内帧数计（1.0）',
+      'gaussian 合併的寬度，以組內影格數計（1.0）'],
   'port.flashvsr-src-encoder.source': ['',
       '像素域的低质量片段：平面 U8 RGB [frames, 3, H, W]，`fps` 放在边带上，'
       + '这正是 temporal-stack 构造出的形状。必接——这个模型族只以它的源作为'
@@ -4667,6 +4728,17 @@ const STRINGS = {
       + 'row_frames}，以及它們的位置：所含的串流區塊、是延續上一拍還是結束來'
       + '源、修復出的影格裡有多少是真實的、與相鄰片段如何重疊，以及每個影格'
       + '的色彩參考'],
+  'port.flashvsr-src-encoder.color_reference': ['',
+      '每个条件节拍的解码所需的源图，平面 U8 [n, 3, H, W]，紧跟在该节拍之后'
+      + '：先是它修复的那些帧，供 wavelet 颜色校正使用；再是它的解码覆盖的那'
+      + '些帧，供小型解码器使用。接到 vae-decode 的 color_reference 输入；只'
+      + '有两者之一在运行且已接线时才会写出。它最多领先 vae-decode 几拍，因此'
+      + '源不会远远跑在修复前面',
+      '每個條件節拍的解碼所需的來源圖，平面 U8 [n, 3, H, W]，緊跟在該節拍之'
+      + '後：先是它修復的那些影格，供 wavelet 色彩校正使用；再是它的解碼涵蓋'
+      + '的那些影格，供小型解碼器使用。接到 vae-decode 的 color_reference 輸'
+      + '入；只有兩者之一在執行且已接線時才會寫出。它最多領先 vae-decode 幾'
+      + '拍，因此來源不會遠遠跑在修復前面'],
 
   // ---- FLUX.2 Model Config (model-specific-config) ----
   'stage.flux2-model-config.name': ['',

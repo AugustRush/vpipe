@@ -125,6 +125,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ane-emitter.cc
         metal-compute.cc
         metal-compute-gemm-mma.cc
+        kernel-tuning-cache.cc
         optiq-block-perf.cc
         mlp-fuse-ab.cc
         metal-compute-sdpa-mma.cc

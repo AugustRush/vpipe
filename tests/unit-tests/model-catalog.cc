@@ -782,12 +782,12 @@ TEST(model_catalog, flashvsr_fetches_the_published_files) {
   EXPECT_TRUE(e->model_type == "flashvsr");
   EXPECT_TRUE(e->parent_model_type.empty());
   EXPECT_TRUE(catalog_category(*e) != "supplement");
+  // ...the reference's tiny decoder among them, which vae-decode runs.
   for (const char* f : {"diffusion_pytorch_model_streaming_dmd.safetensors",
-                        "LQ_proj_in.ckpt", "Wan2.1_VAE.pth"}) {
+                        "LQ_proj_in.ckpt", "Wan2.1_VAE.pth",
+                        "TCDecoder.ckpt"}) {
     EXPECT_TRUE(has_(e->files, f));
   }
-  // The reference's tiny decoder: nothing in this tree runs it.
-  EXPECT_TRUE(!has_(e->files, "TCDecoder.ckpt"));
   ASSERT_TRUE(e->companion_files.size() == 1);
   if (e->companion_files.size() != 1) { return; }
   EXPECT_TRUE(e->companion_files[0].repo == "deAPI-ai/flashvsr-v1-1");
@@ -1550,6 +1550,8 @@ TEST(model_catalog, flashvsr_plus_variants_register_their_folders) {
     EXPECT_TRUE(pinned(sub + "/dit.safetensors"));
     EXPECT_TRUE(pinned(sub + "/lq_proj_in.safetensors"));
     EXPECT_TRUE(pinned("Wan2.1_VAE.pth") && pinned("config.json"));
+    // The reference's default decoder, shared at the root like the VAE.
+    EXPECT_TRUE(pinned("TCDecoder.ckpt"));
     // The other variant's weights are not this one's download.
     const std::string other = sub == "turbo" ? "base" : "turbo";
     EXPECT_FALSE(pinned(other + "/dit.safetensors"));

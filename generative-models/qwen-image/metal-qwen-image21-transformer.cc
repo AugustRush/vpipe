@@ -5,6 +5,7 @@
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/shared/i8-gemm.h"
+#include "generative-models/shared/signed-affine.h"
 #include "generative-models/shared/metal-sage-attention.h"
 #include "generative-models/shared/metal-sol-attention.h"
 #include "generative-models/shared/mma-tile.h"
@@ -401,7 +402,7 @@ MetalQwenImage21Transformer::to_elt_(WeightSet& ws, const std::string& name,
 
 MetalQwenImage21Transformer::QWeight
 MetalQwenImage21Transformer::load_qw_(WeightSet& ws, const std::string& name,
-                                      Retain r)
+                                      Retain r, bool sign)
 {
   QWeight qw;
   const MetalLlamaWeights& wts = ws.src();
@@ -414,6 +415,46 @@ MetalQwenImage21Transformer::load_qw_(WeightSet& ws, const std::string& name,
     const long K = scols * (long)_quant_group;
     const int bits = K > 0 ? (int)(gcols * 32 / K) : 0;
     qw.bits = (bits == 8) ? 8 : 4;
+    // THE SIGNED LAYOUT, converted where the bytes are first the model's
+    // own: in the builder of the entries the set keeps for a retained
+    // block (so nothing unsigned stays cached beside them), in place in
+    // a streamed read. As FLUX.2's and Krea-2's.
+    if (sign && _sgn && _i8 && _i8->signed_available(qw.bits)) {
+      const std::string cn = name + ".weight", bn = name + ".biases";
+      const auto cp = WeightSet::Residency::Copied;
+      qw.scales = to_elt_(ws, name + ".scales", r);
+      if (r == Retain::Streamed) {
+        qw.codes = ws.stream_tensor(cn, _mc, cp);
+        qw.qbias = ws.stream_derived(
+            [&]() { return to_bf16_(ws.src(), _mc, bn); });
+        qw.sgn = !qw.codes.empty() && !qw.scales.empty() &&
+                 genai::to_signed_affine(qw.codes, qw.scales, qw.qbias,
+                                         qw.bits, /*bf16=*/true);
+      } else {
+        const int qb = qw.bits;
+        qw.codes = ws.derived(std::string(kKey) + "sgn|" + cn, [&]() {
+          SharedBuffer c = ws.read(cn, _mc, cp);
+          return !c.empty() && genai::to_signed_codes(c, qb)
+                     ? std::move(c) : SharedBuffer{};
+        });
+        if (!qw.scales.empty()) {
+          qw.qbias = ws.derived(std::string(kKey) + "sgn|" + bn, [&]() {
+            SharedBuffer b = to_bf16_(ws.src(), _mc, bn);
+            return !b.empty() && genai::to_signed_zero_points(
+                                     qw.scales, b, qb, /*bf16=*/true)
+                       ? std::move(b) : SharedBuffer{};
+          });
+        }
+        qw.sgn = !qw.codes.empty() && !qw.qbias.empty();
+      }
+      if (qw.sgn) {
+        qw.quantized = true;
+        return qw;
+      }
+      // Not convertible: the unsigned layout below, as if never asked.
+      qw.codes = {}; qw.scales = {}; qw.qbias = {};
+      qw.sgn = false;
+    }
     qw.codes = r == Retain::Streamed
                    ? ws.stream_tensor(name + ".weight", _mc,
                                       WeightSet::Residency::Copied)
@@ -516,19 +557,19 @@ MetalQwenImage21Transformer::load_block_(WeightSet& ws, int L, Block& b,
                                          Retain r)
 {
   const std::string p = block_pre_(L);
-  b.qw = load_qw_(ws, p + "attn.to_q", r);
-  b.kw = load_qw_(ws, p + "attn.to_k", r);
-  b.vw = load_qw_(ws, p + "attn.to_v", r);
+  b.qw = load_qw_(ws, p + "attn.to_q", r, true);
+  b.kw = load_qw_(ws, p + "attn.to_k", r, true);
+  b.vw = load_qw_(ws, p + "attn.to_v", r, true);
   // to_out is a ModuleList, so the projection is ".0" -- not a typo.
-  b.ow = load_qw_(ws, p + "attn.to_out.0", r);
+  b.ow = load_qw_(ws, p + "attn.to_out.0", r, true);
   b.nq = to_elt_(ws, p + "attn.norm_q.weight", r);
   b.nk = to_elt_(ws, p + "attn.norm_k.weight", r);
   // SwiGLU: out(silu(gate_layer(x)) * proj(x)). `proj` is the UP
   // projection and `out` the down one, which is not the naming any other
   // family here uses.
-  b.gate_w = load_qw_(ws, p + "img_mlp.gate_layer", r);
-  b.proj_w = load_qw_(ws, p + "img_mlp.proj", r);
-  b.out_w = load_qw_(ws, p + "img_mlp.out", r);
+  b.gate_w = load_qw_(ws, p + "img_mlp.gate_layer", r, true);
+  b.proj_w = load_qw_(ws, p + "img_mlp.proj", r, true);
+  b.out_w = load_qw_(ws, p + "img_mlp.out", r, true);
   return !b.qw.empty() && !b.kw.empty() && !b.vw.empty() && !b.ow.empty() &&
          !b.nq.empty() && !b.nk.empty() && !b.gate_w.empty() &&
          !b.proj_w.empty() && !b.out_w.empty();
@@ -665,6 +706,7 @@ MetalQwenImage21Transformer::clone_block_(const Block& src, Block& dst,
     d.bits       = s.bits;
     d.f8         = s.f8;
     d.f8_per_row = s.f8_per_row;
+    d.sgn        = s.sgn;
     ok = clone_buf_(_mc, s.f8_scale, d.f8_scale, copy) && ok;
     ok = clone_buf_(_mc, s.w, d.w, copy) && ok;
     ok = clone_buf_(_mc, s.codes, d.codes, copy) && ok;
@@ -700,6 +742,44 @@ MetalQwenImage21Transformer::rebuild_one_(const std::string& nm, Placement how)
   return _ws->stream_derived([&]() { return to_bf16_(_ws->src(), _mc, nm); });
 }
 
+bool
+MetalQwenImage21Transformer::sign_(QWeight& w) const
+{
+  // A weight this model keeps unsigned (dense, FP8, the layout off) has
+  // nothing to do. A signed one in a slot was just REFILLED raw, whatever
+  // its flag says from the build, so it converts unconditionally.
+  if (!w.quantized || !_sgn || !_i8 || !_i8->signed_available(w.bits)) {
+    return true;
+  }
+  if (!genai::to_signed_affine(w.codes, w.scales, w.qbias, w.bits,
+                               /*bf16=*/true)) {
+    return false;
+  }
+  w.sgn = true;
+  return true;
+}
+
+const MetalQwenImage21Transformer::QWeight*
+MetalQwenImage21Transformer::signed_dense_(ComputeEncoder& enc,
+                                           const QWeight& w, QWeight& view,
+                                           int N, int K) const
+{
+  if (!w.quantized || !w.sgn) { return &w; }
+  const std::size_t need = (std::size_t)N * (std::size_t)K * 2;
+  if (_w_deq.empty() || _w_deq.byte_size() < need) {
+    _w_deq = _mc->make_shared_buffer(need);
+    if (_w_deq.empty()) { return nullptr; }
+  }
+  if (!_i8 || !_i8->encode_dequant_signed(enc, w.codes, w.scales, w.qbias,
+                                          w.bits, _w_deq, N, K)) {
+    return nullptr;
+  }
+  view = QWeight{};
+  view.w = _w_deq.subview(0, need);
+  if (view.w.empty()) { return nullptr; }
+  return &view;
+}
+
 void
 MetalQwenImage21Transformer::configure_slots_()
 {
@@ -720,7 +800,15 @@ MetalQwenImage21Transformer::configure_slots_()
   ops.empty = [](const Block& b) { return b.qw.empty(); };
   // A slot built for one kind of weight and refilled with another
   // (an FP8 file with a dense block) cannot be read as either: rebuilt.
-  ops.post_refill = [this](int L, Block& b) { return fp8_kinds_match_(L, b); };
+  // Every quantized projection just landed RAW, and converts to the
+  // signed layout here, on the reader thread, under the GPU's work.
+  ops.post_refill = [this](int L, Block& b) {
+    for (QWeight* w : {&b.qw, &b.kw, &b.vw, &b.ow, &b.gate_w, &b.proj_w,
+                       &b.out_w}) {
+      if (!sign_(*w)) { return false; }
+    }
+    return fp8_kinds_match_(L, b);
+  };
   _slots.set_weight_set(_ws.get());
   _slots.configure(_mc, std::move(ops), "MetalQwenImage21Transformer",
                    "VPIPE_QWEN_IMAGE21_NO_SLOTS");
@@ -1011,6 +1099,18 @@ MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
     return nullptr;
   }
 
+  // THE SIGNED LAYOUT for the block projections (see _sgn): decided
+  // before any block loads. Its GEMM runs only on the matrix-core route,
+  // and the ANE tiers' stagers read the codes unsigned.
+  m->_sgn = m->_i8 && m->_use_mma2 && m->_quant_bits > 0 &&
+            m->_quant_group == 64 &&
+            !m->_cfg.ane_ffn && !m->_cfg.ane_qkv &&
+            (m->_i8->signed_available(8) || m->_i8->signed_available(4));
+  if (m->_sgn && mc->session() != nullptr) {
+    mc->session()->info(fmt(
+        "MetalQwenImage21Transformer: the quantized block projections take "
+        "the signed int8 layout"));
+  }
   m->_wire.open(mc);
   if (stream_blocks) {
     m->configure_slots_();
@@ -2367,10 +2467,15 @@ MetalQwenImage21Transformer::lin_(ComputeEncoder& enc,
   QWeight fv;
   const QWeight* wp = fp8_dense_(enc, w_in, fv, N, K);
   if (wp == nullptr) { return; }
-  const QWeight& w = *wp;
   _flops.gemm(M, N, K);
   // Matrix cores first; a decline encodes nothing and falls through.
-  if (gemm_mma_(enc, x, xe, w, y, ye, M, N, K)) { lora_after(); return; }
+  if (gemm_mma_(enc, x, xe, *wp, y, ye, M, N, K)) { lora_after(); return; }
+  // The steel tiles do not read the signed layout: a signed weight here
+  // (a shape matmul2d declines) is dequantized first.
+  QWeight sv;
+  const QWeight* sp = signed_dense_(enc, *wp, sv, N, K);
+  if (sp == nullptr) { return; }
+  const QWeight& w = *sp;
   if (!w.quantized) {
     // The tile, which is the whole of this path's performance on a box
     // with no matrix cores.
@@ -2430,7 +2535,7 @@ MetalQwenImage21Transformer::gemm_mma_(ComputeEncoder& enc,
   // 128-row tile, and where N is not degenerate. The timestep and
   // modulation GEMMs are M=2, which is exactly the shape the tile is
   // wrong for -- they stay on steel and cost nothing either way.
-  if (!_use_mma2 || M < _mma_min_m || N < 16) { return false; }
+  if (!_use_mma2 || N < 16) { return false; }
   // And decline a shape whose operands would not survive the tiles'
   // 32-bit addressing: past 2^31 BYTES on ANY operand the mma tiles
   // stop storing, SILENTLY. Declining rather than banding is right
@@ -2440,9 +2545,23 @@ MetalQwenImage21Transformer::gemm_mma_(ComputeEncoder& enc,
   // 12288, which puts the limit at 87381 joint rows against the 4160 a
   // 1024^2 image has. See shared/mma-tile.h.
   if (M > mma_row_band(N, K)) { return false; }
+  // A signed weight's int8 GEMM, before the matmul2d tile's row gate:
+  // its floor is the int8 route's own (I8GemmContext::signed_accepts --
+  // 1024 rows, or lower by VPIPE_I8_SIGNED_MIN_M, which it then beats
+  // the dequant + matmul2d below at).
+  if (_i8 && !_i8_hold && w.quantized && w.sgn &&
+      _i8->gemm_signed(enc, xin, xe, w.codes, w.scales, w.qbias, w.bits, y,
+                       ye, M, N, K)) {
+    return true;
+  }
+  if (M < _mma_min_m) { return false; }
 
   const SharedBuffer* wdense = nullptr;
-  if (w.quantized) {
+  if (w.quantized && w.sgn) {
+    QWeight view;
+    if (signed_dense_(enc, w, view, N, K) == nullptr) { return false; }
+    wdense = &_w_deq;
+  } else if (w.quantized) {
     const metal_compute::ComputeFunction& dq =
         (w.bits == 8) ? _fn_dequant8 : _fn_dequant4;
     if (!dq.valid()) { return false; }

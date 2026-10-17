@@ -1,4 +1,5 @@
 #include "generative-models/flashvsr/flashvsr-family.h"
+#include "generative-models/flashvsr/flashvsr-tiny-decoder.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/beat-keys.h"
@@ -44,6 +45,7 @@ constexpr const char* kPublishedDenoiser =
 constexpr const char* kPublishedSource  = "LQ_proj_in.ckpt";
 constexpr const char* kPublishedContext = "posi_prompt.pth";
 constexpr const char* kPublishedVae     = "Wan2.1_VAE.pth";
+constexpr const char* kTinyDecoder      = "TCDecoder.ckpt";
 // FlashVSR+'s, one pair per variant folder.
 constexpr const char* kPlusDenoiser = "dit.safetensors";
 constexpr const char* kPlusSource   = "lq_proj_in.safetensors";
@@ -110,6 +112,7 @@ resolve_plus_variant_(const fs::path& dir, FlashVsrLayout* out)
   l.context = ctx;
   l.context_name = "posi_prompt";
   l.vae = shared(kPublishedVae);
+  l.tiny_decoder = shared(kTinyDecoder);
   l.published = true;
   l.plus = true;
   l.variant = plus_variant_(dir);
@@ -302,8 +305,9 @@ class FlashVsrGenerator final : public VideoGenerator {
     out->latents_per_second = 0.0;
     // What the DECODE needs to know, forwarded as the encoder said it:
     // whether this latent continues the last (so its carries do), whether
-    // the stream ends here, how many of its frames are real, the per-frame
-    // colour reference, and how it overlaps its neighbours.
+    // the stream ends here, how many of its frames are real, how runs of
+    // repeated frames merge back, the colour fix's references, and how it
+    // overlaps its neighbours.
     if (sb.is_object()) {
       FlexData fw = FlexData::make_object();
       auto in = sb.as_object();
@@ -311,7 +315,10 @@ class FlashVsrGenerator final : public VideoGenerator {
       for (std::string_view k :
            {sideband::kStreamContinues, sideband::kStreamFinal,
             sideband::kValidFrames, sideband::kColorRef,
-            sideband::kBlendHead, sideband::kBlendTail}) {
+            sideband::kBlendHead, sideband::kBlendTail,
+            sideband::kMergeWeights, sideband::kMergeLead,
+            sideband::kColorRefFrames, sideband::kColorRefLevels,
+            sideband::kDecoder, sideband::kDecoderCondFrames}) {
         if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
       }
       out->sideband = std::move(fw);
@@ -354,6 +361,9 @@ resolve_flashvsr_layout(const std::string& root, FlashVsrLayout* out)
     l.context = root;
     l.context_name = "posi_context";
     if (fs::is_directory(r / "vae", ec)) { l.vae = (r / "vae").string(); }
+    if (fs::is_regular_file(r / kTinyDecoder, ec)) {
+      l.tiny_decoder = (r / kTinyDecoder).string();
+    }
     if (out != nullptr) { *out = std::move(l); }
     return true;
   }
@@ -384,6 +394,9 @@ resolve_flashvsr_layout(const std::string& root, FlashVsrLayout* out)
   if (fs::is_regular_file(r / kPublishedVae, ec)) {
     l.vae = (r / kPublishedVae).string();
   }
+  if (fs::is_regular_file(r / kTinyDecoder, ec)) {
+    l.tiny_decoder = (r / kTinyDecoder).string();
+  }
   l.published = true;
   if (out != nullptr) { *out = std::move(l); }
   return true;
@@ -407,9 +420,25 @@ flashvsr_schedule(const std::string& root)
   return flashvsr_schedule(l);
 }
 
+namespace {
+
+// The tiny decoder's weights and scratch at this geometry, when the
+// layout has one and asked for: a stream's beats are whole chunks, and
+// the scratch past one commit's worth does not grow with them.
+bool
+tiny_figures_(const FlashVsrLayout& layout, int width, int height,
+              std::size_t* weights, std::size_t* scratch)
+{
+  return !layout.tiny_decoder.empty() &&
+         FlashVsrTinyDecoder::plan(layout.tiny_decoder, 4, height / 8,
+                                   width / 8, weights, scratch);
+}
+
+}  // namespace
+
 std::size_t
 flashvsr_stream_bytes(const std::string& root, int width, int height,
-                      double kv_ratio)
+                      double kv_ratio, bool tiny)
 {
   if (width <= 0 || height <= 0) { return 0; }
   FlashVsrLayout layout;
@@ -418,36 +447,49 @@ flashvsr_stream_bytes(const std::string& root, int width, int height,
   MetalFlashVsrTransformer::Params prm =
       MetalFlashVsrTransformer::Params::defaults(cfg.schedule);
   prm.kv_ratio = kv_ratio;
+  const std::size_t windows =
+      (std::size_t)MetalFlashVsrTransformer::stream_window_bytes(
+          cfg, height, width, prm);
+  std::size_t tw = 0, ts = 0;
+  if (tiny && tiny_figures_(layout, width, height, &tw, &ts)) {
+    return windows + ts;
+  }
   // The VAE is Wan 2.1's; read its config where the checkpoint has one.
   MetalWanVae::Config vcfg;
   if (!layout.vae.empty() &&
       !MetalWanVae::config_from_json(layout.vae, vcfg, nullptr)) {
     MetalWanVae::config_for_native_checkpoint(layout.vae, vcfg);
   }
-  return (std::size_t)MetalFlashVsrTransformer::stream_window_bytes(
-             cfg, height, width, prm) +
+  return windows +
          MetalWanVae::decode_carry_bytes(vcfg, height / 8, width / 8);
 }
 
 bool
 flashvsr_stream_fits(const std::string& root, int width, int height,
-                     std::size_t* need)
+                     std::size_t* need, bool tiny)
 {
   if (need != nullptr) { *need = 0; }
-  const std::size_t carries = flashvsr_stream_bytes(root, width, height);
+  const std::size_t carries =
+      flashvsr_stream_bytes(root, width, height, 3.0, tiny);
   if (carries == 0) { return false; }
   FlashVsrLayout layout;
   MetalFlashVsrTransformer::Config cfg;
   if (!config_for_root_(root, &layout, &cfg)) { return false; }
+  // The rest of the decode beside its carries: the tiny decoder's
+  // weights (its scratch is all carried), or a whole-plane VAE decode's
+  // working set past its carries.
+  std::size_t tw = 0, ts = 0;
+  const bool small = tiny && tiny_figures_(layout, width, height, &tw, &ts);
   MetalWanVae::Config vcfg;
   if (!layout.vae.empty() &&
       !MetalWanVae::config_from_json(layout.vae, vcfg, nullptr)) {
     MetalWanVae::config_for_native_checkpoint(layout.vae, vcfg);
   }
   const int h8 = height / 8, w8 = width / 8;
-  const std::size_t peak = MetalWanVae::decode_peak_bytes(vcfg, h8, w8);
+  const std::size_t peak =
+      small ? tw : MetalWanVae::decode_peak_bytes(vcfg, h8, w8);
   const std::size_t vae_carries =
-      MetalWanVae::decode_carry_bytes(vcfg, h8, w8);
+      small ? 0 : MetalWanVae::decode_carry_bytes(vcfg, h8, w8);
   // Beside the carries, what a stream cannot do without: the denoiser at
   // its STREAMING floor (a tight box streams its blocks, and a stream
   // asks nothing of their residency), the projection and its working set

@@ -55,6 +55,7 @@
 
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "generative-models/shared/kernel-autotune.h"
+#include "generative-models/shared/tuned-answers.h"
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -62,6 +63,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -298,13 +300,31 @@ struct MmaSplitK {
   // 0.5% of outputs, so a tuner free to choose differently on the next run
   // makes the output irreproducible. Tune once, then keep the result for the
   // process (which is what `tuned` does) -- do not re-tune per turn.
+  //
+  // `caller` names what `run` encodes -- the family, its tile and weight
+  // format ("h3-dit mma128x256 w4g64") -- which this struct cannot see.
+  // Given one, the answer is filed in the session's kept answers and the
+  // next instance to ask it reads it instead of measuring
+  // (tuned-answers.h), which is also what keeps a reloaded model's
+  // output reproducible. Without one it stays this instance's.
   template <class Run>
-  int tune(metal_compute::MetalCompute* mc, int K, int N, int M, Run&& run)
+  int tune(metal_compute::MetalCompute* mc, int K, int N, int M, Run&& run,
+           std::string_view caller = {})
   {
     if (!enabled || mc == nullptr) { return 0; }
     const int key = m_key_(M);
     for (const Tuned& t : tuned) {
       if (t.N == N && t.K == K && t.M == key) { return t.splits; }
+    }
+    KernelTuningCache* const answers =
+        caller.empty() ? nullptr : tuning_cache(mc);
+    const TuneKey skey = TuneKey("mma-splitk/1")("caller", caller)
+        ("plane_mb", (long long)(budget_bytes() >> 20))
+        ("N", N)("K", K)("M", key);
+    int kept = 0;
+    if (find_tuned(answers, skey, kept)) {
+      tuned.push_back(Tuned{N, K, key, kept});
+      return kept;
     }
     // Candidate 0 is "no split". The rest are every exact chunk with a
     // kernel and a row block that fits -- the same filter plan() applies,
@@ -318,6 +338,7 @@ struct MmaSplitK {
     }
     if (cands.size() < 2) {
       tuned.push_back(Tuned{N, K, key, 0});
+      store_tuned(answers, skey, 0);
       return 0;
     }
     const int w = autotune_vote((int)cands.size(), /*rounds=*/3,
@@ -332,6 +353,7 @@ struct MmaSplitK {
         });
     const int splits = cands[(std::size_t)w];
     tuned.push_back(Tuned{N, K, key, splits});
+    store_tuned(answers, skey, splits);
     return splits;
   }
 

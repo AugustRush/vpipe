@@ -1940,6 +1940,10 @@ class MetalMiniMaxH3Transformer {
   // time coming back. `probing` says whether that time is a probe sample.
   int  plan_attn_tile_(bool wide_available, bool streaming);
   void note_attn_tile_(double block_ms);
+  // The session key of the probe's verdict (tuned-answers.h), and the
+  // sequence the probe running now is measuring.
+  TuneKey attn_tile_key_(int seq) const;
+  int     _attn_tile_seq = -1;
   // Rows the GEMM tuner measures at, and therefore the row count a tuned
   // answer is filed under -- see tune_row_key(). Fixed at load from
   // VPIPE_H3_TUNE_ROWS.

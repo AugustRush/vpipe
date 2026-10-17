@@ -70,6 +70,7 @@ host_features() noexcept
     VPIPE_FEATURE_VIDEO_TURN,
     VPIPE_FEATURE_PERF_FLOPS,
     VPIPE_FEATURE_ANE_ADAPTERS,
+    VPIPE_FEATURE_KERNEL_TUNING,
   };
   return kFeatures;
 }

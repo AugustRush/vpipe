@@ -72,6 +72,11 @@ namespace vpipe {
 //                    the rows belong to -- source width, height, frame
 //                    count and row frame count -- because a row count
 //                    alone cannot say which of those produced it.
+//   oport1  color_reference  the source pictures a beat's decode needs:
+//                    the wavelet colour fix's, then the tiny decoder's.
+//                    It BACKPRESSURES (a few beats deep): vae-decode
+//                    reads them as its latents arrive, so the source
+//                    cannot run ahead of the restoration by more.
 //
 // THE PROJECTION IS CAUSAL, which shapes how this stage drives it. It
 // carries the last two input frames of each convolution across calls,
@@ -108,6 +113,12 @@ namespace vpipe {
 //              statistics for the decode's colour fix. Unset, the
 //              release's reference decides: on for v1.1, off for
 //              FlashVSR+.
+//   decoder    ("auto" | "vae" | "tiny") -- what vae-decode decodes the
+//              latents with: the Wan VAE, or the reference's TINY
+//              decoder (TCDecoder.ckpt beside the model), which reads the
+//              source pictures this stage sends on `color_reference`
+//              beside each latent. auto: the release's reference -- tiny
+//              for FlashVSR+ when the file is there, the VAE for v1.1.
 //
 // BOTH RELEASES. FlashVSR-v1.1 and FlashVSR+ (Turbo, Base) project their
 // source the same way and differ in its cadence -- the frames a chunk
@@ -171,61 +182,103 @@ private:
   // Both modes cut the source themselves out of one buffer of frames
   // received and not yet restored: a stream into chunks, clips into
   // overlapping clips.
+  //
+  // TWO TIMELINES. What the model reads is the EXPANDED one: with temporal
+  // compression below 4, every source frame but the first is repeated
+  // r = 4 / compression times, so each latent frame covers fewer source
+  // frames and fast motion gets more of them. Frame counts here --
+  // pending, received, padded, chunk and clip bounds -- are expanded;
+  // what is restored is the SOURCE, frame for frame, so the colour
+  // references, the cross-fade and the output frames count source frames.
+  // src_of_() maps an expanded boundary to the source boundary; cuts are
+  // only ever made where the two agree (on whole runs of r).
   struct ColorStats { float v[6]; };
+  // One beat for each output: the rows; for the wavelet colour fix the
+  // source pictures they restore; for the tiny decoder the source
+  // pictures its decode covers.
+  struct Out {
+    std::unique_ptr<TensorBeatPayload> rows;
+    std::unique_ptr<TensorBeatPayload> refs;
+    std::unique_ptr<TensorBeatPayload> cond;
+  };
   void reset_stream_();
   // Every beat the frames received so far complete; with `flush`, the
   // source has ended and its end is padded with its last frame, as the
   // reference pads it, so every real frame is restored.
-  std::vector<std::unique_ptr<TensorBeatPayload>> drain_(bool flush,
-                                                         std::string* err);
+  std::vector<Out> drain_(bool flush, std::string* err);
   // A stream: run every chunk the frames received complete, appending
   // their rows.
   bool drive_chunks_(bool flush,
                      std::vector<metal_compute::SharedBuffer>* rows,
                      int* chunk0, int* chunks, std::string* err);
-  // Clips: the next one, or null when its frames are not here yet.
-  std::unique_ptr<TensorBeatPayload> next_clip_(bool flush,
-                                                std::string* err);
-  // Chunk `c` of a run that starts at source frame `origin`, through the
-  // projection in the reference's call pattern.
+  // Clips: the next one, or nothing when its frames are not here yet.
+  Out next_clip_(bool flush, std::string* err);
+  // Chunk `c` of a run that starts at expanded frame `origin`, through
+  // the projection in the reference's call pattern.
   bool feed_chunk_(long long origin, int c,
                    std::vector<metal_compute::SharedBuffer>* rows,
                    std::string* err);
   void pad_to_(long long end);
-  void drop_before_(long long g);          // frames and their statistics
-  void drop_before_stats_(long long g);
+  // Expanded frames before `g`, and the per-SOURCE-frame records before
+  // its source frame.
+  void drop_before_(long long g);
+  void drop_records_before_(long long s);
+  long long src_of_(long long e) const noexcept
+  {
+    return e <= 0 ? 0 : 1 + (e - 1) / _r;
+  }
   std::unique_ptr<TensorBeatPayload>
   rows_beat_(const std::vector<metal_compute::SharedBuffer>& rows) const;
   FlexData color_refs_(long long frame0, long long n) const;
-  std::unique_ptr<TensorBeatPayload>
-  stream_beat_(const std::vector<metal_compute::SharedBuffer>& rows,
-               int chunk0, int chunks, bool final_beat);
-  std::unique_ptr<TensorBeatPayload>
-  clip_beat_(const std::vector<metal_compute::SharedBuffer>& rows,
-             int chunks, long long S, long long valid, int head, int tail);
+  // The output frames [s0, s0 + n) of a beat whose decode starts at
+  // expanded frame `e0` and covers `decoded` frames, `valid` of them
+  // real: the merge, the colour fix's references and the tiny decoder's
+  // conditioning, announced on the rows and set on `out`.
+  void finish_beat_(long long e0, long long valid, long long decoded,
+                    long long s0, long long n, Out* out) const;
+  // Pictures [s0, s0 + n) of the records, as one planar U8 beat; null
+  // (and said) when they are no longer held.
+  std::unique_ptr<TensorBeatPayload> pictures_(long long s0, long long n,
+                                               const char* what) const;
+  // Whether the tiny decoder runs: the release asks for it and the
+  // pictures it reads have a consumer.
+  bool tiny_on_() const noexcept { return _tiny && _refs_wired; }
+  Out stream_beat_(const std::vector<metal_compute::SharedBuffer>& rows,
+                   int chunk0, int chunks, bool final_beat);
+  Out clip_beat_(const std::vector<metal_compute::SharedBuffer>& rows,
+                 int chunks, long long S, long long valid, int head,
+                 int tail);
   // A frame's channel statistics in [-1, 1], as the reference's colour
   // fix computes them.
   static ColorStats frame_stats_(const std::uint8_t* px, int H, int W);
 
   bool                      _open = false;    // a source is open
   int                       _sw = 0, _sh = 0; // ...and its geometry
-  // Frames received and not yet done with, from source frame `_pend_g0`.
+  // Expanded frames received and not yet done with, from `_pend_g0`.
   std::vector<std::uint8_t> _pending;
   long long                 _pend_g0 = 0;
-  long long                 _received = 0;   // real frames, this source
+  long long                 _received = 0;   // real frames, expanded
+  long long                 _src_received = 0;  // ...and as the source
   long long                 _padded = 0;     // ...and the end's padding
   std::vector<std::uint8_t> _last_frame;
-  // The colour statistics of frames not yet restored, from `_stats_g0`.
+  // Per SOURCE frame not yet restored, from `_rec_g0`: its colour
+  // statistics (AdaIN) or its picture (the wavelet fix).
   std::vector<ColorStats>   _stats;
-  long long                 _stats_g0 = 0;
+  std::vector<std::vector<std::uint8_t>> _pics;
+  long long                 _rec_g0 = 0;
   bool                      _overlap_noted = false;
   // A stream: the next chunk.
   int                       _next_chunk = 0;
   // Clips: where the next starts, where the last one's restored frames
-  // end, and how many have gone.
+  // end (both expanded), and how many have gone.
   long long                 _clip_s = 0;
   long long                 _covered = 0;
   int                       _clips = 0;
+  // Whether the color_reference output has a consumer, and whether its
+  // absence has been said.
+  bool                      _refs_wired = false;
+  bool                      _refs_noted = false;
+  bool                      _tiny_noted = false;
 #endif
   std::string   _hf_dir;
   bool          _model_latched = false;
@@ -238,6 +291,23 @@ private:
   int           _cfg_clip_frames = 0;     // 0: the release's own
   int           _clip_frames = 41;
   int           _blend_frames = 8;
+  // The colour fix's method, as configured and as resolved for the
+  // loaded release (off when the fix is), and the wavelet's levels.
+  enum class ColorFix { kAuto, kOff, kAdain, kWavelet };
+  ColorFix      _cfg_method = ColorFix::kAuto;
+  ColorFix      _method = ColorFix::kAdain;
+  int           _wavelet_levels = 5;
+  // The decoder: as configured, and resolved for the loaded release --
+  // the tiny one where it asks for it and TCDecoder.ckpt is there.
+  enum class Decoder { kAuto, kVae, kTiny };
+  Decoder       _cfg_decoder = Decoder::kAuto;
+  bool          _tiny = false;
+  // TEMPORAL COMPRESSION: input frames per latent frame (4, 2 or 1); each
+  // source frame but the first is fed r = 4 / it times, and the decode
+  // merges every run of r back with `_merge_w`.
+  int           _tc = 4;
+  int           _r = 1;
+  std::vector<float> _merge_w;
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // The loaded release's cadence; v1.1's until a model loads.
   genai::MetalFlashVsrTransformer::Schedule _sch;

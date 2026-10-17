@@ -395,7 +395,8 @@ bool
 xet_fetch(const SessionContextIntf* s, const XetSource& src,
           const string& hf_token, const FetchOpts& o, const fs::path& part,
           std::uint64_t total, string& err, UiProgress* progress,
-          const std::function<bool()>* cancel)
+          const std::function<bool()>* cancel,
+          const std::function<void(std::uint64_t)>* on_bytes)
 {
   if (src.hash.empty() || src.repo.empty() || o.xet_streams == 0) {
     err = "no xet hash for this file";
@@ -543,7 +544,7 @@ xet_fetch(const SessionContextIntf* s, const XetSource& src,
           if (c > given)      { credit.fetch_add(c - given); }
           else if (c < given) { credit.fetch_sub(given - c); }
           given = c;
-          if (!progress) { return; }
+          if (!progress && !on_bytes) { return; }
           // Whoever gets there first pushes for everyone, and the value
           // is the total across all eight, so it does not matter which
           // worker that is.
@@ -555,8 +556,11 @@ xet_fetch(const SessionContextIntf* s, const XetSource& src,
             return;
           }
           const std::uint64_t d = have0 + credit.load();
-          progress->update(d, total,
-                           human_bytes(d) + " / " + human_bytes(total));
+          if (on_bytes) { (*on_bytes)(d); }
+          if (progress) {
+            progress->update(d, total,
+                             human_bytes(d) + " / " + human_bytes(total));
+          }
         };
         for (unsigned a = 0; a <= o.retries && !ok; ++a) {
           if (cancel && (*cancel)()) { break; }
@@ -698,6 +702,7 @@ xet_fetch(const SessionContextIntf* s, const XetSource& src,
       // Land exactly on the finished size. The in-flight report is
       // pushed on a clock, so the last one can be half a second short of
       // the end -- and nothing reports this file again.
+      if (on_bytes) { (*on_bytes)(have); }
       if (progress) {
         progress->update(have, total,
                          human_bytes(have) + " / " + human_bytes(total));

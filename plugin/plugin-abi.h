@@ -95,11 +95,17 @@
 //                      stages up to ane::kMaxAdapters (8) adapters a
 //                      projection, lora0 .. lora7; a host without it
 //                      takes lora0 and lora1 and refuses the rest
+//   kernel-tuning      interfaces/session-services-intf.h: the session's
+//                      KernelTuningCache, the answers kernel tuners
+//                      measured kept for the session, found by service
+//                      id -- null on a host without it, so never list
+//                      it as required (the toolkit's tuners ask for it)
 #define VPIPE_FEATURE_KERNEL_CONTRACT_2 "kernel-contract/2"
 #define VPIPE_FEATURE_CONTENT_SCREEN    "content-screen/1"
 #define VPIPE_FEATURE_VIDEO_TURN        "video-turn/1"
 #define VPIPE_FEATURE_PERF_FLOPS        "perf-flops/1"
 #define VPIPE_FEATURE_ANE_ADAPTERS      "ane-adapters/1"
+#define VPIPE_FEATURE_KERNEL_TUNING     "kernel-tuning/1"
 
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }

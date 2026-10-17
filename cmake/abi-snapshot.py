@@ -150,6 +150,22 @@ def walk_ast(text, stable):
             for c in node.get("inner", []):
                 visit(c, scope, True, internal)
             return
+        # An EXPLICIT specialization is a class of its own, named by its
+        # arguments: `ServiceId<vpipe::LmdbEnv>`. Walked without its name,
+        # every ServiceId<T>::value landed on one key, `vpipe::value`, and
+        # the snapshot held whichever was declared last -- a new service
+        # read as the previous one's id changing, and a real change to
+        # any but the last went unseen.
+        if kind == "ClassTemplateSpecializationDecl":
+            args = [c.get("type", {}).get("qualType", "")
+                    for c in node.get("inner", [])
+                    if c.get("kind") == "TemplateArgument"]
+            spec = "%s<%s>" % (name, ", ".join(args))
+            for c in node.get("inner", []):
+                if c.get("kind") == "CXXRecordDecl" and c.get("isImplicit"):
+                    continue
+                visit(c, scope + [spec], in_template, internal)
+            return
         if kind == "CXXRecordDecl":
             q = "::".join(scope + [name])
             ok = (name and not in_template and not internal and

@@ -394,6 +394,18 @@ record vpipe::Job::promise_type
   20 | struct std::atomic<_Bool> _quiescent
   | [sizeof=24, dsize=21, align=8,
   | nvsize=21, nvalign=8]
+record vpipe::KernelTuningCache
+  0 | class vpipe::KernelTuningCache
+  0 | (KernelTuningCache vtable pointer)
+  | [sizeof=8, dsize=8, align=8,
+  | nvsize=8, nvalign=8]
+record vpipe::KernelTuningCache::Stats
+  0 | struct vpipe::KernelTuningCache::Stats
+  0 | std::uint64_t entries
+  8 | std::uint64_t hits
+  16 | std::uint64_t misses
+  | [sizeof=24, dsize=24, align=8,
+  | nvsize=24, nvalign=8]
 record vpipe::LogSinkIntf
   0 | class vpipe::LogSinkIntf
   0 | (LogSinkIntf vtable pointer)
@@ -1771,6 +1783,11 @@ class vpipe::FsSandboxIntf
   fs_sandboxed bool () const
   fs_sandbox_root std::filesystem::path () const
   fs_whitelist std::vector<std::filesystem::path> () const
+class vpipe::KernelTuningCache
+  ~KernelTuningCache void ()
+  find bool (std::string_view, std::string &) const = 0
+  store void (std::string_view, std::string_view) = 0
+  stats Stats () const = 0
 class vpipe::LogSinkIntf
   ~LogSinkIntf void () noexcept
   error void (const VpipeFormat &) const = 0
@@ -3024,6 +3041,12 @@ vtable for vpipe::genai::WeightSet
 vtable for vpipe::metal_compute::MetalCompute
 
 [keys]
+vpipe::ServiceId<vpipe::CoreMLModelManager>::value = "vpipe.coreml/1"
+vpipe::ServiceId<vpipe::FFmpegLibraries>::value = "vpipe.ffmpeg/1"
+vpipe::ServiceId<vpipe::KernelTuningCache>::value = "vpipe.kernel-tuning/1"
+vpipe::ServiceId<vpipe::LmdbEnv>::value = "vpipe.lmdb/1"
+vpipe::ServiceId<vpipe::genai::GenerativeModelManager>::value = "vpipe.genai/1"
+vpipe::ServiceId<vpipe::metal_compute::MetalCompute>::value = "vpipe.metal-compute/1"
 vpipe::beat::kAllowEmpty = "allow_empty"
 vpipe::beat::kBatch = "batch"
 vpipe::beat::kHfDir = "hf_dir"
@@ -3242,4 +3265,3 @@ vpipe::sideband::kSourceBits = "source_bits"
 vpipe::spec_key::kCategory = "category"
 vpipe::spec_key::kChoices = "choices"
 vpipe::spec_key::kSince = "since"
-vpipe::value = "vpipe.metal-compute/1"

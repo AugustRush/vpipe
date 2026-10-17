@@ -11,6 +11,7 @@
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
+#include "generative-models/flashvsr/flashvsr-family.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/weight-set.h"
@@ -98,6 +99,9 @@ namespace {
 // the primary `latent` input, so it is iport1. (Referenced only from the
 // Apple-gated code below; marked maybe_unused for the inert non-Apple build.)
 [[maybe_unused]] constexpr unsigned kModelPort = 1;
+// The wavelet colour fix's source pictures, read in lockstep with the
+// latents that announce them (sideband::kColorRefFrames).
+[[maybe_unused]] constexpr unsigned kColorRefPort = 2;
 
 // MiniMax-H3's video VAE works in IMAGENET-normalized pixel space, so
 // its decoder's output has to be un-normalized before it means [0, 1].
@@ -196,6 +200,15 @@ const PortSpec kIports[] = {
   {.name = "model", .doc = "OPTIONAL shared model reference from a model-select "
                            "source; overrides the hf_dir config",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
+  {.name = "color_reference",
+   .doc = "OPTIONAL source pictures, planar [n, 3, H, W] (U8, F16 or F32): "
+          "one beat for each that a latent's sideband announces -- "
+          "`color_ref_frames` for the WAVELET colour fix, then "
+          "`decoder_cond_frames` for a TINY decoder that reads the source "
+          "beside the latent (FlashVSR's, which then decodes in place of "
+          "the VAE) -- and read only for those. flashvsr-src-encoder's "
+          "`color_reference` output",
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
 };
 const PortSpec kOports[] = {
   {.name = "image",
@@ -289,7 +302,10 @@ VaeDecodeStage::reset_run_state()
   _model_latched = false;
   // A stream belongs to the run that opened it.
   _wan_stream.reset();
+  _tiny_stream.reset();
+  if (!_tiny) { _tiny_tried = false; }
   _held.clear();
+  _ref_port_noted = false;
 
   // Both are measurements of the PREVIOUS run's beats. The ratchet in
   // particular: a 2048^2 clip in run 1 must not keep this stage
@@ -589,7 +605,7 @@ VaeDecodeStage::unload_vae_()
   // never unloaded a Wan VAE at all: with only _wan_vae held every
   // tested pointer was null and this returned early.
   if (!_vae && !_flux2_vae && !_wan_vae && !_h3_vae &&
-      !_plugin_dec) {
+      !_plugin_dec && !_tiny) {
     return;
   }
   // SETTLED when the policy is `auto`. The manager owns the checkpoint,
@@ -603,6 +619,15 @@ VaeDecodeStage::unload_vae_()
   _wan_vae.reset();
   _h3_vae.reset();
   _plugin_dec.reset();
+  // The tiny decoder's MemBlock memories are its scratch: an open stream
+  // keeps it, and it goes with the stream's last beat.
+  if (_tiny && !_tiny_stream) {
+    _tiny.reset();
+    _tiny_tried = false;
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      mgr->pool_weights(_tiny_path);
+    }
+  }
   // SETTLE IT NOW that the borrow has ended. `destroy` is the caller
   // asking for the bytes back, which parking does not do; anything else
   // keeps the checkpoint for the next clip, purgeable, so a peer that
@@ -629,6 +654,80 @@ VaeDecodeStage::reload_vae_()
   _unloaded = false;
   _load_attempted = false;      // let ensure_loaded_ run its body again
   ensure_loaded_();
+}
+
+bool
+VaeDecodeStage::ensure_wan_vae_()
+{
+  if (_wan_vae) { return true; }
+  if (!_wan_deferred) { return false; }
+  _wan_deferred = false;
+  auto* mc = session()->services()->metal_compute();
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  const std::string vae_dir = resolve_vae_dir(root);
+  genai::MetalWanVae::Config wcfg;
+  std::string werr;
+  if (!genai::MetalWanVae::config_from_json(vae_dir, wcfg, &werr) &&
+      !genai::MetalWanVae::config_for_native_checkpoint(vae_dir, wcfg)) {
+    session()->error(fmt(
+        "VaeDecodeStage('{}'): {}; inert", this->id(), werr));
+    return false;
+  }
+  std::shared_ptr<genai::WeightSet> ws =
+      genai::open_weight_set(resolve_vae_weights_path(vae_dir), session());
+  if (mc == nullptr || !ws) {
+    session()->error(fmt(
+        "VaeDecodeStage('{}'): no readable checkpoint under '{}'; inert",
+        this->id(), vae_dir));
+    return false;
+  }
+  load_note_(fmt("VaeDecodeStage('{}'): loading Wan video VAE from '{}'",
+                 this->id(), vae_dir));
+  // Decode-only: the encoder half is the vae-encode stage's business.
+  _wan_vae = genai::MetalWanVae::load(ws, mc, wcfg, /*with_encoder=*/false);
+  if (!_wan_vae) {
+    session()->error(fmt(
+        "VaeDecodeStage('{}'): failed to load the Wan VAE from '{}'; inert",
+        this->id(), vae_dir));
+  }
+  return _wan_vae != nullptr;
+}
+
+bool
+VaeDecodeStage::ensure_tiny_()
+{
+  if (_tiny) { return true; }
+  if (_tiny_tried) { return false; }
+  _tiny_tried = true;
+  auto* mc = session()->services()->metal_compute();
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  genai::FlashVsrLayout layout;
+  if (!genai::resolve_flashvsr_layout(root, &layout) ||
+      layout.tiny_decoder.empty()) {
+    session()->warn(fmt(
+        "VaeDecodeStage('{}'): the latents ask for the model's tiny decoder "
+        "and '{}' has no {} beside it; decoding with the VAE", this->id(),
+        root, genai::FlashVsrTinyDecoder::kFile));
+    return false;
+  }
+  std::string err;
+  _tiny_path = layout.tiny_decoder;
+  if (mc != nullptr) {
+    _tiny = genai::FlashVsrTinyDecoder::load(
+        genai::open_weight_set(_tiny_path, session()), mc, &err);
+  }
+  if (!_tiny) {
+    session()->warn(fmt(
+        "VaeDecodeStage('{}'): the tiny decoder at '{}' did not load ({}); "
+        "decoding with the VAE", this->id(), _tiny_path,
+        err.empty() ? "no metal-compute backend" : err));
+    return false;
+  }
+  load_note_(fmt(
+      "VaeDecodeStage('{}'): loading FlashVSR's tiny decoder from '{}' -- "
+      "a TAEHV decoder conditioned on the source pictures", this->id(),
+      _tiny_path));
+  return true;
 }
 
 void
@@ -882,23 +981,10 @@ VaeDecodeStage::ensure_loaded_()
     return;
   }
   if (_family == "wan") {
-    genai::MetalWanVae::Config wcfg;
-    std::string werr;
-    if (!genai::MetalWanVae::config_from_json(vae_dir, wcfg, &werr) &&
-        !genai::MetalWanVae::config_for_native_checkpoint(vae_dir, wcfg)) {
-      session()->error(fmt(
-          "VaeDecodeStage('{}'): {}; inert", this->id(), werr));
-      return;
-    }
-    load_note_(fmt("VaeDecodeStage('{}'): loading Wan video VAE from '{}'",
-                   this->id(), vae_dir));
-    // Decode-only: the encoder half is the vae-encode stage's business.
-    _wan_vae = genai::MetalWanVae::load(ws, mc, wcfg, /*with_encoder=*/false);
-    if (!_wan_vae) {
-      session()->error(fmt(
-          "VaeDecodeStage('{}'): failed to load the Wan VAE from '{}'; inert",
-          this->id(), vae_dir));
-    }
+    // Deferred while the latents ask for the tiny decoder (FlashVSR):
+    // loaded by the first one that does not.
+    _wan_deferred = true;
+    if (!_want_tiny) { ensure_wan_vae_(); }
     return;
   }
 
@@ -1163,6 +1249,16 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     _held.clear();
     ctx.signal_done();
     co_return;
+  }
+  // A latent its model's TINY decoder decodes needs no VAE weights: read
+  // its ask before anything loads, so they wait for a latent that does.
+  _want_tiny = false;
+  if (const auto* lt = dynamic_cast<const TensorBeatPayload*>(in.get());
+      lt != nullptr && lt->sideband.is_object()) {
+    FlexData sb = lt->sideband;          // as_object() is a view: keep it
+    auto o = sb.as_object();
+    _want_tiny = o.contains(sideband::kDecoder) &&
+                 o.at(sideband::kDecoder).as_string() == "tiny";
   }
   // NOW there is work for it. First latent => first load (the model-select
   // branch above deliberately only recorded the directory); a later one =>
@@ -1827,11 +1923,6 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   // downstream (save-image, rgb-to-video -> save-video, a preview) is the
   // per-frame machinery that already exists. ----
   if (_family == "wan") {
-    if (!_wan_vae) {
-      session()->warn(fmt(
-          "VaeDecodeStage('{}'): Wan VAE not loaded; skipping", this->id()));
-      co_return;
-    }
     if (tbp->shape.size() != 4) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): the Wan VAE decodes a VIDEO latent "
@@ -1843,13 +1934,6 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     const int T  = (int)tbp->shape[1];
     const int h8 = (int)tbp->shape[2];
     const int w8 = (int)tbp->shape[3];
-    if (Cz != _wan_vae->config().z_dim || T <= 0 || h8 <= 0 || w8 <= 0) {
-      session()->warn(fmt(
-          "VaeDecodeStage('{}'): latent [{}, {}, {}, {}] does not match z_dim "
-          "{}; skipping", this->id(), Cz, T, h8, w8,
-          _wan_vae->config().z_dim));
-      co_return;
-    }
     // The producer knows the clip's rate; the config is the fallback for a
     // latent that arrived from somewhere else (a file, a test).
     double fps = _fps;
@@ -1860,6 +1944,13 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     long long valid = -1;
     int blend_head = 0, blend_tail = 0;
     std::vector<std::array<float, 6>> color_ref;
+    // A source fed several times: runs of decoded frames merged back into
+    // one, after `merge_lead` that pass alone. And the wavelet colour
+    // fix's source pictures, announced here and read below.
+    std::vector<float> merge_w;
+    int merge_lead = 0, ref_frames = 0, ref_levels = 5;
+    // The decoder the latent asks for, and the tiny one's source pictures.
+    int cond_frames = 0;
     if (tbp->sideband.is_object()) {
       FlexData sb = tbp->sideband;        // as_object() is a view: keep it
       auto o = sb.as_object();
@@ -1882,6 +1973,27 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       if (o.contains(sideband::kBlendTail)) {
         blend_tail = (int)o.at(sideband::kBlendTail).as_int(0);
       }
+      if (o.contains(sideband::kMergeWeights)) {
+        FlexData mw = o.at(sideband::kMergeWeights);   // keep the owner
+        if (mw.is_array()) {
+          for (const FlexData& x : mw.as_array()) {
+            merge_w.push_back((float)x.as_real(0.0));
+          }
+        }
+      }
+      if (o.contains(sideband::kMergeLead)) {
+        merge_lead = (int)o.at(sideband::kMergeLead).as_int(0);
+      }
+      if (o.contains(sideband::kColorRefFrames)) {
+        ref_frames = (int)o.at(sideband::kColorRefFrames).as_int(0);
+      }
+      if (o.contains(sideband::kColorRefLevels)) {
+        ref_levels = std::clamp(
+            (int)o.at(sideband::kColorRefLevels).as_int(5), 1, 12);
+      }
+      if (o.contains(sideband::kDecoderCondFrames)) {
+        cond_frames = (int)o.at(sideband::kDecoderCondFrames).as_int(0);
+      }
       if (o.contains(sideband::kColorRef)) {
         FlexData refs = o.at(sideband::kColorRef);   // keep the view's owner
         if (refs.is_array()) {
@@ -1900,6 +2012,67 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         }
       }
     }
+    // THE PICTURES this latent announces, read NOW, before anything below
+    // can skip it: they come in lockstep with the latents, so a beat left
+    // unread pairs with the next latent -- and the producer waits on this
+    // input. The colour fix's first, then the tiny decoder's.
+    const bool pics_wired = ctx.num_iports() > kColorRefPort &&
+                            ctx.iport_connected(kColorRefPort);
+    std::unique_ptr<BeatPayloadIntf> ref_in, cond_in;
+    if (pics_wired && ref_frames > 0) {
+      ref_in = co_await ctx.read(kColorRefPort);
+    }
+    if (pics_wired && cond_frames > 0) {
+      cond_in = co_await ctx.read(kColorRefPort);
+    }
+    if (!pics_wired && (ref_frames > 0 || cond_frames > 0) &&
+        !_ref_port_noted) {
+      _ref_port_noted = true;
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): latents announce source pictures (for {}), "
+          "but nothing is wired to the color_reference input (iport {}); "
+          "restoring without them", this->id(),
+          ref_frames > 0 ? "the wavelet colour fix" : "the tiny decoder",
+          kColorRefPort));
+    }
+    // THE DECODER: the model's tiny one where the latent asks and its
+    // pictures came, else the VAE.
+    const auto* cond_tb =
+        cond_in ? dynamic_cast<const TensorBeatPayload*>(cond_in.get())
+                : nullptr;
+    bool tiny = _want_tiny && cond_tb != nullptr && ensure_tiny_();
+    if (tiny && (cond_tb->dtype != TensorBeat::DType::U8 &&
+                 cond_tb->dtype != TensorBeat::DType::F16 &&
+                 cond_tb->dtype != TensorBeat::DType::F32)) {
+      tiny = false;
+    }
+    if (tiny && (!cond_tb->strides.empty() || cond_tb->shape.size() != 4 ||
+                 cond_tb->shape[0] != cond_frames || cond_frames <= 0 ||
+                 cond_tb->shape[1] != 3 || cond_tb->shape[2] != h8 * 8 ||
+                 cond_tb->shape[3] != w8 * 8)) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): the tiny decoder's pictures are {}, not {} "
+          "planar [3, {}, {}] pictures; decoding this latent with the VAE",
+          this->id(), cond_in->describe(), cond_frames, h8 * 8, w8 * 8));
+      tiny = false;
+    }
+    if (_want_tiny && !tiny && cond_in == nullptr && pics_wired) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): the latent asks for the tiny decoder and "
+          "announces no pictures for it; decoding with the VAE", this->id()));
+    }
+    if (!tiny && !ensure_wan_vae_()) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): Wan VAE not loaded; skipping", this->id()));
+      co_return;
+    }
+    const int z_dim = tiny ? 16 : _wan_vae->config().z_dim;
+    if (Cz != z_dim || T <= 0 || h8 <= 0 || w8 <= 0) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): latent [{}, {}, {}, {}] does not match z_dim "
+          "{}; skipping", this->id(), Cz, T, h8, w8, z_dim));
+      co_return;
+    }
     // THE DECODE CONTINUES a stream's carries from the beat before, so a
     // cut between latents is no cut in the frames. A beat that opens a
     // stream starts fresh carries; one that continues a stream this stage
@@ -1907,28 +2080,88 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // decodes cold, which is the seam a stream exists to remove -- said.
     // A beat that opens and ends its stream at once -- a clip -- needs no
     // carries kept, and decoding it without them leaves it free to tile.
-    if (!in_stream || (!continues && final_beat)) {
+    const auto cold_note = [&] {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): this latent continues a stream whose "
+          "earlier beats this stage holds no decode carries for; decoding "
+          "it cold, which shows as a change where it begins", this->id()));
+    };
+    if (tiny) {
+      // The tiny decoder's memories, carried while the source is one
+      // stream; a beat that stands alone opens (and ends) its own.
+      _wan_stream.reset();
+      if (!in_stream || !continues || !_tiny_stream) {
+        if (in_stream && continues) { cold_note(); }
+        _tiny_stream =
+            std::make_unique<genai::FlashVsrTinyDecoder::Stream>();
+      }
+    } else if (!in_stream || (!continues && final_beat)) {
+      _tiny_stream.reset();
       _wan_stream.reset();
     } else if (!continues || !_wan_stream || _wan_stream->frames == 0) {
-      if (continues) {
-        session()->warn(fmt(
-            "VaeDecodeStage('{}'): this latent continues a stream whose "
-            "earlier beats this stage holds no decode carries for; decoding "
-            "it cold, which shows as a change where it begins", this->id()));
-      }
+      _tiny_stream.reset();
+      if (continues) { cold_note(); }
       _wan_stream = std::make_unique<genai::MetalWanVae::DecodeStream>();
     }
-    long long base = _wan_stream ? _wan_stream->frames : 0;
+    long long base = tiny         ? _tiny_stream->frames
+                     : _wan_stream ? _wan_stream->frames
+                                   : 0;
     // A continued decode's first latent frame is four frames, not one.
     const int F_dec = base > 0 ? 4 * T : genai::MetalWanVae::video_frames(T);
     const int F = (valid >= 0 && valid < F_dec) ? (int)valid : F_dec;
     const int H = h8 * 8, W = w8 * 8;
+    // THE MERGE, for a source its producer fed several times: after the
+    // lead, each run of r decoded frames is one output frame. Everything
+    // below that counts frames -- the colour references, the cross-fade,
+    // the frame index on the beats -- counts the merged ones.
+    const int r = merge_w.size() > 1 ? (int)merge_w.size() : 1;
+    const int lead = r > 1 ? std::clamp(merge_lead, 0, F) : 0;
+    int F_out = F;
+    if (r > 1) {
+      if ((F - lead) % r != 0) {
+        session()->warn(fmt(
+            "VaeDecodeStage('{}'): {} decoded frames after a lead of {} are "
+            "not whole runs of {} to merge; the last {} are dropped",
+            this->id(), F - lead, lead, r, (F - lead) % r));
+      }
+      F_out = lead + (F - lead) / r;
+    }
+    // THE WAVELET COLOUR FIX's source pictures, read above in lockstep
+    // with the latent.
+    const TensorBeatPayload* ref_tb = nullptr;
+    if (ref_frames > 0 && ref_in) {
+      ref_tb = dynamic_cast<const TensorBeatPayload*>(ref_in.get());
+      const bool ok_dtype =
+          ref_tb != nullptr && (ref_tb->dtype == TensorBeat::DType::U8 ||
+                                ref_tb->dtype == TensorBeat::DType::F16 ||
+                                ref_tb->dtype == TensorBeat::DType::F32);
+      if (!ok_dtype || !ref_tb->strides.empty() ||
+          ref_tb->shape.size() != 4 ||
+          ref_tb->shape[0] != F_out || ref_tb->shape[1] != 3 ||
+          ref_tb->shape[2] != H || ref_tb->shape[3] != W) {
+        session()->warn(fmt(
+            "VaeDecodeStage('{}'): the colour reference is {}, not {} "
+            "planar [3, {}, {}] pictures; restoring this latent without "
+            "the wavelet colour fix", this->id(), ref_in->describe(), F_out,
+            H, W));
+        ref_tb = nullptr;
+      }
+      if (ref_tb != nullptr && !_wavelet) {
+        _wavelet = std::make_unique<WaveletColorFix>(mc);
+      }
+      if (ref_tb != nullptr && !_wavelet->valid()) {
+        session()->warn(fmt(
+            "VaeDecodeStage('{}'): the wavelet colour fix's kernel is "
+            "unavailable; restoring without it", this->id()));
+        ref_tb = nullptr;
+      }
+    }
     // THE CROSS-FADE between overlapping clips. Frames held from the beat
     // before that this one does not blend go out first, as they are; a
     // blend can take no more than were held, nor more than this beat has.
     std::vector<std::unique_ptr<TensorBeatPayload>> frames;
-    frames.reserve((std::size_t)F);
-    blend_head = std::clamp(blend_head, 0, F);
+    frames.reserve((std::size_t)F_out);
+    blend_head = std::clamp(blend_head, 0, F_out);
     if (blend_head > (int)_held.size()) {
       if (!_held.empty() || blend_head > 0) {
         session()->warn(fmt(
@@ -1944,19 +2177,24 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       }
       if (blend_head == 0) { _held.clear(); }
     }
-    blend_tail = std::clamp(blend_tail, 0, F - blend_head);
+    blend_tail = std::clamp(blend_tail, 0, F_out - blend_head);
     std::vector<HeldFrame> new_held;
 
-    const std::size_t nz = (std::size_t)Cz * T * h8 * w8;
-    metal_compute::SharedBuffer z = mc->make_shared_buffer(nz * 2);
-    { auto* d = static_cast<_Float16*>(z.contents());
-      const float* s = tbp->as_f32();
-      for (std::size_t i = 0; i < nz; ++i) { d[i] = (_Float16)s[i]; } }
-    metal_compute::SharedBuffer zw = _wan_vae->unwhiten(z, T, h8, w8);
-    if (zw.empty()) {
-      session()->warn(fmt(
-          "VaeDecodeStage('{}'): un-whiten failed; skipping", this->id()));
-      co_return;
+    // The VAE's input: f16, un-whitened. The tiny decoder reads the
+    // latent as the denoiser left it.
+    metal_compute::SharedBuffer zw;
+    if (!tiny) {
+      const std::size_t nz = (std::size_t)Cz * T * h8 * w8;
+      metal_compute::SharedBuffer z = mc->make_shared_buffer(nz * 2);
+      { auto* d = static_cast<_Float16*>(z.contents());
+        const float* s = tbp->as_f32();
+        for (std::size_t i = 0; i < nz; ++i) { d[i] = (_Float16)s[i]; } }
+      zw = _wan_vae->unwhiten(z, T, h8, w8);
+      if (zw.empty()) {
+        session()->warn(fmt(
+            "VaeDecodeStage('{}'): un-whiten failed; skipping", this->id()));
+        co_return;
+      }
     }
 
     // The VAE streams its output a chunk at a time so a long clip never
@@ -1968,102 +2206,188 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // replaces (81 frames of 480x832 = 97 MB), not the f16 working set the
     // chunking exists to bound.
     std::vector<float> unit((std::size_t)3 * H * W);
+    const std::size_t hw = (std::size_t)H * W;
+    const std::size_t per = 3 * hw;
+    // One OUTPUT frame, in [-1, 1]: its colour fix, the cross-fade, and out
+    // -- or held back for the next beat's blend.
+    std::vector<float> refbuf;
+    auto finish = [&](int o, std::vector<float>& x) {
+      const std::array<float, 6>* ref =
+          o < (int)color_ref.size() ? &color_ref[(std::size_t)o] : nullptr;
+      if (ref != nullptr && hw > 1) {
+        // THE REFERENCE'S COLOUR FIX (v1.1): each channel's mean and
+        // spread moved to the source frame's (AdaIN, the unbiased variance
+        // plus 1e-5), then clamped to the decode's range.
+        for (int c = 0; c < 3; ++c) {
+          float* p = x.data() + (std::size_t)c * hw;
+          double sum = 0.0, sq = 0.0;
+          for (std::size_t i = 0; i < hw; ++i) {
+            sum += (double)p[i];
+            sq += (double)p[i] * (double)p[i];
+          }
+          const double mu = sum / (double)hw;
+          const double var =
+              std::max(0.0, (sq - (double)hw * mu * mu) / (double)(hw - 1));
+          const double sd = std::sqrt(var + 1e-5);
+          const float scale = (float)((*ref)[3 + c] / sd);
+          const float shift = (float)((*ref)[c] - mu * (*ref)[3 + c] / sd);
+          for (std::size_t i = 0; i < hw; ++i) {
+            p[i] = std::clamp(p[i] * scale + shift, -1.0f, 1.0f);
+          }
+        }
+      } else if (ref_tb != nullptr && o < F_out) {
+        // THE WAVELET COLOUR FIX (FlashVSR+): the frame's low frequencies
+        // from its source picture, its detail its own.
+        refbuf.resize(per);
+        const std::size_t at = (std::size_t)o * per;
+        if (ref_tb->dtype == TensorBeat::DType::U8) {
+          const std::uint8_t* rp8 = ref_tb->as_u8() + at;
+          for (std::size_t i = 0; i < per; ++i) {
+            refbuf[i] = (float)rp8[i] / 127.5f - 1.0f;
+          }
+        } else if (ref_tb->dtype == TensorBeat::DType::F16) {
+          const auto* rp16 =
+              reinterpret_cast<const _Float16*>(ref_tb->as_f16()) + at;
+          for (std::size_t i = 0; i < per; ++i) {
+            refbuf[i] = 2.0f * (float)rp16[i] - 1.0f;
+          }
+        } else {
+          const float* rp32 = ref_tb->as_f32() + at;
+          for (std::size_t i = 0; i < per; ++i) {
+            refbuf[i] = 2.0f * rp32[i] - 1.0f;
+          }
+        }
+        std::string werr;
+        if (!_wavelet->apply(x.data(), refbuf.data(), H, W, ref_levels,
+                             &werr)) {
+          session()->warn(fmt(
+              "VaeDecodeStage('{}'): wavelet colour fix failed ({}); this "
+              "frame goes out without it", this->id(), werr));
+        }
+      }
+      auto out = std::make_unique<TensorBeatPayload>();
+      out->dtype = _out_dtype;
+      out->shape = {3, H, W};
+      out->resize_contiguous(per);
+      for (std::size_t i = 0; i < per; ++i) { unit[i] = (x[i] + 1.0f) * 0.5f; }
+      // A frame the last beat also restored: a raised cosine from its
+      // copy to this one, so neither clip's start or end is seen alone.
+      if (o < blend_head) {
+        const HeldFrame& h = _held[(std::size_t)o];
+        const float w = (float)(0.5 - 0.5 * std::cos(
+            M_PI * (double)(o + 1) / (double)(blend_head + 1)));
+        for (std::size_t i = 0; i < unit.size(); ++i) {
+          unit[i] = (1.0f - w) * h.unit[i] + w * unit[i];
+        }
+      }
+      for (std::size_t i = 0; i < unit.size(); ++i) {
+        put_unit_(*out, i, unit[i]);
+      }
+      FlexData sb = FlexData::make_object();
+      sb.as_object().insert_or_assign(sideband::kFrame,
+                                      FlexData::make_int((std::int64_t)o));
+      sb.as_object().insert_or_assign(
+          sideband::kFrames, FlexData::make_int((std::int64_t)F_out));
+      sb.as_object().insert_or_assign(sideband::kFps,
+                                      FlexData::make_real(fps));
+      out->sideband = std::move(sb);
+      forward_model_name_(*tbp, *out);
+      // The next beat repeats this one's last frames: hold them for it.
+      if (o >= F_out - blend_tail) {
+        HeldFrame h;
+        h.unit = unit;
+        h.H = H;
+        h.W = W;
+        h.sb = out->sideband;
+        new_held.push_back(std::move(h));
+        return;
+      }
+      frames.push_back(std::move(out));
+    };
+    // The decoded frame in [-1, 1], and the run being merged.
+    std::vector<float> xf(per), acc;
+    if (r > 1) { acc.assign(per, 0.0f); }
+    // Decoded frame `local` of this beat, in `xf`: into its run, or
+    // finished as it is.
+    auto take = [&](long long local) {
+      if (r == 1 || local < lead) {
+        finish((int)local, xf);
+        return;
+      }
+      // A RUN: the weighted sum of its r decoded frames, in f32 as the
+      // reference sums it. Runs never straddle a beat (the producer cuts
+      // on whole runs), but they do straddle the decode's chunks, which
+      // is why the sum lives out here.
+      const int slot = (int)((local - lead) % r);
+      const float w = merge_w[(std::size_t)slot];
+      for (std::size_t i = 0; i < per; ++i) {
+        acc[i] = (slot == 0 ? 0.0f : acc[i]) + w * xf[i];
+      }
+      if (slot == r - 1) {
+        finish(lead + (int)((local - lead) / r), acc);
+      }
+    };
     auto sink = [&](const metal_compute::SharedBuffer& rgb, int frame0,
                     int n) -> bool {
       const auto* rp = static_cast<const _Float16*>(rgb.contents());
-      const std::size_t per = (std::size_t)3 * H * W;
-      const std::size_t hw = (std::size_t)H * W;
       for (int k = 0; k < n; ++k) {
         // This beat's own index of the frame: a stream's decode counts
         // from the stream's start.
         const long long local = (long long)frame0 + k - base;
         // The stream's padding, past its last real frame.
         if (local < 0 || local >= F) { continue; }
-        auto out = std::make_unique<TensorBeatPayload>();
-        out->dtype = _out_dtype;
-        out->shape = {3, H, W};
-        out->resize_contiguous(per);
         // The VAE hands back [3, n, H, W] (channel-first over the chunk),
         // so frame k is a stride into each channel plane, not a contiguous
         // block.
-        const std::array<float, 6>* ref =
-            local < (long long)color_ref.size()
-                ? &color_ref[(std::size_t)local]
-                : nullptr;
         for (int c = 0; c < 3; ++c) {
           const _Float16* src = rp + ((std::size_t)c * n + k) * hw;
-          const std::size_t base_i = (std::size_t)c * hw;
-          // THE REFERENCE'S COLOUR FIX: this channel's mean and spread
-          // moved to the source frame's (AdaIN, the unbiased variance
-          // plus 1e-5), then clamped to the decode's range.
-          float scale = 1.0f, shift = 0.0f;
-          float* u = unit.data() + base_i;
-          if (ref != nullptr && hw > 1) {
-            double sum = 0.0, sq = 0.0;
-            for (std::size_t i = 0; i < hw; ++i) {
-              const double x = (double)src[i];
-              sum += x;
-              sq += x * x;
-            }
-            const double mu = sum / (double)hw;
-            const double var =
-                std::max(0.0, (sq - (double)hw * mu * mu) / (double)(hw - 1));
-            const double sd = std::sqrt(var + 1e-5);
-            scale = (float)((*ref)[3 + c] / sd);
-            shift = (float)((*ref)[c] - mu * (*ref)[3 + c] / sd);
-          }
-          for (std::size_t i = 0; i < hw; ++i) {
-            float x = (float)src[i];
-            if (ref != nullptr) {
-              x = std::clamp(x * scale + shift, -1.0f, 1.0f);
-            }
-            u[i] = (x + 1.0f) * 0.5f;
-          }
+          float* d = xf.data() + (std::size_t)c * hw;
+          for (std::size_t i = 0; i < hw; ++i) { d[i] = (float)src[i]; }
         }
-        // A frame the last beat also restored: a raised cosine from its
-        // copy to this one, so neither clip's start or end is seen alone.
-        if (local < blend_head) {
-          const HeldFrame& h = _held[(std::size_t)local];
-          const float w = (float)(0.5 - 0.5 * std::cos(
-              M_PI * (double)(local + 1) / (double)(blend_head + 1)));
-          for (std::size_t i = 0; i < unit.size(); ++i) {
-            unit[i] = (1.0f - w) * h.unit[i] + w * unit[i];
-          }
-        }
-        for (std::size_t i = 0; i < unit.size(); ++i) {
-          put_unit_(*out, i, unit[i]);
-        }
-        FlexData sb = FlexData::make_object();
-        sb.as_object().insert_or_assign(
-            sideband::kFrame, FlexData::make_int((std::int64_t)local));
-        sb.as_object().insert_or_assign(sideband::kFrames,
-                                        FlexData::make_int((std::int64_t)F));
-        sb.as_object().insert_or_assign(sideband::kFps,
-                                        FlexData::make_real(fps));
-        out->sideband = std::move(sb);
-        forward_model_name_(*tbp, *out);
-        // The next beat repeats this one's last frames: hold them for it.
-        if (local >= F - blend_tail) {
-          HeldFrame h;
-          h.unit = unit;
-          h.H = H;
-          h.W = W;
-          h.sb = out->sideband;
-          new_held.push_back(std::move(h));
-          continue;
-        }
-        frames.push_back(std::move(out));
+        take(local);
       }
       return true;
     };
+    // THE TINY DECODER's conditioning: decoded frame d's source picture,
+    // by the merge's own rule (the lead alone, then one per run of r), the
+    // last standing in for the padding past the source's end.
+    const auto picture = [&](long long d) {
+      genai::FlashVsrTinyDecoder::Picture p;
+      const long long m = cond_tb != nullptr ? cond_tb->shape[0] : 0;
+      long long i = (r == 1 || d < lead) ? d : lead + (d - lead) / r;
+      i = std::clamp<long long>(i, 0, m - 1);
+      const std::size_t at = (std::size_t)i * per;
+      if (cond_tb->dtype == TensorBeat::DType::U8) {
+        p.u8 = cond_tb->as_u8() + at;
+      } else if (cond_tb->dtype == TensorBeat::DType::F16) {
+        p.f16 = reinterpret_cast<const _Float16*>(cond_tb->as_f16()) + at;
+      } else {
+        p.f32 = cond_tb->as_f32() + at;
+      }
+      return p;
+    };
+    const auto tiny_sink = [&](long long d, float* chw) {
+      if (d < 0 || d >= F) { return true; }   // past the real frames
+      std::memcpy(xf.data(), chw, per * sizeof(float));
+      take(d);
+      return true;
+    };
     {
-      // The clip, and what the decode holds to make it: carries for the
-      // whole clip and a full-resolution chunk pool, several times the
-      // clip at 1920x1152.
+      // The clip, and what the decode holds to make it: for the VAE
+      // carries for the whole clip and a full-resolution chunk pool,
+      // several times the clip at 1920x1152; for the tiny decoder its
+      // scratch, a commit's input and outputs and one frame a layer.
       const std::size_t px =
           (std::size_t)F * (std::size_t)H * (std::size_t)W;
-      revise_decode_arena_(px * 3 * 2 + px * 3 +
-                           _wan_vae->decode_peak_bytes(h8, w8));
+      std::size_t scratch = 0;
+      if (tiny) {
+        genai::FlashVsrTinyDecoder::plan(_tiny_path, T, h8, w8, nullptr,
+                                         &scratch);
+        revise_decode_arena_(px * 3 + scratch);
+      } else {
+        revise_decode_arena_(px * 3 * 2 + px * 3 +
+                             _wan_vae->decode_peak_bytes(h8, w8));
+      }
     }
     std::string derr;
     bool ok = false;
@@ -2071,11 +2395,18 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
                          kPerfLlmVaeBegin,
                          (std::uint64_t)F * (std::uint64_t)H * W);
-      ok = _wan_vae->decode(zw, T, h8, w8, sink, &derr, _wan_stream.get());
+      if (tiny) {
+        ok = _tiny->decode(tbp->as_f32(), T, h8, w8, picture, tiny_sink,
+                           _tiny_stream.get(), &derr);
+        if (!ok) { _tiny_stream.reset(); }
+      } else {
+        ok = _wan_vae->decode(zw, T, h8, w8, sink, &derr,
+                              _wan_stream.get());
+      }
       // A stream's decode that could not run whole-plane loses its
       // carries either way; decoding this beat cold, which may tile, at
       // least keeps its frames.
-      if (!ok && _wan_stream && frames.empty()) {
+      if (!tiny && !ok && _wan_stream && frames.empty()) {
         session()->warn(fmt(
             "VaeDecodeStage('{}'): the stream's decode failed ({}); decoding "
             "this beat cold, so its first frames will not match the last "
@@ -2087,6 +2418,9 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       }
     }
     if (in_stream && final_beat) { _wan_stream.reset(); }
+    // The tiny decoder's memories go with the stream's last beat, and a
+    // beat that stands alone was its own stream.
+    if (!in_stream || final_beat) { _tiny_stream.reset(); }
     if (ok) { _held = std::move(new_held); }
     if (!ok) {
       session()->warn(fmt(
@@ -2096,8 +2430,8 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     }
     session()->log_debug(fmt(
         "VaeDecodeStage('{}'): decoded [{}, {}, {}, {}] -> {} frames "
-        "[3, {}, {}] @ {:.3f} fps", this->id(), Cz, T, h8, w8,
-        frames.size(), H, W, fps));
+        "[3, {}, {}] @ {:.3f} fps{}", this->id(), Cz, T, h8, w8,
+        frames.size(), H, W, fps, tiny ? " (tiny decoder)" : ""));
     if (_unload_idle) { unload_vae_(); }
     auto clip = (!frames.empty() && frames[0] != nullptr
                  && frames[0]->shape.size() == 3)

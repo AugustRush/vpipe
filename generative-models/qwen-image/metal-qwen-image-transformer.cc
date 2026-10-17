@@ -991,6 +991,19 @@ MetalQwenImageTransformer::gemm_mma_(ComputeEncoder& enc,
   // GEMM for a resolution nothing can allocate is not the same trade.
   // See shared/mma-tile.h.
   if (M > mma_row_band(N, K)) { return false; }
+  // Accelerated mode on the checkpoint's OWN codes, before any dequant
+  // exists: the int8 GEMM against them in the signed layout, converted
+  // per call (I8GemmContext::gemm_affine) -- one pass over the codes in
+  // place of the dequant pass AND the requant pass the route below pays,
+  // and the weight quantized once instead of twice. MEASURED as a route
+  // on the M5 Pro (gemm_i8.w8_against_bf16_routes): 0.98-1.05x a bf16
+  // weight under i8, where dequant + requant ran 0.95-0.98x. A shape it
+  // declines falls through with nothing encoded.
+  if (_i8 && w.quantized && _quant_group == 64 &&
+      _i8->gemm_affine(enc, xin, xe, w.codes, w.scales, w.qbias, w.bits, y,
+                       ye, M, N, K)) {
+    return true;
+  }
   const SharedBuffer* wdense;
   if (w.quantized) {
     const metal_compute::ComputeFunction& dq =

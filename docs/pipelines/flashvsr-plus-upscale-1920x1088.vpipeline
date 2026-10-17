@@ -116,6 +116,10 @@
         {
           "src": "model-select",
           "oport": 0
+        },
+        {
+          "src": "flashvsr-src-encoder",
+          "oport": 1
         }
       ],
       "config": {}

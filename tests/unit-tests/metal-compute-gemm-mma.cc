@@ -23,6 +23,8 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
 #include "generative-models/shared/i8-gemm.h"
+#include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 #include "generative-models/shared/mma-tile.h"
 
 #include <Metal/Metal.hpp>
@@ -32,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <random>
 #include <vector>
 
@@ -4070,6 +4073,9 @@ TEST(gemm_i8, native_affine_matches_oracle) {
   vpipe::genai::I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/false);
   if (!ctx.enabled()) { return; }
   ctx.set_native_policy(12);   // both widths, whatever the default
+  // The UNSIGNED kernel: gemm_affine converts to the signed layout per
+  // call where it can, and the replica below is the unsigned algorithm.
+  ctx.set_signed_policy(0);
   EXPECT_TRUE(ctx.native_available(4) && ctx.native_available(8));
   if (!ctx.native_available(4) || !ctx.native_available(8)) {
     std::printf("[gemm_i8nat] native kernels unavailable\n");
@@ -4246,6 +4252,448 @@ TEST(gemm_i8, native_affine_matches_oracle) {
   }
   }  // cmode
   ctx.set_native_cmode(0);
+}
+
+// THE SIGNED-CODE LAYOUT (I8GemmContext::gemm_signed): codes stored q ^
+// 0x80 / q ^ 0x8 per nibble, the zero point moved to b' = b + 128 s / 8 s.
+// Per width: the GPU's conversion is the CPU's to the byte (into a new
+// buffer and in place); the GEMM matches a CPU replica of the exact
+// integer algorithm; gemm_affine's per-call conversion is the stored
+// layout's result BYTE FOR BYTE; its f32 quality is at least the requant
+// route's and close to the unsigned kernel's (b' is rounded once, where
+// the unsigned kernel keeps b); the signed dequant is the CPU's; and the
+// split and bias forms agree with the single op.
+TEST(gemm_i8, signed_layout_matches_oracle) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  ::setenv("VPIPE_I8_GEMM_MIN_M", "64", 1);
+  struct Unset { ~Unset() { ::unsetenv("VPIPE_I8_GEMM_MIN_M"); } } unset;
+  ComputeLibrary lib_dq = mc->load_library("affine_dequant");
+  ComputeFunction f_dq4 = lib_dq.function("affine_dequant_w4g64");
+  ComputeFunction f_dq8 = lib_dq.function("affine_dequant_w8g64");
+  vpipe::genai::I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/false);
+  if (!ctx.enabled()) { return; }
+  ctx.set_native_policy(12);
+  ctx.set_signed_policy(12);
+  EXPECT_TRUE(ctx.signed_available(4) && ctx.signed_available(8));
+  if (!ctx.signed_available(4) || !ctx.signed_available(8)) {
+    std::printf("[gemm_i8sig] signed kernels unavailable\n");
+    return;
+  }
+  const int M = 256, N = 512, K = 1024, G = K / 64;
+  std::mt19937 rng(616u);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<_Float16> x((std::size_t)M * K);
+  for (auto& v : x) { v = (_Float16)(nd(rng) * 0.5f); }
+  SharedBuffer xb = mc->make_shared_buffer(x.size() * 2);
+  std::memcpy(xb.contents(), x.data(), x.size() * 2);
+  // The CPU's copy of the quantizer: the same f32 ops as the GPU's.
+  std::vector<int> xq((std::size_t)M * K);
+  std::vector<float> xa((std::size_t)M * G), xu((std::size_t)M * G);
+  for (int m = 0; m < M; ++m) {
+    for (int g = 0; g < G; ++g) {
+      float am = 0.0f;
+      for (int k = g * 64; k < (g + 1) * 64; ++k) {
+        am = std::max(am, std::fabs((float)x[(std::size_t)m * K + k]));
+      }
+      const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+      const float a = (float)(_Float16)(am * (1.0f / 127.0f));
+      int sum = 0;
+      for (int k = g * 64; k < (g + 1) * 64; ++k) {
+        int v = (int)std::rint((float)x[(std::size_t)m * K + k] * inv);
+        v = std::max(-127, std::min(127, v));
+        xq[(std::size_t)m * K + k] = v;
+        sum += v;
+      }
+      xa[(std::size_t)m * G + g] = a;
+      xu[(std::size_t)m * G + g] = (float)(_Float16)(a * (float)sum);
+    }
+  }
+  auto rel = [](const _Float16* a, const _Float16* b, std::size_t n) {
+    double nn = 0, dd = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      nn += d * d;
+      dd += (double)b[i] * (double)b[i];
+    }
+    return std::sqrt(nn / dd);
+  };
+  for (int bits : {8, 4}) {
+    std::vector<std::uint8_t> packed;
+    std::vector<_Float16> scales, biases;
+    std::vector<float> deq;
+    std::vector<int> q;
+    pack_affine_(bits, N, K, rng, &packed, &scales, &biases, &deq, &q);
+    const int off = bits == 8 ? 128 : 8;
+    const std::uint8_t flip = bits == 8 ? 0x80 : 0x88;
+    std::vector<std::uint8_t> spk(packed.size());
+    for (std::size_t i = 0; i < packed.size(); ++i) {
+      spk[i] = (std::uint8_t)(packed[i] ^ flip);
+    }
+    std::vector<_Float16> zb(biases.size());
+    for (std::size_t i = 0; i < zb.size(); ++i) {
+      zb[i] = (_Float16)((float)biases[i] + (float)off * (float)scales[i]);
+    }
+    auto up = [&](const void* p, std::size_t n) {
+      SharedBuffer b = mc->make_shared_buffer(n);
+      std::memcpy(b.contents(), p, n);
+      return b;
+    };
+    SharedBuffer wb = up(packed.data(), packed.size());
+    SharedBuffer sb = up(scales.data(), scales.size() * 2);
+    SharedBuffer bb = up(biases.data(), biases.size() * 2);
+    SharedBuffer gcs = mc->make_shared_buffer(packed.size());
+    SharedBuffer gzb = mc->make_shared_buffer(zb.size() * 2);
+    SharedBuffer ipc = up(packed.data(), packed.size());     // in place
+    SharedBuffer ipb = up(biases.data(), biases.size() * 2);
+    SharedBuffer wdq = mc->make_shared_buffer((std::size_t)N * K * 2);
+    SharedBuffer sdq = mc->make_shared_buffer((std::size_t)N * K * 2);
+    const std::size_t ybytes = (std::size_t)M * N * 2;
+    SharedBuffer y_sig = mc->make_shared_buffer(ybytes);
+    SharedBuffer y_aff = mc->make_shared_buffer(ybytes);
+    SharedBuffer y_nat = mc->make_shared_buffer(ybytes);
+    SharedBuffer y_rq = mc->make_shared_buffer(ybytes);
+    SharedBuffer y_sk = mc->make_shared_buffer(ybytes);
+    SharedBuffer y_b = mc->make_shared_buffer(ybytes);
+    if (y_b.empty() || sdq.empty()) { return; }
+    ctx.bypass_split = true;
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        EXPECT_TRUE(ctx.encode_to_signed(e, wb, sb, bb, gcs, gzb, bits, N,
+                                         K));
+        EXPECT_TRUE(ctx.encode_to_signed(e, ipc, sb, ipb, ipc, ipb, bits, N,
+                                         K));
+        EXPECT_TRUE(ctx.gemm_signed(e, xb, 0, gcs, sb, gzb, bits, y_sig, 0,
+                                    M, N, K));
+        EXPECT_TRUE(ctx.gemm_affine(e, xb, 0, wb, sb, bb, bits, y_aff, 0, M,
+                                    N, K));
+        EXPECT_TRUE(ctx.encode_dequant_signed(e, gcs, sb, gzb, bits, sdq, N,
+                                              K));
+        e.set_function(bits == 8 ? f_dq8 : f_dq4);
+        e.set_buffer(0, wb); e.set_buffer(1, sb); e.set_buffer(2, bb);
+        e.set_buffer(3, wdq);
+        e.set_constant(4, K); e.set_constant(5, N);
+        e.dispatch({(unsigned)(bits == 8 ? K / 4 : K / 8), (unsigned)N, 1},
+                   {64, 1, 1});
+        EXPECT_TRUE(ctx.gemm(e, xb, 0, wdq, y_rq, 0, M, N, K)); }
+      st.commit().wait(); }
+    ctx.set_signed_policy(0);
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        EXPECT_TRUE(ctx.gemm_affine(e, xb, 0, wb, sb, bb, bits, y_nat, 0, M,
+                                    N, K)); }
+      st.commit().wait(); }
+    ctx.set_signed_policy(12);
+    ctx.bypass_split = false;
+
+    // The conversion, to the byte, both ways.
+    EXPECT_TRUE(std::memcmp(gcs.contents(), spk.data(), spk.size()) == 0);
+    EXPECT_TRUE(std::memcmp(ipc.contents(), spk.data(), spk.size()) == 0);
+    EXPECT_TRUE(std::memcmp(gzb.contents(), zb.data(), zb.size() * 2) == 0);
+    EXPECT_TRUE(std::memcmp(ipb.contents(), zb.data(), zb.size() * 2) == 0);
+    // Per call IS the stored layout's result.
+    EXPECT_TRUE(std::memcmp(y_aff.contents(), y_sig.contents(), ybytes) ==
+                0);
+
+    // The replica, and f32 truth.
+    const auto* ps = static_cast<const _Float16*>(y_sig.contents());
+    const auto* pn = static_cast<const _Float16*>(y_nat.contents());
+    const auto* pr = static_cast<const _Float16*>(y_rq.contents());
+    double n_or = 0, d_or = 0, n_s = 0, n_n = 0, n_r = 0, d_f = 0;
+    for (int m = 0; m < M; ++m) {
+      for (int n = 0; n < N; ++n) {
+        float facc = 0.0f, ub = 0.0f;
+        double truth = 0.0;
+        for (int g = 0; g < G; ++g) {
+          long long P = 0;
+          for (int k = g * 64; k < (g + 1) * 64; ++k) {
+            P += (long long)xq[(std::size_t)m * K + k] *
+                 (long long)(q[(std::size_t)n * K + k] - off);
+          }
+          const std::size_t wg = (std::size_t)n * G + g;
+          facc += xa[(std::size_t)m * G + g] * (float)scales[wg] * (float)P;
+          ub += xu[(std::size_t)m * G + g] * (float)zb[wg];
+        }
+        facc += ub;
+        for (int k = 0; k < K; ++k) {
+          truth += (double)x[(std::size_t)m * K + k] *
+                   (double)deq[(std::size_t)n * K + k];
+        }
+        const std::size_t o = (std::size_t)m * N + n;
+        const double ref = (double)(_Float16)facc;
+        n_or += ((double)ps[o] - ref) * ((double)ps[o] - ref);
+        d_or += ref * ref;
+        n_s += ((double)ps[o] - truth) * ((double)ps[o] - truth);
+        n_n += ((double)pn[o] - truth) * ((double)pn[o] - truth);
+        n_r += ((double)pr[o] - truth) * ((double)pr[o] - truth);
+        d_f += truth * truth;
+      }
+    }
+    const double r_or = std::sqrt(n_or / d_or);
+    const double q_s = std::sqrt(n_s / d_f), q_n = std::sqrt(n_n / d_f);
+    const double q_r = std::sqrt(n_r / d_f);
+    std::printf("[gemm_i8sig] w%d: replica rel-L2 %.3e | vs f32: signed "
+                "%.4e, unsigned %.4e, dequant+requant %.4e\n", bits, r_or,
+                q_s, q_n, q_r);
+    EXPECT_TRUE(r_or < 1e-3);
+    EXPECT_TRUE(q_s < q_r);
+    EXPECT_TRUE(q_s < 1.15 * q_n);
+
+    // The signed dequant: the CPU's s * code + b', and within the zero
+    // point's rounding of the unsigned dequant.
+    {
+      std::vector<_Float16> want((std::size_t)N * K);
+      for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; ++k) {
+          const std::size_t wg = (std::size_t)n * G + k / 64;
+          want[(std::size_t)n * K + k] = (_Float16)(
+              (float)scales[wg] * (float)(q[(std::size_t)n * K + k] - off) +
+              (float)zb[wg]);
+        }
+      }
+      const double rd = rel(static_cast<const _Float16*>(sdq.contents()),
+                            want.data(), want.size());
+      const double ru = rel(static_cast<const _Float16*>(sdq.contents()),
+                            static_cast<const _Float16*>(wdq.contents()),
+                            want.size());
+      std::printf("[gemm_i8sig] w%d: signed dequant vs CPU %.2e, vs the "
+                  "unsigned dequant %.2e\n", bits, rd, ru);
+      EXPECT_TRUE(rd < 1e-4);
+      EXPECT_TRUE(ru < 2e-3);
+    }
+
+    // Split-K against the single op.
+    for (int S : {2, 4}) {
+      ctx.force_splits = S;
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          EXPECT_TRUE(ctx.gemm_signed(e, xb, 0, gcs, sb, gzb, bits, y_sk, 0,
+                                      M, N, K)); }
+        st.commit().wait(); }
+      const double r = rel(static_cast<const _Float16*>(y_sk.contents()),
+                           ps, (std::size_t)M * N);
+      std::printf("[gemm_i8sig] w%d: S=%d vs single rel-L2 %.2e\n", bits, S,
+                  r);
+      EXPECT_TRUE(r < 1e-4);
+    }
+    ctx.force_splits = 0;
+    // THE ROUTES RECORD THEIR SHAPES. The native route never did, so a
+    // quantized checkpoint's GEMMs kept the untuned split at every shape;
+    // both now queue for tune_pending, which settles them over the
+    // recorded weight, and the GEMM after is still right.
+    for (int route = 0; route < 2; ++route) {
+      vpipe::genai::I8GemmContext d(mc, /*want=*/true, /*bf16=*/false);
+      if (!d.split_available()) { break; }
+      d.set_signed_policy(route == 0 ? 0 : 12);
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          EXPECT_TRUE(route == 0
+              ? d.gemm_affine(e, xb, 0, wb, sb, bb, bits, y_sk, 0, M, N, K)
+              : d.gemm_signed(e, xb, 0, gcs, sb, gzb, bits, y_sk, 0, M, N,
+                              K)); }
+        st.commit().wait(); }
+      EXPECT_TRUE(d.pending_for_test() == 1);
+      EXPECT_TRUE(!d.tuned_for_test(M, N, K));
+      d.tune_pending(mc);
+      EXPECT_TRUE(d.pending_for_test() == 0);
+      EXPECT_TRUE(d.tuned_for_test(M, N, K));
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          EXPECT_TRUE(route == 0
+              ? d.gemm_affine(e, xb, 0, wb, sb, bb, bits, y_sk, 0, M, N, K)
+              : d.gemm_signed(e, xb, 0, gcs, sb, gzb, bits, y_sk, 0, M, N,
+                              K)); }
+        st.commit().wait(); }
+      EXPECT_TRUE(d.pending_for_test() == 0);
+      const double r = rel(static_cast<const _Float16*>(y_sk.contents()),
+                           route == 0 ? pn : ps, (std::size_t)M * N);
+      std::printf("[gemm_i8sig] w%d: %s route tuned to S=%d, rel-L2 %.2e "
+                  "from the single op\n", bits,
+                  route == 0 ? "unsigned" : "signed",
+                  d.plan_for_test(M, N, K), r);
+      EXPECT_TRUE(r < 1e-4);
+    }
+    // The bias form.
+    {
+      std::vector<_Float16> cb((std::size_t)N);
+      for (auto& v : cb) { v = (_Float16)(nd(rng) * 0.25f); }
+      SharedBuffer cbb = up(cb.data(), cb.size() * 2);
+      ctx.bypass_split = true;
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          EXPECT_TRUE(ctx.gemm_signed(e, xb, 0, gcs, sb, gzb, bits, cbb, y_b,
+                                      0, M, N, K)); }
+        st.commit().wait(); }
+      ctx.bypass_split = false;
+      const auto* pb = static_cast<const _Float16*>(y_b.contents());
+      double worst = 0.0, ymax = 0.0;
+      for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
+        const double want = (double)ps[i] + (double)(float)cb[i % N];
+        worst = std::max(worst, std::fabs(want - (double)pb[i]));
+        ymax = std::max(ymax, std::fabs((double)ps[i]));
+      }
+      std::printf("[gemm_i8sig] w%d: bias worst |got - (y+b)| %.2e at "
+                  "max|y| %.1f\n", bits, worst, ymax);
+      EXPECT_TRUE(worst <= 2.0 * ymax * 0.001);
+    }
+  }
+}
+
+// THE SIGNED LAYOUT ON A REAL PACK's weights: the signed dequant against
+// the unsigned one, weight by weight, so the one rounding the layout adds
+// (b' to the element type) is measured where it lives rather than through
+// a model. VPIPE_I8_SIGNED_PACK=<model-quantize'd dir>, optionally
+// VPIPE_I8_SIGNED_PACK_MATCH=<substring> to pick the weights (default:
+// the first 12 quantized ones). bf16, as the image DiTs run.
+TEST(gemm_i8, signed_dequant_on_a_real_pack) {
+  const char* dir = std::getenv("VPIPE_I8_SIGNED_PACK");
+  if (dir == nullptr || *dir == '\0') { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  vpipe::genai::I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/true);
+  if (!ctx.signed_available(8)) { return; }
+  ComputeLibrary lib = mc->load_library("affine_dequant_bf16");
+  ComputeFunction f8 = lib.function("affine_dequant_w8g64");
+  ComputeFunction f4 = lib.function("affine_dequant_w4g64");
+  auto ws = vpipe::genai::WeightSet::open(dir, nullptr);
+  ASSERT_TRUE(ws != nullptr);
+  if (!ws) { return; }
+  const auto& src = ws->src();
+  const char* mt = std::getenv("VPIPE_I8_SIGNED_PACK_MATCH");
+  std::shared_ptr<vpipe::genai::WeightSet> orig;
+  if (const char* od = std::getenv("VPIPE_I8_SIGNED_PACK_ORIG")) {
+    orig = vpipe::genai::WeightSet::open(od, nullptr);
+  }
+  auto f16_to_bf16 = [](const SharedBuffer& b) {
+    const std::size_t n = b.byte_size() / 2;
+    std::vector<std::uint16_t> out(n);
+    const auto* h = static_cast<const _Float16*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      const float f = (float)h[i];
+      std::uint32_t u = 0;
+      std::memcpy(&u, &f, 4);
+      u += 0x7fffu + ((u >> 16) & 1u);
+      out[i] = (std::uint16_t)(u >> 16);
+    }
+    return out;
+  };
+  auto bf = [](std::uint16_t h) {
+    const std::uint32_t u = (std::uint32_t)h << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return (double)f;
+  };
+  int done = 0;
+  for (const std::string& nm : src.tensor_names()) {
+    if (done >= 12) { break; }
+    const std::string sfx = ".scales";
+    if (nm.size() < sfx.size() ||
+        nm.compare(nm.size() - sfx.size(), sfx.size(), sfx) != 0) {
+      continue;
+    }
+    const std::string base = nm.substr(0, nm.size() - sfx.size());
+    if (mt != nullptr && base.find(mt) == std::string::npos) { continue; }
+    const auto* ci = src.info(base + ".weight");
+    const auto* si = src.info(nm);
+    if (ci == nullptr || si == nullptr || ci->shape.size() != 2) { continue; }
+    const int N = (int)ci->shape[0];
+    const int K = (int)si->shape[1] * 64;
+    const int bits = (int)(ci->shape[1] * 32 / K);
+    if (bits != 8 && bits != 4) { continue; }
+    SharedBuffer codes = ws->read(base + ".weight", mc,
+                                  vpipe::genai::WeightSet::Residency::Copied);
+    SharedBuffer sc16 = ws->read(nm, mc,
+                                 vpipe::genai::WeightSet::Residency::Copied);
+    SharedBuffer bi16 = ws->read(base + ".biases", mc,
+                                 vpipe::genai::WeightSet::Residency::Copied);
+    if (codes.empty() || sc16.empty() || bi16.empty()) { continue; }
+    // F16 in a model-quantize'd pack; anything already bf16 is copied.
+    auto to_bf = [&](const SharedBuffer& b, const std::string& dt) {
+      if (dt == "F16") { return f16_to_bf16(b); }
+      std::vector<std::uint16_t> v(b.byte_size() / 2);
+      std::memcpy(v.data(), b.contents(), v.size() * 2);
+      return v;
+    };
+    const std::vector<std::uint16_t> sh = to_bf(sc16, si->dtype);
+    const std::vector<std::uint16_t> bh =
+        to_bf(bi16, src.info(base + ".biases")->dtype);
+    SharedBuffer sb = mc->make_shared_buffer(sh.size() * 2);
+    SharedBuffer bb = mc->make_shared_buffer(bh.size() * 2);
+    std::memcpy(sb.contents(), sh.data(), sh.size() * 2);
+    std::memcpy(bb.contents(), bh.data(), bh.size() * 2);
+    SharedBuffer cs = mc->make_shared_buffer(codes.byte_size());
+    SharedBuffer zb = mc->make_shared_buffer(bh.size() * 2);
+    SharedBuffer du = mc->make_shared_buffer((std::size_t)N * K * 2);
+    SharedBuffer dsg = mc->make_shared_buffer((std::size_t)N * K * 2);
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        e.set_function(bits == 8 ? f8 : f4);
+        e.set_buffer(0, codes); e.set_buffer(1, sb); e.set_buffer(2, bb);
+        e.set_buffer(3, du);
+        e.set_constant(4, K); e.set_constant(5, N);
+        e.dispatch({(unsigned)(bits == 8 ? K / 4 : K / 8), (unsigned)N, 1},
+                   {64, 1, 1});
+        EXPECT_TRUE(ctx.encode_to_signed(e, codes, sb, bb, cs, zb, bits, N,
+                                         K));
+        EXPECT_TRUE(ctx.encode_dequant_signed(e, cs, sb, zb, bits, dsg, N,
+                                              K)); }
+      st.commit().wait(); }
+    const auto* pu = static_cast<const std::uint16_t*>(du.contents());
+    const auto* pg = static_cast<const std::uint16_t*>(dsg.contents());
+    double n2 = 0, d2 = 0, worst = 0;
+    for (std::size_t i = 0; i < (std::size_t)N * K; ++i) {
+      const double d = bf(pg[i]) - bf(pu[i]);
+      n2 += d * d;
+      d2 += bf(pu[i]) * bf(pu[i]);
+      worst = std::max(worst, std::fabs(d));
+    }
+    // How large b' runs against a quantization step, over the groups.
+    double zr = 0, zmax = 0;
+    const auto* pz = static_cast<const std::uint16_t*>(zb.contents());
+    for (std::size_t g = 0; g < sh.size(); ++g) {
+      const double r = std::fabs(bf(pz[g])) / std::max(1e-30, bf(sh[g]));
+      zr += r / (double)sh.size();
+      zmax = std::max(zmax, r);
+    }
+    std::printf("[gemm_i8pack] %-48s w%d %5dx%-5d signed vs unsigned "
+                "dequant rel-L2 %.2e worst %.2e | |b'|/s mean %.1f max "
+                "%.0f\n", base.c_str(), bits, N, K, std::sqrt(n2 / d2),
+                worst, zr, zmax);
+    // Against the weight the pack quantized, where its checkpoint is
+    // given (VPIPE_I8_SIGNED_PACK_ORIG): each dequant's own error.
+    if (orig) {
+      SharedBuffer ow = orig->read(base + ".weight", mc,
+                                   vpipe::genai::WeightSet::Residency::Copied);
+      const auto* oi = orig->src().info(base + ".weight");
+      if (!ow.empty() && oi != nullptr &&
+          ow.byte_size() == (std::size_t)N * K * (oi->dtype == "F32" ? 4 : 2)) {
+        auto ov = [&](std::size_t i) {
+          if (oi->dtype == "F32") {
+            return (double)static_cast<const float*>(ow.contents())[i];
+          }
+          if (oi->dtype == "F16") {
+            return (double)static_cast<const _Float16*>(ow.contents())[i];
+          }
+          return bf(static_cast<const std::uint16_t*>(ow.contents())[i]);
+        };
+        double eu = 0, es = 0, dd = 0;
+        for (std::size_t i = 0; i < (std::size_t)N * K; ++i) {
+          const double o = ov(i);
+          eu += (bf(pu[i]) - o) * (bf(pu[i]) - o);
+          es += (bf(pg[i]) - o) * (bf(pg[i]) - o);
+          dd += o * o;
+        }
+        std::printf("[gemm_i8pack]   vs the %s original: unsigned "
+                    "dequant %.3e, signed %.3e\n", oi->dtype.c_str(),
+                    std::sqrt(eu / dd), std::sqrt(es / dd));
+      }
+    }
+    ++done;
+  }
+  EXPECT_TRUE(done > 0);
 }
 
 // THE NATIVE PATH'S WORTH: per call, what a DiT pays for a quantized
@@ -4478,6 +4926,452 @@ TEST(gemm_i8, native_affine_kernel_arms) {
   };
   sweep(4096, 12288, 4096);
   sweep(4096, 4096, 4096);
+}
+
+// WHERE THE UNTUNED SPLIT SHOULD START, by measurement: the single op
+// against every balanced split, per route (a bf16 weight under requant,
+// a w8 weight in the signed layout), per row count, at the deep-K
+// projections of the families in tree. Two weights are cycled so no call
+// finds its weight warm; candidates are interleaved, the order reversed
+// every round, and the median kept. VPIPE_I8_SPLIT_SWEEP=1 runs it;
+// VPIPE_I8_SPLIT_SWEEP_SHAPES="N:K,..." and _ROWS="M,..." narrow it.
+TEST(gemm_i8, split_rule_sweep) {
+  if (std::getenv("VPIPE_I8_SPLIT_SWEEP") == nullptr) {
+    std::printf("[gemm_i8sw] VPIPE_I8_SPLIT_SWEEP unset -- skip\n");
+    return;
+  }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ::setenv("VPIPE_I8_GEMM_MIN_M", "64", 1);
+  vpipe::genai::I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/true);
+  ::unsetenv("VPIPE_I8_GEMM_MIN_M");
+  if (!ctx.enabled() || !ctx.split_available() ||
+      !ctx.signed_available(8)) {
+    std::printf("[gemm_i8sw] unavailable -- skip\n");
+    return;
+  }
+  auto parse = [](const char* e, int arity) {
+    std::vector<std::vector<int>> out;
+    const std::string s = e;
+    for (std::size_t b = 0; b < s.size();) {
+      std::size_t end = s.find(',', b);
+      if (end == std::string::npos) { end = s.size(); }
+      std::vector<int> v;
+      std::size_t p = b;
+      while (p < end) {
+        std::size_t q = s.find(':', p);
+        if (q == std::string::npos || q > end) { q = end; }
+        v.push_back(std::atoi(s.substr(p, q - p).c_str()));
+        p = q + 1;
+      }
+      if ((int)v.size() == arity) { out.push_back(v); }
+      b = end + 1;
+    }
+    return out;
+  };
+  std::vector<std::vector<int>> shapes = {
+      {3072, 9216}, {3072, 12288}, {4096, 12288}, {3840, 10240},
+      {4096, 16384}, {7168, 14336}, {3072, 3072}, {12288, 4096}};
+  std::vector<int> rows = {512, 1024, 2048, 4096, 8192};
+  if (const char* e = std::getenv("VPIPE_I8_SPLIT_SWEEP_SHAPES")) {
+    shapes = parse(e, 2);
+  }
+  if (const char* e = std::getenv("VPIPE_I8_SPLIT_SWEEP_ROWS")) {
+    rows.clear();
+    for (const auto& v : parse(e, 1)) { rows.push_back(v[0]); }
+  }
+  constexpr int kWeights = 2, kIters = 4, kRounds = 3;
+  for (const auto& sh : shapes) {
+    const int N = sh[0], K = sh[1], G = K / 64;
+    std::vector<SharedBuffer> wd, wc, ws, wz;
+    for (int i = 0; i < kWeights; ++i) {
+      wd.push_back(mc->make_shared_buffer((std::size_t)N * K * 2));
+      wc.push_back(mc->make_shared_buffer((std::size_t)N * K));
+      ws.push_back(mc->make_shared_buffer((std::size_t)N * G * 2));
+      wz.push_back(mc->make_shared_buffer((std::size_t)N * G * 2));
+      if (wd.back().empty() || wc.back().empty()) { break; }
+      std::memset(wd.back().contents(), 0x3c, wd.back().byte_size());
+      std::memset(wc.back().contents(), 0x1a + i, wc.back().byte_size());
+      std::memset(ws.back().contents(), 0x10, ws.back().byte_size());
+      std::memset(wz.back().contents(), 0x08, wz.back().byte_size());
+    }
+    if ((int)wd.size() != kWeights || wd.back().empty() ||
+        wc.back().empty()) {
+      continue;
+    }
+    for (int M : rows) {
+      SharedBuffer x = mc->make_shared_buffer((std::size_t)M * K * 2);
+      SharedBuffer y = mc->make_shared_buffer((std::size_t)M * N * 2);
+      if (x.empty() || y.empty()) { continue; }
+      std::memset(x.contents(), 0x3c, x.byte_size());
+      std::vector<int> cands{0};
+      for (int S : ctx.split_candidates(M, N, K)) {
+        if (S <= 4) { cands.push_back(S); }
+      }
+      if (cands.size() < 2) { continue; }
+      for (int route = 0; route < 2; ++route) {
+        auto sample = [&](int S) {
+          ctx.bypass_split = (S == 0);
+          ctx.force_splits = S;
+          CommandStream st = mc->make_command_stream();
+          const auto t0 = std::chrono::steady_clock::now();
+          { ComputeEncoder e = st.begin_compute();
+            for (int i = 0; i < kIters; ++i) {
+              const int w = i % kWeights;
+              if (route == 0) {
+                EXPECT_TRUE(ctx.gemm(e, x, 0, wd[w], y, 0, M, N, K));
+              } else {
+                EXPECT_TRUE(ctx.gemm_signed(e, x, 0, wc[w], ws[w], wz[w],
+                                            8, y, 0, M, N, K));
+              }
+            } }
+          st.commit().wait();
+          ctx.bypass_split = false;
+          ctx.force_splits = 0;
+          return std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - t0).count() / kIters;
+        };
+        for (int S : cands) { (void)sample(S); }
+        std::vector<std::vector<double>> t(cands.size());
+        for (int r = 0; r < kRounds; ++r) {
+          for (std::size_t k = 0; k < cands.size(); ++k) {
+            const std::size_t c = (r % 2 == 0) ? k : cands.size() - 1 - k;
+            t[c].push_back(sample(cands[c]));
+          }
+        }
+        std::string line;
+        double t0 = 0.0, best = 0.0;
+        int best_s = 0;
+        for (std::size_t c = 0; c < cands.size(); ++c) {
+          std::sort(t[c].begin(), t[c].end());
+          const double m = t[c][t[c].size() / 2];
+          if (c == 0) { t0 = m; best = m; }
+          if (m < best) { best = m; best_s = cands[c]; }
+          char buf[64];
+          std::snprintf(buf, sizeof buf, " S%d %.2fx", cands[c], t0 / m);
+          line += buf;
+        }
+        std::printf("[gemm_i8sw] %-7s M=%-5d N=%-5d K=%-5d S0 %7.2f ms "
+                    "|%s | best S=%d\n", route == 0 ? "requant" : "signed",
+                    M, N, K, t0, line.c_str(), best_s);
+      }
+    }
+  }
+}
+
+// W8 AGAINST BF16, EVERY ROUTE A DiT CAN TAKE, as a bf16 family pays it
+// per projection: the dense matmul2d tile it would pick by K, the same
+// weight under i8 (act quant + weight requant + int8 GEMM), and a w8g64
+// pack four ways -- dequant then matmul2d (i8 off), dequant then the
+// requant route (i8 on, a family with no native call), the native route
+// (act quant + code sums + u8 GEMM), and the steel qmm (no matrix
+// cores). Several weights are cycled so no call finds its weight in the
+// cache from the call before, as no projection does in a model. Arms are
+// interleaved, the order reversed every round, and the median kept: this
+// box throttles. VPIPE_I8_W8_SHAPES="M:N:K,..." times other shapes.
+TEST(gemm_i8, w8_against_bf16_routes) {
+  if (std::getenv("VPIPE_I8_W8_BENCH") == nullptr) {
+    std::printf("[gemm_i8w8] VPIPE_I8_W8_BENCH unset -- skip\n");
+    return;
+  }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib_mma = mc->load_library("dense_gemm_mma_bf16");
+  ComputeLibrary lib_dq = mc->load_library("affine_dequant_bf16");
+  ComputeLibrary lib_qmm = mc->load_library("affine_qmm_steel_bf16");
+  ComputeFunction f_n128 = lib_mma.function("dense_gemm_mma_t_n128_f16");
+  ComputeFunction f_deep = lib_mma.function("dense_gemm_mma_t_n128x256_f16");
+  ComputeFunction f_tn2 =
+      lib_mma.function("dense_gemm_mma_t_n128x256_tn2_f16");
+  ComputeFunction f_dq8 = lib_dq.function("affine_dequant_w8g64");
+  ComputeFunction f_qmm8 = lib_qmm.function("affine_qmm_steel_w8g64");
+  vpipe::genai::I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/true);
+  if (!f_n128.valid() || !f_deep.valid() || !f_tn2.valid() ||
+      !f_dq8.valid() || !f_qmm8.valid() || !ctx.enabled() ||
+      !ctx.native_available(8) || !ctx.signed_available(8)) {
+    std::printf("[gemm_i8w8] a kernel is missing -- skip\n");
+    return;
+  }
+  auto to_bf16 = [](float f) {
+    std::uint32_t u = 0;
+    std::memcpy(&u, &f, 4);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (std::uint16_t)(u >> 16);
+  };
+  auto from_bf16 = [](std::uint16_t h) {
+    const std::uint32_t u = (std::uint32_t)h << 16;
+    float f = 0.0f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  // ACCURACY FIRST, on random operands: each w8 route and bf16 + i8 (on
+  // the dequantized weight, which is what a bf16 checkpoint of these
+  // values would hold) against f64 truth.
+  {
+    const int M = 256, N = 512, K = 1024, G = K / 64;
+    std::mt19937 rng(77u);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::uniform_int_distribution<int> qd(0, 255);
+    std::uniform_real_distribution<float> sd(0.003f, 0.02f);
+    std::uniform_real_distribution<float> bd(-0.1f, 0.1f);
+    std::vector<std::uint16_t> xh((std::size_t)M * K), sh((std::size_t)N * G),
+        bh((std::size_t)N * G), b2h((std::size_t)N * G),
+        dh((std::size_t)N * K);
+    std::vector<std::uint8_t> q((std::size_t)N * K), qs((std::size_t)N * K);
+    for (auto& v : xh) { v = to_bf16(nd(rng) * 0.5f); }
+    for (std::size_t i = 0; i < sh.size(); ++i) {
+      sh[i] = to_bf16(sd(rng));
+      bh[i] = to_bf16(bd(rng));
+      b2h[i] = to_bf16(from_bf16(bh[i]) + 128.0f * from_bf16(sh[i]));
+    }
+    for (std::size_t i = 0; i < q.size(); ++i) {
+      q[i] = (std::uint8_t)qd(rng);
+      qs[i] = (std::uint8_t)(q[i] ^ 0x80u);
+      const std::size_t gi = (i / K) * G + (i % K) / 64;
+      dh[i] = to_bf16(from_bf16(sh[gi]) * (float)q[i] + from_bf16(bh[gi]));
+    }
+    auto up = [&](const void* p, std::size_t n) {
+      SharedBuffer b = mc->make_shared_buffer(n);
+      std::memcpy(b.contents(), p, n);
+      return b;
+    };
+    SharedBuffer xb = up(xh.data(), xh.size() * 2);
+    SharedBuffer cb = up(q.data(), q.size());
+    SharedBuffer csb = up(qs.data(), qs.size());
+    SharedBuffer sb = up(sh.data(), sh.size() * 2);
+    SharedBuffer bb = up(bh.data(), bh.size() * 2);
+    SharedBuffer b2b = up(b2h.data(), b2h.size() * 2);
+    SharedBuffer db = up(dh.data(), dh.size() * 2);
+    SharedBuffer wdq0 = mc->make_shared_buffer((std::size_t)N * K * 2);
+    // The GPU's conversion, checked against the CPU's below.
+    SharedBuffer gcs = mc->make_shared_buffer(q.size());
+    SharedBuffer gzb = mc->make_shared_buffer(b2h.size() * 2);
+    const std::size_t yb = (std::size_t)M * N * 2;
+    SharedBuffer y_nat = mc->make_shared_buffer(yb);
+    SharedBuffer y_sig = mc->make_shared_buffer(yb);
+    SharedBuffer y_rq = mc->make_shared_buffer(yb);
+    SharedBuffer y_bf = mc->make_shared_buffer(yb);
+    ::setenv("VPIPE_I8_GEMM_MIN_M", "64", 1);
+    vpipe::genai::I8GemmContext small(mc, /*want=*/true, /*bf16=*/true);
+    ::unsetenv("VPIPE_I8_GEMM_MIN_M");
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        EXPECT_TRUE(small.gemm_affine(e, xb, 0, cb, sb, bb, 8, y_nat, 0, M,
+                                      N, K));
+        EXPECT_TRUE(small.encode_to_signed(e, cb, sb, bb, gcs, gzb, 8, N,
+                                           K));
+        EXPECT_TRUE(small.gemm_signed(e, xb, 0, csb, sb, b2b, 8, y_sig, 0,
+                                      M, N, K));
+        e.set_function(f_dq8);
+        e.set_buffer(0, cb); e.set_buffer(1, sb); e.set_buffer(2, bb);
+        e.set_buffer(3, wdq0);
+        e.set_constant(4, K); e.set_constant(5, N);
+        e.dispatch({(unsigned)(K / 4), (unsigned)N, 1}, {64, 1, 1});
+        EXPECT_TRUE(small.gemm(e, xb, 0, wdq0, y_rq, 0, M, N, K));
+        EXPECT_TRUE(small.gemm(e, xb, 0, db, y_bf, 0, M, N, K)); }
+      st.commit().wait(); }
+    double nt = 0, e_nat = 0, e_sig = 0, e_rq = 0, e_bf = 0;
+    const auto* pn = static_cast<const std::uint16_t*>(y_nat.contents());
+    const auto* ps = static_cast<const std::uint16_t*>(y_sig.contents());
+    const auto* pr = static_cast<const std::uint16_t*>(y_rq.contents());
+    const auto* pb = static_cast<const std::uint16_t*>(y_bf.contents());
+    for (int m = 0; m < M; ++m) {
+      for (int n = 0; n < N; ++n) {
+        double t = 0.0;
+        for (int k = 0; k < K; ++k) {
+          const std::size_t gi = (std::size_t)n * G + k / 64;
+          t += (double)from_bf16(xh[(std::size_t)m * K + k]) *
+               ((double)from_bf16(sh[gi]) * q[(std::size_t)n * K + k] +
+                (double)from_bf16(bh[gi]));
+        }
+        const std::size_t o = (std::size_t)m * N + n;
+        nt += t * t;
+        e_nat += std::pow(from_bf16(pn[o]) - t, 2);
+        e_sig += std::pow(from_bf16(ps[o]) - t, 2);
+        e_rq += std::pow(from_bf16(pr[o]) - t, 2);
+        e_bf += std::pow(from_bf16(pb[o]) - t, 2);
+      }
+    }
+    EXPECT_TRUE(std::memcmp(gcs.contents(), qs.data(), qs.size()) == 0);
+    EXPECT_TRUE(std::memcmp(gzb.contents(), b2h.data(), b2h.size() * 2) ==
+                0);
+    const double r_nat = std::sqrt(e_nat / nt), r_sig = std::sqrt(e_sig / nt);
+    const double r_rq = std::sqrt(e_rq / nt), r_bf = std::sqrt(e_bf / nt);
+    std::printf("[gemm_i8w8] rel-L2 vs f64 at %dx%dx%d: native %.3e  "
+                "signed %.3e  dequant+requant %.3e  bf16+i8 %.3e\n", M, N, K,
+                r_nat, r_sig, r_rq, r_bf);
+    // The signed route holds the same codes exactly; only b' rounds.
+    EXPECT_TRUE(r_sig < 1.25 * r_nat);
+  }
+  struct Shape { int M, N, K; };
+  std::vector<Shape> shapes = {
+      {4096, 3072, 3072},  {4096, 18432, 3072}, {4096, 3072, 9216},
+      {4096, 3840, 3840},  {4096, 10240, 3840}, {4096, 3840, 10240},
+      {4096, 12288, 4096}, {4096, 4096, 12288},
+  };
+  if (const char* e = std::getenv("VPIPE_I8_W8_SHAPES")) {
+    shapes.clear();
+    const std::string want = e;
+    for (std::size_t b = 0; b < want.size();) {
+      std::size_t end = want.find(',', b);
+      if (end == std::string::npos) { end = want.size(); }
+      int m = 0, n = 0, k = 0;
+      if (std::sscanf(want.substr(b, end - b).c_str(), "%d:%d:%d", &m, &n,
+                      &k) == 3) {
+        shapes.push_back({m, n, k});
+      }
+      b = end + 1;
+    }
+  }
+  auto bf16 = [](float f) {
+    std::uint32_t u = 0;
+    std::memcpy(&u, &f, 4);
+    return (std::uint16_t)(u >> 16);
+  };
+  constexpr int kWeights = 4;   // cycled, so each call reads cold
+  constexpr int kIters = 8;     // calls a sample
+  constexpr int kRounds = 6;
+  for (const Shape& sh : shapes) {
+    const int M = sh.M, N = sh.N, K = sh.K, G = K / 64;
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)M * K * 2);
+    SharedBuffer y = mc->make_shared_buffer((std::size_t)M * N * 2);
+    SharedBuffer wdq = mc->make_shared_buffer((std::size_t)N * K * 2);
+    // The per-call arm's conversion targets.
+    SharedBuffer pcs = mc->make_shared_buffer((std::size_t)N * K);
+    SharedBuffer pzb = mc->make_shared_buffer((std::size_t)N * G * 2);
+    std::vector<SharedBuffer> wd, wc, ws, wb, wcs, wb2;
+    for (int i = 0; i < kWeights; ++i) {
+      wd.push_back(mc->make_shared_buffer((std::size_t)N * K * 2));
+      wc.push_back(mc->make_shared_buffer((std::size_t)N * K));
+      ws.push_back(mc->make_shared_buffer((std::size_t)N * G * 2));
+      wb.push_back(mc->make_shared_buffer((std::size_t)N * G * 2));
+      wcs.push_back(mc->make_shared_buffer((std::size_t)N * K));
+      wb2.push_back(mc->make_shared_buffer((std::size_t)N * G * 2));
+      if (wd.back().empty() || wc.back().empty() || wcs.back().empty()) {
+        break;
+      }
+      auto* pd = static_cast<std::uint16_t*>(wd.back().contents());
+      for (std::size_t j = 0; j < (std::size_t)N * K; ++j) {
+        pd[j] = bf16(0.01f * (float)((int)((j + i) % 11) - 5));
+      }
+      std::memset(wc.back().contents(), 0x5a + i, wc.back().byte_size());
+      std::memset(wcs.back().contents(), (0x5a + i) ^ 0x80,
+                  wcs.back().byte_size());
+      auto* ps = static_cast<std::uint16_t*>(ws.back().contents());
+      auto* pb = static_cast<std::uint16_t*>(wb.back().contents());
+      auto* pb2 = static_cast<std::uint16_t*>(wb2.back().contents());
+      for (std::size_t j = 0; j < (std::size_t)N * G; ++j) {
+        ps[j] = bf16(0.0005f);
+        pb[j] = bf16(-0.05f);
+        pb2[j] = bf16(-0.05f + 128.0f * 0.0005f);
+      }
+    }
+    if (x.empty() || y.empty() || wdq.empty() ||
+        (int)wd.size() != kWeights || wd.back().empty() ||
+        wc.back().empty()) {
+      std::printf("[gemm_i8w8] alloc failed at %dx%dx%d -- skip\n", M, N,
+                  K);
+      continue;
+    }
+    auto* px = static_cast<std::uint16_t*>(x.contents());
+    for (std::size_t j = 0; j < (std::size_t)M * K; ++j) {
+      px[j] = bf16(0.25f * (float)((int)(j % 7) - 3));
+    }
+    // The family's own tile choice by reduction depth (FLUX.3's).
+    const ComputeFunction* fmma = &f_deep;
+    int RN = 256;
+    if (K < 6144) { fmma = &f_n128; RN = 128; }
+    else if (K < 12288) { fmma = &f_tn2; RN = 512; }
+    auto mma = [&](ComputeEncoder& e, const SharedBuffer& w) {
+      e.set_function(*fmma);
+      e.set_buffer(0, x); e.set_buffer(1, w); e.set_buffer(2, w);
+      e.set_buffer(3, y);
+      e.set_constant(4, K); e.set_constant(5, N); e.set_constant(6, M);
+      e.set_constant(7, 0);
+      e.dispatch({(unsigned)(((N + RN - 1) / RN) * 256),
+                  (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+    };
+    auto dequant = [&](ComputeEncoder& e, int i) {
+      e.set_function(f_dq8);
+      e.set_buffer(0, wc[i]); e.set_buffer(1, ws[i]); e.set_buffer(2, wb[i]);
+      e.set_buffer(3, wdq);
+      e.set_constant(4, K); e.set_constant(5, N);
+      e.dispatch({(unsigned)(K / 4), (unsigned)N, 1}, {64, 1, 1});
+    };
+    struct Arm { const char* name; std::function<void(ComputeEncoder&, int)>
+                 run; };
+    std::vector<Arm> arms = {
+        {"bf16 matmul2d", [&](ComputeEncoder& e, int i) { mma(e, wd[i]); }},
+        {"bf16 + i8",
+         [&](ComputeEncoder& e, int i) {
+           EXPECT_TRUE(ctx.gemm(e, x, 0, wd[i], y, 0, M, N, K));
+         }},
+        {"w8 dequant+matmul2d",
+         [&](ComputeEncoder& e, int i) { dequant(e, i); mma(e, wdq); }},
+        {"w8 dequant+requant",
+         [&](ComputeEncoder& e, int i) {
+           dequant(e, i);
+           EXPECT_TRUE(ctx.gemm(e, x, 0, wdq, y, 0, M, N, K));
+         }},
+        {"w8 native i8",
+         [&](ComputeEncoder& e, int i) {
+           EXPECT_TRUE(ctx.gemm_affine(e, x, 0, wc[i], ws[i], wb[i], 8, y,
+                                       0, M, N, K));
+         }},
+        {"w8 signed i8",
+         [&](ComputeEncoder& e, int i) {
+           EXPECT_TRUE(ctx.gemm_signed(e, x, 0, wcs[i], ws[i], wb2[i], 8, y,
+                                       0, M, N, K));
+         }},
+        {"w8 signed per call",
+         [&](ComputeEncoder& e, int i) {
+           EXPECT_TRUE(ctx.encode_to_signed(e, wc[i], ws[i], wb[i], pcs, pzb,
+                                            8, N, K));
+           EXPECT_TRUE(ctx.gemm_signed(e, x, 0, pcs, ws[i], pzb, 8, y, 0, M,
+                                       N, K));
+         }},
+        {"w8 qmm steel",
+         [&](ComputeEncoder& e, int i) {
+           e.set_function(f_qmm8);
+           e.set_buffer(0, wc[i]); e.set_buffer(1, ws[i]);
+           e.set_buffer(2, wb[i]); e.set_buffer(3, x); e.set_buffer(4, y);
+           e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, M);
+           e.dispatch({(unsigned)(((N + 31) / 32) * 32),
+                       (unsigned)(((M + 31) / 32) * 2), 2u}, {32, 2, 2});
+         }},
+    };
+    auto sample = [&](const Arm& a) {
+      CommandStream st = mc->make_command_stream();
+      const auto t0 = std::chrono::steady_clock::now();
+      { ComputeEncoder e = st.begin_compute();
+        for (int i = 0; i < kIters; ++i) { a.run(e, i % kWeights); } }
+      st.commit().wait();
+      return std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - t0).count() / kIters;
+    };
+    for (const Arm& a : arms) { (void)sample(a); }   // warm, build scratch
+    std::vector<std::vector<double>> t(arms.size());
+    for (int r = 0; r < kRounds; ++r) {
+      for (std::size_t k = 0; k < arms.size(); ++k) {
+        const std::size_t a = (r % 2 == 0) ? k : arms.size() - 1 - k;
+        t[a].push_back(sample(arms[a]));
+      }
+    }
+    std::vector<double> med(arms.size());
+    for (std::size_t a = 0; a < arms.size(); ++a) {
+      std::sort(t[a].begin(), t[a].end());
+      med[a] = t[a][t[a].size() / 2];
+    }
+    const double gflop = 2.0 * M * (double)N * K * 1e-9;
+    std::printf("[gemm_i8w8] M=%d N=%d K=%d (%.1f GFLOP)\n", M, N, K, gflop);
+    for (std::size_t a = 0; a < arms.size(); ++a) {
+      std::printf("[gemm_i8w8]   %-20s %7.2f ms  %5.2f TOP/s  "
+                  "%.2fx bf16  %.2fx bf16+i8\n", arms[a].name, med[a],
+                  gflop / med[a], med[0] / med[a], med[1] / med[a]);
+    }
+  }
 }
 
 // WHAT A FINER GROUP BUYS, and on which data. Both operands quantized

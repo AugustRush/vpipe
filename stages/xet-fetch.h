@@ -55,11 +55,16 @@ namespace vpipe {
 // an expired grant that would not renew, a range that would not come
 // down. The caller falls back to the plain download; anything already
 // appended stays, because it is still a valid prefix.
+// `on_bytes` (optional) is told the file's bytes so far, the part
+// already there included, wherever `progress` is -- from the workers'
+// threads (FetchRequest::on_bytes).
 bool xet_fetch(const SessionContextIntf* s, const XetSource& src,
                const std::string& hf_token, const FetchOpts& o,
                const std::filesystem::path& part, std::uint64_t total,
                std::string& err, UiProgress* progress,
-               const std::function<bool()>* cancel = nullptr);
+               const std::function<bool()>* cancel = nullptr,
+               const std::function<void(std::uint64_t)>* on_bytes =
+                   nullptr);
 
 // ---- exposed for tests -------------------------------------------------
 

@@ -1650,6 +1650,123 @@ TEST(flux2_smoke, streamed_matches_preloaded)
   EXPECT_TRUE(gdiff == 0);
 }
 
+// THE SIGNED INT8 LAYOUT on a real quantized pack (VPIPE_FLUX2_DIT_DIR at a
+// model-quantize'd w4/w8 DiT; i8_gemm on; M5 only). The layout is converted
+// in three places -- in the entries a preloaded block keeps, in a streamed
+// read, and in a refilled slot -- and promotion copies it, so every arm
+// must be BYTE-IDENTICAL to the preloaded one: preloaded, streamed through
+// the slots, streamed without them, and the second forward of a streamed
+// run that has promoted blocks. Against the dense forward (i8 off) it is
+// held within a gross-error bar of the unsigned native route
+// (VPIPE_I8_SIGNED=0). MEASURED on the FLUX.2-klein-4B w8 pack, signed
+// 3.43e-2 and native 3.64e-2: the native route's zero point is b ~ -128
+// s, and its zero-point product rounds u to bf16 against a term that
+// cancels most of the main one, where b' is near the group's middle. The
+// geometry reaches every route a
+// signed weight takes: the int8 GEMM (1280 image rows), the signed
+// dequant into matmul2d (the double blocks' 64-row text stream, under the
+// int8 floor), and the steel fallback through the signed dequant (an
+// 8-row text stream in the second geometry). VPIPE_I8_SIGNED_MIN_M=16
+// sends the 64-row stream through the int8 GEMM too.
+TEST(flux2_smoke, signed_layout_matches_native)
+{
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  if (ddir == nullptr || *ddir == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  const std::string tdir = ddir;
+  struct Env {
+    const char* k;
+    explicit Env(const char* key, const char* v) : k(key) {
+      ::setenv(key, v, 1);
+    }
+    ~Env() { ::unsetenv(k); }
+  };
+  // The split tuner acts between forwards and would make the promoted
+  // arm's second forward a different reassociation: splits off.
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  for (int TS : {64, 8}) {
+    const int gh = 32, gw = 40, img_seq = gh * gw;
+    bool engaged = true;
+    auto run = [&](bool sgn, bool stream, bool grow, bool slots,
+                   std::vector<float>& out, bool i8 = true) -> bool {
+      std::unique_ptr<Env> e1, e2;
+      if (!sgn) { e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0"); }
+      if (!slots) { e2 = std::make_unique<Env>("VPIPE_FLUX2_NO_SLOTS", "1"); }
+      MetalFlux2Transformer::Config cfg{};
+      cfg.i8_gemm = i8;
+      auto dit = MetalFlux2Transformer::load(tdir, mc, cfg, stream);
+      if (dit == nullptr) { return false; }
+      if (dit->signed_layout() != (sgn && i8)) { engaged = false; }
+      dit->set_residency_reserve(grow ? (2ull << 30) : 0);
+      if (grow) { dit->set_residency_schedule(4); }
+      const auto& c = dit->config();
+      SharedBuffer ctx =
+          mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+      SharedBuffer lat =
+          mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+      if (ctx.empty() || lat.empty()) { return false; }
+      std::mt19937 rng(20261016);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      auto* cp = static_cast<_Float16*>(ctx.contents());
+      for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+        cp[i] = (_Float16)nd(rng);
+      }
+      auto* lp = static_cast<_Float16*>(lat.contents());
+      for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels;
+           ++i) {
+        lp[i] = (_Float16)nd(rng);
+      }
+      SharedBuffer v;
+      for (int it = 0; it < (grow ? 2 : 1); ++it) {
+        v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+      }
+      if (grow && dit->resident_block_count() == 0) { engaged = false; }
+      const std::size_t n = (std::size_t)img_seq * c.out_channels;
+      if (v.empty() || v.byte_size() < n * 2) { return false; }
+      const auto* p = static_cast<const _Float16*>(v.contents());
+      out.resize(n);
+      for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+      return true;
+    };
+    std::vector<float> dense, nat, pre, str, flat, grown;
+    ASSERT_TRUE(run(false, false, false, true, dense, /*i8=*/false));
+    ASSERT_TRUE(run(false, false, false, true, nat));
+    ASSERT_TRUE(run(true, false, false, true, pre));
+    ASSERT_TRUE(run(true, true, false, true, str));
+    ASSERT_TRUE(run(true, true, false, false, flat));
+    ASSERT_TRUE(run(true, true, true, true, grown));
+    EXPECT_TRUE(engaged);
+    if (nat.empty() || pre.size() != nat.size()) { continue; }
+    auto same = [&](const std::vector<float>& a) {
+      return a.size() == pre.size() &&
+             std::memcmp(a.data(), pre.data(), a.size() * 4) == 0;
+    };
+    const double r = rel_l2_(pre.data(), nat.data(), pre.size());
+    const double rs = rel_l2_(pre.data(), dense.data(), pre.size());
+    const double rn = rel_l2_(nat.data(), dense.data(), pre.size());
+    std::printf("[flux2_smoke] signed layout, txt %d: vs native rel-L2 "
+                "%.3e; vs the dense (i8 off) forward: signed %.3e, native "
+                "%.3e; streamed %s, no slots %s, promoted %s\n", TS, r, rs,
+                rn, same(str) ? "IDENTICAL" : "DIFFERENT",
+                same(flat) ? "IDENTICAL" : "DIFFERENT",
+                same(grown) ? "IDENTICAL" : "DIFFERENT");
+    EXPECT_TRUE(same(str));
+    EXPECT_TRUE(same(flat));
+    EXPECT_TRUE(same(grown));
+    // At least as close to the dense forward as the unsigned route.
+    // A GROSS-ERROR guard, not a ranking: on random inputs this forward
+    // is chaotic -- QI21's dense forward moved 4.8e-2 for a per-weight
+    // change of 5e-5 (gemm_i8.signed_dequant_on_a_real_pack: both
+    // dequants 7.3e-3 from the bf16 weights, equal to four digits) -- so
+    // two equally accurate routes land a few percent apart either way.
+    // gemm_i8.signed_layout_matches_oracle is the accuracy statement; a
+    // misread layout is O(1) here.
+    EXPECT_TRUE(rs <= 1.25 * rn);
+  }
+}
+
 // Reference-image conditioning: forward_dit with reference latents (a) still
 // emits ONLY the generated-token velocity [img_seq, out_channels] (refs dropped
 // from the output), (b) stays finite with one and two references, and (c)
@@ -2877,6 +2994,103 @@ TEST(flux2_bench, forward_dit)
 // Quantize <root>/transformer -> <root>-dit-w<bits>g64 (plain affine, the DiT
 // Linear leaf set), reusing the dir if present. Opt-in: VPIPE_FLUX2_QUANTIZE =
 // 8 | 4. Produces the dirs the bench / golden feed via VPIPE_FLUX2_DIT_DIR.
+// THE SIGNED INT8 LAYOUT'S WORTH, in the forward itself: one bf16 DiT and
+// one quantized pack (VPIPE_FLUX2_DIT_DIR), i8_gemm on, preloaded, at a
+// 1024^2 geometry (4096 image rows + 512 text). Arms: bf16, the pack in
+// the signed layout, the pack on the unsigned native route
+// (VPIPE_I8_SIGNED=0). Each arm loads, warms (two forwards: the second
+// is the first the split tuner has answered), then times VPIPE_FLUX2_
+// SIGNED_BENCH_ITERS forwards and keeps the median; the arms rotate
+// through VPIPE_FLUX2_SIGNED_BENCH_ROUNDS rounds, the order reversed
+// every other one, so a box that throttles mid-run costs every arm alike.
+// VPIPE_FLUX2_SIGNED_BENCH=1 runs it.
+TEST(flux2_bench, signed_layout_forward)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  if (root == nullptr || *root == '\0' || ddir == nullptr || *ddir == '\0' ||
+      std::getenv("VPIPE_FLUX2_SIGNED_BENCH") == nullptr) {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  auto env_int = [](const char* k, int d) {
+    const char* e = std::getenv(k);
+    return e != nullptr ? std::max(1, std::atoi(e)) : d;
+  };
+  const int iters = env_int("VPIPE_FLUX2_SIGNED_BENCH_ITERS", 5);
+  const int rounds = env_int("VPIPE_FLUX2_SIGNED_BENCH_ROUNDS", 3);
+  const int HW = env_int("VPIPE_FLUX2_BENCH_HW", 1024);
+  const int gh = HW / 16, gw = HW / 16, img_seq = gh * gw, TS = 512;
+  struct Arm { const char* name; std::string dir; bool sgn; };
+  const Arm arms[] = {
+      {"bf16", std::string(root) + "/transformer", true},
+      {"w8 signed", ddir, true},
+      {"w8 native", ddir, false},
+  };
+  std::vector<std::vector<double>> med(3);
+  for (int r = 0; r < rounds; ++r) {
+    for (int k = 0; k < 3; ++k) {
+      const int a = (r % 2 == 0) ? k : 2 - k;
+      if (!arms[a].sgn) { ::setenv("VPIPE_I8_SIGNED", "0", 1); }
+      MetalFlux2Transformer::Config cfg{};
+      cfg.i8_gemm = true;
+      auto dit = MetalFlux2Transformer::load(arms[a].dir, mc, cfg,
+                                             /*stream_blocks=*/false);
+      ::unsetenv("VPIPE_I8_SIGNED");
+      ASSERT_TRUE(dit != nullptr);
+      if (dit == nullptr) { return; }
+      const auto& c = dit->config();
+      std::mt19937 rng(0);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      SharedBuffer ctx =
+          mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+      SharedBuffer lat =
+          mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+      { auto* p = static_cast<_Float16*>(ctx.contents());
+        for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+          p[i] = (_Float16)nd(rng);
+        } }
+      { auto* p = static_cast<_Float16*>(lat.contents());
+        for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels;
+             ++i) {
+          p[i] = (_Float16)nd(rng);
+        } }
+      for (int w = 0; w < 2; ++w) {
+        ASSERT_TRUE(
+            !dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f).empty());
+      }
+      std::vector<double> t;
+      for (int i = 0; i < iters; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        SharedBuffer v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw,
+                                          0.5f);
+        t.push_back(std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count());
+        ASSERT_TRUE(!v.empty());
+      }
+      std::sort(t.begin(), t.end());
+      med[(std::size_t)a].push_back(t[t.size() / 2]);
+      std::printf("[flux2_bench] round %d %-10s %7.1f ms/forward (median of "
+                  "%d; signed layout %s)\n", r, arms[a].name,
+                  t[t.size() / 2], iters, dit->signed_layout() ? "on" : "off");
+    }
+  }
+  std::printf("[flux2_bench] %dx%d, %d+%d rows, medians over %d rounds:\n",
+              HW, HW, img_seq, TS, rounds);
+  std::vector<double> m(3);
+  for (int a = 0; a < 3; ++a) {
+    std::vector<double> v = med[(std::size_t)a];
+    std::sort(v.begin(), v.end());
+    m[(std::size_t)a] = v[v.size() / 2];
+  }
+  for (int a = 0; a < 3; ++a) {
+    std::printf("[flux2_bench]   %-10s %7.1f ms  %.3fx bf16\n", arms[a].name,
+                m[(std::size_t)a], m[0] / m[(std::size_t)a]);
+  }
+}
+
 TEST(flux2_quant, make)
 {
   const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");

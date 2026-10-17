@@ -256,6 +256,9 @@ class MetalKrea2Transformer {
   void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
+  // Whether the block projections run in the signed int8 layout (see
+  // _sgn) -- what a test asserts before it compares anything.
+  bool signed_layout() const { return _sgn; }
   std::size_t release_resident_blocks(std::size_t bytes);
   // Free the highest resident block; its bytes, or 0 when there is
   // nothing left.
@@ -439,6 +442,10 @@ class MetalKrea2Transformer {
     fp8::Format f8 = fp8::Format::kNone;
     metal_compute::SharedBuffer f8_scale;
     bool f8_per_row = false;
+    // codes/qbias are in the SIGNED layout (I8GemmContext::gemm_signed):
+    // q ^ 0x80 / 0x8 and b' = b + 128 s / 8 s. Only the int8 route and
+    // the signed dequant read it; see _sgn.
+    bool sgn = false;
     bool is_fp8() const { return f8 != fp8::Format::kNone; }
     bool empty() const {
       return (quantized || is_fp8()) ? codes.empty() : w.empty();
@@ -480,7 +487,19 @@ class MetalKrea2Transformer {
                    bool keep_split = false);
   // Load a Linear weight: quantized (affine triple) when `<name>.scales` is
   // present, else dense f16.
-  QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r);
+  // `sign`: a BLOCK projection, which takes the signed layout when _sgn
+  // is set; the model-level linears stay as the checkpoint has them.
+  QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r,
+                   bool sign = false);
+  // Convert a quantized weight the model OWNS (a refilled slot) to the
+  // signed layout in place, and say so on it. False touches nothing.
+  bool sign_(QWeight& w) const;
+  // A signed weight as a DENSE one, dequantized into _w_deq -- for the
+  // steel tiles, which do not read the layout. `w` itself when it is
+  // not signed; null when the scratch cannot be had.
+  const QWeight* signed_dense_(metal_compute::ComputeEncoder& enc,
+                               const QWeight& w, QWeight& view, int N,
+                               int K);
   // ---- the streamed blocks' reusable destinations --------------------
   //
   // See shared/block-slots.h. NOTE the tensor lists this model carries --
@@ -785,6 +804,14 @@ class MetalKrea2Transformer {
   // seq >= 1024.
   metal_compute::ComputeFunction _fn_qmm_swiglu4_bm128, _fn_qmm_swiglu8_bm128;
   bool _fuse_ff = false;
+  // THE SIGNED-CODE LAYOUT for the blocks' quantized projections (main
+  // and text-fusion): with i8_gemm on a matrix-core box they run int8 x
+  // int8 off the layout (I8GemmContext::gemm_signed) instead of the
+  // unsigned native route. Converted once: at load into the entries the
+  // set keeps, after every refill in the slot. OFF where something else
+  // reads the codes: the ANE tier's stager and the fused-SwiGLU qmm both
+  // assume them unsigned. VPIPE_I8_SIGNED=0 for the A/B.
+  bool _sgn = false;
 
   // ---- runtime LoRA ------------------------------------------------
   // Krea-2's projections are SPLIT (to_q / to_k / to_v / to_out.0,

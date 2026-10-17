@@ -1624,7 +1624,12 @@ still serves revision 1), `"content-screen/1"`
 (`generative-models/video-turn.h`) and `"ane-adapters/1"` (the ANE tier
 stages up to `ane::kMaxAdapters`, eight, runtime adapters a projection,
 `lora0` .. `lora7`; a host without it takes `lora0` and `lora1` and
-refuses the rest by name, so ask `has_feature()` before binding a third).
+refuses the rest by name, so ask `has_feature()` before binding a third)
+and `"kernel-tuning/1"` (the session's `KernelTuningCache`, found by
+service id: the answers kernel tuners measured, kept for the session so a
+model loaded again measures nothing -- the toolkit's tuners ask for it
+through `generative-models/shared/tuned-answers.h`, and a host without it
+answers null, so never list it as required).
 
 ## Where your stages show up
 

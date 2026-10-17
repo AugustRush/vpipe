@@ -246,6 +246,12 @@ public:
   // SessionContextIntf for the contract.
   metal_compute::MetalCompute* metal_compute() const;
 
+  // The session's kernel-tuning answers (KernelTuningCache): every
+  // model in the session reads what another -- or its own earlier load
+  // -- measured. Lazily constructed; nullptr when the config's
+  // `kernel_tuning.cache` is false or VPIPE_TUNING_CACHE=0.
+  KernelTuningCache* kernel_tuning_cache() const;
+
   // This session IS its own service bundle -- the subsystems it lazily
   // constructs are the ones callers ask for. Keeping the accessors on
   // Session as well means the ~450 direct `sess.metal_compute()` call
@@ -411,6 +417,12 @@ private:
   // const accessor can lazy-init.
   mutable std::once_flag                                  _mc_once;
   mutable std::unique_ptr<metal_compute::MetalCompute>    _mc;
+
+  // The kernel tuners' answers, kept for the session. Lazily constructed
+  // on first kernel_tuning_cache() call, and only when the config leaves
+  // it on. Text only: nothing in it points into the device or a model.
+  mutable std::once_flag                                  _tuning_once;
+  mutable std::unique_ptr<KernelTuningCache>              _tuning;
 
   // Owns every PipelineHandleImpl we hand out. Keyed on the impl's
   // own pointer (which is the value carried inside PipelineHandle).

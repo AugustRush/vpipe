@@ -104,6 +104,44 @@ inline constexpr std::string_view kBlendTail = "blend_tail";
 // colour correction a restoration model's reference applies against its
 // own input. Absent: no correction.
 inline constexpr std::string_view kColorRef = "color_ref";
+// Reals, from a producer that fed its model each source frame SEVERAL
+// times -- FlashVSR+'s temporal compression 2 or 1 repeats every frame
+// but the first 2 or 4 times, giving fast motion more latent frames --
+// the N weights a decoder merges each run of N decoded frames back into
+// one frame with, after the first `merge_lead` decoded frames, which pass
+// through alone. `valid_frames` counts DECODED frames; `color_ref`,
+// `color_ref_frames` and the blend counts count the merged ones. Absent:
+// every decoded frame is a frame.
+inline constexpr std::string_view kMergeWeights = "merge_weights";
+// Int: decoded frames at the start of this beat that are not merged (the
+// source's first frame, which its producer fed once). Absent: 0.
+inline constexpr std::string_view kMergeLead = "merge_lead";
+// Int: for this beat a decoder's colour-reference input carries a beat
+// of this many source pictures, one per output frame at the output size
+// (planar [n, 3, H, W]), and the decoder moves each frame's LOW
+// FREQUENCIES to its picture's while keeping its own detail: the wavelet
+// colour fix, `clamp(x - low(x) + low(ref))` with `low` five passes (or
+// `color_ref_levels`) of a 3x3 Gaussian dilated 1, 2, 4, ... with
+// edge-replicate padding, over samples in [-1, 1]. Absent: nothing to
+// read.
+inline constexpr std::string_view kColorRefFrames = "color_ref_frames";
+// Int: the wavelet colour fix's levels. Absent: 5.
+inline constexpr std::string_view kColorRefLevels = "color_ref_levels";
+// String: which of its model's decoders a latent asks to be decoded by.
+// "tiny": the model's small CONDITIONED decoder in place of its VAE --
+// FlashVSR's TCDecoder, which reads the restored clip's own source beside
+// the latent (`decoder_cond_frames`). Absent or "vae": the VAE. A decoder
+// with no such model decodes with the VAE, and says so.
+inline constexpr std::string_view kDecoder = "decoder";
+// Int: for this beat a decoder's colour-reference input carries a beat of
+// this many SOURCE pictures at the output size (planar [n, 3, H, W]): the
+// frames the latent's decode covers, from its first decoded frame, one
+// per source frame. A conditioned decoder reads them beside the latent --
+// decoded frame d takes picture d up to `merge_lead`, then lead + (d -
+// lead) / r for runs of r (`merge_weights`), the last picture standing in
+// past the end. Sent after the colour fix's pictures (`color_ref_frames`)
+// when both are announced. Absent: nothing to read.
+inline constexpr std::string_view kDecoderCondFrames = "decoder_cond_frames";
 // The picture's own rectangle on a canvas it was padded out to, as Ints
 // [left, top, right, bottom] in pixels (right and bottom exclusive) -- of
 // the picture, or on a latent of the picture it decodes to.

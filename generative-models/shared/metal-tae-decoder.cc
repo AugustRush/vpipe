@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <string>
 #include <utility>
@@ -729,14 +730,17 @@ MetalTaeDecoder::plan(const std::string& file, int T, int h, int w,
   std::string e;
   if (!d.parse_(*src, /*read=*/false, &e)) { return fail(e); }
   const Scratch z = d.scratch_for_(h, w);
-  const int want = frames_for(T, d._info.time_upscale, trim);
+  const int tu = d._info.time_upscale;
+  const int want = frames_for(T, tu, trim);
+  const int slots = d.slots_per_commit_(z.head_frame, want);
   out->info = d._info;
   out->weight_bytes = d._weight_bytes;
   out->scratch_bytes =
       z.fixed_bytes() +
-      (std::size_t)T * z.in * 2 +   // the whole latent, uploaded once
-      (std::size_t)d.slots_per_commit_(z.head_frame, want) * z.head_frame *
-          2;
+      // One commit's input, as core_ uploads it.
+      (std::size_t)frames_per_commit_(T, tu, trim, 0, slots, want) * z.in *
+          2 +
+      (std::size_t)slots * z.head_frame * 2;
   return true;
 }
 
@@ -1151,6 +1155,151 @@ MetalTaeDecoder::run_(ComputeEncoder& enc, std::size_t i,
   }
 }
 
+int
+MetalTaeDecoder::frames_per_commit_(int T, int tu, Trim trim, long long t0,
+                                    int per_commit, int want)
+{
+  // The loop core_ runs, counting only: the most latent frames a commit
+  // takes, which is what `_in_all` must hold.
+  int most = 1, t = 0, done = 0;
+  while (t < T && done < want) {
+    int used = 0, t_end = t;
+    while (t_end < T && done + used < want && used + tu <= per_commit) {
+      for (int s = 0; s < tu; ++s) {
+        if (kept_((long)(t0 + t_end) * tu + s, tu, trim) &&
+            done + used < want) {
+          ++used;
+        }
+      }
+      ++t_end;
+    }
+    most = std::max(most, t_end - t);
+    done += used;
+    t = t_end;
+  }
+  return most;
+}
+
+bool
+MetalTaeDecoder::core_(int T, int h, int w, Trim trim, long long t0,
+                       int want, const Input& input,
+                       const std::function<bool(const _Float16*)>& emit,
+                       const std::function<bool()>& cancel,
+                       std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  if (!ensure_scratch_(h, w)) {
+    return fail(fmt("scratch for a {}x{} latent did not allocate", w, h)());
+  }
+  const int tu = _info.time_upscale;
+  // Every memory starts at zeros -- the first frame's past -- at a
+  // stream's start; later calls carry on from the frame before.
+  if (t0 == 0) {
+    for (const SharedBuffer& m : _mem) {
+      std::memset(m.contents(), 0, m.byte_size());
+    }
+  }
+  metal_compute::CommandStream cs = _mc->make_command_stream();
+  if (!cs.valid()) { return fail("no command stream"); }
+  // A cancelled decode's count was never committed: drop it.
+  _flops.begin();
+  _profile.clear();
+  _prof_cs = std::getenv("VPIPE_TAE_PROFILE") != nullptr ? &cs : nullptr;
+  // Cleared on EVERY way out: the stream is this call's local.
+  struct ProfGuard {
+    metal_compute::CommandStream** cs;
+    ~ProfGuard() { *cs = nullptr; }
+  } prof_guard{&_prof_cs};
+
+  // AS FEW COMMITS AS THE OUTPUT ALLOWS. A preview decodes while a DiT
+  // owns the GPU, and a held DiT forward is ONE command buffer that runs
+  // for seconds: every commit here queues behind one of them. MEASURED
+  // with a commit per latent frame on a resident H3 at 512x288 -- 12
+  // commits, and a preview took several denoise steps to come out. So a
+  // decode commits once, or in as many pieces as its head outputs need
+  // to fit kHeadBudget.
+  const std::size_t slot_bytes = _head_frame * 2;
+  const int per_commit = slots_per_commit_(_head_frame, want);
+  if (_head.byte_size() < (std::size_t)per_commit * slot_bytes) {
+    _scratch_bytes -= _head.byte_size();
+    _head = _mc->make_shared_buffer((std::size_t)per_commit * slot_bytes);
+    if (_head.empty()) { return fail("decode output did not allocate"); }
+    _scratch_bytes += _head.byte_size();
+  }
+  // THE INPUT OF ONE COMMIT'S FRAMES, channel-last and zero-padded to the
+  // first conv's width, written by the caller just before the commit and
+  // copied into the first op's input on the GPU, in encode order. One
+  // commit's and not the clip's: a conditioned decoder's input is ~50x
+  // the latent (800 channels a pixel), 55 MB a latent frame at 1080p.
+  const int cin = _ops.front().c.cin;
+  const std::size_t in_frame = (std::size_t)h * w * (std::size_t)cin;
+  const int fpc = frames_per_commit_(T, tu, trim, t0, per_commit, want);
+  if (_in_all.byte_size() < (std::size_t)fpc * in_frame * 2) {
+    _scratch_bytes -= _in_all.byte_size();
+    _in_all = _mc->make_shared_buffer((std::size_t)fpc * in_frame * 2);
+    if (_in_all.empty()) { return fail("decode input did not allocate"); }
+    _scratch_bytes += _in_all.byte_size();
+  }
+
+  int t = 0, done = 0;
+  while (t < T && done < want) {
+    // Latent frames until the head slots are full.
+    std::map<long, int> slots;
+    int used = 0, t_end = t;
+    while (t_end < T && done + used < want && used + tu <= per_commit) {
+      for (int s = 0; s < tu; ++s) {
+        const long raw = (long)(t0 + t_end) * tu + s;
+        if (kept_(raw, tu, trim) && done + used < want) {
+          slots[raw] = used++;
+        }
+      }
+      ++t_end;
+    }
+    auto* in = static_cast<_Float16*>(_in_all.contents());
+    for (int k = t; k < t_end; ++k) {
+      if (cancel && cancel()) { return false; }
+      _Float16* d = in + (std::size_t)(k - t) * in_frame;
+      std::memset(d, 0, in_frame * 2);
+      if (!input(k, d, cin)) {
+        return fail(fmt("latent frame {}: no input", k)());
+      }
+    }
+    {
+      ComputeEncoder enc = cs.begin_compute();
+      const std::function<int(long)> slot_of = [&slots](long raw) {
+        auto it = slots.find(raw);
+        return it == slots.end() ? -1 : it->second;
+      };
+      for (int k = t; k < t_end; ++k) {
+        enc.set_function(_fn_copy);
+        enc.set_buffer(0, _in_all, (std::size_t)(k - t) * in_frame * 2);
+        enc.set_buffer(1, _in);
+        enc.set_constant(2, 0);
+        enc.set_constant(3, (int)in_frame);
+        dispatch_(enc, "copy", {(unsigned)in_frame, 1, 1}, {256, 1, 1});
+        run_(enc, 0, _in, h, w, (long)(t0 + k), slot_of);
+      }
+      enc.end();
+    }
+    _flops.flush(cs);
+    std::string ferr;
+    if (!cs.commit().wait_ok(&ferr)) {
+      return fail(fmt("latent frame {}: {}", t_end - 1,
+                      ferr.empty() ? "GPU failure" : ferr)());
+    }
+    const auto* hd = static_cast<const _Float16*>(_head.contents());
+    for (int s = 0; s < used; ++s) {
+      if (!emit(hd + (std::size_t)s * _head_frame)) { return false; }
+    }
+    done += used;
+    t = t_end;
+  }
+  return true;
+}
+
 bool
 MetalTaeDecoder::decode(const float* latent, int C, int T, int h, int w,
                         Trim trim, int max_frames, int shrink, Frames* out,
@@ -1169,10 +1318,6 @@ MetalTaeDecoder::decode(const float* latent, int C, int T, int h, int w,
     return fail(fmt("the latent has {} channels and this decoder reads {}",
                     C, _info.latent_channels)());
   }
-  if (!ensure_scratch_(h, w)) {
-    return fail(fmt("scratch for a {}x{} latent did not allocate", w, h)());
-  }
-  const int tu = _info.time_upscale;
   const int p = _info.patch;
   const Op& head = _ops.back();
   const int Hh = h * head.scale, Wh = w * head.scale;   // head input
@@ -1198,174 +1343,146 @@ MetalTaeDecoder::decode(const float* latent, int C, int T, int h, int w,
   // the box filter's source.
   std::vector<float> native(k > 1 ? (std::size_t)ic * NH * NW : 0);
 
-  // Every memory starts at zeros -- the first frame's past.
-  for (const SharedBuffer& m : _mem) {
-    std::memset(m.contents(), 0, m.byte_size());
-  }
-  metal_compute::CommandStream cs = _mc->make_command_stream();
-  if (!cs.valid()) { return fail("no command stream"); }
-  // A cancelled decode's count was never committed: drop it.
-  _flops.begin();
-  _profile.clear();
-  _prof_cs = std::getenv("VPIPE_TAE_PROFILE") != nullptr ? &cs : nullptr;
-  // Cleared on EVERY way out: the stream is this call's local.
-  struct ProfGuard {
-    metal_compute::CommandStream** cs;
-    ~ProfGuard() { *cs = nullptr; }
-  } prof_guard{&_prof_cs};
-
-  // The whole latent, channel-last, zero-padded to the first conv's width
-  // and through the input Clamp, uploaded ONCE: each latent frame is
-  // copied into the first op's input on the GPU, in encode order.
-  const int cin = _ops.front().c.cin;
+  // The latent, channel-last, through the input Clamp.
   const std::size_t hw = (std::size_t)h * w;
-  const std::size_t in_frame = hw * (std::size_t)cin;
-  if (_in_all.byte_size() < (std::size_t)T * in_frame * 2) {
-    _scratch_bytes -= _in_all.byte_size();
-    _in_all = _mc->make_shared_buffer((std::size_t)T * in_frame * 2);
-    if (_in_all.empty()) { return fail("latent upload did not allocate"); }
-    _scratch_bytes += _in_all.byte_size();
-  }
-  {
-    auto* in = static_cast<_Float16*>(_in_all.contents());
-    for (int t = 0; t < T; ++t) {
-      for (std::size_t px = 0; px < hw; ++px) {
-        for (int c = 0; c < cin; ++c) {
-          float v = 0.0f;
-          if (c < C) {
-            v = latent[((std::size_t)c * T + t) * hw + px];
-            if (_clamp_input) { v = std::tanh(v / 3.0f) * 3.0f; }
-          }
-          in[(std::size_t)t * in_frame + px * cin + c] = (_Float16)v;
-        }
+  const Input in = [&](int t, _Float16* d, int stride) {
+    for (std::size_t px = 0; px < hw; ++px) {
+      for (int c = 0; c < C; ++c) {
+        float v = latent[((std::size_t)c * T + t) * hw + px];
+        if (_clamp_input) { v = std::tanh(v / 3.0f) * 3.0f; }
+        d[px * (std::size_t)stride + c] = (_Float16)v;
       }
     }
-  }
-
-  // AS FEW COMMITS AS THE OUTPUT ALLOWS. A preview decodes while a DiT
-  // owns the GPU, and a held DiT forward is ONE command buffer that runs
-  // for seconds: every commit here queues behind one of them. MEASURED
-  // with a commit per latent frame on a resident H3 at 512x288 -- 12
-  // commits, and a preview took several denoise steps to come out. So a
-  // decode commits once, or in as many pieces as its head outputs need
-  // to fit kHeadBudget.
-  const std::size_t slot_bytes = _head_frame * 2;
-  const int per_commit = slots_per_commit_(_head_frame, want);
-  if (_head.byte_size() < (std::size_t)per_commit * slot_bytes) {
-    _scratch_bytes -= _head.byte_size();
-    _head = _mc->make_shared_buffer((std::size_t)per_commit * slot_bytes);
-    if (_head.empty()) { return fail("preview output did not allocate"); }
-    _scratch_bytes += _head.byte_size();
-  }
+    return true;
+  };
 
   const std::size_t plane = (std::size_t)OH * OW;
   const std::size_t nplane = (std::size_t)NH * NW;
   const int hc = head.c.cout;
-  int t = 0;
-  while (t < T && out->frames < want) {
-    // Encode latent frames until the head slots are full.
-    std::map<long, int> slots;
-    int used = 0;
-    {
-      ComputeEncoder enc = cs.begin_compute();
-      while (t < T && out->frames + used < want &&
-             used + tu <= per_commit) {
-        if (cancel && cancel()) { return false; }
-        for (int s = 0; s < tu; ++s) {
-          const long raw = (long)t * tu + s;
-          if (kept_(raw, tu, trim) && out->frames + used < want) {
-            slots[raw] = used++;
-          }
-        }
-        enc.set_function(_fn_copy);
-        enc.set_buffer(0, _in_all, (std::size_t)t * in_frame * 2);
-        enc.set_buffer(1, _in);
-        enc.set_constant(2, 0);
-        enc.set_constant(3, (int)in_frame);
-        dispatch_(enc, "copy", {(unsigned)in_frame, 1, 1}, {256, 1, 1});
-        const std::function<int(long)> slot_of = [&slots](long raw) {
-          auto it = slots.find(raw);
-          return it == slots.end() ? -1 : it->second;
-        };
-        run_(enc, 0, _in, h, w, (long)t, slot_of);
-        ++t;
-      }
-      enc.end();
-    }
-    _flops.flush(cs);
-    std::string ferr;
-    if (!cs.commit().wait_ok(&ferr)) {
-      return fail(fmt("latent frame {}: {}", t - 1,
-                      ferr.empty() ? "GPU failure" : ferr)());
-    }
-    // Pixel shuffle + [0, 1] clamp on the host: pic[c, y * p + i, x * p +
-    // j] = head[(y, x), c * p^2 + i * p + j]; then the box filter.
-    const auto* hd = static_cast<const _Float16*>(_head.contents());
-    for (int s = 0; s < used; ++s) {
-      const _Float16* src = hd + (std::size_t)s * _head_frame;
-      std::uint8_t* dst = out->rgb.data() +
-                          (std::size_t)out->frames * ic * plane;
-      for (int y = 0; y < Hh; ++y) {
-        for (int x = 0; x < Wh; ++x) {
-          const _Float16* px = src + ((std::size_t)y * Wh + x) * hc;
-          for (int c = 0; c < ic; ++c) {
-            for (int i = 0; i < p; ++i) {
-              for (int j = 0; j < p; ++j) {
-                float v = (float)px[c * p * p + i * p + j];
-                v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-                const std::size_t py = (std::size_t)(y * p + i);
-                const std::size_t qx = (std::size_t)(x * p + j);
-                if (k == 1) {
-                  dst[(std::size_t)c * plane + py * OW + qx] =
-                      (std::uint8_t)std::lround(v * 255.0f);
-                } else {
-                  native[(std::size_t)c * nplane + py * NW + qx] = v;
-                }
+  // Pixel shuffle + [0, 1] clamp on the host: pic[c, y * p + i, x * p +
+  // j] = head[(y, x), c * p^2 + i * p + j]; then the box filter.
+  const std::function<bool(const _Float16*)> emit =
+      [&](const _Float16* src) {
+    std::uint8_t* dst = out->rgb.data() +
+                        (std::size_t)out->frames * ic * plane;
+    for (int y = 0; y < Hh; ++y) {
+      for (int x = 0; x < Wh; ++x) {
+        const _Float16* px = src + ((std::size_t)y * Wh + x) * hc;
+        for (int c = 0; c < ic; ++c) {
+          for (int i = 0; i < p; ++i) {
+            for (int j = 0; j < p; ++j) {
+              float v = (float)px[c * p * p + i * p + j];
+              v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+              const std::size_t py = (std::size_t)(y * p + i);
+              const std::size_t qx = (std::size_t)(x * p + j);
+              if (k == 1) {
+                dst[(std::size_t)c * plane + py * OW + qx] =
+                    (std::uint8_t)std::lround(v * 255.0f);
+              } else {
+                native[(std::size_t)c * nplane + py * NW + qx] = v;
               }
             }
           }
         }
       }
-      if (k > 1) {
-        // A box filter per output pixel. With alpha it is PREMULTIPLIED:
-        // colour is weighted by alpha before averaging and divided back
-        // out, or the arbitrary colour under transparent pixels -- black,
-        // on a generated RGBA picture -- bleeds into every edge.
-        const float inv = 1.0f / (float)(k * k);
-        const float* ap =
-            ic == 4 ? native.data() + (std::size_t)3 * nplane : nullptr;
-        for (int y = 0; y < OH; ++y) {
-          for (int x = 0; x < OW; ++x) {
-            float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            for (int dy = 0; dy < k; ++dy) {
-              const std::size_t row =
-                  (std::size_t)(y * k + dy) * NW + (std::size_t)x * k;
-              for (int dx = 0; dx < k; ++dx) {
-                const float a = ap != nullptr ? ap[row + dx] : 1.0f;
-                for (int c = 0; c < 3; ++c) {
-                  acc[c] += native[(std::size_t)c * nplane + row + dx] * a;
-                }
-                acc[3] += a;
+    }
+    if (k > 1) {
+      // A box filter per output pixel. With alpha it is PREMULTIPLIED:
+      // colour is weighted by alpha before averaging and divided back
+      // out, or the arbitrary colour under transparent pixels -- black,
+      // on a generated RGBA picture -- bleeds into every edge.
+      const float inv = 1.0f / (float)(k * k);
+      const float* ap =
+          ic == 4 ? native.data() + (std::size_t)3 * nplane : nullptr;
+      for (int y = 0; y < OH; ++y) {
+        for (int x = 0; x < OW; ++x) {
+          float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+          for (int dy = 0; dy < k; ++dy) {
+            const std::size_t row =
+                (std::size_t)(y * k + dy) * NW + (std::size_t)x * k;
+            for (int dx = 0; dx < k; ++dx) {
+              const float a = ap != nullptr ? ap[row + dx] : 1.0f;
+              for (int c = 0; c < 3; ++c) {
+                acc[c] += native[(std::size_t)c * nplane + row + dx] * a;
               }
+              acc[3] += a;
             }
-            const std::size_t o = (std::size_t)y * OW + x;
-            const float wa = acc[3] > 0.0f ? 1.0f / acc[3] : 0.0f;
-            for (int c = 0; c < 3; ++c) {
-              dst[(std::size_t)c * plane + o] =
-                  (std::uint8_t)std::lround(acc[c] * wa * 255.0f);
-            }
-            if (ic == 4) {
-              dst[(std::size_t)3 * plane + o] =
-                  (std::uint8_t)std::lround(acc[3] * inv * 255.0f);
-            }
+          }
+          const std::size_t o = (std::size_t)y * OW + x;
+          const float wa = acc[3] > 0.0f ? 1.0f / acc[3] : 0.0f;
+          for (int c = 0; c < 3; ++c) {
+            dst[(std::size_t)c * plane + o] =
+                (std::uint8_t)std::lround(acc[c] * wa * 255.0f);
+          }
+          if (ic == 4) {
+            dst[(std::size_t)3 * plane + o] =
+                (std::uint8_t)std::lround(acc[3] * inv * 255.0f);
           }
         }
       }
-      ++out->frames;
     }
+    ++out->frames;
+    return true;
+  };
+  if (!core_(T, h, w, trim, 0, want, in, emit, cancel, err)) {
+    return false;
   }
   out->rgb.resize((std::size_t)out->frames * ic * plane);
   return true;
+}
+
+bool
+MetalTaeDecoder::decode_stream(int T, int h, int w, Trim trim,
+                               const Input& input, const FrameSink& sink,
+                               Stream* stream, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  if (err != nullptr) { err->clear(); }
+  if (stream == nullptr || !input || !sink || T <= 0 || h <= 0 || w <= 0) {
+    return fail("empty latent");
+  }
+  const int p = _info.patch;
+  const Op& head = _ops.back();
+  const int Hh = h * head.scale, Wh = w * head.scale;
+  const int NH = Hh * p, NW = Wh * p;
+  const int ic = _info.image_channels;
+  const int hc = head.c.cout;
+  const std::size_t nplane = (std::size_t)NH * NW;
+  std::vector<float> pic((std::size_t)ic * nplane);
+  long long frame = stream->frames;
+  // The head's channel-last f16 as planar f32, pixel-shuffled, as the
+  // network left it: the caller decides what to clamp.
+  const std::function<bool(const _Float16*)> emit =
+      [&](const _Float16* src) {
+    for (int y = 0; y < Hh; ++y) {
+      for (int x = 0; x < Wh; ++x) {
+        const _Float16* px = src + ((std::size_t)y * Wh + x) * hc;
+        for (int c = 0; c < ic; ++c) {
+          float* d = pic.data() + (std::size_t)c * nplane;
+          for (int i = 0; i < p; ++i) {
+            for (int j = 0; j < p; ++j) {
+              d[(std::size_t)(y * p + i) * NW + (std::size_t)(x * p + j)] =
+                  (float)px[c * p * p + i * p + j];
+            }
+          }
+        }
+      }
+    }
+    return sink(frame++, pic.data());
+  };
+  // A stream decodes every kept frame; the caller drops what it does not
+  // keep.
+  const bool ok =
+      core_(T, h, w, trim, stream->latent_frames,
+            std::numeric_limits<int>::max(), input, emit, {}, err);
+  // On failure (or a sink that stopped) the memories are part-advanced:
+  // the stream cannot continue, and the caller opens a new one.
+  stream->latent_frames += T;
+  stream->frames = frame;
+  return ok;
 }
 
 }  // namespace genai

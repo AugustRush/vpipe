@@ -20,7 +20,10 @@
 //                                        posi_prompt.pth)
 //   VPIPE_FLASHVSR_PLUS_GOLDEN           a directory holding the dumps:
 //                                        turbo-384x640/, base-512/ and,
-//                                        for the bar, their -bf16 twins
+//                                        for the bar, their -bf16 twins;
+//                                        for the tiny decoder,
+//                                        turbo-pattern-384x640/ and
+//                                        tiny-pattern-384x640(-bf16)/
 // The first two tests need neither.
 
 #include "minitest.h"
@@ -31,10 +34,12 @@
 #include "common/vpipe-format.h"
 #include "generative-models/flashvsr/flashvsr-family.h"
 #include "generative-models/flashvsr/flashvsr-lq-proj.h"
+#include "generative-models/flashvsr/flashvsr-tiny-decoder.h"
 #include "generative-models/flashvsr/metal-flashvsr-transformer.h"
 #include "generative-models/video-model-registry.h"
 #include "generative-models/weight-set.h"
 #include "stages/model-detect.h"
+#include "stages/wavelet-color-fix.h"
 
 #include <algorithm>
 #include <chrono>
@@ -786,4 +791,177 @@ TEST(flashvsr_plus, stream_requests_equal_one_request)
     }
   }
   ::unsetenv("VPIPE_FVSR_CHUNK_OUTER");
+}
+
+// THE WAVELET COLOUR FIX against the reference's own WaveletColorCorrector
+// (tools/dump_flashvsr_plus_golden.py --wavelet): a picture with a cast
+// that varies across the frame, corrected toward the same picture without
+// it. f32 both ways; only the order of the nine taps' sum differs.
+TEST(flashvsr_plus, wavelet_fix_matches_reference)
+{
+  const char* gd = std::getenv("VPIPE_FLASHVSR_PLUS_GOLDEN");
+  if (gd == nullptr || *gd == '\0') { return; }
+  const fs::path dir = fs::path(gd) / "wavelet-96x160";
+  const auto content = read_f32_(dir / "content.f32");
+  const auto style = read_f32_(dir / "style.f32");
+  const auto want = read_f32_(dir / "corrected.f32");
+  constexpr int H = 96, W = 160, F = 2;
+  const std::size_t n = (std::size_t)3 * H * W;
+  if (content.size() != F * n || style.size() != F * n ||
+      want.size() != F * n) {
+    return;
+  }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  WaveletColorFix wf(mc);
+  ASSERT_TRUE(wf.valid());
+  double worst = 0.0;
+  std::vector<float> got(content);
+  for (int f = 0; f < F; ++f) {
+    ASSERT_TRUE(wf.apply(got.data() + f * n, style.data() + f * n, H, W, 5));
+  }
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    worst = std::max(worst, (double)std::fabs(got[i] - want[i]));
+  }
+  // And the cast it removes is real: the uncorrected content is far off.
+  const double r = rel_l2_(got, want), r0 = rel_l2_(content, want);
+  std::printf("  wavelet fix vs the reference: worst %.2e, rel-L2 %.2e "
+              "(uncorrected %.3f)\n", worst, r, r0);
+  EXPECT_TRUE(worst < 1e-5 && r0 > 0.1);
+  // Four levels is a different low-pass, and the test can tell.
+  std::vector<float> four(content);
+  for (int f = 0; f < F; ++f) {
+    ASSERT_TRUE(wf.apply(four.data() + f * n, style.data() + f * n, H, W, 4));
+  }
+  EXPECT_TRUE(rel_l2_(four, want) > 100.0 * r + 1e-4);
+}
+
+// THE TINY DECODER (TCDecoder.ckpt) against the reference's own
+// TinyDecoder -- serial, four latent frames a call, memory carried --
+// over a stream golden's latent and its source clip, which is the
+// decoder's conditioning (tools/dump_flashvsr_plus_golden.py --content
+// pattern, then --tiny-from). Held to the reference's own bf16 error;
+// pieces of the stream must decode to the one call's frames byte for
+// byte; and a source paired one frame late must show -- the conditioning
+// is half of what this decoder reads, and an off-by-one in it is
+// otherwise a picture that merely looks a little soft.
+TEST(flashvsr_plus, tiny_decoder_matches_reference)
+{
+  const char* mp = std::getenv("VPIPE_FLASHVSR_PLUS_TEST_MODEL_PATH");
+  const char* gd = std::getenv("VPIPE_FLASHVSR_PLUS_GOLDEN");
+  if (mp == nullptr || *mp == '\0' || gd == nullptr || *gd == '\0') {
+    return;
+  }
+  const fs::path src = fs::path(gd) / "turbo-pattern-384x640";
+  const fs::path dir = fs::path(gd) / "tiny-pattern-384x640";
+  constexpr int H = 384, W = 640, T = 16, F = 4 * T - 3;
+  constexpr int h = H / 8, w = W / 8;
+  const std::size_t frame = (std::size_t)3 * H * W;
+  const auto z = read_f32_(src / "latent.f32");
+  const auto want = read_f32_(dir / "tiny_frames.f32");
+  const auto bf16 = read_f32_(fs::path(gd) / "tiny-pattern-384x640-bf16" /
+                              "tiny_frames.f32");
+  std::vector<std::uint8_t> lq(frame * F);
+  {
+    std::ifstream in(src / "lq_video_u8.bin", std::ios::binary);
+    in.read(reinterpret_cast<char*>(lq.data()), (std::streamsize)lq.size());
+    if (!in) { return; }
+  }
+  if (z.size() != (std::size_t)16 * T * h * w || want.size() != frame * F) {
+    return;
+  }
+  FlashVsrLayout layout;
+  ASSERT_TRUE(resolve_flashvsr_layout(mp, &layout));
+  ASSERT_TRUE(!layout.tiny_decoder.empty());
+  if (layout.tiny_decoder.empty()) { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  std::string err;
+  auto dec = FlashVsrTinyDecoder::load(
+      WeightSet::open(layout.tiny_decoder, nullptr), mc, &err);
+  ASSERT_TRUE(dec != nullptr);
+  if (dec == nullptr) { std::printf("  %s\n", err.c_str()); return; }
+
+  // Decode the latent in calls of `sizes` latent frames, pairing decoded
+  // frame d with source frame d + `lag` (the last standing in past the
+  // end).
+  auto run = [&](const std::vector<int>& sizes, int lag) {
+    std::vector<float> out;
+    FlashVsrTinyDecoder::Stream s;
+    int at = 0;
+    for (int n : sizes) {
+      std::vector<float> zc((std::size_t)16 * n * h * w);
+      const std::size_t plane = (std::size_t)h * w;
+      for (int c = 0; c < 16; ++c) {
+        std::memcpy(zc.data() + (std::size_t)c * n * plane,
+                    z.data() + ((std::size_t)c * T + at) * plane,
+                    (std::size_t)n * plane * sizeof(float));
+      }
+      const long long f0 = s.frames;
+      const auto pic = [&](long long d) {
+        FlashVsrTinyDecoder::Picture p;
+        const long long g = std::min<long long>(f0 + d + lag, F - 1);
+        p.u8 = lq.data() + (std::size_t)g * frame;
+        return p;
+      };
+      const auto sink = [&](long long, float* chw) {
+        out.insert(out.end(), chw, chw + frame);
+        return true;
+      };
+      std::string e;
+      if (!dec->decode(zc.data(), n, h, w, pic, sink, &s, &e)) {
+        std::printf("  decode failed: %s\n", e.c_str());
+        return std::vector<float>{};
+      }
+      at += n;
+    }
+    return out;
+  };
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto one = run({T}, 0);
+  const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+  ASSERT_TRUE(one.size() == frame * F);
+  if (one.size() != frame * F) { return; }
+  const double r = rel_l2_(one, want);
+  const double bar = bf16.size() == want.size() ? rel_l2_(bf16, want) : 0.0;
+  double worst = 0.0;
+  for (std::size_t i = 0; i < one.size(); ++i) {
+    worst = std::max(worst, (double)std::fabs(one[i] - want[i]));
+  }
+  std::printf("  tiny decoder, %d latent frames -> %d frames at %dx%d in "
+              "%.0f ms: rel-L2 %.5f, worst %.4f (the reference's bf16 "
+              "%.5f)\n", T, F, W, H, ms, r, worst, bar);
+  EXPECT_TRUE(r < (bar > 0.0 ? bar : 0.01));
+  // The stream in pieces is the one call.
+  for (const std::vector<int>& sizes :
+       {std::vector<int>{4, 4, 4, 4}, std::vector<int>{3, 5, 1, 7}}) {
+    const auto c0 = std::chrono::steady_clock::now();
+    const auto cut = run(sizes, 0);
+    const double cms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - c0).count();
+    const bool same = cut.size() == one.size() &&
+                      std::memcmp(cut.data(), one.data(),
+                                  one.size() * sizeof(float)) == 0;
+    std::printf("  calls of %d, %d, %d, %d latent frames vs 1: %s (%.0f "
+                "ms)\n", sizes[0], sizes[1], sizes[2], sizes[3],
+                same ? "IDENTICAL" : "DIFFERENT", cms);
+    EXPECT_TRUE(same);
+  }
+  // What it holds at 1080p-class sizes, as the plan books it: the stream
+  // rule's figure for this decoder.
+  std::size_t wb = 0, sb = 0;
+  if (FlashVsrTinyDecoder::plan(layout.tiny_decoder, 4, 1152 / 8, 1920 / 8,
+                                &wb, &sb)) {
+    std::printf("  at 1920x1152: %zu MB of weights, %zu MB of scratch "
+                "(held %zu MB here at %dx%d)\n", wb >> 20, sb >> 20,
+                dec->resident_bytes() >> 20, W, H);
+  }
+  // The source one frame late.
+  const auto late = run({T}, 1);
+  const double rl = rel_l2_(late, want);
+  std::printf("  the source one frame late: rel-L2 %.5f\n", rl);
+  EXPECT_TRUE(rl > 2.0 * r);
 }

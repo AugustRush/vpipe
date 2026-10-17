@@ -1967,6 +1967,109 @@ TEST(minimax_h3_dit, tuned_routes_are_shared_above_the_tune_ceiling)
   EXPECT_TRUE(m->qmm_tune_count() == 1);
 }
 
+// A RELOAD READS THE ROUTES THE SESSION ALREADY MEASURED.
+//
+// A host gives a model's memory back between jobs, so every clip loaded
+// the DiT again and its tuner measured every route again -- 3-16 s at
+// the production shapes. The answers are now filed in the session
+// (generative-models/shared/tuned-answers.h): a second load in the same
+// session measures nothing and runs the same routes, splits included; a
+// session that keeps no answers measures as before.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_dit, a_reload_reads_the_session_s_routes)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  ::unsetenv("VPIPE_TUNING_CACHE");
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  cfg.n_layers = 1;
+  auto load = [&](MetalCompute* mc) {
+    ::setenv("VPIPE_H3_TUNE_ROWS", "128", 1);
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+    ::unsetenv("VPIPE_H3_TUNE_ROWS");
+    return m;
+  };
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k) * 0.5f;
+    }
+    return v;
+  };
+  auto forward = [&](MetalCompute* mc, MetalMiniMaxH3Transformer* m) {
+    h3::PackedLayout L;
+    const std::vector<int> tags(8, h3::kTextTag);
+    if (!h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                   cfg.patch_w, h3::kAudioChannels, {}, &L)) {
+      return false;
+    }
+    std::vector<float> uniq;
+    std::vector<int>   row_idx;
+    h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+    const int n_video = (int)L.video_indices.size();
+    const SharedBuffer vb = to_bf16_buf_(
+        mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+    const SharedBuffer ab = to_bf16_buf_(
+        mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+    const SharedBuffer tb = to_bf16_buf_(
+        mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+    if (vb.empty() || ab.empty() || tb.empty()) { return false; }
+    MetalMiniMaxH3Transformer::Step step;
+    step.video = &vb;  step.audio = &ab;  step.text = &tb;
+    step.layout = &L;  step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    std::string ferr;
+    if (m->forward(step, &ferr).empty()) {
+      std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+      return false;
+    }
+    return true;
+  };
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  std::string routes;
+  {
+    auto a = load(mc);
+    ASSERT_TRUE(a != nullptr);
+    if (a == nullptr) { return; }
+    ASSERT_TRUE(forward(mc, a.get()));
+    if (a->qmm_tune_count() == 0) {
+      std::printf("[minimax_h3_dit] no GEMM route to tune on this build; "
+                  "the session's answers not exercised\n");
+      return;
+    }
+    routes = a->qmm_tuning();
+  }
+  auto b = load(mc);
+  ASSERT_TRUE(b != nullptr);
+  if (b == nullptr) { return; }
+  ASSERT_TRUE(forward(mc, b.get()));
+  std::printf("[minimax_h3_dit] first load: %s | reload: %s (%d "
+              "measured)\n", routes.c_str(), b->qmm_tuning().c_str(),
+              b->qmm_tune_count());
+  EXPECT_TRUE(b->qmm_tune_count() == 0);
+  EXPECT_TRUE(b->qmm_tuning() == routes);
+  b.reset();
+
+  Session off(R"({"kernel_tuning": {"cache": false}})");
+  MetalCompute* mo = off.metal_compute();
+  for (int i = 0; i < 2 && mo != nullptr; ++i) {
+    auto c = load(mo);
+    ASSERT_TRUE(c != nullptr);
+    if (c == nullptr) { return; }
+    ASSERT_TRUE(forward(mo, c.get()));
+    EXPECT_TRUE(c->qmm_tune_count() == 1);
+  }
+}
+
 // IS THE FORWARD DETERMINISTIC AT A VIDEO GEOMETRY?
 //
 // A 1376x768x243 generation returns whole-latent noise in both video and

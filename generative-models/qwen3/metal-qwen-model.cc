@@ -8,6 +8,7 @@
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/mma-tile.h"
 #include "generative-models/shared/stream-sizing.h"
+#include "generative-models/shared/tuned-answers.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/event.h"
@@ -4305,6 +4306,31 @@ MetalQwenModel::autotune_qmv_ladder_()
     }
   }
   if ((int)pl.size() < 2) { return; }
+  const bool have8 = _qmv8_enabled && _fn_qmv_batch8_xp.valid();
+
+  // What this session measured for this model's shape before
+  // (tuned-answers.h): the helper is unloaded whenever another model
+  // needs its memory, and each load probed again. The tiles are named by
+  // their pipeline states -- MetalCompute keeps every one it builds for
+  // the session, so the address IS the kernel there, env-chosen twins
+  // (VPIPE_QMV_XP4) included.
+  auto pso_ = [](const metal_compute::ComputeFunction& f) {
+    return std::to_string((std::uintptr_t)f.mtl_pso());
+  };
+  KernelTuningCache* const answers = tuning_cache(_mc);
+  const TuneKey key = TuneKey("qwen-qmv-ladder/1")("K", Kk)("N", Nout)
+      ("layers", (int)pl.size())("t2", pso_(_fn_qmv_batch))
+      ("t4", pso_(_fn_qmv_batch4))
+      ("t8", have8 ? pso_(_fn_qmv_batch8_xp) : std::string("-"))
+      ("mix56", _qmv_mix56);
+  std::vector<int> kept;
+  if (find_tuned(answers, key, kept) &&
+      kept.size() == (std::size_t)(kQmvBatchMaxRows - 1)) {
+    for (int m = 2; m <= kQmvBatchMaxRows; ++m) {
+      _qmv_plan[m] = (QmvPlan)kept[(std::size_t)(m - 2)];
+    }
+    return;
+  }
   SharedBuffer px = _mc->make_shared_buffer((std::size_t)8 * Kk * 2);
   SharedBuffer py = _mc->make_shared_buffer((std::size_t)8 * Nout * 2);
   if (px.empty() || py.empty()) { return; }
@@ -4312,7 +4338,6 @@ MetalQwenModel::autotune_qmv_ladder_()
 
   struct Cand { const metal_compute::ComputeFunction* fn; int m; };
   std::vector<Cand> cands = {{&_fn_qmv_batch, 2}, {&_fn_qmv_batch4, 4}};
-  const bool have8 = _qmv8_enabled && _fn_qmv_batch8_xp.valid();
   if (have8) { cands.push_back({&_fn_qmv_batch8_xp, 8}); }
 
   // 3 passes over the layer cycle per bench call: the one-off command-
@@ -4353,6 +4378,13 @@ MetalQwenModel::autotune_qmv_ladder_()
     }
     if (m > 2 && have8 && t8 < best) { best = t8; p = QmvPlan::kXp8; }
     _qmv_plan[m] = p;
+  }
+  {
+    std::vector<int> answer;
+    for (int m = 2; m <= kQmvBatchMaxRows; ++m) {
+      answer.push_back((int)_qmv_plan[m]);
+    }
+    store_tuned(answers, key, answer);
   }
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();

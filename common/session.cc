@@ -5,6 +5,7 @@
 #include "common/ffmpeg-libraries.h"
 #include "common/flex-data.h"
 #include "common/i18n.h"
+#include "common/kernel-tuning-cache.h"
 #include "common/library-handle.h"
 #include "common/lmdb-env.h"
 #include "common/session-config.h"
@@ -245,6 +246,34 @@ parse_sandbox_config(const FlexData& config)
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   return PathSandbox{std::filesystem::path(dir), std::move(whitelist)};
+}
+
+// Whether the session keeps its kernel tuners' answers
+// (KernelTuningCache): `kernel_tuning: { cache: bool }`, on by default
+// -- a model loaded again then reads what it measured the first time
+// instead of measuring it again. VPIPE_TUNING_CACHE=0|1 overrides the
+// config either way (an A/B of the tuners themselves wants it off).
+bool
+parse_tuning_cache_config(const FlexData& config)
+{
+  bool on = true;
+  if (config.is_object()) {
+    auto root = config.as_object();
+    if (root.contains("kernel_tuning")) {
+      FlexData kt = root.at("kernel_tuning");
+      if (kt.is_object()) {
+        auto obj = kt.as_object();
+        if (obj.contains("cache")) {
+          FlexData v = obj.at("cache");
+          if (v.is_bool()) { on = v.get_bool(); }
+        }
+      }
+    }
+  }
+  if (const char* e = std::getenv("VPIPE_TUNING_CACHE")) {
+    on = std::atoi(e) != 0;
+  }
+  return on;
 }
 
 // Read the top-level "language" config key (an IETF tag) and normalize
@@ -729,6 +758,17 @@ Session::metal_compute() const
 #else
   return nullptr;
 #endif
+}
+
+KernelTuningCache*
+Session::kernel_tuning_cache() const
+{
+  std::call_once(_tuning_once, [this] {
+    if (parse_tuning_cache_config(_config)) {
+      _tuning = make_unique<SessionKernelTuningCache>();
+    }
+  });
+  return _tuning.get();
 }
 
 genai::GenerativeModelManager*
@@ -2081,6 +2121,9 @@ Session::find_service(std::string_view id) const
   }
   if (id == ServiceId<metal_compute::MetalCompute>::value) {
     return metal_compute();
+  }
+  if (id == ServiceId<KernelTuningCache>::value) {
+    return kernel_tuning_cache();
   }
   return nullptr;
 }

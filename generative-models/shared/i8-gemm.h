@@ -4,9 +4,11 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/shared/kernel-autotune.h"
+#include "generative-models/shared/tuned-answers.h"
 
 #include <cstddef>
 #include <cstdlib>
+#include <string_view>
 #include <vector>
 
 // TOOLKIT: compiled into each plugin (libvpipe_toolkit.a), not exported
@@ -178,6 +180,13 @@ class I8GemmContext {
   // 0 (off), 8 (w8 only, the fastest), 4 (w4 only), 1 or 12 (both, the
   // default).
   //
+  // AND IN THE SIGNED LAYOUT, PER CALL, where signed_available(bits): the
+  // codes are converted into a scratch (one pass, as the code sums above
+  // were) and the signed GEMM runs instead of the unsigned one -- see
+  // gemm_signed. The unsigned kernel remains for VPIPE_I8_SIGNED=0 and a
+  // host without the signed kernels. Either way the shape gate is the
+  // requant route's, 1024 rows: a caller of this route was promised that.
+  //
   // Returns false with nothing encoded when the shape does not qualify
   // (as accepts(), and K % 64 == 0 -- a g64 checkpoint's K always is),
   // when bits is not 4 or 8, when the group is not 64, or when the
@@ -219,9 +228,133 @@ class I8GemmContext {
   int native_policy() const { return _native; }
   void set_native_policy(int mask) { _native = mask & 12; }
 
+  // ---- the SIGNED-CODE layout ---------------------------------------
+  //
+  // The native route reads the checkpoint's codes as they lie and pays
+  // for it twice: the matrix units have no int8 x uint8 form, so it runs
+  // uint8 x uint8 (16% under int8 x int8 at a wide N on the M5 Pro), and
+  // the activation's +128 has to come back out through two more post-
+  // loop matmuls. Store the codes SIGNED instead -- q ^ 0x80 per byte
+  // (w8), q ^ 0x8 per nibble (w4), which is lossless -- with the zero
+  // point moved to b' = b + 128 s / 8 s, and the product is int8 x int8
+  // with one post-loop matmul and no per-call pass over the weight. Only
+  // b' is rounded, once, to the element type.
+  //
+  // MEASURED on the M5 Pro (gemm_i8.w8_against_bf16_routes: 4096 rows,
+  // FLUX.2 / Z-Image / FLUX.3 projections, bf16, splits off), per GEMM
+  // against the same weight held bf16 under i8 (requant + g64rs):
+  //
+  //   w8 dequant + requant   0.95-0.98x     rel-L2 vs f64  7.7e-3
+  //   w8 native              0.95-1.00x                    6.3e-3
+  //   w8 signed              1.03-1.06x                    6.6e-3
+  //
+  // So a w8 pack is FASTER than bf16 under i8 only in this layout.
+  //
+  // A family converts each weight ONCE -- at load, inside the derived
+  // buffer it keeps, or after each streamed refill, in place in its own
+  // slot (encode_to_signed allows in == out) -- and from then on every
+  // reader of that weight must understand the layout: gemm_signed here,
+  // encode_dequant_signed for the dense matmul2d route below the i8
+  // floor. The steel qmm and the qmv kernels do NOT read it; a weight
+  // that needs either stays unsigned. VPIPE_I8_SIGNED = 0 (off), 8, 4,
+  // or 1 / 12 (both, the default).
+  bool signed_available(int bits) const
+  {
+    if (!_on || _group != 64 || !_fn_quant_s8.valid() ||
+        !_fn_fold.valid()) {
+      return false;
+    }
+    if (bits == 8) {
+      return (_signed & 8) != 0 && _fn_s8_w8.valid() &&
+             _fn_to_s8.valid() && _fn_dq_s8.valid();
+    }
+    if (bits == 4) {
+      return (_signed & 4) != 0 && _fn_s8_w4.valid() &&
+             _fn_to_s4.valid() && _fn_dq_s4.valid();
+    }
+    return false;
+  }
+  int signed_policy() const { return _signed; }
+  void set_signed_policy(int mask) { _signed = mask & 12; }
+
+  // y[M,N] = x[M,K] @ w^T for a weight in the signed layout: codes [N, K
+  // bits/8], scales and zero points b' [N, K/64] in the element type.
+  // GROUP 64 ON THE WEIGHT as well as the activation, and only the caller
+  // knows the weight's: a group-32 pack's scales are twice as long and
+  // would be read as these, so a caller with one must not call this (nor
+  // gemm_affine) -- every family here gates on its _quant_group.
+  // Returns false with nothing encoded when the shape does not qualify
+  // (as gemm_affine) or the width is unavailable.
+  bool gemm_signed(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& x, std::size_t xe,
+                   const metal_compute::SharedBuffer& codes,
+                   const metal_compute::SharedBuffer& scales,
+                   const metal_compute::SharedBuffer& zb, int bits,
+                   const metal_compute::SharedBuffer& y, std::size_t ye,
+                   int M, int N, int K)
+  {
+    return gemm_signed(enc, x, xe, codes, scales, zb, bits,
+                       metal_compute::SharedBuffer{}, y, ye, M, N, K);
+  }
+  bool gemm_signed(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& x, std::size_t xe,
+                   const metal_compute::SharedBuffer& codes,
+                   const metal_compute::SharedBuffer& scales,
+                   const metal_compute::SharedBuffer& zb, int bits,
+                   const metal_compute::SharedBuffer& b,
+                   const metal_compute::SharedBuffer& y, std::size_t ye,
+                   int M, int N, int K);
+
+  // Whether a weight of this shape would take gemm_signed at `M` rows --
+  // the gate a caller asks BEFORE choosing between it and a dense route.
+  //
+  // THE ROW FLOOR is the requant route's (1024) by default, so i8_gemm
+  // runs the same GEMMs lossy whichever layout a weight is in -- what
+  // changes is how fast and how close. VPIPE_I8_SIGNED_MIN_M lowers it,
+  // and below the requant floor the signed GEMM is the FASTEST route a
+  // w8 weight has: MEASURED on the M5 Pro (gemm_i8.w8_against_bf16_
+  // routes, 3072 / 12288 x 3072 / 4096 / 9216) against its dequant +
+  // matmul2d, 1.2-2.4x at 64-768 rows, and against bf16's own matmul2d
+  // 1.05-3.7x; still 1.15-1.2x bf16 at 16 and 32 rows. But it is a
+  // precision choice too: those rows are a model's TEXT stream, whose
+  // error reaches every block. MEASURED at 16 rows: FLUX.2-klein-4B's
+  // 1024^2 forward 1.5% faster for 3.43e-2 -> 3.57e-2 of distance from
+  // the dense forward, and Z-Image's with a 64-token caption 3.84e-2 ->
+  // 5.21e-2 (its caption refiner then runs int8), past what the route it
+  // replaced cost (4.50e-2). So it is opt-in.
+  bool signed_accepts(int M, int N, int K, int bits) const
+  {
+    const int floor = _signed_min_m > 0 ? _signed_min_m : _min_m;
+    return signed_available(bits) && M >= floor && K >= 1024 && N >= 16 &&
+           (K % 64) == 0;
+  }
+
+  // Encode the conversion of an affine weight [N, K] to the signed
+  // layout. `codes_out` may be `codes_in` and `zb` may be `biases`: each
+  // thread reads its own words and zero point before writing them.
+  bool encode_to_signed(metal_compute::ComputeEncoder& enc,
+                        const metal_compute::SharedBuffer& codes_in,
+                        const metal_compute::SharedBuffer& scales,
+                        const metal_compute::SharedBuffer& biases,
+                        const metal_compute::SharedBuffer& codes_out,
+                        const metal_compute::SharedBuffer& zb, int bits,
+                        int N, int K) const;
+
+  // Encode the dequant of a signed-layout weight into a dense [N, K]
+  // element-type matrix -- the operand of a dense matmul2d GEMM, for the
+  // rows gemm_signed declines.
+  bool encode_dequant_signed(metal_compute::ComputeEncoder& enc,
+                             const metal_compute::SharedBuffer& codes,
+                             const metal_compute::SharedBuffer& scales,
+                             const metal_compute::SharedBuffer& zb, int bits,
+                             const metal_compute::SharedBuffer& out, int N,
+                             int K) const;
+
   // Drop the grow-only act/weight scratches (they re-grow on demand at the
-  // next gemm()). Call between generations on a memory-bounded box so the
-  // idle scratch doesn't crowd out a large downstream allocation.
+  // next gemm()), and the untuned shapes recorded since the last replay
+  // with the weight references they hold. Call between generations on a
+  // memory-bounded box so the idle scratch doesn't crowd out a large
+  // downstream allocation.
   void release_scratch();
 
   // ---- split-K over the 512-groups ---------------------------------
@@ -269,17 +402,32 @@ class I8GemmContext {
   // (N/64)*(M/64) threadgroups, so a wide N and a large M already fill the
   // machine; and the fold reads S*M*N*4 bytes, 411 MB at S=14/M=1024. So
   // this is measured rather than derived.
+  //
+  // `caller` names what `run` encodes (the family and its route: "h3-dit
+  // mma128x256 w4g64"), which is the part of the question this context
+  // cannot see. Given one, the answer is filed in the session and read
+  // back by the next context to ask it (tuned-answers.h); without one it
+  // is this context's alone, as before.
   template <class Run>
-  int tune(metal_compute::MetalCompute* mc, int K, int N, int M, Run&& run)
+  int tune(metal_compute::MetalCompute* mc, int K, int N, int M, Run&& run,
+           std::string_view caller = {})
   {
     if (!_on || mc == nullptr || !split_available()) { return 0; }
     const int key = m_key_(M);
     for (const Tuned& t : _tuned) {
       if (t.N == N && t.K == K && t.M == key) { return t.splits; }
     }
+    KernelTuningCache* const answers = caller.empty() ? nullptr : _answers;
+    const TuneKey skey = split_key_(caller, 0, N, K, M);
+    int kept = 0;
+    if (find_tuned(answers, skey, kept)) {
+      _tuned.push_back(Tuned{N, K, key, kept});
+      return kept;
+    }
     const std::vector<int> cands = tune_candidates(M, N, K);
     if (cands.size() < 2) {
       _tuned.push_back(Tuned{N, K, key, 0});
+      store_tuned(answers, skey, 0);
       return 0;
     }
     const int w = autotune_vote((int)cands.size(), /*rounds=*/3,
@@ -294,6 +442,7 @@ class I8GemmContext {
         });
     const int splits = cands[(std::size_t)w];
     _tuned.push_back(Tuned{N, K, key, splits});
+    store_tuned(answers, skey, splits);
     return splits;
   }
 
@@ -348,10 +497,22 @@ class I8GemmContext {
   // and the native w4/w8 route at Krea-2 / FLUX.2 shapes, 4096 rows,
   // K 4096 / 6144: 0.86-0.92x at five of six (the sixth, 4096^3 w4,
   // disagreed between its two kernel modes). Over a YuE2 song that was
-  // 1258 ms per evaluation against 1130 unsplit. Default 9216 (the cliff
-  // sits between 9k and 10k); VPIPE_I8_SPLIT_MIN_K moves it, and 0
-  // restores the old rule (every untuned shape at S=2, every width
-  // tuned).
+  // 1258 ms per evaluation against 1130 unsplit.
+  //
+  // AND PAST IT TOO, on the g64 register kernels: the cliff was the
+  // drained g512 kernel's. MEASURED on the M5 Pro (gemm_i8.split_rule_
+  // sweep: the requant route and the signed layout, 512-8192 rows, every
+  // deep-K projection in tree -- K 9216 / 10240 / 12288 / 14336 / 16384),
+  // the single op won at every shape from 1024 rows, the i8 floor, with
+  // S=2 at 0.92-0.99x; the only splits that won were S=3 at 1024 rows x
+  // 3072 x 9216 (1.07-1.10x) and S=2 at H3's fc2 at 1024 rows (1.02x).
+  // So an UNTUNED shape runs unsplit at every K -- it was S=2 from 9216,
+  // which cost 7-8% at 4096 rows (bf16 under i8, 3072-4096 x 9216-12288)
+  // on every route the tuner never reached, the native one among them.
+  // split_min_k() now only widens the TUNER's candidates (all balanced
+  // splits from it, S=2 alone below). Default 9216; VPIPE_I8_SPLIT_MIN_K
+  // moves it, and VPIPE_I8_UNTUNED_SPLIT=2 restores the old untuned S=2
+  // from it (for an A/B).
   int split_min_k() const { return _split_min_k; }
 
   // What tune() and tune_pending() weigh for a shape: the single op, and
@@ -367,6 +528,21 @@ class I8GemmContext {
   // observable from the OUTPUT (it is a reassociation), so a test that
   // wants to know the tuner's answer took effect has to ask.
   int plan_for_test(int M, int N, int K) const { return plan_(M, N, K); }
+  // Test-only: shapes recorded and not yet tuned, and whether a shape
+  // has a tuned answer (a tuned 0 and the untuned default 0 are the same
+  // plan, so the plan cannot say).
+  int pending_for_test() const { return (int)_pending.size(); }
+  // Test-only: shapes this context measured itself (tune_pending's
+  // votes), against those it read from the session's answers.
+  int measured_for_test() const { return _measured; }
+  bool tuned_for_test(int M, int N, int K) const
+  {
+    const int key = m_key_(M);
+    for (const Tuned& t : _tuned) {
+      if (t.N == N && t.K == K && t.M == key) { return true; }
+    }
+    return false;
+  }
 
   // The quantization group on both operands (64; 32, 128 or 512 under
   // the A/B).
@@ -375,8 +551,18 @@ class I8GemmContext {
  private:
   metal_compute::MetalCompute* _mc = nullptr;
   bool _on = false;
+  bool _bf16 = false;
   int _group = 64;                   // VPIPE_I8_GROUP: 32|64|128|512
   int _native = 12;                  // VPIPE_I8_NATIVE: 8 | 4 mask
+  int _signed = 12;                  // VPIPE_I8_SIGNED: 8 | 4 mask
+  // The signed layout: its activation quantizer, conversion, dequant and
+  // GEMM (+ split twins).
+  metal_compute::ComputeFunction _fn_quant_s8, _fn_to_s8, _fn_to_s4;
+  metal_compute::ComputeFunction _fn_dq_s8, _fn_dq_s4;
+  metal_compute::ComputeFunction _fn_s8_w8, _fn_s8_w4;
+  metal_compute::ComputeFunction _fn_s8_w8_sk, _fn_s8_w4_sk;
+  // gemm_affine's per-call conversion targets: codes and zero points.
+  metal_compute::SharedBuffer _sc, _szb;
   metal_compute::ComputeFunction _fn_quant_u8, _fn_wsum8, _fn_wsum4;
   metal_compute::ComputeFunction _fn_u8q_w8, _fn_u8q_w4;
   metal_compute::ComputeFunction _fn_u8q_w8_sk, _fn_u8q_w4_sk;
@@ -398,6 +584,7 @@ class I8GemmContext {
 
  private:
   int _min_m = 1024;
+  int _signed_min_m = 0;             // VPIPE_I8_SIGNED_MIN_M; 0 = _min_m
   int _max_pad_pct = 10;   // VPIPE_I8_MAX_PAD_PCT
   metal_compute::ComputeLibrary _lib_q, _lib_g;
   metal_compute::ComputeFunction _fn_quant, _fn_quant_pad, _fn_gemm;
@@ -411,13 +598,51 @@ class I8GemmContext {
   std::size_t _plane_budget = 0;
   int _max_splits = 16;              // VPIPE_I8_SPLITK_MAX_S; 0 disables
   int _split_min_k = 9216;           // VPIPE_I8_SPLIT_MIN_K; see above
+  int _untuned_split = 0;            // VPIPE_I8_UNTUNED_SPLIT (A/B)
   metal_compute::SharedBuffer _planes;
 
   struct Tuned { int N, K, M, splits; };
   std::vector<Tuned> _tuned;
-  // Shapes gemm() has run but nobody has tuned. Bounded, because a caller
-  // sweeping sequence lengths must not grow it without limit.
-  std::vector<Tuned> _pending;
+  // The session's kept answers (tuned-answers.h), or null; and the
+  // shapes already asked of it and not found, so a forward's hundred
+  // calls to an untuned shape ask once.
+  KernelTuningCache* _answers = nullptr;
+  struct Asked { int N, K, M; };
+  std::vector<Asked> _asked;
+  int _measured = 0;
+  // Shapes a route has run but nobody has tuned. Bounded, because a
+  // caller sweeping sequence lengths must not grow it without limit. The
+  // requant route replays over its own scratches; the native and signed
+  // routes read the caller's weight, so the record holds references to
+  // it until the replay (a streamed slot or a resident tensor -- either
+  // outlives the forward that recorded it).
+  enum class Route { kRequant, kNative, kSigned };
+  struct Pending {
+    int N, K, M;
+    Route route = Route::kRequant;
+    int bits = 8;
+    metal_compute::SharedBuffer codes, scales, zb;
+  };
+  std::vector<Pending> _pending;
+  // Record a shape for tune_pending unless it is settled or queued.
+  void record_(Pending p);
+  // Before a route plans a shape it has not settled: the session's
+  // answer to it, when one is kept, settles it -- the first call then
+  // runs the tuned split, and nothing is recorded to measure.
+  void settle_(Route route, int bits, int N, int K, int M);
+  // The session key of a split answer. `route` is a Route's name or a
+  // tune() caller's; everything else that moves the vote is this
+  // context's own state: the element type, the group, the split
+  // limits, the native correction's form.
+  TuneKey split_key_(std::string_view route, int bits, int N, int K,
+                     int M) const
+  {
+    return TuneKey("i8-split/1")("route", route)("bits", bits)
+        ("bf16", _bf16)("group", _group)("cmode", _cmode)
+        ("max_s", _max_splits)("min_k", _split_min_k)
+        ("plane_mb", (long long)(_plane_budget >> 20))
+        ("N", N)("K", K)("M", m_key_(M));
+  }
   metal_compute::SharedBuffer _tune_y;
   // Rows the deferred tuner MEASURES at, whatever the shape's real M. A
   // destination is M*N*2 bytes and a video forward's M is six figures --
@@ -427,9 +652,27 @@ class I8GemmContext {
   static constexpr int kTuneRows = 2048;
   // What one timed sample of the deferred tuner should last, at least.
   static constexpr double kTuneSampleMs = 4.0;
-  // Encode ONE candidate's GEMM (+ fold) over the existing scratches.
-  void encode_tuned_(metal_compute::ComputeEncoder& enc, int M, int N,
-                     int KP, int S);
+  // Encode ONE candidate's GEMM (+ fold) over the existing scratches
+  // (and, for the native and signed routes, the recorded weight).
+  void encode_tuned_(metal_compute::ComputeEncoder& enc, const Pending& p,
+                     int M, int KP, int S);
+  // The native and signed GEMMs alone, single op or split in row blocks
+  // -- shared by the routes and by the replay. `y` is the element-type
+  // output (unused when split: the planes are folded into it after).
+  void encode_native_gemm_(metal_compute::ComputeEncoder& enc,
+                           const metal_compute::SharedBuffer& codes,
+                           const metal_compute::SharedBuffer& scales,
+                           const metal_compute::SharedBuffer& qbias,
+                           int bits, const metal_compute::SharedBuffer& b,
+                           const metal_compute::SharedBuffer& y,
+                           std::size_t ye, int M, int N, int K, int S);
+  void encode_signed_gemm_(metal_compute::ComputeEncoder& enc,
+                           const metal_compute::SharedBuffer& codes,
+                           const metal_compute::SharedBuffer& scales,
+                           const metal_compute::SharedBuffer& zb, int bits,
+                           const metal_compute::SharedBuffer& b,
+                           const metal_compute::SharedBuffer& y,
+                           std::size_t ye, int M, int N, int K, int S);
   // Row buckets, so a forward whose row count wobbles does not re-tune --
   // and so the answer is attached to the count it was measured at.
   static int m_key_(int M)

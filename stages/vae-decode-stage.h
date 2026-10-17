@@ -13,10 +13,12 @@
 #include "apple-silicon/tensor-beat.h"
 #include "stages/model-memory.h"
 #include "generative-models/krea2/metal-krea2-vae.h"
+#include "generative-models/flashvsr/flashvsr-tiny-decoder.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/vae-model-registry.h"
 #include "generative-models/wan/metal-wan-vae.h"
+#include "stages/wavelet-color-fix.h"
 #endif
 
 #include <cstdint>
@@ -224,6 +226,24 @@ private:
     FlexData           sb;
   };
   std::vector<HeldFrame> _held;
+  // The wavelet colour fix, made at the first latent that asks for it,
+  // and whether a missing color_reference input has been said.
+  std::unique_ptr<WaveletColorFix> _wavelet;
+  bool _ref_port_noted = false;
+  // FlashVSR's TINY decoder (sideband::kDecoder "tiny"), loaded at the
+  // first latent that asks for it, and its stream: the MemBlocks'
+  // memories live in the decoder's scratch, so an idle unload leaves it
+  // loaded while a stream is open. `_want_tiny` is the latent in hand's
+  // ask, read before anything loads -- such a latent needs no VAE, so the
+  // Wan VAE's weights are deferred (`_wan_deferred`) until one that does.
+  std::unique_ptr<genai::FlashVsrTinyDecoder> _tiny;
+  std::unique_ptr<genai::FlashVsrTinyDecoder::Stream> _tiny_stream;
+  std::string _tiny_path;
+  bool _tiny_tried = false;
+  bool _want_tiny = false;
+  bool _wan_deferred = false;
+  bool ensure_tiny_();
+  bool ensure_wan_vae_();
   std::unique_ptr<TensorBeatPayload> held_beat_(const HeldFrame& h) const;
   // MiniMax-H3's video VAE. Its decoder is a ViT rather than an
   // upsampling conv stack, so it tiles STRUCTURALLY and returns the whole

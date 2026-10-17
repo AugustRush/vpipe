@@ -1640,15 +1640,17 @@ builtin_catalog_()
     //     reads the upscaled clip in PIXELS (the flashvsr-src-encoder
     //     stage runs it).
     //   Wan2.1_VAE.pth  = the Wan 2.1 VAE, natively named, no config.
-    // Three of those are torch.save() files, READ IN PLACE: they map as
+    //   TCDecoder.ckpt  = the reference's TINY decoder, a TAEHV decoder
+    //     that reads the source beside the latent (189 MB); vae-decode
+    //     runs it where the source encoder's `decoder` asks.
+    // Four of those are torch.save() files, READ IN PLACE: they map as
     // shards (shared/torch-zip.h), so nothing is converted.
     //
     // THE CONTEXT IS NOT ON THE MODEL PAGE. The reference keeps it in its
     // GitHub repo (examples/WanVSR/prompt_tensor/posi_prompt.pth), and a
     // companion can only name a HuggingFace repo -- so it comes from
     // deAPI-ai's copy of v1.1, which is BYTE-IDENTICAL to GitHub's
-    // (sha256 4601107a11e4e11a...) as of 2026-09-12. 4 MB. TCDecoder.ckpt
-    // (the reference's tiny decoder) is not fetched: nothing here runs it.
+    // (sha256 4601107a11e4e11a...) as of 2026-09-12. 4 MB.
     {.family = "FlashVSR", .version = "1.1", .param_class = "1.3B",
      .variant = "one-step streaming 4x (OpenImagingLab)",
      .hf_path = "JunhaoZhuang/FlashVSR-v1.1",
@@ -1656,7 +1658,7 @@ builtin_catalog_()
      .inputs = {"video"}, .outputs = {"video"},
      .files = {"config.json", "model_index.json",
                "diffusion_pytorch_model_streaming_dmd.safetensors",
-               "LQ_proj_in.ckpt", "Wan2.1_VAE.pth"},
+               "LQ_proj_in.ckpt", "Wan2.1_VAE.pth", "TCDecoder.ckpt"},
      .companion_files = {{.repo = "deAPI-ai/flashvsr-v1-1",
                           .file = "posi_prompt.pth",
                           .dest = "posi_prompt.pth"}},
@@ -1677,16 +1679,18 @@ builtin_catalog_()
     // The context is not in this repository either: the reference keeps
     // it in its GitHub repo (prompt_tensor/posi_prompt.pth), and it is
     // BYTE-IDENTICAL to v1.1's (sha256 4601107a11e4e11a..., checked
-    // 2026-10-15), so it comes from the same companion. The
-    // reference's default decoder, TCDecoder.ckpt, is not fetched:
-    // nothing here runs it; the Wan VAE is its documented alternative.
+    // 2026-10-15), so it comes from the same companion. TCDecoder.ckpt,
+    // the reference's DEFAULT decoder (the Wan VAE is its documented
+    // alternative), sits at the root beside the VAE, byte-identical to
+    // v1.1's (sha256 e224bdcf2f52745c..., checked 2026-10-16).
     {.family = "FlashVSR+", .version = "1.0", .param_class = "1.3B",
      .variant = "Turbo, hybrid attention (OpenImagingLab)",
      .hf_path = "ruchangyao/FlashVSR_plus",
      .model_type = "flashvsr",
      .inputs = {"video"}, .outputs = {"video"},
      .files = {"config.json", "turbo/dit.safetensors",
-               "turbo/lq_proj_in.safetensors", "Wan2.1_VAE.pth"},
+               "turbo/lq_proj_in.safetensors", "Wan2.1_VAE.pth",
+               "TCDecoder.ckpt"},
      .companion_files = {{.repo = "deAPI-ai/flashvsr-v1-1",
                           .file = "posi_prompt.pth",
                           .dest = "posi_prompt.pth"}},
@@ -1699,7 +1703,8 @@ builtin_catalog_()
      .model_type = "flashvsr",
      .inputs = {"video"}, .outputs = {"video"},
      .files = {"config.json", "base/dit.safetensors",
-               "base/lq_proj_in.safetensors", "Wan2.1_VAE.pth"},
+               "base/lq_proj_in.safetensors", "Wan2.1_VAE.pth",
+               "TCDecoder.ckpt"},
      .companion_files = {{.repo = "deAPI-ai/flashvsr-v1-1",
                           .file = "posi_prompt.pth",
                           .dest = "posi_prompt.pth"}},

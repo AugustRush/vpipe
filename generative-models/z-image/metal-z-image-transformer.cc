@@ -6,6 +6,7 @@
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/shared/i8-gemm.h"
+#include "generative-models/shared/signed-affine.h"
 #include "generative-models/shared/metal-sage-attention.h"
 #include "generative-models/shared/metal-sol-attention.h"
 #include "generative-models/shared/lora-names.h"
@@ -356,7 +357,7 @@ MetalZImageTransformer::to_elt_(WeightSet& ws, const std::string& name,
 
 MetalZImageTransformer::QWeight
 MetalZImageTransformer::load_qw_(WeightSet& ws, const std::string& name,
-                                 Retain r)
+                                 Retain r, bool sign)
 {
   QWeight qw;
   const MetalLlamaWeights& wts = ws.src();
@@ -369,6 +370,46 @@ MetalZImageTransformer::load_qw_(WeightSet& ws, const std::string& name,
     const long K = scols * (long)_quant_group;
     const int bits = K > 0 ? (int)(gcols * 32 / K) : 0;
     qw.bits = (bits == 8) ? 8 : 4;
+    // THE SIGNED LAYOUT, converted where the bytes are first the model's
+    // own: in the builder of the entries the set keeps for a retained
+    // block (so nothing unsigned stays cached beside them), in place in
+    // a streamed read. As FLUX.2's.
+    if (sign && _sgn && _i8 && _i8->signed_available(qw.bits)) {
+      const std::string cn = name + ".weight", bn = name + ".biases";
+      const auto cp = WeightSet::Residency::Copied;
+      qw.scales = to_elt_(ws, name + ".scales", r);
+      if (r == Retain::Streamed) {
+        qw.codes = ws.stream_tensor(cn, _mc, cp);
+        qw.qbias = ws.stream_derived(
+            [&]() { return to_bf16_(ws.src(), _mc, bn); });
+        qw.sgn = !qw.codes.empty() && !qw.scales.empty() &&
+                 genai::to_signed_affine(qw.codes, qw.scales, qw.qbias,
+                                         qw.bits, /*bf16=*/true);
+      } else {
+        const int qb = qw.bits;
+        qw.codes = ws.derived(std::string(kKey) + "sgn|" + cn, [&]() {
+          SharedBuffer c = ws.read(cn, _mc, cp);
+          return !c.empty() && genai::to_signed_codes(c, qb)
+                     ? std::move(c) : SharedBuffer{};
+        });
+        if (!qw.scales.empty()) {
+          qw.qbias = ws.derived(std::string(kKey) + "sgn|" + bn, [&]() {
+            SharedBuffer b = to_bf16_(ws.src(), _mc, bn);
+            return !b.empty() && genai::to_signed_zero_points(
+                                     qw.scales, b, qb, /*bf16=*/true)
+                       ? std::move(b) : SharedBuffer{};
+          });
+        }
+        qw.sgn = !qw.codes.empty() && !qw.qbias.empty();
+      }
+      if (qw.sgn) {
+        qw.quantized = true;
+        return qw;
+      }
+      // Not convertible: the unsigned layout below, as if never asked.
+      qw.codes = {}; qw.scales = {}; qw.qbias = {};
+      qw.sgn = false;
+    }
     qw.codes = r == Retain::Streamed
                    ? ws.stream_tensor(name + ".weight", _mc,
                                       WeightSet::Residency::Copied)
@@ -390,19 +431,19 @@ bool
 MetalZImageTransformer::load_block_(WeightSet& ws, const std::string& p,
                                     bool with_ada, Block& b, Retain r)
 {
-  b.qw = load_qw_(ws, p + "attention.to_q", r);
-  b.kw = load_qw_(ws, p + "attention.to_k", r);
-  b.vw = load_qw_(ws, p + "attention.to_v", r);
+  b.qw = load_qw_(ws, p + "attention.to_q", r, true);
+  b.kw = load_qw_(ws, p + "attention.to_k", r, true);
+  b.vw = load_qw_(ws, p + "attention.to_v", r, true);
   // to_out is a ModuleList, so the projection is ".0" -- not a typo.
-  b.ow = load_qw_(ws, p + "attention.to_out.0", r);
+  b.ow = load_qw_(ws, p + "attention.to_out.0", r, true);
   b.nq = to_elt_(ws, p + "attention.norm_q.weight", r);
   b.nk = to_elt_(ws, p + "attention.norm_k.weight", r);
   // SwiGLU as Llama names it: w1 gates, w3 is the up projection and w2
   // the down one. Reading w1 and w3 the other way round is a model that
   // still denoises.
-  b.w1 = load_qw_(ws, p + "feed_forward.w1", r);
-  b.w3 = load_qw_(ws, p + "feed_forward.w3", r);
-  b.w2 = load_qw_(ws, p + "feed_forward.w2", r);
+  b.w1 = load_qw_(ws, p + "feed_forward.w1", r, true);
+  b.w3 = load_qw_(ws, p + "feed_forward.w3", r, true);
+  b.w2 = load_qw_(ws, p + "feed_forward.w2", r, true);
   b.an1 = to_elt_(ws, p + "attention_norm1.weight", r);
   b.an2 = to_elt_(ws, p + "attention_norm2.weight", r);
   b.fn1 = to_elt_(ws, p + "ffn_norm1.weight", r);
@@ -524,6 +565,7 @@ MetalZImageTransformer::clone_block_(const Block& src, Block& dst,
   auto cq = [&](const QWeight& s, QWeight& d) {
     d.quantized = s.quantized;
     d.bits = s.bits;
+    d.sgn = s.sgn;
     ok = clone_buf_(_mc, s.w, d.w, copy) && ok;
     ok = clone_buf_(_mc, s.codes, d.codes, copy) && ok;
     ok = clone_buf_(_mc, s.scales, d.scales, copy) && ok;
@@ -579,6 +621,43 @@ MetalZImageTransformer::fill_narrow_(const std::string& nm,
                          static_cast<std::uint16_t*>(dst.contents()));
 }
 
+bool
+MetalZImageTransformer::sign_(QWeight& w) const
+{
+  // A weight this model keeps unsigned (dense, the layout off) has
+  // nothing to do. A signed one in a slot was just REFILLED raw, whatever
+  // its flag says from the build, so it converts unconditionally.
+  if (!w.quantized || !_sgn || !_i8 || !_i8->signed_available(w.bits)) {
+    return true;
+  }
+  if (!genai::to_signed_affine(w.codes, w.scales, w.qbias, w.bits,
+                               /*bf16=*/true)) {
+    return false;
+  }
+  w.sgn = true;
+  return true;
+}
+
+const MetalZImageTransformer::QWeight*
+MetalZImageTransformer::signed_dense_(ComputeEncoder& enc, const QWeight& w,
+                                      QWeight& view, int N, int K) const
+{
+  if (!w.quantized || !w.sgn) { return &w; }
+  const std::size_t need = (std::size_t)N * (std::size_t)K * 2;
+  if (_w_deq.empty() || _w_deq.byte_size() < need) {
+    _w_deq = _mc->make_shared_buffer(need);
+    if (_w_deq.empty()) { return nullptr; }
+  }
+  if (!_i8 || !_i8->encode_dequant_signed(enc, w.codes, w.scales, w.qbias,
+                                          w.bits, _w_deq, N, K)) {
+    return nullptr;
+  }
+  view = QWeight{};
+  view.w = _w_deq.subview(0, need);
+  if (view.w.empty()) { return nullptr; }
+  return &view;
+}
+
 void
 MetalZImageTransformer::configure_slots_()
 {
@@ -601,6 +680,15 @@ MetalZImageTransformer::configure_slots_()
   };
   ops.bytes = [](const Block& b) { return block_bytes_(b); };
   ops.empty = [](const Block& b) { return b.qw.empty(); };
+  // Every quantized projection just landed RAW, and converts to the
+  // signed layout here, on the reader thread, under the GPU's work. The
+  // adaLN, which load_block_ keeps unsigned, is left as read.
+  ops.post_refill = [this](int, Block& b) {
+    for (QWeight* w : {&b.qw, &b.kw, &b.vw, &b.ow, &b.w1, &b.w3, &b.w2}) {
+      if (!sign_(*w)) { return false; }
+    }
+    return true;
+  };
   _slots.set_weight_set(_ws.get());
   _slots.configure(_mc, std::move(ops), "MetalZImageTransformer",
                    "VPIPE_Z_IMAGE_NO_SLOTS");
@@ -806,6 +894,20 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
                                "weights are incomplete"));
     }
     return nullptr;
+  }
+
+  // THE SIGNED LAYOUT for the block projections (see _sgn): decided
+  // before any block loads -- the context refiner's first. Its GEMM runs
+  // only on the matrix-core route, and the ANE tiers' stagers read the
+  // codes unsigned.
+  m->_sgn = m->_i8 && m->_use_mma2 && m->_quant_bits > 0 &&
+            m->_quant_group == 64 &&
+            !m->_cfg.ane_ffn && !m->_cfg.ane_qkv &&
+            (m->_i8->signed_available(8) || m->_i8->signed_available(4));
+  if (m->_sgn && mc->session() != nullptr) {
+    mc->session()->info(fmt(
+        "MetalZImageTransformer: the quantized block projections take the "
+        "signed int8 layout"));
   }
 
   // THE CONTEXT REFINER IS ALWAYS HELD, in both modes. It is two blocks
@@ -1166,7 +1268,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
   };
 
   // ---- dispatch helpers ---------------------------------------------
-  auto lin = [&](const SharedBuffer& x, std::size_t xe, const QWeight& w,
+  auto lin = [&](const SharedBuffer& x, std::size_t xe, const QWeight& w_in,
                  const SharedBuffer& y, std::size_t ye, int M, int N, int K,
                  const lora::Stack& lf = lora::Stack{}) {
     // The adapter accumulates ONTO the base result, so it runs after
@@ -1177,7 +1279,16 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       }
     };
     _flops.gemm(M, N, K);
-    if (gemm_mma_(enc, x, xe, w, y, ye, M, N, K)) { lora_after(); return; }
+    if (gemm_mma_(enc, x, xe, w_in, y, ye, M, N, K)) {
+      lora_after();
+      return;
+    }
+    // The steel tiles do not read the signed layout: a signed weight
+    // here (a shape matmul2d declines) is dequantized first.
+    QWeight sv;
+    const QWeight* sp = signed_dense_(enc, w_in, sv, N, K);
+    if (sp == nullptr) { return; }
+    const QWeight& w = *sp;
     if (!w.quantized) {
       int bm = 32, bn = 32;
       const metal_compute::ComputeFunction* fn = &_fn_gemm_t;
@@ -2067,14 +2178,28 @@ MetalZImageTransformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& xin,
   // 128-row tile, and where N is not degenerate. The timestep, the
   // modulation and the final adaLN are M=1 -- exactly the shape the
   // tile is wrong for -- and stay on steel at no cost either way.
-  if (!_use_mma2 || M < _mma_min_m || N < 16) { return false; }
+  if (!_use_mma2 || N < 16) { return false; }
   // And decline a shape whose operands would not survive the tiles'
   // 32-bit addressing: past 2^31 BYTES on ANY operand the mma tiles
   // stop storing, SILENTLY. See shared/mma-tile.h.
   if (M > mma_row_band(N, K)) { return false; }
+  // A signed weight's int8 GEMM, before the matmul2d tile's row gate:
+  // its floor is the int8 route's own (I8GemmContext::signed_accepts --
+  // 1024 rows, or lower by VPIPE_I8_SIGNED_MIN_M, which it then beats
+  // the dequant + matmul2d below at).
+  if (_i8 && w.quantized && w.sgn &&
+      _i8->gemm_signed(enc, xin, xe, w.codes, w.scales, w.qbias, w.bits, y,
+                       ye, M, N, K)) {
+    return true;
+  }
+  if (M < _mma_min_m) { return false; }
 
   const SharedBuffer* wdense = nullptr;
-  if (w.quantized) {
+  if (w.quantized && w.sgn) {
+    QWeight view;
+    if (signed_dense_(enc, w, view, N, K) == nullptr) { return false; }
+    wdense = &_w_deq;
+  } else if (w.quantized) {
     const metal_compute::ComputeFunction& dq =
         (w.bits == 8) ? _fn_dequant8 : _fn_dequant4;
     if (!dq.valid()) { return false; }
