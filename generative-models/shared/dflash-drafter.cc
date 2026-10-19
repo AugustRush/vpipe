@@ -392,6 +392,13 @@ struct MetalDFlashDrafter::Impl {
   // Affine GEMM tiers for the held width, and the dense pair.
   ComputeFunction fn_qmv, fn_qmv_b2, fn_qmv_b4, fn_qmv_b8, fn_qmm;
   ComputeFunction fn_dgemm, fn_dgemv;
+  // Split-K tiles at the held width (affine_qmv_ks<r>_w<bits>g64, by row
+  // count 2/3/4/6/8): a block's rows read each weight about once. The
+  // batch tiles before them ran the drafter's 8 rows at a fraction of the
+  // bandwidth on an M5 Ultra (10 of an 80 ms round, ~0.9 GB of weights).
+  // VPIPE_DFLASH_KSPLIT=0 goes back to them.
+  ComputeFunction fn_ks[9];
+  bool ks_ok = false;
 
   // Scratch sized for Lmax block rows and kIngestChunk context rows.
   static constexpr int kIngestChunk = 256;
@@ -482,6 +489,16 @@ MetalDFlashDrafter::Impl::gemm(ComputeEncoder& enc, const Lin& W,
     const char* e = std::getenv("VPIPE_DFLASH_GEMV_MAX");
     return e != nullptr ? std::atoi(e) : 8;
   }();
+  if (ks_ok && M <= 8 && (N % 4) == 0 && (K % 64) == 0) {
+    // Split-K: one tile up to 6 rows, else 4-row tiles (an 8-row one
+    // holds 32 accumulators a thread and loses occupancy).
+    const int tr = M <= 4 ? M : (M <= 6 ? 6 : 4);
+    bind(fn_ks[tr]);
+    enc.set_constant(7, M);
+    enc.dispatch({64u, (unsigned)(N / 4), (unsigned)((M + tr - 1) / tr)},
+                 {64u, 1u, 1u});
+    return;
+  }
   if (M <= gemv_max) {
     // Batched GEMV: the weight read once for every row of the tile.
     const ComputeFunction& fn =
@@ -651,6 +668,16 @@ MetalDFlashDrafter::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
     if (!m.fn_qmv.valid() || !m.fn_qmv_b2.valid() || !m.fn_qmv_b4.valid() ||
         !m.fn_qmv_b8.valid() || !m.fn_qmm.valid()) {
       return fail("the affine " + g + " GEMM kernels failed to load");
+    }
+    m.ks_ok = true;
+    for (int r : {2, 3, 4, 6}) {
+      m.fn_ks[r] = m.lib_qmv.function("affine_qmv_ks" + std::to_string(r) +
+                                      "_" + g);
+      m.ks_ok = m.ks_ok && m.fn_ks[r].valid();
+    }
+    if (const char* e = std::getenv("VPIPE_DFLASH_KSPLIT");
+        e != nullptr && std::atoi(e) == 0) {
+      m.ks_ok = false;
     }
   } else {
     m.lib_dense = mc->load_library("dense_gemm" + sfx);

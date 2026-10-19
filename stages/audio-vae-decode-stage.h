@@ -89,6 +89,9 @@ private:
   std::vector<ResourceClaim> decide_resources() const override;
 
   std::string _hf_dir;
+  // `vae_dir`: the audio VAE's WEIGHTS when they are not the model's own
+  // (a Draw Things .ckpt); the config is still the model's. Empty: none.
+  std::string _vae_weights;
   std::string _family;              // "minimax-h3"
   std::uint64_t _clips = 0;
 

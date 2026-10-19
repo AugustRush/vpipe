@@ -22,8 +22,11 @@
 #include "generative-models/gemma4/metal-gemma4-vision.h"
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/mistral3/metal-pixtral-vision.h"
+#include "generative-models/model-loader.h"
 #include "generative-models/qwen3/metal-audio-encoder.h"
+#include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
+#include "generative-models/shared/dflash-drafter.h"
 #include "generative-models/shared/mcp/python-sandbox.h"
 #include "generative-models/shared/mcp/shell-tool.h"
 #include "generative-models/token-muxer.h"
@@ -688,7 +691,8 @@ const PortSpec kIports[] = {
 };
 const PortSpec kOports[] = {
   {.name = "assistant",
-   .doc = "FlexData {text,prefill_ms,decode_ms,decoded,ctx_pos} per "
+   .doc = "FlexData {text,prefill_ms,decode_ms,decoded,prefilled,"
+          "ctx_pos, a drafter's drafter,rounds,drafted,accepted} per "
           "turn (downstream optional)",
    .type = &typeid(FlexDataPayload),
    .tags = "text", .clock_group = 0},
@@ -829,6 +833,44 @@ TextChatStage::declare_memory() const
   return m;
 }
 
+std::string
+TextChatStage::spec_scratch_label_(const std::string& dir)
+{
+  return "spec-verify:" + dir;
+}
+
+std::size_t
+TextChatStage::spec_scratch_bytes_(const std::string& dir) const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // The rounds' widest: a DFlash block, or MTP's anchor + two drafts.
+  if (_draft_model.empty() && !_mtp_enabled) { return 0; }
+  int rows = 0;
+  bool mtp = false;
+  genai::ModelLoader loader(session());
+  const auto mcfg = loader.load_config(dir);
+  if (!mcfg.has_value() || mcfg->hidden <= 0) { return 0; }
+  if (!_draft_model.empty()) {
+    const auto dc = genai::DFlashConfig::from_dir(
+        resolve_model_dir(session(), _draft_model));
+    rows = dc.has_value() ? dc->block_size : 16;
+  } else if (_mtp_enabled) {
+    std::error_code ec;
+    namespace fs = std::filesystem;
+    mtp = !_mtp_model.empty() || mcfg->num_nextn_layers > 0
+          || fs::exists(dir + "/mtp.safetensors", ec)
+          || fs::exists(dir + "/optiq/mtp.safetensors", ec);
+    rows = mtp ? 3 : 0;
+  }
+  if (rows == 0) { return 0; }
+  return genai::MetalQwenModel::verify_scratch_bytes(
+      genai::MetalQwenModel::config_from(*mcfg), rows, mtp);
+#else
+  (void)dir;
+  return 0;
+#endif
+}
+
 std::vector<ResourceClaim>
 TextChatStage::declare_resources() const
 {
@@ -837,7 +879,16 @@ TextChatStage::declare_resources() const
   if (!_draft_model.empty()) {
     dirs.push_back(resolve_model_dir(session(), _draft_model));
   }
-  return model_memory::weight_claims(dirs);
+  std::vector<ResourceClaim> out = model_memory::weight_claims(dirs);
+  // A drafter's verify pools its scratch for the model's life (tens of
+  // MB on a 27B: the long-context attention's partials, a block's
+  // logits). Withdrawn at load when no drafter attaches.
+  for (auto& c : model_memory::scratch_claims(
+           spec_scratch_label_(dirs[0]), spec_scratch_bytes_(dirs[0]),
+           {})) {
+    out.push_back(std::move(c));
+  }
+  return out;
 }
 
 Job
@@ -909,6 +960,14 @@ TextChatStage::initialize(RuntimeContext& ctx)
   }
   // Kept warm past this graph: the next chat's load is handed this one.
   if (_keep_loaded > 0) { mgr->keep_warm(_lm, spec.hf_dir, _keep_loaded); }
+  // No drafter will run: the verify's scratch is never made.
+  {
+    const std::string d = _lm->spec_drafter();
+    if (d.empty()
+        || (d == genai::spec_decode::kDrafterMtp && !_mtp_enabled)) {
+      mgr->revise_scratch(spec_scratch_label_(spec.hf_dir), 0);
+    }
+  }
   // Apply the MTP prefix-seed preference before any prefill (no-op unless the
   // model carries a metal MTP head). Chat is decode-bound, so default on.
   if (_mtp_enabled) { _lm->set_mtp_prefix_seed(_mtp_prefix_seed); }
@@ -1545,6 +1604,12 @@ TextChatStage::process(RuntimeContext& ctx)
   double     decode_s_total     = 0.0;
   int        prefill_n_total    = 0;
   int        decode_calls_total = 0;
+  // A drafter's rounds over the beat (its verify forwards), the draft
+  // tokens it offered and those kept: how much it bought.
+  std::string spec_drafter;
+  long       spec_rounds_total   = 0;
+  long       spec_drafted_total  = 0;
+  long       spec_accepted_total = 0;
   StopReason reason             = StopReason::StopToken;
 
   // Stop check + assistant-turn close token come from the same
@@ -1746,6 +1811,10 @@ TextChatStage::process(RuntimeContext& ctx)
                          is_stop, on_toks, &produced, &stopped, prompt_ids,
                          _draft_block, &sres);
       if (sres.rounds > 0) {
+        spec_drafter = drafter;
+        spec_rounds_total += sres.rounds;
+        spec_drafted_total += sres.drafted;
+        spec_accepted_total += sres.accepted;
         session()->info(fmt(
             "TextChatStage('{}'): {} decode: {} tokens in {} rounds "
             "({:.2f} a round), {}/{} drafts accepted", this->id(), drafter,
@@ -2278,7 +2347,14 @@ TextChatStage::process(RuntimeContext& ctx)
         FlexData::make_int(
             static_cast<int64_t>(decode_s * 1000.0)));
     root.insert("decoded", FlexData::make_int(decode_calls_total));
+    root.insert("prefilled", FlexData::make_int(prefill_n_total));
     root.insert("ctx_pos", FlexData::make_int(conv_ctx_pos));
+    if (spec_rounds_total > 0) {
+      root.insert("drafter", FlexData::make_string(spec_drafter));
+      root.insert("rounds", FlexData::make_int(spec_rounds_total));
+      root.insert("drafted", FlexData::make_int(spec_drafted_total));
+      root.insert("accepted", FlexData::make_int(spec_accepted_total));
+    }
     if (conv.on) {
       root.insert("content", FlexData::make_string(reply_words(
           assistant_text, tpl->tool_call_open_marker(),
@@ -2286,7 +2362,6 @@ TextChatStage::process(RuntimeContext& ctx)
       root.insert("tool_calls", std::move(conv_calls));
       root.insert("finish", FlexData::make_string(conv_finish));
       root.insert("reused", FlexData::make_int(conv_reused));
-      root.insert("prefilled", FlexData::make_int(prefill_n_total));
       root.insert("restored", FlexData::make_string(conv_restored));
       root.insert("ctx_bytes", FlexData::make_int(
           static_cast<int64_t>(_lm->kv_bytes())));

@@ -59,6 +59,7 @@ VaeEncodeStage::VaeEncodeStage(const SessionContextIntf* s,
   // now -- a model-select source on the model iport can supply it instead --
   // so the "no model at all" case is reported at initialize()/process() time.
   _hf_dir    = attr_str("hf_dir");
+  _vae_weights = attr_str("vae_dir");
   // THE ACCELERATION BAG, built once and handed to a registered family
   // whole. Written whether the tier is on or off, and with the SETTLED
   // value, so no family repeats this stage's reading or reaches a
@@ -68,6 +69,20 @@ VaeEncodeStage::VaeEncodeStage(const SessionContextIntf* s,
   _accel = FlexData::make_object();
   genai::accel::set_flag(&_accel, genai::accel::kI8Gemm,
                          attr_bool("i8_gemm"));
+  {
+    const std::string t = attr_str("i8_gemm_tier");
+    const bool known = t == genai::accel::kI8TierFast ||
+                       t == genai::accel::kI8TierToken ||
+                       t == genai::accel::kI8TierTokenPlain;
+    if (!t.empty() && !known && t != genai::accel::kI8TierAccurate) {
+      fail_config(fmt("VaeEncodeStage('{}'): i8_gemm_tier must be 'accurate', "
+                      "'fast', 'token' or 'token_plain' (got '{}')",
+                      this->id(), t));
+    }
+    genai::accel::set_text(&_accel, genai::accel::kI8GemmTier,
+                           known ? t
+                                 : std::string(genai::accel::kI8TierAccurate));
+  }
 
   // Optional letterbox resize: target_width + target_height (both required
   // together, both multiples of 8 -- the VAE downsamples by 8, and the
@@ -209,6 +224,9 @@ constexpr const char* kInputRangeDoc =
 constexpr SpecExtra kUnloadChoices[] = {
   {spec_key::kChoices, "auto,destroy,keep"},
 };
+constexpr SpecExtra kI8TierChoices[] = {
+  {spec_key::kChoices, "accurate,fast,token,token_plain"},
+};
 const ConfigKey kAttrs[] = {
   {.key = "input_range", .type = ConfigType::String, .required = false,
    .doc = kInputRangeDoc, .def_str = "unit"},
@@ -237,6 +255,13 @@ const ConfigKey kAttrs[] = {
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-image-vae,vosr",
    .model_channel = "diffusion-model"},
+  {.key = "vae_dir", .type = ConfigType::String, .required = false,
+   .doc = "the VAE's WEIGHTS, when they are not hf_dir's own: a "
+          "directory, a registry key, or a single file -- a Draw Things "
+          ".ckpt (Qwen-Image-2.1's VAE, MiniMax-H3's video VAE), read under "
+          "the release's names. The config (latent statistics, geometry) "
+          "still comes from hf_dir's VAE",
+   .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
   {.key = "target_width", .type = ConfigType::Int, .required = false,
    .doc = "letterbox-resize the input to this width before encoding (multiple "
           "of 8; requires target_height). 0/unset = encode at native size"},
@@ -264,9 +289,23 @@ const ConfigKey kAttrs[] = {
           "the pixels a person looks at, so an approximation in it has "
           "nowhere to be absorbed -- where the same trade inside a DiT is "
           "followed by dozens of blocks and a decode. It is settable so the "
-          "trade can be MEASURED. Only a REGISTERED family reads it; the "
-          "built-in codecs ignore it. Env VPIPE_I8_GEMM overrides",
+          "trade can be MEASURED. Read by the Qwen-Image codec (Krea-2's, "
+          "Qwen-Image-2.1's: its 3x3 convs on the int8 hardware "
+          "convolution, an activation channel at a step of its own, and "
+          "its materialized mid-block attention's two GEMMs -- MEASURED "
+          "1.15x / 1.26x a 1024^2 decode at 'accurate' / 'fast', 52-60 / "
+          "50-57 dB from the f16 picture) and by a REGISTERED family; the "
+          "other built-in codecs ignore it. Env VPIPE_I8_GEMM overrides",
    .def_bool = false},
+  {.key = "i8_gemm_tier", .type = ConfigType::String, .required = false,
+   .doc = "which int8 i8_gemm runs, in generate-image's words: 'accurate' "
+          "(default) takes only the resnet convs -- their inputs are "
+          "RMS-normed -- and runs the attention's GEMMs at groups of 64; "
+          "'fast', 'token' and 'token_plain' take every 3x3 the route "
+          "fits, the residual stream's too, and run the GEMMs at that "
+          "tier (a depth its layout cannot take stays accurate). The "
+          "Qwen-Image codec only; others read 'accurate'",
+   .def_str = "accurate", .extra = kI8TierChoices},
 };
 const PortSpec kIports[] = {
   {.name = "image", .doc = "U8, f16 or f32 RGB, channel-first (U8 "
@@ -360,9 +399,19 @@ VaeEncodeStage::reset_run_state()
   _batch = false;
 }
 std::string
+VaeEncodeStage::vae_weights_() const
+{
+  if (_vae_weights.empty()) { return {}; }
+  return resolve_model_dir(session(), _vae_weights);
+}
+
+std::string
 VaeEncodeStage::vae_dir_for_release_() const
 {
   if (_hf_dir.empty()) { return {}; }
+  // Weights named apart from the model (`vae_dir`) are what loads, so
+  // they are what is claimed and released.
+  if (const std::string w = vae_weights_(); !w.empty()) { return w; }
   namespace fs = std::filesystem;
   const std::string root = resolve_model_dir(session(), _hf_dir);
   const std::string vae_dir = resolve_vae_dir(root);
@@ -520,6 +569,22 @@ VaeEncodeStage::reload_vae_()
   ensure_loaded_();
 }
 
+namespace {
+
+// The settled bag (the ctor's) as the Qwen-Image codec takes it.
+genai::MetalKrea2Vae::Accel
+krea2_accel_(const FlexData& bag)
+{
+  namespace ac = genai::accel;
+  const std::string t = ac::text(&bag, ac::kI8GemmTier);
+  return {ac::flag(&bag, ac::kI8Gemm),
+          t == ac::kI8TierTokenPlain ? 3
+          : t == ac::kI8TierToken    ? 2
+          : t == ac::kI8TierFast     ? 1 : 0};
+}
+
+}  // namespace
+
 void
 VaeEncodeStage::ensure_loaded_()
 {
@@ -633,10 +698,16 @@ VaeEncodeStage::ensure_loaded_()
   // family's resolver returns what it was handed -- and a STANDALONE VAE
   // is one freely-named safetensors in a directory nothing globs, so
   // that one is opened on the FILE. See resolve_vae_weights_path.
+  const std::string ws_override = vae_weights_();
   const std::string ws_dir =
-      (_family == "minimax-h3")
+      !ws_override.empty() ? ws_override
+      : (_family == "minimax-h3")
           ? genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(vae_dir)
           : resolve_vae_weights_path(vae_dir);
+  if (!ws_override.empty()) {
+    load_note_(fmt("VaeEncodeStage('{}'): the VAE's weights from '{}', its "
+                   "config from '{}'", this->id(), ws_override, vae_dir));
+  }
   std::shared_ptr<genai::WeightSet> ws =
       genai::open_weight_set(ws_dir, session());
   if (!ws) {
@@ -698,7 +769,9 @@ VaeEncodeStage::ensure_loaded_()
     }
     load_note_(fmt("VaeEncodeStage('{}'): loading the MiniMax-H3 video VAE "
                    "(encoder) from '{}'", this->id(), vae_dir));
-    _h3_vae = genai::MetalMiniMaxH3VideoVae::load(vae_dir, mc, h3cfg);
+    _h3_vae = ws_override.empty()
+                  ? genai::MetalMiniMaxH3VideoVae::load(vae_dir, mc, h3cfg)
+                  : genai::MetalMiniMaxH3VideoVae::load(ws, mc, h3cfg);
     if (!_h3_vae) {
       session()->error(fmt(
           "VaeEncodeStage('{}'): failed to load the MiniMax-H3 video VAE "
@@ -762,6 +835,11 @@ VaeEncodeStage::ensure_loaded_()
         "inert", this->id(), vae_dir));
     _vae.reset();
     return;
+  }
+  // i8_gemm, settled in the ctor (see VaeDecodeStage).
+  _vae->set_accel(krea2_accel_(_accel));
+  if (const std::string note = _vae->accel_note(); !note.empty()) {
+    session()->log_normal(fmt("VaeEncodeStage('{}'): {}", this->id(), note));
   }
   session()->log_debug(fmt(
       "VaeEncodeStage('{}'): VAE encoder ready from '{}' (z_dim {}, base_dim "

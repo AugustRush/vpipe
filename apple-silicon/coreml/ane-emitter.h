@@ -67,6 +67,10 @@ struct AneGraphSpec {
     Matmul,      // y[M,N] = x[M,K] @ W[K,N]
     SwiGluFfn,   // y[M,K] = (silu(x@Wg) * (x@Wu)) @ Wd, N == ffn inner
     GeluFfn,     // y[M,K] = gelu_tanh(x@Wu) @ Wd, N == ffn inner
+    // MOSS-Image's: y = (4 tanh(g/4) sigmoid(g) * 25 tanh(u/25)) @ Wd,
+    // g = x@Wg, u = x@Wu. The SwiGLU's three inputs (and biases); only the
+    // activation differs.
+    SituFfn,
   };
 
   Kind kind = Kind::Matmul;

@@ -470,8 +470,9 @@ AneEmitter::emit_mil_(const AneGraphSpec& s)
       o << "            " << T << nm << " = " << expr << "[name = string(\""
         << nm << "\")];\n";
     };
+    const bool situ = s.kind == AneGraphSpec::Kind::SituFfn;
     if (kSiluOp) {
-      op("sg", "silu(x = " + g + ")");
+      if (!situ) { op("sg", "silu(x = " + g + ")"); }
     } else {
       cst("s_zero", 0.0);
       cst("s_one", 1.0);
@@ -483,9 +484,33 @@ AneEmitter::emit_mil_(const AneGraphSpec& s)
       op("s_e", "exp(x = s_nab)");
       op("s_den", "add(x = s_e, y = s_one)");
       op("sgm", "real_div(x = s_num, y = s_den)");
-      op("sg", "mul(x = " + g + ", y = sgm)");
+      if (!situ) { op("sg", "mul(x = " + g + ", y = sgm)"); }
     }
-    op("hh", "mul(x = sg, y = " + u + ")");
+    if (situ) {
+      // MOSS-Image's SITU: (4 tanh(g/4) sigmoid(g)) * (25 tanh(u/25)), the
+      // sigmoid the two-path stable form above (not the compiler's op, for
+      // the reason given there) and tanh the op, as the spelled-out GELU
+      // uses it. Every factor is bounded, so an fp16 overflow in g or u
+      // saturates instead of turning to NaN: tanh(inf) is 1, the sigmoid's
+      // two paths never raise an exponent above zero.
+      if (kSiluOp) {
+        op("sgm", "sigmoid(x = " + g + ")");
+      }
+      cst("t_q", 0.25);
+      cst("t_4", 4.0);
+      cst("t_25i", 0.04);
+      cst("t_25", 25.0);
+      op("t_gq", "mul(x = " + g + ", y = t_q)");
+      op("t_gt", "tanh(x = t_gq)");
+      op("t_g4", "mul(x = t_gt, y = t_4)");
+      op("t_ga", "mul(x = t_g4, y = sgm)");
+      op("t_us", "mul(x = " + u + ", y = t_25i)");
+      op("t_ut", "tanh(x = t_us)");
+      op("t_u25", "mul(x = t_ut, y = t_25)");
+      op("hh", "mul(x = t_ga, y = t_u25)");
+    } else {
+      op("hh", "mul(x = sg, y = " + u + ")");
+    }
     if (s.biases) {
       last = biased(tiled("hh", s.N, s.K, "d", "dout"), "bd", s.K, "out");
     } else {

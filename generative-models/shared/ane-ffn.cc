@@ -171,6 +171,7 @@ AneFeedForward::create(const Options& o)
   AneGraphSpec spec;
   spec.kind = o.matmul ? AneGraphSpec::Kind::Matmul
             : o.gelu   ? AneGraphSpec::Kind::GeluFfn
+            : o.situ   ? AneGraphSpec::Kind::SituFfn
                        : AneGraphSpec::Kind::SwiGluFfn;
   spec.M  = chunk;
   spec.K  = o.hidden;
@@ -189,7 +190,8 @@ AneFeedForward::create(const Options& o)
   char work[360];
   std::snprintf(work, sizeof(work), "%s/vpipe-ane-%s-rt-%dx%dx%d-t%d.mlmodelc",
                 std::filesystem::temp_directory_path().c_str(),
-                o.matmul ? "mm" : o.gelu ? "gelu" : "ffn", chunk, o.hidden,
+                o.matmul ? "mm" : o.gelu ? "gelu" : o.situ ? "situ" : "ffn",
+                chunk, o.hidden,
                 o.ffn, o.tile);
   // System-wide wired and the pool's own use BEFORE CoreML builds anything:
   // the growth at the first predict, less the pool's, is what the module
@@ -223,6 +225,7 @@ AneFeedForward::create(const Options& o)
   f->_ffn     = o.ffn;
   f->_matmul  = o.matmul;
   f->_gelu    = o.gelu && !o.matmul;
+  f->_scaled  = (o.situ && !o.matmul && !o.gelu) ? 2 : 1;
   f->_out_w   = o.matmul ? o.ffn : o.hidden;
   // What one row costs the ANE, as perf-flops counts it: one projection
   // `hidden` -> `ffn`, or two (GELU: up and down), or three (SwiGLU:
@@ -395,7 +398,8 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
       // The up projection carries the fp16 headroom scale; see _up_scale.
       // A scaled or adapted row is built in f32 rather than through the
       // table.
-      const float mul = (!_matmul && i == 1) ? 1.0f / _up_scale : 1.0f;
+      const float mul = (!_matmul && i == _scaled) ? 1.0f / _up_scale
+                                                   : 1.0f;
       const bool f32path = q.deltas > 0 || mul != 1.0f;
       ok = q.stageable() && rows > 0 && q.deltas >= 0 &&
            q.deltas <= AneFfnSource::kMaxDeltas &&
@@ -665,7 +669,8 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
     for (std::size_t i = 0; i < nsrc && ok && _w->count() > nsrc; ++i) {
       const AneFfnSource& q = src[i];
       const std::size_t n = (std::size_t)_w->cols(nsrc + i);
-      const float mul = (!_matmul && i == 1) ? 1.0f / _up_scale : 1.0f;
+      const float mul = (!_matmul && i == _scaled) ? 1.0f / _up_scale
+                                                   : 1.0f;
       const bool have = q.bias != nullptr && !q.bias->empty();
       ok = !have || (q.bias->contents() != nullptr &&
                      q.bias->byte_size() >=
@@ -866,17 +871,19 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
       });
       return bad.load();
     };
-    // Divide the up slot (and its bias) by 4 in place: the fp16 headroom
-    // retry. See _up_scale.
+    // Divide the scaled slot (and its bias) by 4 in place: the fp16
+    // headroom retry. See _up_scale.
     auto rescale = [&]() {
-      // Slot 1 is up in a SwiGLU {gate, up, down} and down in a GELU
-      // {up, down}; either way its bias follows the projections at
-      // nproj + 1.
-      const std::size_t ur = (std::size_t)_w->rows(1);
-      const std::size_t uc = (std::size_t)_w->cols(1);
+      // The scaled slot is up (1) in a SwiGLU {gate, up, down}, down (1) in
+      // a GELU {up, down} and down (2) in a SITU {gate, up, down} -- the
+      // one input the activation is linear in, or past it; its bias
+      // follows the projections at nproj + _scaled. A SITU's gate and up
+      // need none: an fp16 overflow there saturates to the right value.
+      const std::size_t ur = (std::size_t)_w->rows(_scaled);
+      const std::size_t uc = (std::size_t)_w->cols(_scaled);
       const std::size_t nproj = _gelu ? 2 : 3;
       if (_w->count() > nproj) {
-        const std::size_t bs = nproj + 1;
+        const std::size_t bs = nproj + _scaled;
         const std::size_t bn = (std::size_t)_w->cols(bs);
         (void)_w->fill(bs, [&](void* base, std::size_t) {
           auto* d = static_cast<std::uint8_t*>(base);
@@ -888,7 +895,7 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
           }
         });
       }
-      return _w->fill(1, [&](void* base, std::size_t bpr) {
+      return _w->fill(_scaled, [&](void* base, std::size_t bpr) {
         auto* d = static_cast<std::uint8_t*>(base);
         w.parallel_for(ur * uc, [&](std::size_t lo, std::size_t hi) {
           const std::size_t r0 = (lo + uc - 1) / uc;

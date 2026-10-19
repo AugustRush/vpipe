@@ -343,6 +343,14 @@ public:
 
 private:
   std::string   _hf_dir;
+  // `encoder_dir` / `vae_dir`: the text encoder's and the two VAEs'
+  // WEIGHTS when they are not the model's own (a Draw Things .ckpt, which
+  // carries both VAEs in one file); the configs stay the model's. Empty:
+  // none.
+  std::string   _enc_weights;
+  std::string   _vae_weights;
+  // Either one resolved (a registry key or a path); empty when unset.
+  std::string   weights_path_(const std::string& ref) const;
   std::string   _enc_dir;
   // The reference files, in read order, resolved from the config once.
   // Paths only: WHAT each one is comes from the file when it is opened,

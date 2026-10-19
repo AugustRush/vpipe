@@ -2936,7 +2936,10 @@ kernel void sdpa_gqa_merge_f16(
 // == 0 (per4 = D/128; D=256/128); other shapes stay on mb256.
 //   0:q 1:kpool 2:vpool 3:o_acc(f32) 4:m(f32) 5:l(f32) 6:scale 7:D 8:Hq
 //   9:Hkv 10:q_offset 11:page_tokens 12:n_pages 13:page_table 14:split
-// grid (32, Hq, split); threadgroup (32, G, 1).
+// grid (32, Hq, split); threadgroup (32, G, 1). ROWS: grid.z = split * n
+// runs n query rows at once -- row r at position q_offset + r, its q and
+// partials at head r * Hq + qhead -- a speculative verify's rows in one
+// dispatch; each row's arithmetic is the one-row dispatch's.
 kernel void sdpa_paged_gqa_vec_f16(
     const device VPIPE_ELT* q          [[buffer(0)]],
     const device VPIPE_ELT* kpool      [[buffer(1)]],
@@ -2958,13 +2961,14 @@ kernel void sdpa_paged_gqa_vec_f16(
     uint  lane      [[thread_index_in_simdgroup]])
 {
   const int kv = (int)tid.y;
-  const int s  = (int)tid.z;
+  const int row = (int)tid.z / split;
+  const int s  = (int)tid.z - row * split;
   const int G  = Hq / Hkv;
   const int g  = (int)simd_gid;
-  const int qhead = kv * G + g;
+  const int qhead = row * Hq + kv * G + g;
   const int per = D / 32;
   const int per4 = per / 4;
-  const int q_pos = q_offset;
+  const int q_pos = q_offset + row;
   const int total = q_pos + 1;
   const uint page_stride = (uint)Hkv * page_tokens * D;
   const uint head_off = (uint)kv * page_tokens * D;
@@ -3090,12 +3094,14 @@ static inline void sdpa_gqa_kbl_impl(
   constexpr int DV = DK4 * 4;                        // head_dim
   typedef vec<VPIPE_ELT, 4> elt4;
 
-  const int s    = (int)tid.z;
+  // grid.z = split * rows: row r at q_offset + r (see sdpa_paged_gqa_vec).
+  const int row  = (int)tid.z / split;
+  const int s    = (int)tid.z - row * split;
   const int G    = Hq / Hkv;
   const int g    = (int)simd_gid;
   const int kvix = (int)tid.y;                      // 0..Hkv-1
-  const int qhead = kvix * G + g;
-  const int total = q_offset + 1;
+  const int qhead = row * Hq + kvix * G + g;
+  const int total = q_offset + row + 1;
   const uint page_stride = (uint)Hkv * page_tokens * D;
   const uint head_off    = (uint)kvix * page_tokens * D;
 
@@ -3371,10 +3377,12 @@ METAL_FUNC void sdpa_paged_gqa_vec2_impl(
     uint3 tid, uint simd_gid, uint simd_lid)
 {
   const int kvh   = (int)tid.y;            // threadgroups in y == Hkv
-  const int block = (int)tid.z;
+  // grid.z = blocks * rows: row r at q_offset + r (see sdpa_paged_gqa_vec).
+  const int row   = (int)tid.z / blocks;
+  const int block = (int)tid.z - row * blocks;
   const int G     = Hq / Hkv;
-  const int qh    = kvh * G + (int)simd_gid;
-  const int N     = q_offset + 1;          // keys 0..q_offset
+  const int qh    = row * Hq + kvh * G + (int)simd_gid;
+  const int N     = q_offset + row + 1;    // keys 0..its position
   const uint page_stride = (uint)Hkv * page_tokens * D;
   const uint head_off    = (uint)kvh * page_tokens * D;
 

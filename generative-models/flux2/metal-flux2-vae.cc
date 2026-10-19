@@ -283,6 +283,16 @@ MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
             }
           }
         }
+        for (int i = 0; i < 4; ++i) { cfg.dec_block_out[i] = cfg.block_out[i]; }
+        if (o.contains("decoder_block_out_channels")) {
+          FlexData bo = o.at("decoder_block_out_channels");
+          if (bo.is_array()) {
+            auto av = bo.as_array();
+            for (int i = 0; i < 4 && i < (int)av.size(); ++i) {
+              cfg.dec_block_out[i] = (int)av[i].as_int(cfg.dec_block_out[i]);
+            }
+          }
+        }
         if (o.contains("patch_size")) {
           FlexData ps = o.at("patch_size");
           if (ps.is_array() && ps.as_array().size() > 0) {
@@ -387,6 +397,7 @@ MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     // the two scratch buffers are allocated once and reused by every norm.
     int cmax = 0;
     for (int c : m->_cfg.block_out) { cmax = std::max(cmax, c); }
+    for (int c : m->_cfg.dec_block_out) { cmax = std::max(cmax, c); }
     cmax = std::max(cmax, m->_cfg.latent_channels);
     m->_gn_part =
         mc->make_shared_buffer((std::size_t)kGnBlocks * 2 * cmax * 4);
@@ -434,7 +445,7 @@ MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   // can't run the metal4.0 tensor kernel keeps the scalar fallback.
   // VPIPE_FLUX2_NO_MMA_ATTN forces scalar.
   if (std::getenv("VPIPE_FLUX2_NO_MMA_ATTN") == nullptr) {
-    const int mid_d = cfg.block_out[3];
+    const int mid_d = cfg.dec_block_out[3];
     const char* fn = (mid_d == 384) ? "sdpa_full_mma2_d384_f16"
                    : (mid_d == 512) ? "sdpa_full_mma2_d512_f16"
                                     : nullptr;
@@ -457,9 +468,23 @@ MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     m->_fn_conv_hw_s2 = m->_lib_convhw.function("conv2d_hw_3x3_s2_f16");
     m->_use_hwconv =
         m->_fn_conv_hw_s1.valid() && m->_fn_conv_hw_s2.valid();
+    // The narrower destination tiles, as MetalKrea2Vae loads them; an
+    // invalid one only declines its widths back to im2col.
+    if (std::getenv("VPIPE_VAE_NO_C32") == nullptr) {
+      m->_fn_conv_hw_s1_c32 =
+          m->_lib_convhw.function("conv2d_hw_3x3_s1_c32_f16");
+      m->_fn_conv_hw_s2_c32 =
+          m->_lib_convhw.function("conv2d_hw_3x3_s2_c32_f16");
+    }
+    if (std::getenv("VPIPE_VAE_NO_C16") == nullptr) {
+      m->_fn_conv_hw_s1_c16 =
+          m->_lib_convhw.function("conv2d_hw_3x3_s1_c16_f16");
+      m->_fn_conv_hw_s2_c16 =
+          m->_lib_convhw.function("conv2d_hw_3x3_s2_c16_f16");
+    }
   }
 
-  const int top = cfg.block_out[3];               // 512
+  const int top = cfg.dec_block_out[3];           // 512 (384 small)
   bool ok = true;
 
   // ---- decoder ----
@@ -478,8 +503,8 @@ MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
 
   // Up blocks over the reversed block_out [512,512,256,128]; layers_per_block+1
   // resnets each; upsample on all but the last.
-  const int rev[4] = {cfg.block_out[3], cfg.block_out[2], cfg.block_out[1],
-                      cfg.block_out[0]};
+  const int rev[4] = {cfg.dec_block_out[3], cfg.dec_block_out[2],
+                      cfg.dec_block_out[1], cfg.dec_block_out[0]};
   m->_up_blocks.resize(4);
   int cin = top;
   for (int i = 0; i < 4; ++i) {
@@ -833,11 +858,27 @@ MetalFlux2Vae::maybe_tune_conv_(int H, int W)
   }
   bool needed = !_use_hwconv;
   if (!needed) {
-    int h = H, w = W;                       // walk the decoder's pyramid
-    for (int lvl = 3; lvl >= 0 && !needed; --lvl) {
-      const int cin = _cfg.block_out[lvl];
+    // Walk the decoder's pyramid from the TOP: level 0 is the full
+    // resolution and block_out[0] wide, each deeper level half the grid.
+    // (It walked block_out[3] at full resolution, so at 2048^2 the
+    // deepest width read as past the int32 extent and the tune ran for
+    // shapes the hardware conv was taking.)
+    int h = H, w = W;
+    for (int lvl = 0; lvl <= 3 && !needed; ++lvl) {
+      const int cin = _cfg.dec_block_out[lvl];
+      // A width the hardware conv has no tile for falls back at EVERY
+      // grid, so its shapes are worth the tune whatever the size.
+      if (cin > kSmallCoutMax && hw_tile_(cin, 1) == 0) {
+        needed = true;
+        break;
+      }
       if ((h % 8) != 0 || (w % 8) != 0) { needed = true; break; }
-      if (!tensor_op_operand_fits((std::size_t)cin * w * h, 2)) {
+      // The level's widest operand is the deeper level's width, which
+      // arrives upsampled at this grid (its first resnet, the upsample
+      // conv that feeds it).
+      const int wide =
+          std::max(cin, lvl < 3 ? _cfg.dec_block_out[lvl + 1] : cin);
+      if (!tensor_op_operand_fits((std::size_t)wide * w * h, 2)) {
         needed = true;
         break;
       }
@@ -901,7 +942,7 @@ MetalFlux2Vae::autotune_conv3x3_(MetalCompute* mc)
   const auto t0 = std::chrono::steady_clock::now();
   for (const auto& sh : shapes) {
     const int cin = sh.first, cout = sh.second;
-    const int top = _cfg.block_out[3] > 0 ? _cfg.block_out[3] : cout;
+    const int top = _cfg.dec_block_out[3] > 0 ? _cfg.dec_block_out[3] : cout;
     const int H = std::min(256, std::max(probe_base,
                                          probe_base * (top / std::max(1, cout))));
     const int W = H;
@@ -1022,6 +1063,23 @@ MetalFlux2Vae::conv3x3_small_cout_(ComputeEncoder& enc, const SharedBuffer& in,
   return true;
 }
 
+int
+MetalFlux2Vae::hw_tile_(int cout, int stride) const noexcept
+{
+  if (!_use_hwconv || cout <= 0) { return 0; }
+  const bool s2 = stride == 2;
+  if ((cout % 64) == 0) { return 64; }
+  if ((cout % 32) == 0 &&
+      (s2 ? _fn_conv_hw_s2_c32 : _fn_conv_hw_s1_c32).valid()) {
+    return 32;
+  }
+  if ((cout % 16) == 0 &&
+      (s2 ? _fn_conv_hw_s2_c16 : _fn_conv_hw_s1_c16).valid()) {
+    return 16;
+  }
+  return 0;
+}
+
 bool
 MetalFlux2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
                            const Conv& c, const SharedBuffer& out,
@@ -1030,11 +1088,13 @@ MetalFlux2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
   // NAX hardware convolution2d (probe-established semantics -- see
   // conv2d_mma.metal): the op reads the full NHWC activation itself,
   // zero-filled pad-1 halo included; no im2col scratch or DRAM round-trip.
-  // Whole 8x8 dest tiles + 64-channel tiles required; others (the 3-ch
-  // conv_in/out, tiny latent grids) keep the im2col path.
+  // Whole 8x8 dest tiles and a channel tile the width divides by (64,
+  // else 32, else 16) required; others (the 3-ch conv_in/out, tiny latent
+  // grids) keep the im2col path.
   if (!_use_hwconv || c.whwio.empty()) { return false; }
   const int OH = H / stride, OW = W / stride;
-  if ((OW % 8) != 0 || (OH % 8) != 0 || (c.cout % 64) != 0) { return false; }
+  const int tile = hw_tile_(c.cout, stride);
+  if ((OW % 8) != 0 || (OH % 8) != 0 || tile == 0) { return false; }
   // The MPP conv op addresses its source and destination in int32 BYTES;
   // past 2^31 of either it leaves rows unwritten and says nothing. Fall back
   // to the (uint-safe) im2col path first, so a very large decode degrades
@@ -1043,7 +1103,13 @@ MetalFlux2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
       !tensor_op_operand_fits((std::size_t)c.cout * OW * OH, 2)) {
     return false;
   }
-  enc.set_function(stride == 2 ? _fn_conv_hw_s2 : _fn_conv_hw_s1);
+  enc.set_function(
+      stride == 2
+          ? (tile == 16 ? _fn_conv_hw_s2_c16
+                        : tile == 32 ? _fn_conv_hw_s2_c32 : _fn_conv_hw_s2)
+          : (tile == 16 ? _fn_conv_hw_s1_c16
+                        : tile == 32 ? _fn_conv_hw_s1_c32 : _fn_conv_hw_s1));
+  if (tile < 64) { ++_narrow_hw_convs; }
   enc.set_buffer(0, in);
   enc.set_buffer(1, c.whwio);
   enc.set_buffer(2, out);
@@ -1055,7 +1121,7 @@ MetalFlux2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
     enc.set_constant(7, 3);
   }
   enc.dispatch({(unsigned)((OW / 8) * 128), (unsigned)(OH / 8),
-                (unsigned)(c.cout / 64)}, {128, 1, 1});
+                (unsigned)(c.cout / tile)}, {128, 1, 1});
   if (!c.b.empty()) {          // fold bias (the hw op has no bias slot)
     const std::size_t rows = (std::size_t)OH * OW;
     const std::size_t total = rows * c.cout;
@@ -1293,9 +1359,9 @@ MetalFlux2Vae::decode_band_bytes_(int h16, int w16) const noexcept
   const std::size_t Hout = (std::size_t)h16 * px;
   const std::size_t Wout = (std::size_t)w16 * px;
   const std::size_t big_cin =
-      _use_hwconv ? (std::size_t)_cfg.block_out[0]
-                  : (std::size_t)std::max(_cfg.block_out[0],
-                                          _cfg.block_out[1]);
+      _use_hwconv ? (std::size_t)_cfg.dec_block_out[0]
+                  : (std::size_t)std::max(_cfg.dec_block_out[0],
+                                          _cfg.dec_block_out[1]);
   const std::size_t full = Hout * Wout * 9 * big_cin * 2;   // whole image
   const std::size_t floor_ = Wout * 9 * big_cin * 8 * 2;    // 8 output rows
   if (full <= kDecodeBandMax) { return full; }
@@ -1316,7 +1382,7 @@ MetalFlux2Vae::decode_peak_bytes(int h16, int w16) const noexcept
   // conv_out/block_out[0] figure. Budget the real peak (block_out[0] alone
   // under-modelled it 2x and risked a false-pass -> a mid-flight OOM).
   const std::size_t base =
-      (std::size_t)std::max(_cfg.block_out[0], _cfg.block_out[1]);
+      (std::size_t)std::max(_cfg.dec_block_out[0], _cfg.dec_block_out[1]);
   const std::size_t top = Hout * Wout * base * 2;  // one full-res base-ch f16 buf
   // The per-up-block command-buffer split (default on; VPIPE_FLUX2_NO_VAE_SPLIT
   // opts out) commits + frees each up-level, so the resident peak is ONE
@@ -1705,9 +1771,9 @@ MetalFlux2Vae::decode_exact_(const SharedBuffer& latent, int h8, int w8,
 
   // The im2col band, as decode() sizes it (a GEMM M-dimension and no more).
   const std::size_t base_max =
-      (std::size_t)std::max(_cfg.block_out[0], _cfg.block_out[1]);
+      (std::size_t)std::max(_cfg.dec_block_out[0], _cfg.dec_block_out[1]);
   const std::size_t big_cin =
-      _use_hwconv ? (std::size_t)_cfg.block_out[0] : base_max;
+      _use_hwconv ? (std::size_t)_cfg.dec_block_out[0] : base_max;
   std::size_t col_cap = kDecodeBandMax / 2;
   if (_mma_max_m > 0) {
     col_cap = std::min(col_cap, (std::size_t)_mma_max_m / 2 * 9 * big_cin);
@@ -2564,9 +2630,9 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
   // im2col_cap / (9*cin), re-capped at kSafeBand below.
   // VPIPE_FLUX2_VAE_BAND_ROWS overrides the memory budget (still safe-capped).
   const std::size_t base_max =
-      (std::size_t)std::max(_cfg.block_out[0], _cfg.block_out[1]);
+      (std::size_t)std::max(_cfg.dec_block_out[0], _cfg.dec_block_out[1]);
   const std::size_t big_cin =
-      _use_hwconv ? (std::size_t)_cfg.block_out[0] : base_max;
+      _use_hwconv ? (std::size_t)_cfg.dec_block_out[0] : base_max;
   const std::size_t k_safe_band =                            // corruption cap
       _mma_max_m > 0 ? (std::size_t)_mma_max_m / 2 : (std::size_t)Hout * Wout;
   const std::size_t floor_band = (std::size_t)Wout * 9 * big_cin * 8;  // 8 rows
@@ -2641,7 +2707,9 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
       vmarks.emplace_back(name,
                           std::chrono::duration<double, std::milli>(
                               vnow() - vlast).count());
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       vlast = vnow();
     };
@@ -2657,7 +2725,9 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
       if (xp != &carry) { carry = ops.take(*xp); }
       ops.clear();
       xp = &carry;
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
     };
 
@@ -2695,7 +2765,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     }
     SharedBuffer& xn = ops.gnorm(*x, (std::size_t)H * W, _norm_out);
     release(*x);
-    ops.silu(xn, (std::size_t)H * W * _cfg.block_out[0]);
+    ops.silu(xn, (std::size_t)H * W * _cfg.dec_block_out[0]);
     mark(fmt("norm_out+silu {}x{}", H, W)());
     SharedBuffer& rgb = ops.conv3x3(xn, H, W, _conv_out);
     release(xn);
@@ -2790,9 +2860,9 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
   // the size of the box; see decode_band_bytes_) -- AND by correctness
   // (k_safe_band rows, matmul2d M-corruption). Headroom only shrinks it.
   const std::size_t base_max =
-      (std::size_t)std::max(_cfg.block_out[0], _cfg.block_out[1]);
+      (std::size_t)std::max(_cfg.dec_block_out[0], _cfg.dec_block_out[1]);
   const std::size_t big_cin =
-      _use_hwconv ? (std::size_t)_cfg.block_out[0] : base_max;
+      _use_hwconv ? (std::size_t)_cfg.dec_block_out[0] : base_max;
   const std::size_t k_safe_band =
       _mma_max_m > 0 ? (std::size_t)_mma_max_m / 2 : (std::size_t)H0 * W0;
   const std::size_t full_band = (std::size_t)H0 * W0 * 9 * big_cin;
@@ -2947,7 +3017,9 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
       }
       pool.clear();
       xp = &carry;
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
     };
 
@@ -2964,7 +3036,9 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
       vmarks.emplace_back(name,
                           std::chrono::duration<double, std::milli>(
                               vnow() - vlast).count());
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       vlast = vnow();
     };

@@ -9,6 +9,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "common/vpipe-api.h"
 
@@ -120,6 +122,22 @@ public:
   // reset before anyone could read them.
   static void fire_and_forget_stats(unsigned long long* completed,
                                     unsigned long long* errored);
+
+  // With VPIPE_MC_GPU_TIME=1: the GPU time of every command buffer the
+  // process committed through a stream (GPUEndTime - GPUStartTime,
+  // summed), and how many. A loop's GPU busy time against its wall time
+  // is the GPU's idle between -- what a dispatch-bound loop loses.
+  // Process-wide and monotonic, as above; zero when off.
+  static void gpu_time_stats(double* busy_ms, unsigned long long* buffers);
+  // VPIPE_MC_GPU_TIME=2 also keeps each buffer's commit, GPU start and
+  // GPU end (seconds on the host's clock, CACurrentMediaTime's):
+  // taken (and cleared) here, for a profile of the gaps. Untaken, the
+  // newest 32768-65536 are kept.
+  // kstart / kend: the kernel driver's own processing of the buffer.
+  struct GpuSpan { double commit, kstart, kend, start, end; };
+  static std::vector<GpuSpan> take_gpu_spans();
+  // The same clock, for a caller's own marks against those spans.
+  static double host_seconds();
 
   // RAII handle on a committed MTL::CommandBuffer. Lets the caller
   // poll status, wait, or attach a completion callback.

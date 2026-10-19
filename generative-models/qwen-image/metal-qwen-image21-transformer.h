@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <vector>
@@ -90,6 +91,21 @@ class MetalQwenImage21Transformer {
 
     // Accel tiers, read from accel-settings.h by the caller.
     bool i8_gemm = false;
+    // The int8 GEMM's tier (I8GemmContext::Tier): 0 accurate (groups
+    // of 64), 1 fast (the block projections held as rotated int8 at a
+    // coarse group), 2 token (int8 per channel x per token, both
+    // operands Hadamard-rotated in blocks of 256), 3 token unrotated
+    // (the i8x layout: a Draw Things i8x checkpoint's codes are read as
+    // stored; rotated, they are requantized). Meaningful only with
+    // i8_gemm; VPIPE_I8_TIER and VPIPE_I8_TOKEN_ROT override it either
+    // way.
+    int i8_tier = 0;
+    // A w4 pack's block projections on the fast / token tiers: HOLD
+    // their int8 layout (true; twice their bytes, the fastest) or keep
+    // the pack and convert it before each GEMM into one scratch (false,
+    // the default; a streamed block always does). The engine's call --
+    // generate-image sets it where the box has room.
+    bool i8_hold_w4 = false;
     sage::Config sage;
     sol::Config  sol;
     // THE FEED-FORWARD ON THE NEURAL ENGINE, beside the GPU. A SwiGLU
@@ -130,8 +146,16 @@ class MetalQwenImage21Transformer {
     // rather than reusing, so a caller cannot hand a cache from one
     // picture to another.
     int prefix = 0, joint = 0, target = 0;
+    // TOKEN-major [prefix, hidden] (the strided attention path) rather
+    // than head-major [heads, prefix, head_dim]; a step in the other
+    // layout refuses the cache.
+    bool token_major = false;
     bool populated() const { return !k.empty() && prefix > 0; }
-    void clear() { k.clear(); v.clear(); prefix = joint = target = 0; }
+    void clear()
+    {
+      k.clear(); v.clear(); prefix = joint = target = 0;
+      token_major = false;
+    }
   };
   enum class KvMode {
     kOff,       // no cache; run the whole joint sequence every step
@@ -263,9 +287,45 @@ class MetalQwenImage21Transformer {
   void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
+  // Drop what a forward keeps for the next one -- the dense stand-in,
+  // split-K planes and the int8 context's buffers; each regrows on
+  // demand. The stage calls it after a
+  // generation on a bounded box, before the decode wants the room.
+  void release_forward_scratch();
+  // A STREAMED stack residency has kept whole gives its slot pair
+  // back (BlockSlots::release_if_saturated); every forward does the same
+  // at its end. Returns the bytes freed.
+  std::size_t release_idle_slots()
+  {
+    return _slots.release_if_saturated(_blocks);
+  }
+  // Streamed blocks BUILT into their slot because the slot was laid
+  // out for another (a mixed pack's other width; BlockSlots::Ops::
+  // same_layout), over the model's life. For a test to show the slots
+  // crossed widths -- and did not give up and stream without them.
+  // Block projections the model holds in the fast or token layout from
+  // a pack at `bits` (4 or 8), over the blocks it HOLDS (all of them,
+  // preloaded): a test's proof that a tier took every width of a mixed
+  // pack rather than leaving one on the accurate tier.
+  int fast_weights(int bits) const;
+  int slot_relayouts() const { return _slots.relaid(); }
   // Whether the block projections run in the signed int8 layout (see
   // _sgn) -- what a test asserts before it compares anything.
   bool signed_layout() const { return _sgn; }
+  // Whether the block projections run the int8 FAST tier (see _fast).
+  bool fast_tier() const { return _fast; }
+  // ...and at which group: I8GemmContext::kTokenGroup on the token
+  // tier, 0 off both.
+  int fast_group() const
+  {
+    return _fast && _i8 ? _i8->fast_group(_cfg.hidden) : 0;
+  }
+  // ...and the token tiers' GEMM kernel it took ("blocked 128x64", ...;
+  // empty without int8).
+  std::string i8_token_kernel() const
+  {
+    return _i8 ? _i8->token_kernel() : std::string();
+  }
   std::size_t release_resident_blocks(std::size_t bytes);
   std::uint64_t resident_bytes() const;
 
@@ -303,6 +363,14 @@ class MetalQwenImage21Transformer {
   static std::size_t ane_runtime_bytes(const Config& c, int seq) noexcept;
   // The joint length a plan should book for, from the picture.
   static int ane_plan_seq(int width, int height) noexcept;
+  // What one denoise step's forwards allocate beyond the weights, for the
+  // plan's denoise phase: img_rows image tokens beside txt_rows of prompt,
+  // `cfg` for a negative branch (its own K / V cache), `packed` for a
+  // pack (the dense stand-in), `matrix_cores` for the tiers that need
+  // them (int8, Sage, Sol).
+  static std::size_t forward_scratch_bytes(const Config& c, int img_rows,
+                                           int txt_rows, bool cfg,
+                                           bool packed, bool matrix_cores);
   bool streaming() const { return _stream_blocks; }
   int quant_bits() const { return _quant_bits; }
 
@@ -332,6 +400,29 @@ class MetalQwenImage21Transformer {
     // q ^ 0x80 / 0x8 and b' = b + 128 s / 8 s. Only the int8 route and
     // the signed dequant read it; see _sgn.
     bool sgn = false;
+    // THE FAST TIER's layout (I8GemmContext::gemm_fast) when gc > 0:
+    // `codes` holds int8 [N, K] in the group-rotated basis and `cscales`
+    // [N, K/gc]. A streamed slot also keeps the raw scales / qbias its
+    // refill lands, which post_refill converts from. n / k are the
+    // weight's shape, which a refill needs and the buffers do not say.
+    int gc = 0;
+    int n = 0, k = 0;
+    metal_compute::SharedBuffer cscales;
+    // A w4 pack's weight kept AS STORED (its codes / scales / qbias) and
+    // converted per GEMM (fast_operand_); false for a layout held, w4 or
+    // w8 (Config::i8_hold_w4).
+    bool pc = false;
+    // A DRAW THINGS i8x weight held as it is stored (gc ==
+    // kTokenGroup, unrotated): `codes` are the file's `<stem>.i8x` and
+    // `cscales` its row scales widened to f32 -- nothing to convert
+    // after a refill, and a slot refills both by name.
+    bool i8x = false;
+    // A DENSE checkpoint's weight in the fast layout in a STREAMED slot:
+    // `w` keeps the raw bf16 a refill lands (the source) and post_refill
+    // quantizes it into codes / cscales, exactly as a preloaded block's
+    // entry was built. A promotion keeps only the layout, as the entry
+    // does -- the source is the slot's alone.
+    bool ds = false;
     bool is_fp8() const { return f8 != fp8::Format::kNone; }
     bool empty() const {
       return (quantized || is_fp8()) ? codes.empty() : w.empty();
@@ -353,6 +444,26 @@ class MetalQwenImage21Transformer {
   // Convert a quantized weight the model OWNS (a refilled slot) to the
   // signed layout in place, and say so on it. False touches nothing.
   bool sign_(QWeight& w) const;
+  // ...to the fast tier's layout, on the GPU, in place (a refilled slot
+  // whose build chose it); a weight not in that layout is untouched.
+  bool fast_(QWeight& w) const;
+  // The same conversion encoded on `e`, for a caller converting a whole
+  // block in one command buffer (post_refill). True with nothing encoded
+  // for a weight not in that layout.
+  bool encode_fast_(metal_compute::ComputeEncoder& e, QWeight& w) const;
+  // The fast-layout operands of a weight on the fast / token tier: its
+  // own codes and scales, or -- a w4 pack's weight, held as stored -- the
+  // context's scratch it is converted into here, on `enc`, for the GEMM
+  // encoded right after (I8GemmContext::encode_to_fast_scratch). False
+  // with nothing encoded where the conversion declines.
+  bool fast_operand_(metal_compute::ComputeEncoder& enc, const QWeight& w,
+                     const metal_compute::SharedBuffer** codes,
+                     const metal_compute::SharedBuffer** scales) const;
+  // A fast-layout weight dequantized into `out` [N, K] -- the values the
+  // fast GEMM reads, for a route that does not read the layout.
+  bool fast_dense_(metal_compute::ComputeEncoder& enc, const QWeight& w,
+                   const metal_compute::SharedBuffer& out, int N,
+                   int K) const;
   // A signed weight as a DENSE one, dequantized into _w_deq -- for the
   // routes that do not read the layout. `w` itself when it is not
   // signed; null when the scratch cannot be had.
@@ -377,6 +488,20 @@ class MetalQwenImage21Transformer {
   void configure_slots_();
   static std::size_t qw_bytes_(const QWeight& w);
   static std::size_t block_bytes_(const Block& b);
+  // What a PROMOTION of slot block `b` keeps (clone_block_ with copy):
+  // a dense source and dead pack scales dropped, a w4 pack whose layout
+  // is held converted into it. What residency and the wired pool are
+  // asked for -- a slot-sized ask books bytes nothing keeps.
+  std::size_t kept_block_bytes_(const Block& b) const;
+  // ...and makes the promoted block hold exactly that, whichever way it
+  // was promoted. A slot's clone already did (clone_block_); without
+  // slots the per-block fallback is MOVED in whole, source, dead scales
+  // and a per-call w4 pack included. Idempotent: after a clone it finds
+  // nothing to do.
+  bool keep_block_(Block& b) const;
+  // post_refill's conversions, on a stream the reader thread keeps (a
+  // fresh queue's first commit costs ~1-1.9 ms; seven a block added up).
+  mutable metal_compute::CommandStream _cvt_stream;
 
 
   // The sinusoid + its two Linears, on the host: 256 channels of one row
@@ -408,6 +533,22 @@ class MetalQwenImage21Transformer {
             std::size_t ye, int M, int N, int K,
             const lora::Stack& lf = lora::Stack{});
 
+  // THE FAST TIER over one input for several projections (q|k|v,
+  // gate|up): one rotated quantizer, then each GEMM -- what lin_ would run
+  // per projection, less the repeated quantizer. False with NOTHING
+  // encoded unless every one is in the fast layout at one group with no
+  // adapter attached (the caller then runs lin_ per projection).
+  struct FastOut {
+    const QWeight* w;
+    const metal_compute::SharedBuffer* y;
+    std::size_t ye;
+    int n;                       // the projection's output width
+    bool adapted;                // a LoRA stack is attached
+  };
+  bool fast_shared_(metal_compute::ComputeEncoder& enc,
+                    const metal_compute::SharedBuffer& x, std::size_t xe,
+                    int M, int K, std::initializer_list<FastOut> outs);
+
   // The matrix-core GEMM. Returns false with NOTHING encoded when this
   // box or this shape is not for it, and the caller keeps its steel
   // path -- so a decline is a fallback, never a hole.
@@ -426,6 +567,9 @@ class MetalQwenImage21Transformer {
                             int K) const;
   // After a slot refill: every FP8 weight still the kind the file says.
   bool fp8_kinds_match_(int L, const Block& b) const;
+  // Is block L stored as `b` was built -- affine widths (a mixed pack)
+  // and FP8 kinds? See BlockSlots::Ops::same_layout.
+  bool same_layout_(int L, const Block& b) const;
   metal_compute::SharedBuffer fp8_scale_buf_(const std::string& weight) const;
 
   // ---- residency + the wired pool ------------------------------------
@@ -484,7 +628,9 @@ class MetalQwenImage21Transformer {
       _fn_qmm4, _fn_qmm8, _fn_dequant4, _fn_dequant8, _fn_gemm_mma,
       _fn_gemm_mma_deep, _fn_gemm_mma_tn2, _fn_copy_rows,
       _fn_gated_tanh4, _fn_swiglu4, _fn_gemm_bm64, _fn_gemm_bm64bn64,
-      _fn_ln_plain, _fn_scale_rows, _fn_silu, _fn_transpose;
+      _fn_ln_plain, _fn_scale_rows, _fn_silu, _fn_transpose,
+      // q/k RMSNorm + rope in place, token-major (see forward's `tm`).
+      _fn_rms_rope_tm;
   // One params buffer per dispatch GROUP is required, not one per
   // model: the block-causal decomposition encodes several attention
   // dispatches into one stream, and a shared mutable buffer would hand
@@ -587,6 +733,15 @@ class MetalQwenImage21Transformer {
   // off the int8 pipe (_i8_hold) takes the signed dequant instead.
   // VPIPE_I8_SIGNED=0 for the A/B.
   bool _sgn = false;
+  // THE FAST OR TOKEN TIER for the block projections (Config::i8_tier;
+  // both hold I8GemmContext's fast layout, at gc or kTokenGroup): g64
+  // packs converted -- in the derived entry a retained block keeps, in
+  // the slot after every refill; a w4 weight is then held at int8's
+  // size, twice its nibbles' -- and bf16 checkpoints quantized once
+  // into the entry (a streamed bf16 block stays on the accurate tier).
+  // Off under the ANE tiers, whose stagers read the codes as affine.
+  bool _fast = false;
+  bool _fast_failed = false;
 };
 
 }  // namespace genai

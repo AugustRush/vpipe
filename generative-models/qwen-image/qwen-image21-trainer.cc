@@ -291,6 +291,14 @@ QwenImage21Trainer::dense_(ComputeEncoder& enc, const QWeight& w, int N,
     return d != nullptr ? &d->w : nullptr;
   }
   if (!w.quantized) { return &w.w; }
+  // The fast tier's layout (rotated int8 at a coarse group) back to dense
+  // through its own dequant, which undoes the rotation.
+  if (w.gc > 0) {
+    return _m->_i8 != nullptr &&
+                   _m->_i8->encode_dequant_fast(enc, w.codes, w.cscales,
+                                                w.gc, _deq, N, K)
+               ? &_deq : nullptr;
+  }
   // A block projection in the signed int8 layout dequantizes through its
   // own kernel (the affine one would read the flipped codes as unsigned).
   if (w.sgn) {
@@ -392,7 +400,6 @@ QwenImage21Trainer::back_split_(AneBack& a, int L, CommandStream& st,
                                 const SharedBuffer& dx, int M,
                                 std::string* err)
 {
-  metal_compute::MetalCompute* mc = _m->_mc;
   auto gpu = [&](int r0, int n) {
     if (n <= 0) { return; }
     QWeight wt;
@@ -416,7 +423,9 @@ QwenImage21Trainer::back_split_(AneBack& a, int L, CommandStream& st,
       *ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t0).count();
     }
-    st = mc->make_command_stream();
+    // The same stream: a fresh one is a new queue, and its first
+    // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+    // stream_per_commit_costs).
     enc = st.begin_compute();
     if (!ok && err != nullptr) { *err = "qwen-image-2.1 train: " + ge; }
     return ok;
@@ -778,7 +787,9 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
         if (bk.first == bucket) { bk.second += ms; found = true; }
       }
       if (!found) { _pbuckets.emplace_back(bucket, ms); }
-      st = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = st.begin_compute();
       pclock = std::chrono::steady_clock::now();
     };
@@ -988,7 +999,9 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
       }
       _t_start_wait += std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - tw0).count();
-      st = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = st.begin_compute();
       ane_back_stage_(abt[0], L);
     }

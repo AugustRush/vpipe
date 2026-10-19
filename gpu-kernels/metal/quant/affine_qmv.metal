@@ -3187,9 +3187,31 @@ kernel void affine_qmv_geglu_w8g64(
 // batch tiles / single-row qmv (another summation order, within an ulp;
 // qmv_ksplit_matches_batch). M=8 (32 accumulators) loses occupancy;
 // ks1 / ks4k4 / ks8 are benchmark arms (qmv_batch_bandwidth_sweep).
+// BITS = 8 runs the same loop on 8-bit weights: a lane's unit is still
+// 8 weights (a uint2 there, a uint32 at 4 bits), so the x it reads, the
+// group a unit falls in and every row's summation order are the 4-bit
+// tile's -- the mixed (OptiQ) models' 8-bit tensors verify at the speed
+// their bytes allow instead of on the batch tiles.
 // Grid (threads) = {32*KP, N/4, ceil(m/M)}, tg = {32*KP, 1, 1}.
 // ===================================================================
-template <typename T, int M, int KP, bool SWIGLU = false>
+template <int BITS>
+METAL_FUNC float ks_weight(uint2 u, int ki) {
+  if (BITS == 4) { return float((u.x >> (ki * 4)) & 0xFu); }
+  const uint word = ki < 4 ? u.x : u.y;
+  return float((word >> ((ki & 3) * 8)) & 0xFFu);
+}
+
+template <int BITS>
+METAL_FUNC uint2 ks_unit(const device uint32_t* row, int unit) {
+  if (BITS == 4) { return uint2(row[unit], 0u); }
+  return ((const device uint2*)row)[unit];
+}
+
+// ADD: y = r + x @ W^T, the layer's residual folded into the write (r may
+// be y itself: each output is read and written by the one lane that sums
+// it) -- two dispatches fewer a layer in a verify.
+template <typename T, int M, int KP, bool SWIGLU = false, int BITS = 4,
+          bool ADD = false>
 METAL_FUNC void qmv_ksplit_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -3200,11 +3222,13 @@ METAL_FUNC void qmv_ksplit_impl(
     const constant int& N,
     const constant int& m_total,
     threadgroup float* partials,
-    uint3 tid, uint sg, uint lane) {
+    uint3 tid, uint sg, uint lane,
+    const device T* r = nullptr) {
   // Every small loop is FULLY unrolled: an accumulator array indexed by
   // a live loop counter spills to the stack (measured ~10x slower).
   constexpr int GS = 64;
-  const int K_by_p = K / 8;
+  const int K_by_p = K / 8;          // units of 8 weights a row
+  const int K_by_w = K * BITS / 32;  // 32-bit words a row
   const int K_by_gs = K / GS;
   const int per_part = K_by_p / KP;
   const int n0 = (int)tid.y * 4;
@@ -3223,10 +3247,10 @@ METAL_FUNC void qmv_ksplit_impl(
   float acc[4 * M];
 #pragma clang loop unroll(full)
   for (int i = 0; i < 4 * M; ++i) { acc[i] = 0.0f; }
-  const device uint32_t* w0 = w + (size_t)(n0 + 0) * K_by_p;
-  const device uint32_t* w1 = w + (size_t)(n0 + 1) * K_by_p;
-  const device uint32_t* w2 = w + (size_t)(n0 + 2) * K_by_p;
-  const device uint32_t* w3 = w + (size_t)(n0 + 3) * K_by_p;
+  const device uint32_t* w0 = w + (size_t)(n0 + 0) * K_by_w;
+  const device uint32_t* w1 = w + (size_t)(n0 + 1) * K_by_w;
+  const device uint32_t* w2 = w + (size_t)(n0 + 2) * K_by_w;
+  const device uint32_t* w3 = w + (size_t)(n0 + 3) * K_by_w;
   const device T* sc = scales + (size_t)n0 * K_by_gs;
   const device T* bi = biases + (size_t)n0 * K_by_gs;
   for (int pack = p_start + (int)lane; pack < p_end; pack += 32) {
@@ -3234,8 +3258,8 @@ METAL_FUNC void qmv_ksplit_impl(
     Vec8 v[M];
 #pragma clang loop unroll(full)
     for (int m = 0; m < M; ++m) { v[m] = xv[m][pack]; }
-    const uint32_t p0 = w0[pack], p1 = w1[pack], p2 = w2[pack],
-                   p3 = w3[pack];
+    const uint2 p0 = ks_unit<BITS>(w0, pack), p1 = ks_unit<BITS>(w1, pack),
+                p2 = ks_unit<BITS>(w2, pack), p3 = ks_unit<BITS>(w3, pack);
     float s[4], b[4];
 #pragma clang loop unroll(full)
     for (int j = 0; j < 4; ++j) {
@@ -3244,10 +3268,10 @@ METAL_FUNC void qmv_ksplit_impl(
     }
 #pragma clang loop unroll(full)
     for (int j = 0; j < 4; ++j) {
-      const uint32_t packed = j == 0 ? p0 : (j == 1 ? p1 : (j == 2 ? p2 : p3));
+      const uint2 packed = j == 0 ? p0 : (j == 1 ? p1 : (j == 2 ? p2 : p3));
 #pragma clang loop unroll(full)
       for (int ki = 0; ki < 8; ++ki) {
-        const float wv = float((packed >> (ki * 4)) & 0xFu) * s[j] + b[j];
+        const float wv = ks_weight<BITS>(packed, ki) * s[j] + b[j];
 #pragma clang loop unroll(full)
         for (int m = 0; m < M; ++m) {
           acc[j * M + m] += float(v[m][ki]) * wv;
@@ -3287,12 +3311,14 @@ METAL_FUNC void qmv_ksplit_impl(
     const int j = (int)lane / M;
     const int row = (int)lane - j * M;
     if (row < m_rows) {
-      y[(size_t)(base_row + row) * N + n0 + j] = static_cast<T>(total);
+      const size_t at = (size_t)(base_row + row) * N + n0 + j;
+      y[at] = ADD ? static_cast<T>(float(r[at]) + total)
+                  : static_cast<T>(total);
     }
   }
 }
 
-#define VPIPE_QMV_KSPLIT_SW(NAME, M, KP, SW)                                 \
+#define VPIPE_QMV_KSPLIT_SWB(NAME, M, KP, SW, BITS)                          \
   kernel void NAME(                                                          \
       const device uint32_t* w      [[buffer(0)]],                           \
       const device VPIPE_ELT* scales [[buffer(1)]],                          \
@@ -3306,12 +3332,35 @@ METAL_FUNC void qmv_ksplit_impl(
       uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
       uint simd_lid [[thread_index_in_simdgroup]]) {                         \
     threadgroup float partials[KP * 4 * M];                                  \
-    qmv_ksplit_impl<VPIPE_ELT, M, KP, SW>(                                   \
+    qmv_ksplit_impl<VPIPE_ELT, M, KP, SW, BITS>(                             \
         w, scales, biases, x, y, in_vec_size, out_vec_size, m_total,         \
         partials, tid, simd_gid, simd_lid);                                  \
   }
+#define VPIPE_QMV_KSPLIT_SW(NAME, M, KP, SW)                                 \
+  VPIPE_QMV_KSPLIT_SWB(NAME, M, KP, SW, 4)
 #define VPIPE_QMV_KSPLIT(NAME, M, KP) VPIPE_QMV_KSPLIT_SW(NAME, M, KP, false)
 #define VPIPE_QMV_KSPLIT_SWIGLU(NAME, M) VPIPE_QMV_KSPLIT_SW(NAME, M, 2, true)
+#define VPIPE_QMV_KSPLIT8(NAME, M) VPIPE_QMV_KSPLIT_SWB(NAME, M, 2, false, 8)
+// y = r + x @ W^T (r at buffer 8, may alias y), at 4 or 8 bits.
+#define VPIPE_QMV_KSPLIT_ADD(NAME, M, BITS)                                  \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      constant int& m_total      [[buffer(7)]],                              \
+      const device VPIPE_ELT* r      [[buffer(8)]],                          \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    threadgroup float partials[2 * 4 * M];                                   \
+    qmv_ksplit_impl<VPIPE_ELT, M, 2, false, BITS, true>(                     \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total,         \
+        partials, tid, simd_gid, simd_lid, r);                               \
+  }
 VPIPE_QMV_KSPLIT_SWIGLU(affine_qmv_ks2_swiglu_w4g64, 2)
 VPIPE_QMV_KSPLIT_SWIGLU(affine_qmv_ks3_swiglu_w4g64, 3)
 VPIPE_QMV_KSPLIT_SWIGLU(affine_qmv_ks4_swiglu_w4g64, 4)
@@ -3323,3 +3372,23 @@ VPIPE_QMV_KSPLIT(affine_qmv_ks4_w4g64, 4, 2)
 VPIPE_QMV_KSPLIT(affine_qmv_ks4k4_w4g64, 4, 4)
 VPIPE_QMV_KSPLIT(affine_qmv_ks6_w4g64, 6, 2)
 VPIPE_QMV_KSPLIT(affine_qmv_ks8_w4g64, 8, 2)
+VPIPE_QMV_KSPLIT_SWIGLU(affine_qmv_ks8_swiglu_w4g64, 8)
+VPIPE_QMV_KSPLIT8(affine_qmv_ks1_w8g64, 1)
+VPIPE_QMV_KSPLIT_SWIGLU(affine_qmv_ks1_swiglu_w4g64, 1)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks1_add_w4g64, 1, 4)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks1_add_w8g64, 1, 8)
+VPIPE_QMV_KSPLIT8(affine_qmv_ks2_w8g64, 2)
+VPIPE_QMV_KSPLIT8(affine_qmv_ks3_w8g64, 3)
+VPIPE_QMV_KSPLIT8(affine_qmv_ks4_w8g64, 4)
+VPIPE_QMV_KSPLIT8(affine_qmv_ks6_w8g64, 6)
+VPIPE_QMV_KSPLIT8(affine_qmv_ks8_w8g64, 8)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks2_add_w4g64, 2, 4)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks3_add_w4g64, 3, 4)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks4_add_w4g64, 4, 4)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks6_add_w4g64, 6, 4)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks8_add_w4g64, 8, 4)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks2_add_w8g64, 2, 8)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks3_add_w8g64, 3, 8)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks4_add_w8g64, 4, 8)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks6_add_w8g64, 6, 8)
+VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks8_add_w8g64, 8, 8)

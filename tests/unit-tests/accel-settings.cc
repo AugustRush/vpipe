@@ -24,6 +24,8 @@
 #include "generative-models/video-model-registry.h"
 #include "stages/generate-image-stage.h"
 #include "stages/generate-video-stage.h"
+#include "stages/vae-decode-stage.h"
+#include "stages/vae-encode-stage.h"
 #include "common/session.h"
 #include "minitest.h"
 
@@ -391,4 +393,41 @@ TEST(accel_settings, the_video_stage_settles_motion_cache)
                 c.warmup_steps == d.warmup_steps && c.end == d.end);
     EXPECT_TRUE(accel::tiers_on(&bag).empty());
   }
+}
+
+// THE CODEC'S INT8 TIER, off both VAE stages: the graph's word SETTLED
+// into the bag the Qwen-Image codec is set from (MetalKrea2Vae::
+// set_accel) and a registered family is handed -- and a word neither
+// stage knows refused, the bag reading accurate rather than carrying it.
+TEST(accel_settings, the_vae_stages_settle_the_int8_tier)
+{
+  Session sess;
+  auto cfg = [](const char* tier) {
+    FlexData c = FlexData::make_object();
+    auto o = c.as_object();
+    o.insert_or_assign("i8_gemm", FlexData::make_bool(true));
+    o.insert_or_assign("i8_gemm_tier", FlexData::make_string(tier));
+    return c;
+  };
+  for (const char* t : {"accurate", "fast", "token", "token_plain"}) {
+    VaeDecodeStage dec(&sess, "vd", std::vector<InEdge>{}, cfg(t));
+    VaeEncodeStage enc(&sess, "ve", std::vector<InEdge>{}, cfg(t));
+    EXPECT_TRUE(dec.config_error().empty());
+    EXPECT_TRUE(enc.config_error().empty());
+    for (const FlexData* bag : {&dec.accel_settings(),
+                                &enc.accel_settings()}) {
+      EXPECT_TRUE(accel::flag(bag, accel::kI8Gemm));
+      EXPECT_TRUE(accel::text(bag, accel::kI8GemmTier) == t);
+    }
+  }
+  VaeDecodeStage bad(&sess, "vd", std::vector<InEdge>{}, cfg("fastest"));
+  EXPECT_TRUE(!bad.config_error().empty());
+  EXPECT_TRUE(accel::text(&bad.accel_settings(), accel::kI8GemmTier) ==
+              accel::kI8TierAccurate);
+  // Nothing asked: off, accurate.
+  VaeDecodeStage none(&sess, "vd", std::vector<InEdge>{},
+                      FlexData::make_object());
+  EXPECT_TRUE(!accel::flag(&none.accel_settings(), accel::kI8Gemm));
+  EXPECT_TRUE(accel::text(&none.accel_settings(), accel::kI8GemmTier) ==
+              accel::kI8TierAccurate);
 }

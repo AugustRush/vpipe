@@ -25,6 +25,7 @@
 #include "generative-models/shared/motion-cache.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #include "generative-models/weight-set.h"
+#include "generative-models/llama3/metal-llama-weights.h"
 #endif
 
 #include <algorithm>
@@ -82,6 +83,9 @@ static_assert(kH3LoraSlots ==
 constexpr SpecExtra kUnloadChoices[] = {
   {spec_key::kChoices, "auto,destroy,keep"},
 };
+constexpr SpecExtra kI8TierChoices[] = {
+  {spec_key::kChoices, "accurate,fast,token,token_plain"},
+};
 constexpr SpecExtra kSeedSequenceExtra[] = {
   {spec_key::kChoices, kSeedSequenceChoices},
 };
@@ -101,10 +105,12 @@ const ConfigKey kAttrs[] = {
           "under hf_dir, whose text encoder and VAEs are still used -- a "
           "single .safetensors (a Comfy-Org repack, or the diffusers "
           "naming, e.g. lightx2v's FP8 turbo DiT, read as it is with FP8 "
-          "kept FP8) or a transformer directory. Empty: the one hf_dir "
-          "holds",
+          "kept FP8), a Draw Things .ckpt (its i8x codes run as stored on "
+          "i8_gemm_tier token_plain) or a transformer directory. Empty: "
+          "the one hf_dir holds",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "minimax-h3-dit,minimax-h3-fl2va,minimax-h3-ref2va"},
+   .suggest_db_type = "minimax-h3-dit,minimax-h3-fl2va,minimax-h3-ref2va",
+   .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
   {.key = "height", .type = ConfigType::Int, .required = false,
    .doc = "video height in pixels. ROUNDED UP to the resident family's VAE "
           "stride times its DiT patch, which differs per family, so any "
@@ -141,6 +147,16 @@ const ConfigKey kAttrs[] = {
           "re-run. \"keep\": `seed` for every clip, which compares prompts "
           "on the same noise",
    .def_str = "increment", .extra = kSeedSequenceExtra},
+  {.key = "i8_gemm_tier", .type = ConfigType::String, .required = false,
+   .doc = "which int8 GEMM i8_gemm runs: 'accurate' (default; the "
+          "weight and activation quantized per call in groups of 64), "
+          "'fast' (the block weights held as rotated int8 at a coarse "
+          "group), 'token' (int8 per weight row x per token after a "
+          "256-wide Hadamard rotation: the fastest) or 'token_plain' (the "
+          "same unrotated, which reads a Draw Things i8x checkpoint's "
+          "codes as stored). Taken by minimax-h3; others run accurate. "
+          "Env VPIPE_I8_TIER overrides",
+   .def_str = "accurate", .extra = kI8TierChoices},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
           "block matmuls instead of bf16, at int8 quality. Independent of "
@@ -617,6 +633,20 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   // reach a different answer than the log line did.
   _accel = FlexData::make_object();
   genai::accel::set_flag(&_accel, genai::accel::kI8Gemm, _i8_gemm);
+  {
+    const std::string t = attr_str("i8_gemm_tier");
+    const bool known = t == genai::accel::kI8TierFast ||
+                       t == genai::accel::kI8TierToken ||
+                       t == genai::accel::kI8TierTokenPlain;
+    if (!t.empty() && !known && t != genai::accel::kI8TierAccurate) {
+      fail_config(fmt("GenerateVideoStage('{}'): i8_gemm_tier must be "
+                      "'accurate', 'fast', 'token' or 'token_plain' (got "
+                      "'{}')", this->id(), t));
+    }
+    genai::accel::set_text(&_accel, genai::accel::kI8GemmTier,
+                           known ? t
+                                 : std::string(genai::accel::kI8TierAccurate));
+  }
   genai::accel::set_flag(&_accel, genai::accel::kSageAttn, _sage.enabled);
   genai::accel::set_integer(&_accel, genai::accel::kSageDenseLayers,
                             _sage.dense_layers);
@@ -712,6 +742,14 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _sol  = genai::sol::config_from_flex(&_accel);
   _sage = genai::sage::config_from_flex(&_accel);
   _i8_gemm = genai::accel::flag(&_accel, genai::accel::kI8Gemm);
+  {
+    const std::string t =
+        genai::accel::text(&_accel, genai::accel::kI8GemmTier);
+    _i8_tier = t == genai::accel::kI8TierTokenPlain ? 3
+               : t == genai::accel::kI8TierToken    ? 2
+               : t == genai::accel::kI8TierFast     ? 1
+                                                    : 0;
+  }
 
   _seed_base = (std::uint64_t)attr_int("seed");
   _seed      = _seed_base;
@@ -1064,17 +1102,13 @@ GenerateVideoStage::ane_claim_label_() const
 // planned geometry, with room for two conditioning latent frames and the
 // longest text. The same geometry answers the claim and the grant, so the
 // two cannot book different numbers.
-std::size_t
-GenerateVideoStage::h3_ane_bytes_() const
+int
+GenerateVideoStage::h3_plan_seq_() const
 {
   int w = _width, h = _height, f = _frames;
   (void)planned_geometry_(resolve_model_dir(session(), _hf_dir), &w, &h, &f);
   const genai::MetalMiniMaxH3VideoVae::Config vc;
-  genai::MetalMiniMaxH3Transformer::Config tc;
-  // The CLAIM has to cover every tier the graph asked for. It did not
-  // cover the qkv module while the preflight already charged for it, so
-  // the gate refused against a number the plan had never granted.
-  tc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+  const genai::MetalMiniMaxH3Transformer::Config tc;
   constexpr int kCondFrames = 2, kTextRows = 512;
   const int lf = genai::MetalMiniMaxH3VideoVae::video_latent_frames_for(
       vc, std::max(1, f));
@@ -1085,9 +1119,46 @@ GenerateVideoStage::h3_ane_bytes_() const
           ? genai::MetalMiniMaxH3AudioVae::latent_frames_for_seconds(
                 (double)std::max(1, f) / _fps)
           : 0;
-  const int seq = (std::max(0, lf) + kCondFrames) * gh * gw + audio +
-                  kTextRows;
-  return genai::MetalMiniMaxH3Transformer::ane_runtime_bytes(tc, seq);
+  return (std::max(0, lf) + kCondFrames) * gh * gw + audio + kTextRows;
+}
+
+std::size_t
+GenerateVideoStage::h3_ane_bytes_() const
+{
+  genai::MetalMiniMaxH3Transformer::Config tc;
+  // The CLAIM has to cover every tier the graph asked for. It did not
+  // cover the qkv module while the preflight already charged for it, so
+  // the gate refused against a number the plan had never granted.
+  tc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+  return genai::MetalMiniMaxH3Transformer::ane_runtime_bytes(tc,
+                                                             h3_plan_seq_());
+}
+
+// THE DENOISE'S ACTIVATIONS, which the plan never booked: only the
+// runtime preflight (preflight_h3_scratch_) knew them, so the one ledger
+// that can refuse a graph carried weights alone through the phase where a
+// video forward holds ~200 KB a row (1.9 GB at 9382 rows, 3.9 at 19k). The
+// forward's scratch at the planned sequence, the dequant scratch where
+// matrix cores may take it (a quantized or FP8 checkpoint, or an int8
+// layout's declined bands), and the int8 context's bound. Sol's and
+// Sage's are mostly lent from the attention arena and stay the
+// preflight's, which still checks the real geometry.
+std::size_t
+GenerateVideoStage::h3_forward_scratch_bytes_(const std::string& dit) const
+{
+  using T = genai::MetalMiniMaxH3Transformer;
+  T::Config c;
+  if (!T::config_from_json(dit, c, nullptr)) { return 0; }
+  auto* mc = session() != nullptr ? session()->services()->metal_compute()
+                                  : nullptr;
+  const bool mx = mc != nullptr && mc->supports_matrix_cores();
+  const int seq = h3_plan_seq_();
+  std::size_t n = T::scratch_bytes(c, seq, 512, T::kTimestepSlots, mx);
+  if (mx && _i8_gemm) {
+    n += genai::I8GemmContext::forward_bytes_bound(seq, c.ffn, 2 * c.ffn,
+                                                   c.hidden, _i8_tier == 0);
+  }
+  return n;
 }
 
 // Carry the settled ANE tier out of the accel bag and onto _h3_cfg.
@@ -1121,7 +1192,47 @@ GenerateVideoStage::apply_h3_ane_()
 }
 #else
 std::size_t GenerateVideoStage::h3_ane_bytes_() const { return 0; }
+int GenerateVideoStage::h3_plan_seq_() const { return 0; }
+std::size_t
+GenerateVideoStage::h3_forward_scratch_bytes_(const std::string&) const
+{
+  return 0;
+}
 void GenerateVideoStage::apply_h3_ane_() {}
+#endif
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+namespace {
+
+// What a STREAMED dense H3 checkpoint's slot pair adds on the int8 tiers:
+// each slot keeps its bf16 source as the refill target AND the layout
+// quantized from it (Linear::ds), so a slot is ~1.5 blocks. Block 0's
+// four projections at int8 with the finest group's scales, twice. Zero for
+// a pack (its codes convert in place) and where the tiers do not engage.
+std::size_t
+h3_int8_slot_bytes_(const SessionContextIntf* session,
+                    const std::string& dit, bool i8, int tier)
+{
+  if (!i8 || tier <= 0 || session == nullptr) { return 0; }
+  auto* mc = session->services()->metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return 0; }
+  auto w = genai::MetalLlamaWeights::open_model(dit);
+  if (!w.has_value()) { return 0; }
+  std::size_t n = 0;
+  for (const char* p : {"attn.qkv_proj", "attn.out_proj", "mlp.fc1",
+                        "mlp.fc2"}) {
+    const std::string nm = std::string("blocks.0.") + p;
+    if (w->info(nm + ".scales") != nullptr) { return 0; }
+    const auto* ti = w->info(nm + ".weight");
+    if (ti == nullptr || ti->shape.size() != 2) { continue; }
+    const std::size_t N = (std::size_t)ti->shape[0];
+    const std::size_t K = (std::size_t)ti->shape[1];
+    n += N * K + std::max(N * (K / 256) * 2, N * 4);
+  }
+  return 2 * n;
+}
+
+}  // namespace
 #endif
 
 std::vector<ResourceClaim>
@@ -1304,7 +1415,23 @@ GenerateVideoStage::declare_resources() const
   // to by streaming its blocks. A graph that does not fit the first and
   // does fit the second is not one to refuse -- it is one to stream.
   std::vector<ResourceClaim> out{model_memory::weight_claim_streamable(
-      dit, genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit))};
+      dit, genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit) +
+               h3_int8_slot_bytes_(session(), dit, _i8_gemm, _i8_tier))};
+  // THE FORWARD'S ACTIVATIONS, in the denoise phase (see
+  // h3_forward_scratch_bytes_): a presence marker where the geometry is
+  // not known, which the preflight then answers for.
+  {
+    int pw = _width, ph = _height, pf = _frames;
+    const std::size_t den = planned_geometry_(root, &pw, &ph, &pf)
+                                ? h3_forward_scratch_bytes_(dit)
+                                : model_memory::kUnknownArena;
+    for (auto& c : model_memory::scratch_claims(
+             fmt("{}-h3-dit", this->id())(),
+             den > 0 ? den : model_memory::kUnknownArena,
+             model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
   // ANE RESIDENCY: one unit, in the denoise phase. CoreML holds the
   // module's bytes where no other ledger can see them, and the feed-forward
   // runs on ONE shared runtime-weight module, so the cost is fixed --
@@ -1422,8 +1549,12 @@ GenerateVideoStage::declare_memory() const
   // is `destroy` -- so under `auto` the pooling below had an empty
   // string and did nothing, silently.
   _dit_dir_declared_ = dit;
-  m.hold(dit, model_memory::dir_weights_bytes(dit),
-         genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit),
+  // A preload holding its w4 projections' int8 layout holds that
+  // layout's growth too (0 until the load decides it; see
+  // _h3_i8_hold_growth_).
+  m.hold(dit, model_memory::dir_weights_bytes(dit) + _h3_i8_hold_growth_,
+         genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit) +
+             h3_int8_slot_bytes_(session(), dit, _i8_gemm, _i8_tier),
          // `destroy` only, the same condition the phase claim carries:
          // `auto` resolves against a figure this would itself change.
          _unload_cfg == model_memory::UnloadPolicy::kDestroy,
@@ -1434,6 +1565,8 @@ GenerateVideoStage::declare_memory() const
 
   int aw = _width, ah = _height, af = _frames;
   if (!planned_geometry_(root, &aw, &ah, &af)) { return m; }
+  // The forward's activations, as the denoise claim books them.
+  m.scratch = h3_forward_scratch_bytes_(dit);
   // oport 0 is the video latent, oport 1 the audio latent. Sized from
   // the same rounded geometry the arena uses, so the two cannot
   // describe different clips.
@@ -2277,6 +2410,7 @@ GenerateVideoStage::ensure_expert_(int which)
     resolve_config_();
     if (!_have_cfg) { return false; }
     if (_h3_dit) { return true; }
+    _h3_cfg.i8_tier = _i8_tier;
     auto* h3mc = session()->services()->metal_compute();
     if (h3mc == nullptr) { return false; }
     // The 33B DiT is the largest here: ~33 GB at w8, which does NOT fit
@@ -2288,6 +2422,9 @@ GenerateVideoStage::ensure_expert_(int which)
     // other DiT families ask rather than assuming the stack fits.
     namespace fs = std::filesystem;
     const std::string dit_dir = h3_dit_(_root, _h3_partition);
+    _h3_dit_dir_ = dit_dir;
+    _h3_load_floor_ = 0;
+    _h3_revised_ = 0;
     // Through the encoder's own resolver, not by spelling a sibling of
     // the DiT: on a Comfy-Org repack the DiT's parent IS the root and the
     // encoder lives under `text_encoders/`, so building the path by hand
@@ -2337,10 +2474,21 @@ GenerateVideoStage::ensure_expert_(int which)
     const auto plan = model_memory::plan_streaming(
         session(), dit_dir, enc_dir, model_memory::kStreamHeadroom,
         dit_retires);
-    bool stream_blocks = plan.stream;
+    // STREAM, THEN RETAIN on every box (model_memory::stream_blocks_by_
+    // default; VPIPE_PRELOAD=1 preloads, for the A/B): the first forward
+    // reads each block as it needs it and residency keeps it, so a box
+    // with room converges on what a preload holds -- int8 layouts
+    // included (Linear::ds / ps, keep_block_) -- one forward in.
+    bool stream_blocks = model_memory::stream_blocks_by_default(plan);
     if (const char* e = std::getenv("VPIPE_H3_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
+    // THE BOX IS TIGHT, apart from the mechanism: what only a tight box
+    // wants -- dropping the DiT after each clip, revising the declaration
+    // to the trunk -- keys on this. A streamed DiT on a box with room
+    // (VPIPE_H3_STREAM=1 there) keeps what residency grows, and a
+    // streamed block is the preloaded one, int8 layouts included.
+    const bool bounded = plan.stream && stream_blocks;
     // The pinned prefix is retired -- see
     // MetalMiniMaxH3Transformer::load. BlockResidency supersedes it:
     // admission against the live budget instead of a fraction of total
@@ -2352,10 +2500,67 @@ GenerateVideoStage::ensure_expert_(int which)
         "less {} GB the AdaLN bake retires) + {} GB headroom -> {}",
         this->id(), plan.footprint >> 30, plan.others >> 30,
         plan.retires >> 30, model_memory::kStreamHeadroom >> 30,
-        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+        !stream_blocks ? "PRELOAD"
+        : plan.stream  ? "STREAM blocks"
+                       : "STREAM blocks, kept as the box allows"));
     _h3_cfg.i8_gemm = _i8_gemm;
     _h3_cfg.sol     = _sol;
     _h3_cfg.sage    = _sage;
+    // A W4 PACK'S INT8 LAYOUT on the int8 tiers: held where the box has
+    // room -- plan_streaming's own rule asked again with the layout's
+    // growth (every w4 block projection's codes again) -- and converted
+    // per projection where it has not, or the blocks stream; generate-
+    // image's rule. VPIPE_I8_W4_HOLD overrides.
+    _h3_cfg.i8_hold_w4 = false;
+    _h3_i8_hold_growth_ = 0;
+    if (_i8_gemm && _i8_tier > 0 && h3mc != nullptr &&
+        h3mc->supports_matrix_cores()) {
+      std::size_t held = 0;
+      if (auto wts = genai::MetalLlamaWeights::open_model(dit_dir)) {
+        for (const std::string& nm : wts->tensor_names()) {
+          const std::string_view sx = ".weight";
+          if (nm.rfind("blocks.", 0) != 0 || nm.size() <= sx.size() ||
+              nm.compare(nm.size() - sx.size(), sx.size(), sx) != 0) {
+            continue;
+          }
+          const auto* ci = wts->info(nm);
+          const auto* sc =
+              wts->info(nm.substr(0, nm.size() - sx.size()) + ".scales");
+          if (ci != nullptr && sc != nullptr && ci->shape.size() == 2 &&
+              sc->shape.size() == 2 &&
+              (long)ci->shape[1] * 32 == (long)sc->shape[1] * 64 * 4) {
+            held += (std::size_t)ci->nbytes;
+          }
+        }
+      }
+      if (held > 0) {
+        // By the box's room, streamed or not: residency converts each
+        // block it keeps into the layout (keep_block_), a slot converts
+        // per projection either way.
+        _h3_cfg.i8_hold_w4 =
+            !bounded &&
+            model_memory::preload_fits_extra(plan, held,
+                                             model_memory::kStreamHeadroom);
+        if (const char* e = std::getenv("VPIPE_I8_W4_HOLD")) {
+          _h3_cfg.i8_hold_w4 = std::atoi(e) != 0;
+        }
+        // What a PRELOAD holds beyond its files when the layout is held:
+        // declare_memory() books it and the load below revises the
+        // manager's declaration by it. A streamed DiT holds the layout
+        // only in the blocks it keeps, which its own revision reads.
+        if (_h3_cfg.i8_hold_w4 && !stream_blocks) {
+          _h3_i8_hold_growth_ = held;
+        }
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): the w4 projections' int8 layout {} "
+            "({} MB to hold it; {})", this->id(),
+            _h3_cfg.i8_hold_w4 ? "HELD" : "CONVERTED PER PROJECTION",
+            held >> 20,
+            std::getenv("VPIPE_I8_W4_HOLD") != nullptr
+                ? "VPIPE_I8_W4_HOLD"
+                : bounded ? "the blocks stream" : "by the box's room"));
+      }
+    }
     apply_h3_ane_();
     // The runtime LoRA, when the model_config beat named one. It is a
     // LOAD-time argument and not a per-step knob: an adapted mlp.fc1
@@ -2507,8 +2712,22 @@ GenerateVideoStage::ensure_expert_(int which)
             _h3_params.audio_shift));
       }
     }
-    resolve_unload_policy_h3_(stream_blocks);
-    if (_h3_dit && stream_blocks) {
+    resolve_unload_policy_h3_(bounded);
+    if (_h3_dit && !stream_blocks && _h3_i8_hold_growth_ > 0) {
+      // A PRELOAD that holds the w4 projections' int8 layout holds its
+      // files AND that growth, which neither ledger had heard of: the
+      // declaration said the files, and the plan's holding the same.
+      // MEASURED on the Ultra: 3.06 GB of peak footprint against the
+      // 3.33 GB the decision above computed.
+      auto* mgr = session()->services()->generative_model_manager();
+      if (mgr != nullptr) {
+        mgr->revise_declaration(dit_dir,
+                                model_memory::dir_weights_bytes(dit_dir) +
+                                    _h3_i8_hold_growth_);
+      }
+      revise_memory(declare_memory());
+    }
+    if (_h3_dit && bounded) {
       // A streamed DiT holds ~one block, not the checkpoint, so the
       // load-time claim would keep sizing every peer against 33 GB. What
       // the SET holds is the right number: the retained top-level
@@ -2670,8 +2889,44 @@ namespace h3 = genai::minimax_h3;
 // needs the working set -- which on MiniMax-H3 is exactly what happened:
 // the DiT stayed resident and a 251 MB video decode was refused with zero
 // headroom and 5.3 GB physically free.
+// A STREAMED H3 DiT grows as residency keeps its blocks, and those are
+// the model's own buffers: its weight set reports only the cached trunk.
+// So after every clip both ledgers are told the whole holding -- the set's
+// entries plus the promoted blocks, the slot pair (given back first when
+// the stack is whole) and the AdaLN tables. The image families' rule
+// (correct_dit_holding_), and the same bug before it: the declaration sat
+// at the trunk while residency held tens of GB.
 void
-GenerateVideoStage::resolve_unload_policy_h3_(bool streamed)
+GenerateVideoStage::correct_h3_holding_()
+{
+  if (!_h3_dit || !_h3_dit->streaming() || _h3_dit_dir_.empty()) { return; }
+  (void)_h3_dit->release_idle_slots();
+  auto* mgr = session()->services()->generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto ws = mgr->weight_set(_h3_dit_dir_);
+  const std::size_t held =
+      (ws ? ws->stats().bytes : 0) + _h3_dit->streamed_holding_bytes();
+  if (held == 0) { return; }
+  mgr->revise_declaration(_h3_dit_dir_, held);
+  StageMemory m = declare_memory();
+  StageHolding* h = nullptr;
+  for (StageHolding& x : m.holdings) {
+    if (x.source == _h3_dit_dir_) { h = &x; break; }
+  }
+  if (h == nullptr) { return; }
+  _h3_load_floor_ = correct_loaded_holding(*h, held, _h3_load_floor_);
+  if (h->preload == _h3_revised_) { return; }
+  _h3_revised_ = h->preload;
+  revise_memory(m);
+  session()->log_debug(fmt(
+      "GenerateVideoStage('{}'): the streamed DiT holds {} MB after a "
+      "clip ({} of {} blocks kept); the plan holds it at {} MB, floor {} MB",
+      this->id(), held >> 20, _h3_dit->resident_block_count(),
+      _h3_cfg.n_layers, h->preload >> 20, h->floor >> 20));
+}
+
+void
+GenerateVideoStage::resolve_unload_policy_h3_(bool tight)
 {
   if (_unload_resolved) { return; }
   _unload_resolved = true;
@@ -2685,7 +2940,7 @@ GenerateVideoStage::resolve_unload_policy_h3_(bool streamed)
     case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
     case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
     default:
-      _unload_idle = streamed ||
+      _unload_idle = tight ||
                      model_memory::bounded(session(), peers,
                                            model_memory::kHeadroom);
       break;
@@ -2695,7 +2950,7 @@ GenerateVideoStage::resolve_unload_policy_h3_(bool streamed)
         "GenerateVideoStage('{}'): memory-bounded -- the DiT is dropped "
         "after each clip so the VAE decode has working set, and reloads "
         "on the next prompt{}", this->id(),
-        streamed ? " (its blocks stream, so the box is already tight)" : ""));
+        tight ? " (its blocks stream, so the box is already tight)" : ""));
   }
 }
 
@@ -2779,6 +3034,10 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // when the setting is off, and reduced by whatever the forward arena
   // could lend -- see MetalMiniMaxH3Transformer::sage_lend_bytes_.
   const std::size_t sage = _h3_dit ? _h3_dit->sage_scratch_bytes(seq) : 0;
+  // AND THE INT8 CONTEXT'S: activation codes at the widest GEMM, the
+  // per-call weight scratch and split-K's planes, grown inside the first
+  // forward and kept. Zero when i8_gemm is off.
+  const std::size_t i8 = _h3_dit ? _h3_dit->i8_scratch_bytes(seq) : 0;
   // AND THE ANE MODULE'S, when the plan granted it: CoreML holds its staged
   // weights and the host rows beside this forward, at THIS sequence rather
   // than the planned one. Counted in `need`, so the refusal is judged with
@@ -2800,7 +3059,7 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // they count against physical RAM only. MEASURED on an M5 Pro 24 GB at
   // 1344x768x328 (98887 rows): charging the ANE's 3.1 GB to the working set
   // refused a clip that runs GPU-only.
-  const std::size_t gpu_need = dit + vdn + sol + sage;
+  const std::size_t gpu_need = dit + vdn + sol + sage + i8;
   // AND WHAT THE CALLER HOLDS BESIDE THE FORWARD for the whole denoise --
   // TaoMate-H3's clean-K/V cache, which at 864x480 is larger than every
   // term above together. It is judged against PHYSICAL RAM and kept out
@@ -4274,6 +4533,9 @@ GenerateVideoStage::process(RuntimeContext& ctx)
                       ref_frames, have_r2v ? &r2v : nullptr,
                       &vlat, &vshape, &alat_out, &ashape);
     if (_h3_dit) { _h3_dit->set_stream_stop({}); }
+    // What the DiT held WHILE it denoised, before any drop below -- the
+    // figure a peer sizes against.
+    correct_h3_holding_();
     // What the adaptive residency actually reached. This is the number
     // that says whether the machine got used: with 0 pinned at load, every
     // resident block here was earned at runtime out of free headroom, and

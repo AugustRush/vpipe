@@ -205,6 +205,9 @@ family_version_(const std::string& mt, std::string& family,
       {"qwen-image-21-lora",     "Qwen-Image",  "2.1"},
       {"z-image",                "Z-Image",     "1"},
       {"z-image-dit",            "Z-Image",     "1"},
+      {"moss-image",             "MOSS-Image",  "1"},
+      {"moss-image-dit",         "MOSS-Image",  "1"},
+      {"moss-image-lora",        "MOSS-Image",  "1"},
       {"boogu-image",            "Boogu-Image", "0.1"},
       {"boogu-image-edit",       "Boogu-Image", "0.1-Edit"},
       {"wan-i2v",                "Wan",         "2.2-I2V"},
@@ -356,6 +359,8 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
   // from a name. A tag per variant would promise a distinction this
   // file cannot actually make.
   if (cls == "ZImageTransformer2DModel") { return "z-image"; }
+  // MOSS-Image. One tag for Base and SFT: the configs are identical.
+  if (cls == "MOSSImageTransformer") { return "moss-image"; }
   if (cls == "BooguImageTransformer2DModel") {
     // The t2i and edit repos ship the SAME transformer config (only the
     // weights differ), so the name is the only signal.
@@ -493,6 +498,7 @@ dit_component_tag_(const std::string& cls)
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit-dit"; }
   if (cls == "QwenImage21Transformer2DModel") { return "qwen-image-21-dit"; }
   if (cls == "ZImageTransformer2DModel")     { return "z-image-dit"; }
+  if (cls == "MOSSImageTransformer")         { return "moss-image-dit"; }
   if (cls == "BooguImageTransformer2DModel") { return "boogu-image-dit"; }
   // Either Wan expert on its own (a quantized transformer/ or
   // transformer_2/ output) is one DiT component; which noise band it

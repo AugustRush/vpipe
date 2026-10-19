@@ -13,6 +13,7 @@
 #include "generative-models/image-model-registry.h"
 #include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/torch-randn.h"
 #include "stages/denoise-progress.h"
 #include "generative-models/generative-model-manager.h"
@@ -78,6 +79,9 @@ bf16_to_f32_(std::uint16_t b)
 constexpr SpecExtra kReferenceModeChoices[] = {
   {spec_key::kChoices, "auto,latch,per_beat"},
 };
+constexpr SpecExtra kI8TierChoices[] = {
+  {spec_key::kChoices, "accurate,fast,token,token_plain"},
+};
 constexpr SpecExtra kSeedSequenceExtra[] = {
   {spec_key::kChoices, kSeedSequenceChoices},
 };
@@ -105,18 +109,20 @@ const ConfigKey kAttrs[] = {
           "overrides it",
    .suggest_db = kModelRegistryDb, .suggest_db_type =
        "krea2,flux2,qwen-image,qwen-image-edit,qwen-image-21,"
-       "boogu-image,boogu-image-edit,z-image,flux3,vosr",
+       "boogu-image,boogu-image-edit,z-image,flux3,moss-image,vosr",
    .model_channel = "diffusion-model"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else "
           "<hf_dir>/transformer. Krea-2 also takes a single .safetensors "
           "in Krea's own layout -- a community fine-tune, FP8 included -- "
           "and Qwen-Image-2.1 a single-file DiT under its diffusers names "
-          "(unsloth's FP8), each read as it is, with no conversion step",
+          "(unsloth's FP8) or a Draw Things .ckpt, each read as it is, with "
+          "no conversion step",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type =
        "krea2-dit,flux2-dit,qwen-image-edit-dit,qwen-image-21-dit,"
-       "boogu-image-dit,z-image-dit,flux3-dit"},
+       "boogu-image-dit,z-image-dit,flux3-dit,moss-image-dit",
+   .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
   {.key = "strength", .type = ConfigType::Real, .required = false,
    .doc = "img2img strength in [0,1]; 0 (default) = text-to-image from noise "
           "(the init latent arrives on the `latent` iport from vae-encode)"},
@@ -223,6 +229,33 @@ const ConfigKey kAttrs[] = {
           "block matmuls, ~2x their f16 rate at int8 quality; IGNORED "
           "without NAX matmul2d (matrix-core GPU + kernels). Default "
           "false; env VPIPE_I8_GEMM overrides"},
+  {.key = "i8_gemm_tier", .type = ConfigType::String, .required = false,
+   .doc = "which int8 GEMM i8_gemm runs: 'accurate' (default; groups of 64 "
+          "on both operands), 'fast' (the block weights held as rotated "
+          "int8 at a group of 512: faster on the M5's matrix cores, ~1.1x "
+          "accurate on an Ultra), 'token' (int8 per weight row x per token "
+          "after a 256-wide Hadamard rotation: the fastest, ~1.4x accurate "
+          "on an M5 Ultra at 1024^2) or 'token_plain' (the same unrotated: "
+          "no faster, and visibly further from the dense picture; it "
+          "reads a Draw Things i8x checkpoint's codes as stored, which "
+          "'token' requantizes). A w4 pack's block weights take 'fast' "
+          "and both token tiers too: the engine keeps their int8 copy "
+          "where the box has room for it (twice the w4 bytes) and "
+          "otherwise converts each before its GEMM, at ~3-5% of the "
+          "denoise. Taken by "
+          "qwen-image-21, krea2, flux2, z-image and moss-image on their "
+          "image-row "
+          "projections; others run accurate. Env VPIPE_I8_TIER overrides",
+   .def_str = "accurate", .extra = kI8TierChoices},
+  {.key = "keep_loaded", .type = ConfigType::Real, .required = false,
+   .doc = "seconds to keep the DiT BUILT after this stage ends (its graph "
+          "unloaded), on a box with room for it: the next graph asking for "
+          "the same checkpoint and settings is handed it resident -- no "
+          "read, no int8 layout made again. Renewed at each end; released "
+          "sooner when a launch that does not use it needs the room. 0 "
+          "(the default) lets it go with the graph. Qwen-Image-2.1, "
+          "Krea-2, FLUX.2, Z-Image, FLUX.3 and MOSS-Image",
+   .def_real = 0.0},
   // Sol-Attn. The same five keys generate-video carries, with the same
   // spellings and the same defaults, because they are one vocabulary
   // (generative-models/shared/accel-settings.h) and a graph moved from
@@ -540,6 +573,101 @@ const StageSpec kSpec = {
 // A stem matching nothing contributes nothing, so naming all four costs
 // one lookup each and cannot mis-measure a checkpoint that uses only
 // one of them.
+// THE INT8 LAYOUTS ON A W4 PACK, in bytes, two ways. On the fast and
+// token tiers (i8_gemm_tier) a w4 block projection is either HELD as its
+// int8 layout -- twice its nibbles, so `held` is every one's codes again
+// -- or kept as stored and converted before each GEMM into one int8
+// scratch the model's I8GemmContext keeps, `scratch` the largest such
+// projection's codes and scales. Which one is the engine's call
+// (hold_w4_int8_). Zero for a family with no such tier and a pack with
+// no w4 projection. Taken over every w4 tensor of a block, where the
+// families convert only the ones at the image's rows: the error
+// over-states, which is the direction that refuses rather than thrashes.
+struct Int8LayoutBytes {
+  std::size_t scratch = 0;
+  std::size_t held = 0;
+};
+
+Int8LayoutBytes
+int8_layout_bytes_(const std::string& family, const std::string& dit)
+{
+  Int8LayoutBytes out;
+  std::vector<std::string_view> stems;
+  if (family == "z-image") {
+    stems = {"noise_refiner.", "layers."};
+  } else if (family == "moss-image") {
+    stems = {"layers."};
+  } else if (family == "krea2" || family == "qwen-image-21") {
+    stems = {"transformer_blocks."};
+  } else if (family == "flux2") {
+    stems = {"transformer_blocks.", "single_transformer_blocks."};
+  } else {
+    return out;
+  }
+  auto wts = genai::MetalLlamaWeights::open_model(dit);
+  if (!wts.has_value()) { return out; }
+  const std::string_view suffix = ".weight";
+  for (const std::string& nm : wts->tensor_names()) {
+    if (nm.size() <= suffix.size() ||
+        nm.compare(nm.size() - suffix.size(), suffix.size(), suffix) != 0) {
+      continue;
+    }
+    bool in_stack = false;
+    for (std::string_view st : stems) {
+      if (nm.rfind(std::string(st), 0) == 0) { in_stack = true; }
+    }
+    if (!in_stack) { continue; }
+    // FLUX.2's double blocks keep their TEXT stream (add_*, to_add_out,
+    // ff_context) off the layout -- it runs at the prompt's rows, under
+    // the int8 floor -- so it neither grows nor needs scratch; counted,
+    // klein-9B's hold decision read ~0.87 GB it would never spend.
+    if (family == "flux2" &&
+        (nm.find(".attn.add_") != std::string::npos ||
+         nm.find(".attn.to_add_out.") != std::string::npos ||
+         nm.find(".ff_context.") != std::string::npos)) {
+      continue;
+    }
+    const std::string stem = nm.substr(0, nm.size() - suffix.size());
+    const auto* ci = wts->info(nm);
+    const auto* sc = wts->info(stem + ".scales");
+    if (ci == nullptr || sc == nullptr || ci->shape.size() != 2 ||
+        sc->shape.size() != 2 || sc->shape[1] <= 0) {
+      continue;
+    }
+    // Group 64, the only one the tiers convert; w4 only.
+    const int N = (int)ci->shape[0];
+    const int K = (int)(sc->shape[1] * 64);
+    if ((long)ci->shape[1] * 32 != (long)K * 4) { continue; }
+    out.held += (std::size_t)ci->nbytes;
+    // Scales at the coarse tier's finest group (256), or the token
+    // tier's f32 a row, whichever is larger.
+    out.scratch = std::max(
+        out.scratch,
+        std::max(genai::I8GemmContext::fast_scratch_bytes(N, K, 256),
+                 genai::I8GemmContext::fast_scratch_bytes(
+                     N, K, genai::I8GemmContext::kTokenGroup)));
+  }
+  return out;
+}
+
+std::string t2i_family_(const std::string& transformer_dir);   // below
+
+// A DiT checkpoint's quantization width from its config.json (0 dense,
+// unreadable, or a single file), for the plan's figures.
+int
+dit_config_quant_bits_(const std::string& dit)
+{
+  std::ifstream in(std::filesystem::path(dit) / "config.json");
+  if (!in) { return 0; }
+  FlexData fd = FlexData::from_json(in);
+  if (!fd.is_object() || !fd.as_object().contains("quantization")) {
+    return 0;
+  }
+  FlexData q = fd.as_object().at("quantization");   // keep the owner
+  if (!q.is_object() || !q.as_object().contains("bits")) { return 0; }
+  return (int)q.as_object().at("bits").as_int(0);
+}
+
 std::size_t
 dit_floor_bytes_(const std::string& root, const std::string& dit)
 {
@@ -572,6 +700,15 @@ dit_floor_bytes_(const std::string& root, const std::string& dit)
       return genai::MetalZImageTransformer::streaming_floor_bytes(dit);
     }
   }
+  // MOSS-IMAGE ANSWERS FOR ITSELF: its two text blocks share the
+  // `layers.`-free trunk with the model-level weights, and one slot pair
+  // serves the 42 main blocks.
+  {
+    genai::MetalMossImageTransformer::Config mc;
+    if (genai::MetalMossImageTransformer::Config::read_dims(dit, &mc)) {
+      return genai::MetalMossImageTransformer::streaming_floor_bytes(dit);
+    }
+  }
   // FLUX.3 ANSWERS FOR ITSELF too: its four stacks (three per-mode, one
   // joint) are ONE block shape sharing ONE slot pair, where the stem list
   // below would book a pair per stem.
@@ -597,7 +734,40 @@ dit_floor_bytes_(const std::string& root, const std::string& dit)
       "single_blocks.",
       "blocks.",                     // single-stack spellings
   };
-  return model_memory::streaming_floor_bytes(dit, kStems);
+  std::size_t floor = model_memory::streaming_floor_bytes(dit, kStems);
+  // A SLOT THAT KEEPS ITS SOURCE holds more than the block on disk: the
+  // products are built out of the raw tensor after every refill, and the
+  // raw tensor stays (see the BlockSlots notes on tensors with no
+  // checkpoint name). Krea-2's fused SwiGLU weaves `ff_gu` beside the
+  // split gate / up it reads; FLUX.2's single block splits
+  // `to_qkv_mlp_proj` into q|k|v and the MLP's gate|up beside the raw
+  // projection. Priced at the disk block, each pair sat short by twice
+  // that tensor -- ~600 MB on FLUX.2-klein-9B. Booked whether or not the
+  // fused path engages, which is the side that refuses.
+  if (floor > 0) {
+    const std::string fam = t2i_family_(dit);
+    std::vector<std::string> keep;
+    if (fam == "krea2") {
+      keep = {"transformer_blocks.0.ff.gate.", "transformer_blocks.0.ff.up."};
+    } else if (fam == "flux2") {
+      keep = {"single_transformer_blocks.0.attn.to_qkv_mlp_proj."};
+    }
+    if (!keep.empty()) {
+      if (auto w = genai::MetalLlamaWeights::open_model(dit)) {
+        std::size_t kept = 0;
+        for (const std::string& nm : w->tensor_names()) {
+          for (const std::string& k : keep) {
+            if (nm.rfind(k, 0) != 0) { continue; }
+            if (const auto* ti = w->info(nm)) {
+              kept += (std::size_t)ti->nbytes;
+            }
+          }
+        }
+        floor += 2 * kept;
+      }
+    }
+  }
+  return floor;
 }
 
 }  // namespace
@@ -668,6 +838,7 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   // faster. klein_kv chooses a RECIPE, so on the wrong checkpoint it
   // does not run slower, it runs wrong.
   _i8_gemm = attr_bool("i8_gemm");
+  _keep_loaded = attr_real("keep_loaded");
   _sage.enabled      = attr_bool("sage_attn");
   _sage.dense_layers = (int)attr_int("sage_dense_layers");
   _sol.enabled      = attr_bool("sol_attn");
@@ -708,6 +879,20 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   // settings the log line did not describe.
   _accel = FlexData::make_object();
   genai::accel::set_flag(&_accel, genai::accel::kI8Gemm, _i8_gemm);
+  {
+    const std::string t = attr_str("i8_gemm_tier");
+    const bool known = t == genai::accel::kI8TierFast ||
+                       t == genai::accel::kI8TierToken ||
+                       t == genai::accel::kI8TierTokenPlain;
+    if (!t.empty() && !known && t != genai::accel::kI8TierAccurate) {
+      fail_config(fmt("GenerateImageStage('{}'): i8_gemm_tier must be "
+                      "'accurate', 'fast', 'token' or 'token_plain' (got "
+                      "'{}')", this->id(), t));
+    }
+    genai::accel::set_text(&_accel, genai::accel::kI8GemmTier,
+                           known ? t
+                                 : std::string(genai::accel::kI8TierAccurate));
+  }
   genai::accel::set_flag(&_accel, genai::accel::kSageAttn, _sage.enabled);
   genai::accel::set_integer(&_accel, genai::accel::kSageDenseLayers,
                             _sage.dense_layers);
@@ -748,6 +933,14 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   _sage    = genai::sage::config_from_flex(&_accel);
   _sol     = genai::sol::config_from_flex(&_accel);
   _i8_gemm = genai::accel::flag(&_accel, genai::accel::kI8Gemm);
+  {
+    const std::string t =
+        genai::accel::text(&_accel, genai::accel::kI8GemmTier);
+    _i8_tier = t == genai::accel::kI8TierTokenPlain ? 3
+               : t == genai::accel::kI8TierToken    ? 2
+               : t == genai::accel::kI8TierFast     ? 1
+                                                    : 0;
+  }
   for (int i = 0; i < kLoraSlots; ++i) {
     _lora[(std::size_t)i].path  = attr_str(lora_slots::kPath[i]);
     _lora[(std::size_t)i].scale = attr_real(lora_slots::kScale[i]);
@@ -865,7 +1058,167 @@ GenerateImageStage::apply_ane_(Cfg& cfg) const
       (int)std::max<long long>(0, a::integer(&_accel, a::kAneLayers, 0));
 }
 
-GenerateImageStage::~GenerateImageStage() = default;
+GenerateImageStage::~GenerateImageStage()
+{
+  keep_models_warm_();
+}
+
+namespace {
+
+// The warm holds' kinds (GenerativeModelManager::keep_model_warm): the
+// class each casts back to.
+constexpr const char* kWarmKrea2  = "krea2-dit";
+constexpr const char* kWarmFlux2  = "flux2-dit";
+constexpr const char* kWarmQi21   = "qwen-image-21-dit";
+constexpr const char* kWarmZImage = "z-image-dit";
+constexpr const char* kWarmFlux3  = "flux3-dit";
+constexpr const char* kWarmMoss   = "moss-image-dit";
+
+}  // namespace
+
+// What this stage built, handed to the manager as it ends to be kept
+// warm (`keep_loaded`, GenerativeModelManager::keep_model_warm) -- only
+// where the box has room for it: a bounded box streams because it does
+// not, and frees the DiT for the decode.
+void
+GenerateImageStage::keep_models_warm_()
+{
+  if (_keep_loaded <= 0 || _dit_bounded || _dit_warm_key.empty() ||
+      session() == nullptr) {
+    return;
+  }
+  keep_warm_dit_(kWarmKrea2, _krea2_dit_dir, _dit, "Krea-2");
+  keep_warm_dit_(kWarmFlux2, _flux2_dit_dir, _flux2_dit, "FLUX.2");
+  keep_warm_dit_(kWarmQi21, _qi21_dit_dir, _qi21_dit, "Qwen-Image-2.1");
+  keep_warm_dit_(kWarmZImage, _zi_dit_dir, _zi_dit, "Z-Image");
+  keep_warm_dit_(kWarmFlux3, _flux3_dit_dir, _flux3_dit, "FLUX.3");
+  keep_warm_dit_(kWarmMoss, _moss_dit_dir, _moss_dit, "MOSS-Image");
+}
+
+template <class Cfg, class Spec>
+std::string
+GenerateImageStage::warm_key_(const Cfg& c, bool stream,
+                              const std::vector<Spec>& loras,
+                              const std::string& extra)
+{
+  std::string k = stream ? "stream" : "preload";
+  if constexpr (requires { c.i8_gemm; }) {
+    k += fmt("|i8 {}", c.i8_gemm ? 1 : 0)();
+  }
+  if constexpr (requires { c.i8_tier; }) { k += fmt(" {}", c.i8_tier)(); }
+  if constexpr (requires { c.i8_hold_w4; }) {
+    k += fmt(" {}", c.i8_hold_w4 ? 1 : 0)();
+  }
+  if constexpr (requires { c.sage; }) {
+    k += fmt("|sage {} {} {}", c.sage.enabled ? 1 : 0, c.sage.dense_layers,
+             c.sage.smooth_k ? 1 : 0)();
+  }
+  if constexpr (requires { c.sol; }) {
+    k += fmt("|sol {} {} {} {} {} {} {}", c.sol.enabled ? 1 : 0, c.sol.tau,
+             c.sol.dense_layers, c.sol.local_radius, c.sol.sink_start,
+             c.sol.sink_tokens, c.sol.key_block)();
+  }
+  if constexpr (requires { c.ane_ffn; }) {
+    k += fmt("|ane {}", c.ane_ffn ? 1 : 0)();
+  }
+  // Krea-2 and FLUX.2 arm the tier by a session, which the plan's grant
+  // withholds: a build with the ANE's modules and one without differ by
+  // that alone.
+  if constexpr (requires { c.session; }) {
+    k += fmt("|ane {}", c.session != nullptr ? 1 : 0)();
+  }
+  if constexpr (requires { c.ane_qkv; }) {
+    k += fmt(" {}", c.ane_qkv ? 1 : 0)();
+  }
+  if constexpr (requires { c.ane_rows; }) { k += fmt(" {}", c.ane_rows)(); }
+  if constexpr (requires { c.ane_layers; }) {
+    k += fmt(" {}", c.ane_layers)();
+  }
+  if constexpr (requires { c.ane_templates; }) {
+    k += "|" + std::string(c.ane_templates);
+  }
+  if constexpr (requires { c.klein_kv; }) {
+    k += fmt("|kv {}", c.klein_kv ? 1 : 0)();
+  }
+  // The adapters by file: a strength is live (set_lora_scale), set again
+  // on every take -- see take_warm_dit_.
+  for (const auto& l : loras) { k += fmt("|lora {}", l.path)(); }
+  return k + extra;
+}
+
+template <class Dit>
+std::shared_ptr<Dit>
+GenerateImageStage::take_warm_dit_(const char* kind, const std::string& dir,
+                                   const std::string& key, const char* name)
+{
+  _dit_warm_key = key;
+  if (_keep_loaded <= 0 || _dit_bounded || session() == nullptr) {
+    return nullptr;
+  }
+  auto* mgr = session()->services()->generative_model_manager();
+  if (mgr == nullptr) { return nullptr; }
+  auto warm = mgr->take_warm<Dit>(kind, dir, key);
+  if (warm) {
+    _dit_taken_warm = true;
+    // Each adapter's strength as THIS stage has it: a live change in the
+    // graph that kept it (a model_config beat) stayed on the model, and
+    // adapter_keys pushes a strength only when it changes.
+    for (int i = 0; i < kLoraSlots; ++i) {
+      const int ms = _lora_model_slot[(std::size_t)i];
+      if (ms >= 0 && warm->lora_modules(ms) > 0) {
+        warm->set_lora_scale(ms, (float)_lora[(std::size_t)i].scale);
+      }
+    }
+    std::size_t bytes = 0;
+    if constexpr (requires { warm->resident_bytes(); }) {
+      bytes = (std::size_t)warm->resident_bytes();
+    }
+    session()->info(fmt(
+        "GenerateImageStage('{}'): the {} DiT kept warm is taken back{}",
+        this->id(), name,
+        bytes > 0 ? fmt(" ({} MB resident)", bytes >> 20)() : std::string()));
+  }
+  return warm;
+}
+
+template <class Dit>
+void
+GenerateImageStage::keep_warm_dit_(const char* kind, const std::string& dir,
+                                   std::shared_ptr<Dit>& dit,
+                                   const char* name)
+{
+  if (!dit || dir.empty()) { return; }
+  auto* mgr = session()->services()->generative_model_manager();
+  if (mgr == nullptr) { return; }
+  // What a forward sizes per picture goes; the weights stay.
+  dit->release_forward_scratch();
+  (void)dit->release_idle_slots();
+  // What the hold keeps, for the next launch's fit test: the weights the
+  // model holds (the checkpoint's size where it does not say), and the
+  // ANE's modules -- CoreML's bytes, which no ledger here sees.
+  std::size_t bytes = 0;
+  if constexpr (requires { dit->resident_bytes(); }) {
+    bytes = (std::size_t)dit->resident_bytes();
+  } else {
+    bytes = model_memory::dir_weights_bytes(dir);
+  }
+  if (dit->ane_armed()) {
+    if constexpr (requires { Dit::ane_plan_seq(_width, _height); }) {
+      bytes += Dit::ane_runtime_bytes(dit->config(),
+                                      Dit::ane_plan_seq(_width, _height));
+    } else {   // FLUX.2: sized by its image rows
+      bytes += Dit::ane_runtime_bytes(
+          dit->config(), ((_width > 0 ? _width : 1024) / 16) *
+                             ((_height > 0 ? _height : 1024) / 16));
+    }
+  }
+  session()->info(fmt(
+      "GenerateImageStage('{}'): the {} DiT kept warm for {:.0f} s{}",
+      this->id(), name, _keep_loaded,
+      bytes > 0 ? fmt(" ({} MB)", bytes >> 20)() : std::string()));
+  mgr->keep_model_warm(kind, dir, _dit_warm_key, std::move(dit), bytes,
+                       _keep_loaded);
+}
 
 const StageSpec&
 GenerateImageStage::spec() const noexcept
@@ -920,6 +1273,7 @@ unclaimed_class_(const std::string& transformer_dir)
                           "QwenImage21Transformer2DModel",
                           "ZImageTransformer2DModel",
                           "Flux3Transformer2DModel",
+                          "MOSSImageTransformer",
                           "BooguImageTransformer2DModel"}) {
     if (cls == own) { return {}; }
   }
@@ -936,7 +1290,7 @@ family_implements_sol_(const std::string& family)
 {
   return family == "krea2" || family == "flux2" ||
          family == "qwen-image-21" || family == "z-image" ||
-         family == "flux3";
+         family == "flux3" || family == "moss-image";
 }
 
 int
@@ -951,8 +1305,10 @@ latent_scale_(const std::string& family)
   // [channels, H/(8*patch), W/(8*patch)] and Z-Image's VAE is patch 1,
   // so a reference latent cell is 8 pixels and inferring a size at 16
   // would ask for twice the picture.
-  // FLUX.3 takes FLUX.2's VAE unchanged, so its cell is 16 too.
-  if (family == "flux2" || family == "flux3" || family == "qwen-image-21") {
+  // FLUX.3 takes FLUX.2's VAE unchanged, so its cell is 16 too, and so
+  // does MOSS-Image (the small decoder changes widths, not strides).
+  if (family == "flux2" || family == "flux3" || family == "qwen-image-21" ||
+      family == "moss-image") {
     return 16;
   }
   return 8;
@@ -1013,6 +1369,9 @@ t2i_family_(const std::string& transformer_dir)
         // because the fall-through below would load a Krea-2 config over
         // its weights.
         if (cls == "Flux3Transformer2DModel") { return "flux3"; }
+        // MOSS-Image: a single-stream DiT on FLUX.2's VAE; named for the
+        // same reason as the rest.
+        if (cls == "MOSSImageTransformer") { return "moss-image"; }
         if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
         // Qwen-Image-2.1. A DIFFERENT network from the line above --
         // single-stream, /16 VAE, RGBA -- and named here because the
@@ -1138,8 +1497,15 @@ flux2_vae_base_(const std::string& root)
     FlexData fd = FlexData::from_json(in);
     if (fd.is_object()) {
       auto o = fd.as_object();
-      if (o.contains("block_out_channels")) {
-        FlexData bo = o.at("block_out_channels");
+      // The DECODER's widths where they differ (`decoder_block_out_
+      // channels`, the FLUX.2 small decoder MOSS-Image ships): this sizes
+      // a decode. `null` there (FLUX.3's) is "as the encoder's".
+      const char* key = o.contains("decoder_block_out_channels") &&
+                                o.at("decoder_block_out_channels").is_array()
+                            ? "decoder_block_out_channels"
+                            : "block_out_channels";
+      if (o.contains(key) && o.at(key).is_array()) {
+        FlexData bo = o.at(key);
         auto arr = bo.as_array();       // owner `bo` outlives this view
         // block_out_channels parses as a JSON INTEGER array (mode Int), so read
         // each element with as_real() -- as_real_span() only exposes native-real
@@ -1207,7 +1573,10 @@ std::size_t
 flux2_decode_peak_(int w, int h, int base)
 {
   if (w <= 0 || h <= 0 || base <= 0) { return 0; }
-  return (std::size_t)h * (std::size_t)w * (std::size_t)base * 2 * 7;
+  // Seven full-resolution planes plus the band MetalFlux2Vae allocates on
+  // every decode (whole-image, capped at 128 MB), as its decode_peak_bytes.
+  const std::size_t hwb = (std::size_t)h * (std::size_t)w * (std::size_t)base;
+  return hwb * 2 * 7 + std::min(hwb * 9 * 2, (std::size_t)(128u << 20));
 }
 
 // AutoencoderKLQwenImage -- Krea-2 AND Qwen-Image-Edit, which run the
@@ -1221,11 +1590,17 @@ flux2_decode_peak_(int w, int h, int base)
 // before anything is loaded, so it cannot know whether this GPU gathers.
 // `base` = the checkpoint's base_dim, see krea2_vae_base_.
 std::size_t
-qwen_decode_peak_(int w, int h, int base)
+qwen_decode_peak_(int w, int h, int base, bool residual = false)
 {
   if (w <= 0 || h <= 0 || base <= 0) { return 0; }
   const std::size_t hw = (std::size_t)h * (std::size_t)w;
-  const std::size_t acts = hw * (std::size_t)base * 2 * 6;
+  // MetalKrea2Vae::decode_peak_bytes' units -- nine for a residual
+  // decoder (Qwen-Image-2.1's), six for the plain one -- plus the one an
+  // int8 tier adds, because vae-decode's `i8_gemm` is not this stage's
+  // to see, and the decode's fixed term.
+  constexpr std::size_t kFixed = 256u << 20;   // its kDecodeFixedBytes
+  const std::size_t acts =
+      hw * (std::size_t)base * 2 * (residual ? 10 : 7) + kFixed;
   // Widest cin the decoder bands for is base*dim_mult[1], and dim_mult is
   // {1,2,4,4} for this family.
   const std::size_t band = std::min(hw * 9 * (std::size_t)base * 2 * 2,
@@ -1293,7 +1668,7 @@ GenerateImageStage::reset_run_state()
   // reloading on top of a resident copy is exactly what doubles peak
   // memory.
   if (!_dit && !_flux2_dit && !_qie_dit && !_boogu_dit && !_qi21_dit &&
-      !_zi_dit && !_flux3_dit) {
+      !_zi_dit && !_flux3_dit && !_moss_dit) {
     _load_attempted = false;
     _dit_unloaded   = false;
     // The holding correction describes a DiT that is no longer here. A
@@ -1356,6 +1731,15 @@ GenerateImageStage::reset_run_state()
   // FLUX.3's schedule override: a graph that stops naming one must not
   // keep running it.
   _flux3_alpha_cfg = 0.0;
+  // MOSS-Image's guidance, skipped blocks and shift: "no opinion" again.
+  _moss_guidance_cfg = -1.0;
+  _moss_skip_set = false;
+  _moss_skip_cfg.clear();
+  _moss_shift_cfg = 0.0;
+  _moss_slg_layers.clear();
+  _moss_slg_scale = 0.0;
+  _moss_slg_start = 0.0;
+  _moss_slg_stop = 1.0;
   // Qwen-Image-2.1's schedule keys, which carry no default of their own
   // to argue about: a graph that stops naming a turbo schedule must not
   // keep running it.
@@ -1408,6 +1792,40 @@ GenerateImageStage::dit_resident_bytes_() const
   if (_qi21_dit) { return (std::size_t)_qi21_dit->resident_bytes(); }
   if (_zi_dit) { return (std::size_t)_zi_dit->resident_bytes(); }
   if (_flux3_dit) { return (std::size_t)_flux3_dit->resident_bytes(); }
+  if (_moss_dit) { return (std::size_t)_moss_dit->resident_bytes(); }
+  // Krea-2, FLUX.2, Boogu and Qwen-Image-Edit keep no total of their own:
+  // what their set CACHED (the trunk, and every block when preloaded --
+  // held int8 layouts included, which are derived entries) plus what
+  // residency PROMOTED (the model's own buffers) plus the slot pairs
+  // while they exist. Asked of none of them before, a streaming one was
+  // declared at its load-time trunk for the whole run -- MEASURED on
+  // Krea-2 under 48 GB: ~3.5 GB declared while residency held all 28
+  // blocks, 23.2 GB wired.
+  auto cached_plus = [&](const std::string& dir, std::size_t promoted,
+                         std::size_t slots) -> std::size_t {
+    auto* mgr = session() != nullptr
+                    ? session()->services()->generative_model_manager()
+                    : nullptr;
+    auto ws = mgr != nullptr ? mgr->weight_set(dir) : nullptr;
+    const std::size_t cached = ws ? ws->stats().bytes : 0;
+    return cached + promoted + slots;
+  };
+  if (_dit) {
+    return cached_plus(_krea2_dit_dir, _dit->resident_block_bytes(),
+                       _dit->slot_bytes());
+  }
+  if (_flux2_dit) {
+    return cached_plus(_flux2_dit_dir, _flux2_dit->resident_block_bytes(),
+                       _flux2_dit->slot_bytes());
+  }
+  if (_boogu_dit) {
+    return cached_plus(_boogu_dit_dir, _boogu_dit->resident_block_bytes(),
+                       _boogu_dit->slot_bytes());
+  }
+  if (_qie_dit) {
+    return cached_plus(_qie_dit_dir, _qie_dit->resident_block_bytes(),
+                       _qie_dit->slot_bytes());
+  }
   // A registered family's generator answers the same question. Without
   // it a streaming plugin DiT whose residency grows stayed declared at
   // the floor its load reported -- the trunk -- for the whole run.
@@ -1433,6 +1851,23 @@ GenerateImageStage::dit_resident_bytes_() const
 // the plan's holding, which is what the phase figures are computed
 // from. A revision replans the graph, so it is only published when the
 // number actually moved.
+// A streamed DiT residency kept whole gives its slot pair back between
+// generations, before the holding below is read -- the holding is then the
+// preload's, and the decode that follows does not run beside two blocks
+// nothing reads.
+void
+GenerateImageStage::release_idle_slots_()
+{
+  if (_dit) { (void)_dit->release_idle_slots(); }
+  if (_flux2_dit) { (void)_flux2_dit->release_idle_slots(); }
+  if (_qie_dit) { (void)_qie_dit->release_idle_slots(); }
+  if (_qi21_dit) { (void)_qi21_dit->release_idle_slots(); }
+  if (_zi_dit) { (void)_zi_dit->release_idle_slots(); }
+  if (_flux3_dit) { (void)_flux3_dit->release_idle_slots(); }
+  if (_moss_dit) { (void)_moss_dit->release_idle_slots(); }
+  if (_boogu_dit) { (void)_boogu_dit->release_idle_slots(); }
+}
+
 void
 GenerateImageStage::correct_dit_holding_(const char* when) const
 {
@@ -1479,6 +1914,167 @@ family_claims_dir_(const genai::ImageModelFamily& fam,
 
 }  // namespace
 
+// int8_layout_bytes_() where this stage's DiT will take the int8
+// layouts: i8_gemm on the fast or token tier, on matrix cores (the only
+// box the tiers engage on); zero otherwise.
+// THE DiT THIS STAGE LOADS, which is what both ledgers must name: the
+// `dit_dir` a graph sets (a w4 / w8 / mixed pack, an FP8 file, a Draw
+// Things .ckpt), resolved as the load resolves it, and the checkpoint's
+// own only when it sets none. Planning the root's copy while loading
+// another put a DiT nothing loads in the plan and left the real one
+// undeclared -- so every revision of it was a no-op and the holding
+// correction after a generation never found it. MEASURED on Qwen-Image-
+// 2.1 with a 4 GB w4 pack: 13.6 GB of the release's bf16 DiT booked
+// beside it, and the conditioner's streaming decision sized against it.
+// With a config-only hf_dir (the usual .ckpt graph) the DiT was planned
+// at nothing at all.
+std::string
+GenerateImageStage::planned_dit_dir_(const std::string& root) const
+{
+  if (_dit_dir.empty()) { return planning_dit_dir_(root); }
+  return resolve_model_dir(session(), _dit_dir);
+}
+
+// WHETHER A CLAIMED ANE TIER MAY RUN is the plan's call, read where the
+// grant exists. Krea-2 and FLUX.2 asked; Qwen-Image-2.1, Z-Image, FLUX.3
+// and MOSS-Image built their CoreML modules whatever the plan said --
+// ~0.7 GB on MOSS-Image a plan had refused.
+bool
+GenerateImageStage::ane_granted_(std::size_t bytes, const char* family) const
+{
+  if (bytes > 0 && model_memory::coreml_grant(session(), ane_claim_label_(),
+                                              bytes, 1) > 0) {
+    return true;
+  }
+  session()->info(fmt(
+      "GenerateImageStage('{}'): the ANE feed-forward was requested but the "
+      "plan left no room for {}'s modules ({} MB); keeping the GPU",
+      this->id(), family, bytes >> 20));
+  return false;
+}
+
+// What a STREAMED dense checkpoint's slots add on the int8 layouts: each
+// keeps its bf16 source as the refill target AND the layout quantized
+// from it (QWeight::ds in each family), so a slot is ~1.5 blocks. Block
+// 0's converted projections of each streamed stack at int8, with the
+// finest group's scales, for each of the stack's two slots.
+std::size_t
+GenerateImageStage::int8_slot_bytes_(const std::string& dit) const
+{
+  if (!_i8_gemm || _i8_tier <= 0 || session() == nullptr) { return 0; }
+  auto* mc = session()->services()->metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return 0; }
+  if (dit_config_quant_bits_(dit) != 0) { return 0; }
+  // Per family: block 0 of every streamed stack (each stack has its own
+  // slot pair), and the 2-D tensors there the layout leaves dense -- the
+  // modulation tables, and FLUX.2's double-block text stream, which never
+  // clears the int8 row floor.
+  struct Stack {
+    const char* prefix;
+    std::vector<const char*> dense;
+  };
+  const std::string fam = t2i_family_(dit);
+  std::vector<Stack> stacks;
+  if (fam == "qwen-image-21") {
+    stacks = {{"transformer_blocks.0.", {}}};
+  } else if (fam == "krea2") {
+    stacks = {{"transformer_blocks.0.", {"scale_shift_table"}}};
+  } else if (fam == "z-image") {
+    stacks = {{"layers.0.", {"adaLN"}}};
+  } else if (fam == "moss-image") {
+    stacks = {{"layers.0.", {}}};
+  } else if (fam == "flux2") {
+    stacks = {{"transformer_blocks.0.",
+               {"add_q_proj", "add_k_proj", "add_v_proj", "to_add_out",
+                "ff_context"}},
+              {"single_transformer_blocks.0.", {}}};
+  } else {
+    return 0;
+  }
+  auto w = genai::MetalLlamaWeights::open_model(dit);
+  if (!w.has_value()) { return 0; }
+  const std::string_view sx = ".weight";
+  std::size_t n = 0;
+  for (const Stack& st : stacks) {
+    const std::string pre = st.prefix;
+    for (const std::string& nm : w->tensor_names()) {
+      if (nm.rfind(pre, 0) != 0 || nm.size() <= sx.size() ||
+          nm.compare(nm.size() - sx.size(), sx.size(), sx) != 0) {
+        continue;
+      }
+      bool dense = false;
+      for (const char* d : st.dense) {
+        if (nm.find(d) != std::string::npos) { dense = true; }
+      }
+      const auto* ti = w->info(nm);
+      if (dense || ti == nullptr || ti->shape.size() != 2) { continue; }
+      const std::size_t N = (std::size_t)ti->shape[0];
+      const std::size_t K = (std::size_t)ti->shape[1];
+      n += N * K + std::max(N * (K / 256) * 2, N * 4);
+    }
+  }
+  return 2 * n;
+}
+
+std::size_t
+GenerateImageStage::int8_held_bytes_(const std::string& dit) const
+{
+  if (!_i8_gemm || _i8_tier <= 0 || session() == nullptr) { return 0; }
+  auto* mc = session()->services()->metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return 0; }
+  return int8_layout_bytes_(t2i_family_(dit), dit).held;
+}
+
+std::size_t
+GenerateImageStage::int8_scratch_bytes_(const std::string& dit) const
+{
+  if (!_i8_gemm || _i8_tier <= 0 || session() == nullptr) { return 0; }
+  auto* mc = session()->services()->metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return 0; }
+  return int8_layout_bytes_(t2i_family_(dit), dit).scratch;
+}
+
+// THE ENGINE'S CALL on a w4 pack's int8 layout (the int8 tiers): HOLD it
+// -- the fastest, at twice the w4 projections' bytes -- where the box has
+// room, which is plan_streaming's own preload rule asked again with that
+// growth added; CONVERT IT PER GEMM into one scratch where it has not, or
+// where the blocks stream (a slot holds the pack as stored). MEASURED on
+// the M5 Ultra, a 20-step 1024^2 Qwen-Image-2.1 w4 generation: per call
+// costs +3.0% (fast) to +4.1% (token, token_plain) of the denoise against
+// a layout held, which saves 1.8x of the w4 blocks' bytes.
+// VPIPE_I8_W4_HOLD=0 / 1 overrides, for the A/B.
+bool
+GenerateImageStage::hold_w4_int8_(const model_memory::StreamPlan& plan,
+                                  bool streamed, const std::string& dit)
+{
+  const std::size_t held = int8_held_bytes_(dit);
+  if (held == 0) { return false; }
+  bool hold = !streamed &&
+              model_memory::preload_fits_extra(plan, held,
+                                               model_memory::kStreamHeadroom);
+  const char* forced = std::getenv("VPIPE_I8_W4_HOLD");
+  if (forced != nullptr) { hold = std::atoi(forced) != 0; }
+  const char* why = forced != nullptr ? "VPIPE_I8_W4_HOLD"
+                    : hold            ? "the box has room"
+                    : streamed        ? "the blocks stream"
+                                      : "the box has no room";
+  session()->info(fmt(
+      "GenerateImageStage('{}'): the w4 projections' int8 layout {}",
+      this->id(),
+      hold ? fmt("HELD ({} MB more; {})", held >> 20, why)()
+           : fmt("CONVERTED PER GEMM into a {} MB scratch ({}; holding it "
+                 "would take {} MB more)", int8_scratch_bytes_(dit) >> 20,
+                 why, held >> 20)()));
+  // The report ledger booked the layout held -- the preload at its
+  // largest, before anything decided. Converted per GEMM, it is not, so
+  // the holding drops it now rather than at the first generation's
+  // correction.
+  _i8_hold_w4 = hold;
+  _i8_hold_decided = true;
+  if (!hold) { revise_memory(declare_memory()); }
+  return hold;
+}
+
 StageMemory
 GenerateImageStage::declare_memory() const
 {
@@ -1491,7 +2087,7 @@ GenerateImageStage::declare_memory() const
   const std::string enc = fs::exists(mllm, ec)
                               ? mllm
                               : (fs::path(root) / "text_encoder").string();
-  const std::string dit = planning_dit_dir_(root);
+  const std::string dit = planned_dit_dir_(root);
   // NAMED SEPARATELY, both of them. A DiT and an encoder have different
   // sizes, different streaming forms and -- on other stages -- different
   // lifetimes, and collapsing them to one number loses the distinction
@@ -1519,8 +2115,15 @@ GenerateImageStage::declare_memory() const
     enc_answered = family_claims_dir_(*fam, root, enc);
   }
   if (!held_by_family) {
-    m.hold(dit, model_memory::dir_weights_bytes(dit),
-           dit_floor_bytes_(root, dit));
+    // A w4 pack's int8 layout: held where the box has room (the
+    // preload, at its largest), a scratch where it streams (the floor).
+    const std::size_t floor = dit_floor_bytes_(root, dit) +
+                              int8_slot_bytes_(dit);
+    const bool held = !_i8_hold_decided || _i8_hold_w4;
+    m.hold(dit,
+           model_memory::dir_weights_bytes(dit) +
+               (held ? int8_held_bytes_(dit) : 0),
+           floor);
   }
   if (!enc_answered) { m.hold(enc, model_memory::dir_weights_bytes(enc)); }
   // No unload policy on this stage: it holds both for the run. Freeing
@@ -1619,10 +2222,15 @@ GenerateImageStage::declare_resources() const
     }
     return pout;
   }
-  const std::string dit = planning_dit_dir_(root);
-  std::vector<ResourceClaim> out{
-      model_memory::weight_claim_streamable(dit,
-                                            dit_floor_bytes_(root, dit))};
+  const std::string dit = planned_dit_dir_(root);
+  // (A w4 pack's per-GEMM conversion scratch is the int8 context's, and
+  // is booked with the activations below -- not in the weights' floor. A
+  // dense checkpoint's slots carry their int8 layout too, and that IS a
+  // holding: int8_slot_bytes_.)
+  const std::size_t floor =
+      dit_floor_bytes_(root, dit) + int8_slot_bytes_(dit);
+  std::vector<ResourceClaim> out{model_memory::weight_claim_streamable(
+      dit, floor)};
   for (auto& c : model_memory::weight_claims({enc})) {
     out.push_back(std::move(c));
   }
@@ -1748,6 +2356,111 @@ GenerateImageStage::declare_resources() const
     for (auto& c : model_memory::scratch_claims(
              fmt("flux3-dit:{}", this->id())(), bytes,
              model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
+  // MOSS-Image's ACTIVATIONS, for the same reason as FLUX.3's: a
+  // streamed DiT holds little beside them. Sized at the picture with a
+  // 512-token prompt (the reference allows 4096; a longer prompt grows
+  // the joint sequence by ~25 KB a row a plane).
+  if (t2i_family_(dit) == "moss-image") {
+    genai::MetalMossImageTransformer::Config mc;
+    std::size_t bytes = model_memory::kUnknownArena;
+    if (_width > 0 && _height > 0 &&
+        genai::MetalMossImageTransformer::Config::read_dims(dit, &mc)) {
+      mc.i8_gemm = _i8_gemm;
+      mc.i8_tier = _i8_tier;
+      mc.sage = _sage;
+      mc.sol = _sol;
+      auto* mcm = session() != nullptr
+                      ? session()->services()->metal_compute()
+                      : nullptr;
+      bytes = genai::MetalMossImageTransformer::forward_scratch_bytes(
+          mc, _height / genai::moss_image::kPixelsPerToken,
+          _width / genai::moss_image::kPixelsPerToken, 512, _sol.enabled,
+          dit_config_quant_bits_(dit) > 0,
+          mcm != nullptr && mcm->supports_matrix_cores());
+    }
+    for (auto& c : model_memory::scratch_claims(
+             fmt("moss-image-dit:{}", this->id())(), bytes,
+             model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
+  // QWEN-IMAGE-2.1's, Z-IMAGE's, KREA-2's AND FLUX.2's ACTIVATIONS, for
+  // FLUX.3's reason: no weight claim can see them, and a streamed DiT
+  // holds little beside them. None of the four booked any before -- the
+  // denoise phase carried weights alone. Sized at the picture with a
+  // 512-token prompt; the int8 / Sage / Sol terms only where the box has
+  // the matrix cores they run on.
+  {
+    const std::string fam = t2i_family_(dit);
+    auto* mc = session() != nullptr
+                   ? session()->services()->metal_compute()
+                   : nullptr;
+    const bool mx = mc != nullptr && mc->supports_matrix_cores();
+    const int img = _width > 0 && _height > 0
+                        ? (_width / 16) * (_height / 16) : 0;
+    const int bits = dit_config_quant_bits_(dit);
+    std::size_t bytes = 0;
+    if (img > 0 && fam == "qwen-image-21") {
+      genai::MetalQwenImage21Transformer::Config c;
+      if (genai::MetalQwenImage21Transformer::Config::read_dims(dit, &c)) {
+        c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
+        c.sage = _sage; c.sol = _sol;
+        bytes = genai::MetalQwenImage21Transformer::forward_scratch_bytes(
+            c, img, 512, /*cfg=*/true, bits > 0, mx);
+      }
+    } else if (img > 0 && fam == "z-image") {
+      genai::MetalZImageTransformer::Config c;
+      if (genai::MetalZImageTransformer::Config::read_dims(dit, &c)) {
+        c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
+        c.sage = _sage; c.sol = _sol;
+        bytes = genai::MetalZImageTransformer::forward_scratch_bytes(
+            c, img, 512, bits > 0, mx);
+      }
+    } else if (img > 0 && fam == "krea2") {
+      genai::MetalKrea2Transformer::Config c;   // Turbo's dims
+      c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
+      c.sage = _sage; c.sol = _sol;
+      bytes = genai::MetalKrea2Transformer::forward_scratch_bytes(
+          c, img, 512, mx);
+    } else if (img > 0 && fam == "flux2") {
+      genai::MetalFlux2Transformer::Config c;
+      if (genai::MetalFlux2Transformer::read_dims(dit, &c)) {
+        c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
+        c.sage = _sage; c.sol = _sol;
+        bytes = genai::MetalFlux2Transformer::forward_scratch_bytes(
+            c, img, 512, bits, mx);
+      }
+    }
+    // No geometry (an edit graph sizes from its reference): the
+    // presence marker, as FLUX.3's.
+    if (img == 0 && (fam == "qwen-image-21" || fam == "z-image" ||
+                     fam == "krea2" || fam == "flux2")) {
+      bytes = model_memory::kUnknownArena;
+    }
+    if (bytes > 0) {
+      for (auto& c : model_memory::scratch_claims(
+               fmt("{}-dit:{}", fam, this->id())(), bytes,
+               model_memory::kPhaseDenoise)) {
+        out.push_back(std::move(c));
+      }
+    }
+  }
+  // MOSS-Image's tiers: the main blocks' SITU feed-forward and, beside it,
+  // q / k / v as one matmul -- fixed modules, one unit, in the denoise.
+  if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
+      t2i_family_(dit) == "moss-image") {
+    genai::MetalMossImageTransformer::Config mc;
+    (void)genai::MetalMossImageTransformer::Config::read_dims(dit, &mc);
+    mc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+    for (auto& c : model_memory::coreml_claims(
+             ane_claim_label_(),
+             genai::MetalMossImageTransformer::ane_runtime_bytes(
+                 mc, genai::MetalMossImageTransformer::ane_plan_seq(
+                         _width, _height)),
+             1, model_memory::kPhaseDenoise)) {
       out.push_back(std::move(c));
     }
   }
@@ -1966,6 +2679,72 @@ GenerateImageStage::apply_model_config_()
     adapter_keys("FLUX.3", _flux3_dit != nullptr, [&](int i, float s) {
       if (_flux3_dit && _flux3_dit->lora_modules(i) > 0) {
         _flux3_dit->set_lora_scale(i, s);
+      }
+    });
+  }
+  if (_family == "moss-image") {
+    // guidance_scale (the reference's 3; 1 runs no negative at all),
+    // uncond_skip_layers (its [22]; [] disables the skip) and shift (the
+    // checkpoint's 5). Absent is "no opinion".
+    if (_model_cfg.is_object()) {
+      auto o = _model_cfg.as_object();
+      if (o.contains("guidance_scale")) {
+        const double g = o.at("guidance_scale").as_real(-1.0);
+        if (g >= 0.0) {
+          _moss_guidance_cfg = g;
+        } else {
+          session()->warn(fmt(
+              "GenerateImageStage('{}'): model_config `guidance_scale` must "
+              "be >= 0; IGNORED", this->id()));
+        }
+      }
+      if (o.contains("uncond_skip_layers")) {
+        const FlexData a = o.at("uncond_skip_layers");
+        std::vector<int> v;
+        bool ok = a.is_array();
+        if (ok) {
+          auto arr = a.as_array();
+          for (std::size_t i = 0; i < arr.size(); ++i) {
+            const int x = (int)arr.at(i).as_int(-1);
+            ok = ok && x >= 0;
+            v.push_back(x);
+          }
+        }
+        if (ok) {
+          _moss_skip_set = true;
+          _moss_skip_cfg = std::move(v);
+        } else {
+          session()->warn(fmt(
+              "GenerateImageStage('{}'): model_config `uncond_skip_layers` "
+              "must be a list of block indices >= 0; IGNORED", this->id()));
+        }
+      }
+      if (o.contains("shift")) {
+        const double sh = o.at("shift").as_real(0.0);
+        if (sh > 0.0) { _moss_shift_cfg = sh; }
+      }
+      if (o.contains("slg_layers") && o.at("slg_layers").is_array()) {
+        const FlexData a = o.at("slg_layers");
+        auto arr = a.as_array();
+        _moss_slg_layers.clear();
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+          const int x = (int)arr.at(i).as_int(-1);
+          if (x >= 0) { _moss_slg_layers.push_back(x); }
+        }
+      }
+      if (o.contains("slg_scale")) {
+        _moss_slg_scale = std::max(0.0, o.at("slg_scale").as_real(0.0));
+      }
+      if (o.contains("slg_start")) {
+        _moss_slg_start = o.at("slg_start").as_real(0.0);
+      }
+      if (o.contains("slg_stop")) {
+        _moss_slg_stop = o.at("slg_stop").as_real(1.0);
+      }
+    }
+    adapter_keys("MOSS-Image", _moss_dit != nullptr, [&](int i, float sc) {
+      if (_moss_dit && _moss_dit->lora_modules(i) > 0) {
+        _moss_dit->set_lora_scale(i, sc);
       }
     });
   }
@@ -2286,6 +3065,7 @@ GenerateImageStage::ensure_loaded_()
       // correctly. Two already did.
       _family == "flux2" ? "FLUX.2"
       : _family == "flux3" ? "FLUX.3 Image Klein"
+      : _family == "moss-image" ? "MOSS-Image single-stream"
       : _family == "qwen-image-edit" ? "Qwen-Image-Edit MMDiT"
       : _family == "qwen-image-21" ? "Qwen-Image-2.1 single-stream"
       : _family == "boogu-image" ? "Boogu-Image NextDiT"
@@ -2316,23 +3096,36 @@ GenerateImageStage::ensure_loaded_()
     // Stream the DiT blocks when the box can't hold encoder + DiT together
     // (e.g. the 18 GB 9B DiT + a 16 GB encoder on a 16/32 GB box); ~2-3x slower
     // per step but bounds peak RAM to ~one block. VPIPE_FLUX2_STREAM forces it.
+    // STREAM, THEN RETAIN; `bounded` is the tight box's.
     bool stream_blocks;
+    bool bounded = false;
     {
       const auto plan = model_memory::plan_streaming(
           session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
-      stream_blocks = plan.stream;
+      stream_blocks = model_memory::stream_blocks_by_default(plan);
       if (const char* e = std::getenv("VPIPE_FLUX2_STREAM")) {
         stream_blocks = (std::atoi(e) != 0);
       }
+      bounded = plan.stream && stream_blocks;
       session()->log_debug(fmt(
           "GenerateImageStage('{}'): FLUX.2 footprint {} GB (others {} GB) "
           "+ {} GB headroom vs {} GB RAM -> {}", this->id(),
           plan.footprint >> 30, plan.others >> 30,
           model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
-          stream_blocks ? "STREAM blocks" : "PRELOAD"));
+          !stream_blocks ? "PRELOAD"
+          : bounded      ? "STREAM blocks"
+                         : "STREAM blocks, kept as the box allows"));
+      // HELD by the box's room, streamed or not: residency converts each
+      // block it keeps into the layout; a slot converts per GEMM.
+      _i8_hold_w4 = hold_w4_int8_(plan, bounded, dit_dir);
     }
+    // Before the take below: a tight box takes no DiT kept warm, whose
+    // promoted blocks the floor it was admitted on does not count.
+    _dit_bounded = bounded;
     genai::MetalFlux2Transformer::Config fcfg;
     fcfg.i8_gemm = _i8_gemm;
+    fcfg.i8_tier = _i8_tier;
+    fcfg.i8_hold_w4 = _i8_hold_w4;
     fcfg.sage = _sage;
     fcfg.sol  = _sol;
     // The ANE tiers, whose claim declare_resources booked: WHETHER they run
@@ -2382,9 +3175,17 @@ GenerateImageStage::ensure_loaded_()
             _flux2_params.klein_kv ? "true" : "false"));
       }
     }
-    _flux2_dit = genai::MetalFlux2Transformer::load(
-        weight_set_(dit_dir), mc, fcfg, stream_blocks,
-        lora_specs_<genai::MetalFlux2Transformer::LoraSpec>());
+    {
+      using Dit = genai::MetalFlux2Transformer;
+      const auto loras = lora_specs_<Dit::LoraSpec>();
+      _flux2_dit = take_warm_dit_<Dit>(kWarmFlux2, dit_dir,
+                                       warm_key_(fcfg, stream_blocks, loras),
+                                       "FLUX.2");
+      if (!_flux2_dit) {
+        _flux2_dit = Dit::load(weight_set_(dit_dir), mc, fcfg, stream_blocks,
+                               loras);
+      }
+    }
     if (!_flux2_dit) {
       session()->error(fmt(
           "GenerateImageStage('{}'): failed to load the FLUX.2 DiT from '{}'; "
@@ -2394,11 +3195,13 @@ GenerateImageStage::ensure_loaded_()
     // When the DiT had to stream (box can't hold encoder + DiT together), drop
     // the DiT's per-forward scratch after each generation so it doesn't crowd
     // out a large downstream VAE decode.
-    _release_scratch = stream_blocks;
-    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
+    _release_scratch = bounded;
+    if (bounded) { revise_dit_declaration_(dit_dir); }
     // Cache the load params + VAE base so a memory-driven free after a
     // generation (free_flux2_dit_for_decode_) can reload identically.
     _flux2_dit_dir  = dit_dir;
+    // The holding correct_dit_holding_ moves as residency grows.
+    _dit_holding_dir = dit_dir;
     _flux2_stream   = stream_blocks;
     _vae_base       = flux2_vae_base_(root);
   } else if (_family == "qwen-image-edit") {
@@ -2415,16 +3218,20 @@ GenerateImageStage::ensure_loaded_()
     // VPIPE_QIE_PIN_FRAC override.
     const auto plan = model_memory::plan_streaming(
         session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
-    bool   stream_blocks = plan.stream;
+    // STREAM, THEN RETAIN; `bounded` is the tight box's.
+    bool stream_blocks = model_memory::stream_blocks_by_default(plan);
     if (const char* e = std::getenv("VPIPE_QIE_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
+    const bool bounded = plan.stream && stream_blocks;
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Qwen-Image-Edit footprint {} GB (others {} "
         "GB) + {} GB headroom vs {} GB RAM -> {}", this->id(),
         plan.footprint >> 30, plan.others >> 30,
         model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
-        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+        !stream_blocks ? "PRELOAD"
+        : bounded      ? "STREAM blocks"
+                       : "STREAM blocks, kept as the box allows"));
     genai::MetalQwenImageTransformer::Config qcfg;
     qcfg.sage    = _sage;
     qcfg.i8_gemm = _i8_gemm;
@@ -2446,14 +3253,17 @@ GenerateImageStage::ensure_loaded_()
           "the resident set grows as the box allows", this->id(),
           qcfg.n_layers));
     }
-    _release_scratch = stream_blocks;
-    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
+    _release_scratch = bounded;
+    _dit_bounded = bounded;
+    if (bounded) { revise_dit_declaration_(dit_dir); }
     // Cache the load params + VAE base so a memory-driven free after a
     // generation (free_qie_dit_for_decode_) can reload identically. The
     // Config is default-constructed above and everything else comes from
     // the checkpoint's own config.json, so the dir and the streaming
     // decision are the whole of it.
     _qie_dit_dir = dit_dir;
+    // The holding correct_dit_holding_ moves as residency grows.
+    _dit_holding_dir = dit_dir;
     _qie_stream  = stream_blocks;
     // AutoencoderKLQwenImage, which is the SAME VAE Krea-2 runs (see
     // vae_family_ in vae-decode-stage.cc: anything that is not Flux2 /
@@ -2469,20 +3279,33 @@ GenerateImageStage::ensure_loaded_()
     // VPIPE_QWEN_IMAGE21_STREAM overrides.
     const auto plan = model_memory::plan_streaming(
         session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
-    bool stream_blocks = plan.stream;
+    // STREAM, THEN RETAIN on every box (stream_blocks_by_default), the
+    // verdict on the box kept apart: `bounded` is what only a tight box
+    // wants -- the load deferred past the conditioning, the declaration
+    // revised to the trunk, the forward's scratch released. A streamed
+    // block is the preloaded one, int8 layouts included (a dense source
+    // quantized at the refill, a held w4 layout converted at promotion).
+    bool stream_blocks = model_memory::stream_blocks_by_default(plan);
     if (const char* e = std::getenv("VPIPE_QWEN_IMAGE21_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
+    const bool bounded = plan.stream && stream_blocks;
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Qwen-Image-2.1 footprint {} GB (others {} "
         "GB) + {} GB headroom vs {} GB RAM -> {}", this->id(),
         plan.footprint >> 30, plan.others >> 30,
         model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
-        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+        !stream_blocks ? "PRELOAD"
+        : bounded      ? "STREAM blocks"
+                       : "STREAM blocks, kept as the box allows"));
     _qi21_dit_dir = dit_dir;
     // The holding correct_dit_holding_ moves as residency grows.
     _dit_holding_dir = dit_dir;
     _qi21_stream = stream_blocks;
+    // HELD by the box's room, streamed or not: residency converts each
+    // block it keeps into the layout (MetalQwenImage21Transformer::
+    // clone_block_); a slot converts per GEMM either way.
+    _i8_hold_w4 = hold_w4_int8_(plan, bounded, dit_dir);
     _qi21_ck = qi21_checkpoint_schedule(root);
     session()->info(fmt(
         "GenerateImageStage('{}'): Qwen-Image-2.1 schedule from the "
@@ -2501,9 +3324,10 @@ GenerateImageStage::ensure_loaded_()
     // serves it -- but the DECODER's base, which is 144 here against
     // the encoder's 96, because every peak this feeds is a decode.
     _vae_base = krea2_vae_dec_base_(root);
-    _release_scratch = stream_blocks;
-    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
-    if (stream_blocks) {
+    _release_scratch = bounded;
+    _dit_bounded = bounded;
+    if (bounded) { revise_dit_declaration_(dit_dir); }
+    if (bounded) {
       // Deferred for the same reason Boogu defers: both stages load in
       // initialize(), so a preloaded DiT beside a resident encoder is
       // the peak, and it is the peak that decides whether the box
@@ -2533,20 +3357,26 @@ GenerateImageStage::ensure_loaded_()
     // narrowed on the way in.
     const auto plan = model_memory::plan_streaming(
         session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
-    bool stream_blocks = plan.stream;
+    // STREAM, THEN RETAIN; `bounded` is the tight box's.
+    bool stream_blocks = model_memory::stream_blocks_by_default(plan);
     if (const char* e = std::getenv("VPIPE_Z_IMAGE_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
+    const bool bounded = plan.stream && stream_blocks;
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Z-Image footprint {} GB (others {} GB) + "
         "{} GB headroom vs {} GB RAM -> {}", this->id(),
         plan.footprint >> 30, plan.others >> 30,
         model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
-        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+        !stream_blocks ? "PRELOAD"
+        : bounded      ? "STREAM blocks"
+                       : "STREAM blocks, kept as the box allows"));
     _zi_dit_dir = dit_dir;
     // The holding correct_dit_holding_ moves as residency grows.
     _dit_holding_dir = dit_dir;
     _zi_stream = stream_blocks;
+    // HELD by the box's room, streamed or not (see Qwen-Image-2.1's).
+    _i8_hold_w4 = hold_w4_int8_(plan, bounded, dit_dir);
     {
       bool dyn = false;
       _zi_shift = genai::flow_shift_from_config(root, &dyn);
@@ -2567,9 +3397,10 @@ GenerateImageStage::ensure_loaded_()
     // sizes from block_out_channels like FLUX.2's does, not from a
     // Qwen-Image `base_dim`.
     _vae_base = flux2_vae_base_(root);
-    _release_scratch = stream_blocks;
-    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
-    if (stream_blocks) {
+    _release_scratch = bounded;
+    _dit_bounded = bounded;
+    if (bounded) { revise_dit_declaration_(dit_dir); }
+    if (bounded) {
       // Deferred for the same reason Boogu and 2.1 defer: both stages
       // load in initialize(), so a preloaded DiT beside a resident
       // encoder is the peak, and it is the peak that decides whether
@@ -2591,16 +3422,20 @@ GenerateImageStage::ensure_loaded_()
     // one plan_streaming() rule; VPIPE_FLUX3_STREAM overrides.
     const auto plan = model_memory::plan_streaming(
         session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
-    bool stream_blocks = plan.stream;
+    // STREAM, THEN RETAIN; `bounded` is the tight box's.
+    bool stream_blocks = model_memory::stream_blocks_by_default(plan);
     if (const char* e = std::getenv("VPIPE_FLUX3_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
+    const bool bounded = plan.stream && stream_blocks;
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): FLUX.3 footprint {} GB (others {} GB) + "
         "{} GB headroom vs {} GB RAM -> {}", this->id(),
         plan.footprint >> 30, plan.others >> 30,
         model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
-        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+        !stream_blocks ? "PRELOAD"
+        : bounded      ? "STREAM blocks"
+                       : "STREAM blocks, kept as the box allows"));
     _flux3_dit_dir = dit_dir;
     _dit_holding_dir = dit_dir;
     _flux3_stream = stream_blocks;
@@ -2631,9 +3466,10 @@ GenerateImageStage::ensure_loaded_()
     }
     // FLUX.2's VAE, unchanged (stored F32), so FLUX.2's decode peak.
     _vae_base = flux2_vae_base_(root);
-    _release_scratch = stream_blocks;
-    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
-    if (stream_blocks) {
+    _release_scratch = bounded;
+    _dit_bounded = bounded;
+    if (bounded) { revise_dit_declaration_(dit_dir); }
+    if (bounded) {
       // Deferred like the other streaming families: both stages load in
       // initialize(), and a DiT beside a resident encoder is the peak.
       _dit_unloaded = true;
@@ -2648,6 +3484,75 @@ GenerateImageStage::ensure_loaded_()
           "'{}'; inert", this->id(), dit_dir));
       return;
     }
+  } else if (_family == "moss-image") {
+    // A 5B DiT (9.5 GB bf16) beside a Qwen3.5-9B encoder (~18 GB). The
+    // one plan_streaming() rule; VPIPE_MOSS_IMAGE_STREAM overrides.
+    const auto plan = model_memory::plan_streaming(
+        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+    // STREAM, THEN RETAIN; `bounded` is the tight box's.
+    bool stream_blocks = model_memory::stream_blocks_by_default(plan);
+    if (const char* e = std::getenv("VPIPE_MOSS_IMAGE_STREAM")) {
+      stream_blocks = (std::atoi(e) != 0);
+    }
+    const bool bounded = plan.stream && stream_blocks;
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): MOSS-Image footprint {} GB (others {} "
+        "GB) + {} GB headroom vs {} GB RAM -> {}", this->id(),
+        plan.footprint >> 30, plan.others >> 30,
+        model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
+        !stream_blocks ? "PRELOAD"
+        : bounded      ? "STREAM blocks"
+                       : "STREAM blocks, kept as the box allows"));
+    _moss_dit_dir = dit_dir;
+    _dit_holding_dir = dit_dir;
+    _moss_stream = stream_blocks;
+    // HELD by the box's room, streamed or not (see Qwen-Image-2.1's).
+    _i8_hold_w4 = hold_w4_int8_(plan, bounded, dit_dir);
+    // THE SAMPLER THE CHECKPOINT STATES: MOSSImageScheduler's shift,
+    // training_shift and training grid.
+    {
+      namespace fs = std::filesystem;
+      std::ifstream in(fs::path(root) / "scheduler" /
+                       "scheduler_config.json");
+      if (in) {
+        try {
+          FlexData fd = FlexData::from_json(in);
+          if (fd.is_object()) {
+            auto so = fd.as_object();
+            if (so.contains("shift")) {
+              _moss_shift = so.at("shift").as_real(_moss_shift);
+            }
+            if (so.contains("training_shift")) {
+              _moss_train_shift =
+                  so.at("training_shift").as_real(_moss_train_shift);
+            }
+            if (so.contains("num_train_timesteps")) {
+              _moss_train_steps = (int)so.at("num_train_timesteps")
+                                      .as_int(_moss_train_steps);
+            }
+          }
+        } catch (...) {
+        }
+      }
+    }
+    // FLUX.2's VAE with the small decoder: sized from its decoder widths.
+    _vae_base = flux2_vae_base_(root);
+    _release_scratch = bounded;
+    _dit_bounded = bounded;
+    if (bounded) { revise_dit_declaration_(dit_dir); }
+    if (bounded) {
+      _dit_unloaded = true;
+      session()->info(fmt(
+          "GenerateImageStage('{}'): memory-bounded -- the MOSS-Image DiT "
+          "loads on the first conditioning beat (block streaming on) and is "
+          "freed for the vae-decode, so it never shares the box with the "
+          "text encoder", this->id()));
+    } else if (!load_moss_image_dit_()) {
+      session()->error(fmt(
+          "GenerateImageStage('{}'): failed to load the MOSS-Image DiT from "
+          "'{}'; inert", this->id(), dit_dir));
+      return;
+    }
   } else if (_family == "boogu-image") {
     // Boogu's 10B NextDiT. At ~20 GB bf16 it streams on any box that cannot
     // hold it beside the resident Qwen3-VL mllm (~16 GB), which is every box
@@ -2655,24 +3560,31 @@ GenerateImageStage::ensure_loaded_()
     // VPIPE_BOOGU_STREAM / VPIPE_BOOGU_PIN_FRAC override.
     const auto plan = model_memory::plan_streaming(
         session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
-    bool   stream_blocks = plan.stream;
+    // STREAM, THEN RETAIN; `bounded` is the tight box's.
+    bool stream_blocks = model_memory::stream_blocks_by_default(plan);
     if (const char* e = std::getenv("VPIPE_BOOGU_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
+    const bool bounded = plan.stream && stream_blocks;
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Boogu footprint {} GB (others {} GB) + {} "
         "GB headroom vs {} GB RAM -> {}", this->id(), plan.footprint >> 30,
         plan.others >> 30, model_memory::kStreamHeadroom >> 30,
         phys_ram() >> 30,
-        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+        !stream_blocks ? "PRELOAD"
+        : bounded      ? "STREAM blocks"
+                       : "STREAM blocks, kept as the box allows"));
     // Cache the load params so the stage can free the DiT for a big decode and
     // reload it on the next prompt (free_boogu_dit_for_decode_).
     _boogu_dit_dir = dit_dir;
+    // The holding correct_dit_holding_ moves as residency grows.
+    _dit_holding_dir = dit_dir;
     _boogu_stream = stream_blocks;
     _vae_base = flux2_vae_base_(root);   // Boogu's VAE is a plain AutoencoderKL
-    _release_scratch = stream_blocks;
-    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
-    if (stream_blocks) {
+    _release_scratch = bounded;
+    _dit_bounded = bounded;
+    if (bounded) { revise_dit_declaration_(dit_dir); }
+    if (bounded) {
       // DEFER the load on a bounded box. Streaming and per-prompt reload only
       // help if the DiT is not resident WHILE the conditioner's encoder is:
       // both stages load in initialize(), so a preloaded DiT plus a resident
@@ -2708,29 +3620,47 @@ GenerateImageStage::ensure_loaded_()
     // blocks land in dirty, non-reclaimable buffers and the box swaps
     // instead of evicting. MEASURED: ~7 GB of swap on a 24 GB M5 Pro
     // with the bf16 weights, where the plan says stream.
+    // STREAM, THEN RETAIN; `bounded` is the tight box's.
     bool stream_blocks;
+    bool bounded = false;
     {
       const auto plan = model_memory::plan_streaming(
           session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
-      stream_blocks = plan.stream;
+      stream_blocks = model_memory::stream_blocks_by_default(plan);
       if (const char* e = std::getenv("VPIPE_KREA2_STREAM")) {
         stream_blocks = (std::atoi(e) != 0);
       }
+      bounded = plan.stream && stream_blocks;
+      _dit_bounded = bounded;
       session()->log_debug(fmt(
           "GenerateImageStage('{}'): Krea-2 footprint {} GB (others {} GB) "
           "+ {} GB headroom vs {} GB RAM -> {}", this->id(),
           plan.footprint >> 30, plan.others >> 30,
           model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
-          stream_blocks ? "STREAM blocks" : "PRELOAD"));
+          !stream_blocks ? "PRELOAD"
+          : bounded      ? "STREAM blocks"
+                         : "STREAM blocks, kept as the box allows"));
+      // HELD by the box's room, streamed or not (see Qwen-Image-2.1's).
+      _i8_hold_w4 = hold_w4_int8_(plan, bounded, dit_dir);
     }
     genai::MetalKrea2Transformer::Config kcfg;
     kcfg.i8_gemm = _i8_gemm;
+    kcfg.i8_tier = _i8_tier;
+    kcfg.i8_hold_w4 = _i8_hold_w4;
     kcfg.sage = _sage;
     kcfg.sol  = _sol;
     apply_ane_(kcfg);
-    _dit = genai::MetalKrea2Transformer::load(
-        weight_set_(dit_dir), mc, kcfg, stream_blocks,
-        lora_specs_<genai::MetalKrea2Transformer::LoraSpec>());
+    {
+      using Dit = genai::MetalKrea2Transformer;
+      const auto loras = lora_specs_<Dit::LoraSpec>();
+      _dit = take_warm_dit_<Dit>(kWarmKrea2, dit_dir,
+                                 warm_key_(kcfg, stream_blocks, loras),
+                                 "Krea-2");
+      if (!_dit) {
+        _dit = Dit::load(weight_set_(dit_dir), mc, kcfg, stream_blocks,
+                         loras);
+      }
+    }
     if (!_dit) {
       session()->error(fmt(
           "GenerateImageStage('{}'): failed to load the DiT from '{}'; inert",
@@ -2740,9 +3670,11 @@ GenerateImageStage::ensure_loaded_()
     // Cache the resolved dir (reload after a decode-driven free) + the VAE base
     // channels for the decode-peak estimate (shared MetalKrea2Vae -> base_dim).
     _krea2_dit_dir = dit_dir;
+    // The holding correct_dit_holding_ moves as residency grows.
+    _dit_holding_dir = dit_dir;
     _krea2_stream  = stream_blocks;
     _vae_base = krea2_vae_base_(root);
-    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
+    if (bounded) { revise_dit_declaration_(dit_dir); }
     // Drop the DiT's per-forward scratch after each generation when the
     // box cannot hold encoder + DiT + a large VAE decode at once, so its
     // working set does not crowd out the downstream vae-decode.
@@ -2755,7 +3687,7 @@ GenerateImageStage::ensure_loaded_()
     // away.
     const std::vector<std::string> peers = {dit_dir, enc_dir};
     _release_scratch =
-        stream_blocks ||
+        bounded ||
         model_memory::bounded(session(), peers, model_memory::kHeadroom);
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Krea-2 scratch: footprint {} GB + {} GB "
@@ -2796,6 +3728,19 @@ GenerateImageStage::ensure_loaded_()
         "denoiser does not implement it, so the attention runs dense. It "
         "reaches a REGISTERED image family through the acceleration bag",
         this->id(), _family));
+  }
+  // The int8 FAST tier, the same way: one named family takes it (its
+  // model logs that it did, or why not); the rest run the accurate tier,
+  // and a graph that asked for fast deserves to know which it got.
+  if (_i8_gemm && _i8_tier != 0 && _family != "qwen-image-21" &&
+      _family != "krea2" && _family != "flux2" && _family != "z-image" &&
+      _family != "moss-image") {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): i8_gemm_tier is '{}' and the built-in "
+        "'{}' denoiser implements only the accurate tier, which it runs",
+        this->id(),
+        _i8_tier == 1 ? "fast" : _i8_tier == 2 ? "token" : "token_plain",
+        _family));
   }
   session()->log_debug(fmt(
       "GenerateImageStage('{}'): {} DiT ready{}",
@@ -2845,6 +3790,8 @@ GenerateImageStage::load_flux2_dit_()
   if (mc == nullptr || _flux2_dit_dir.empty()) { return false; }
   genai::MetalFlux2Transformer::Config fcfg;
   fcfg.i8_gemm = _i8_gemm;
+  fcfg.i8_tier = _i8_tier;
+  fcfg.i8_hold_w4 = _i8_hold_w4;
   fcfg.sage = _sage;
   // The RELOAD path too. A tier set here and not there comes back
   // missing on the generation after a decode-driven free, which is the
@@ -2854,9 +3801,15 @@ GenerateImageStage::load_flux2_dit_()
   // The streaming flag the first load used, and the adapter with it. A
   // reload that dropped either would come back preloaded, or
   // un-adapted, on the graph that asked for both.
-  _flux2_dit = genai::MetalFlux2Transformer::load(
-      weight_set_(_flux2_dit_dir), mc, fcfg, _flux2_stream,
-      lora_specs_<genai::MetalFlux2Transformer::LoraSpec>());
+  using Dit = genai::MetalFlux2Transformer;
+  const auto loras = lora_specs_<Dit::LoraSpec>();
+  _flux2_dit = take_warm_dit_<Dit>(kWarmFlux2, _flux2_dit_dir,
+                                   warm_key_(fcfg, _flux2_stream, loras),
+                                   "FLUX.2");
+  if (!_flux2_dit) {
+    _flux2_dit = Dit::load(weight_set_(_flux2_dit_dir), mc, fcfg,
+                           _flux2_stream, loras);
+  }
   return (bool)_flux2_dit;
 }
 
@@ -2999,17 +3952,31 @@ GenerateImageStage::load_qwen_image21_dit_()
     return false;
   }
   cfg.i8_gemm = _i8_gemm;
+  cfg.i8_tier = _i8_tier;
+  cfg.i8_hold_w4 = _i8_hold_w4;
   cfg.sage = _sage;
   cfg.sol = _sol;
   cfg.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
   cfg.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+  using Dit = genai::MetalQwenImage21Transformer;
+  if (cfg.ane_ffn &&
+      !ane_granted_(
+          Dit::ane_runtime_bytes(cfg, Dit::ane_plan_seq(_width, _height)),
+          "Qwen-Image-2.1")) {
+    cfg.ane_ffn = false;
+    cfg.ane_qkv = false;
+  }
   cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
                                             0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
+  const auto loras = lora_specs_<Dit::LoraSpec>();
+  _qi21_dit = take_warm_dit_<Dit>(kWarmQi21, _qi21_dit_dir,
+                                  warm_key_(cfg, _qi21_stream, loras),
+                                  "Qwen-Image-2.1");
+  if (_qi21_dit) { return true; }
   _qi21_dit = genai::MetalQwenImage21Transformer::load(
-      weight_set_(_qi21_dit_dir), mc, cfg, _qi21_stream,
-      lora_specs_<genai::MetalQwenImage21Transformer::LoraSpec>());
+      weight_set_(_qi21_dit_dir), mc, cfg, _qi21_stream, loras);
   if (_qi21_dit && _qi21_stream) {
     session()->info(fmt(
         "GenerateImageStage('{}'): Qwen-Image-2.1 DiT streaming {} blocks; "
@@ -3029,7 +3996,8 @@ GenerateImageStage::free_qwen_image21_dit_for_decode_(int gen_w, int gen_h)
   // of what the same picture costs an /8 family -- the latent grid is
   // half in each axis. Sized from the checkpoint either way.
   const std::size_t peak =
-      qwen_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 96);
+      qwen_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 96,
+                        /*residual=*/true);
   const std::size_t budget = mc->memory_budget().available_physical;
   if (peak <= budget) { return; }
   session()->info(fmt(
@@ -3057,17 +4025,30 @@ GenerateImageStage::load_z_image_dit_()
     return false;
   }
   cfg.i8_gemm = _i8_gemm;
+  cfg.i8_tier = _i8_tier;
+  cfg.i8_hold_w4 = _i8_hold_w4;
   cfg.sage = _sage;
   cfg.sol = _sol;
   cfg.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
   cfg.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+  using Dit = genai::MetalZImageTransformer;
+  if (cfg.ane_ffn &&
+      !ane_granted_(
+          Dit::ane_runtime_bytes(cfg, Dit::ane_plan_seq(_width, _height)),
+          "Z-Image")) {
+    cfg.ane_ffn = false;
+    cfg.ane_qkv = false;
+  }
   cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
                                             0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
-  _zi_dit = genai::MetalZImageTransformer::load(
-      weight_set_(_zi_dit_dir), mc, cfg, _zi_stream,
-      lora_specs_<genai::MetalZImageTransformer::LoraSpec>());
+  const auto loras = lora_specs_<Dit::LoraSpec>();
+  _zi_dit = take_warm_dit_<Dit>(kWarmZImage, _zi_dit_dir,
+                                warm_key_(cfg, _zi_stream, loras),
+                                "Z-Image");
+  if (_zi_dit) { return true; }
+  _zi_dit = Dit::load(weight_set_(_zi_dit_dir), mc, cfg, _zi_stream, loras);
   if (_zi_dit && _zi_stream) {
     session()->info(fmt(
         "GenerateImageStage('{}'): Z-Image DiT streaming {} of {} blocks; "
@@ -3127,13 +4108,25 @@ GenerateImageStage::load_flux3_dit_()
   cfg.sol = _sol;
   cfg.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
   cfg.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+  using Dit = genai::MetalFlux3Transformer;
+  if (cfg.ane_ffn &&
+      !ane_granted_(
+          Dit::ane_runtime_bytes(cfg, Dit::ane_plan_seq(_width, _height)),
+          "FLUX.3")) {
+    cfg.ane_ffn = false;
+    cfg.ane_qkv = false;
+  }
   cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
                                             0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
-  _flux3_dit = genai::MetalFlux3Transformer::load(
-      weight_set_(_flux3_dit_dir), mc, cfg, _flux3_stream,
-      lora_specs_<genai::MetalFlux3Transformer::LoraSpec>());
+  const auto loras = lora_specs_<Dit::LoraSpec>();
+  _flux3_dit = take_warm_dit_<Dit>(kWarmFlux3, _flux3_dit_dir,
+                                   warm_key_(cfg, _flux3_stream, loras),
+                                   "FLUX.3");
+  if (_flux3_dit) { return true; }
+  _flux3_dit = Dit::load(weight_set_(_flux3_dit_dir), mc, cfg, _flux3_stream,
+                         loras);
   if (_flux3_dit && _flux3_stream) {
     session()->info(fmt(
         "GenerateImageStage('{}'): FLUX.3 DiT streaming its {} blocks; the "
@@ -3165,6 +4158,82 @@ GenerateImageStage::free_flux3_dit_for_decode_(int gen_w, int gen_h)
     mgr->pool_weights(_flux3_dit_dir);
   }
   _flux3_dit.reset();
+  _dit_unloaded = true;
+}
+
+bool
+GenerateImageStage::load_moss_image_dit_()
+{
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr || _moss_dit_dir.empty()) { return false; }
+  genai::MetalMossImageTransformer::Config cfg;
+  if (!genai::MetalMossImageTransformer::Config::read_dims(_moss_dit_dir,
+                                                          &cfg)) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): '{}' does not hold a MOSSImageTransformer "
+        "config this build runs", this->id(), _moss_dit_dir));
+    return false;
+  }
+  cfg.i8_gemm = _i8_gemm;
+  cfg.i8_tier = _i8_tier;
+  cfg.i8_hold_w4 = _i8_hold_w4;
+  cfg.sage = _sage;
+  cfg.sol = _sol;
+  cfg.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+  cfg.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+  using Dit = genai::MetalMossImageTransformer;
+  if (cfg.ane_ffn &&
+      !ane_granted_(
+          Dit::ane_runtime_bytes(cfg, Dit::ane_plan_seq(_width, _height)),
+          "MOSS-Image")) {
+    cfg.ane_ffn = false;
+    cfg.ane_qkv = false;
+  }
+  cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
+                                            0);
+  cfg.ane_layers = (int)genai::accel::integer(&_accel,
+                                              genai::accel::kAneLayers, 0);
+  const auto loras = lora_specs_<Dit::LoraSpec>();
+  _moss_dit = take_warm_dit_<Dit>(kWarmMoss, _moss_dit_dir,
+                                  warm_key_(cfg, _moss_stream, loras),
+                                  "MOSS-Image");
+  if (_moss_dit) { return true; }
+  _moss_dit = Dit::load(weight_set_(_moss_dit_dir), mc, cfg, _moss_stream,
+                        loras);
+  if (_moss_dit && _moss_stream) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): MOSS-Image DiT streaming its {} blocks; "
+        "the resident set grows as the box allows", this->id(),
+        _moss_dit->config().n_layers));
+  }
+  return (bool)_moss_dit;
+}
+
+void
+GenerateImageStage::free_moss_image_dit_for_decode_(int gen_w, int gen_h)
+{
+  if (!_moss_dit) { return; }
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr) { return; }
+  const std::size_t peak =
+      flux2_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 128);
+  // VPIPE_IMAGE_DIT_RECLAIM forces (1) or suppresses (0) the free; unset,
+  // the budget decides -- read SETTLED, since the last forward's scratch
+  // is still on its way back.
+  const int forced = forced_dit_reclaim_();
+  if (forced == 0) { return; }
+  const std::size_t budget =
+      mc->memory_budget_settled().available_physical;
+  if (forced < 0 && peak <= budget) { return; }
+  session()->info(fmt(
+      "GenerateImageStage('{}'): freeing the MOSS-Image DiT before a {}x{} "
+      "decode ({} MB wanted, {} MB free{})", this->id(), gen_w, gen_h,
+      peak >> 20, budget >> 20, forced > 0 ? ", FORCED" : ""));
+  publish_decode_arena_(peak);
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->pool_weights(_moss_dit_dir);
+  }
+  _moss_dit.reset();
   _dit_unloaded = true;
 }
 
@@ -3340,14 +4409,22 @@ GenerateImageStage::load_krea2_dit_()
   if (mc == nullptr || _krea2_dit_dir.empty()) { return false; }
   genai::MetalKrea2Transformer::Config kcfg;
   kcfg.i8_gemm = _i8_gemm;
+  kcfg.i8_tier = _i8_tier;
+  kcfg.i8_hold_w4 = _i8_hold_w4;
   kcfg.sage = _sage;
   apply_ane_(kcfg);
   // The streaming flag the first load used, and the adapter with it. A
   // reload that dropped either would come back preloaded, or un-adapted,
   // on the graph that asked for both.
-  _dit = genai::MetalKrea2Transformer::load(
-      weight_set_(_krea2_dit_dir), mc, kcfg, _krea2_stream,
-      lora_specs_<genai::MetalKrea2Transformer::LoraSpec>());
+  using Dit = genai::MetalKrea2Transformer;
+  const auto loras = lora_specs_<Dit::LoraSpec>();
+  _dit = take_warm_dit_<Dit>(kWarmKrea2, _krea2_dit_dir,
+                             warm_key_(kcfg, _krea2_stream, loras),
+                             "Krea-2");
+  if (!_dit) {
+    _dit = Dit::load(weight_set_(_krea2_dit_dir), mc, kcfg, _krea2_stream,
+                     loras);
+  }
   return (bool)_dit;
 }
 
@@ -4301,7 +5378,8 @@ GenerateImageStage::generate_qwen_image21_(
   // from disk on all forty steps.
   if (mc != nullptr && _qi21_dit->streaming()) {
     const std::size_t peak =
-        qwen_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 144);
+        qwen_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 144,
+                          /*residual=*/true);
     const auto mb = mc->memory_budget();
     // No budget to read -> the free bails out too, so the DiT survives
     // the decode and the reserve has to cover it.
@@ -4922,6 +6000,269 @@ GenerateImageStage::generate_flux3_(
         for (const auto& r : rreq) { n += r.grid_h * r.grid_w; }
         return n;
       }()));
+  return unpack(x);
+}
+
+// MOSS-Image: the reference pipeline's loop (pipeline_moss_image.py,
+// MOSSImagePipeline.__call__), to the bit where a bit matters:
+//   * the schedule: a shift-5 grid snapped to the training grid's
+//     nearest nodes (moss_image::sigmas, bit-exact against the reference
+//     on this box), the DiT handed sigma * 1000 in f32;
+//   * the noise: torch.randn((1, 128, H/16, W/16)) from a CPU generator
+//     seeded with the seed, f32 and CHANNEL-major -- so a seed gives the
+//     reference's own picture;
+//   * CFG in f32: uncond + g * (cond - uncond), the uncond branch the
+//     negative prompt (the EMPTY one by default) run WITHOUT block 22;
+//   * Euler in f32: x += (sigma_next - sigma) * v.
+// The state stays f32 between bf16 forwards, as the reference keeps it.
+std::vector<float>
+GenerateImageStage::generate_moss_image_(
+    const metal_compute::SharedBuffer& txt_pos, int n_real,
+    const metal_compute::SharedBuffer& txt_neg, int n_real_neg, int gen_h,
+    int gen_w, const std::vector<float>* init_packed,
+    const std::function<void(const std::vector<float>&)>& emit_step) const
+{
+#pragma clang fp contract(off)
+  auto* mc = session()->services()->metal_compute();
+  using metal_compute::SharedBuffer;
+  if (mc == nullptr || !_moss_dit) { return {}; }
+  const auto& dcfg = _moss_dit->config();
+  const int C = dcfg.latent_channels;          // 128
+  const int PPT = genai::moss_image::kPixelsPerToken;
+  if ((gen_h % PPT) != 0 || (gen_w % PPT) != 0 || gen_h <= 0 ||
+      gen_w <= 0) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): MOSS-Image needs a size that is a "
+        "multiple of {} (got {}x{})", this->id(), PPT, gen_w, gen_h));
+    return {};
+  }
+  const int gh = gen_h / PPT, gw = gen_w / PPT;
+  const int IMG = gh * gw;
+  if (n_real <= 0 ||
+      txt_pos.byte_size() < (std::size_t)n_real * dcfg.text_dim * 2) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): the MOSS-Image DiT wants [rows, {}] bf16 "
+        "conditioning (the diffusion-conditioner's moss-image family); got "
+        "{} bytes for {} rows", this->id(), dcfg.text_dim,
+        txt_pos.byte_size(), n_real));
+    return {};
+  }
+  if (!_ref.empty()) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): a reference latent is wired but "
+        "MOSS-Image is text-to-image only -- it is ignored", this->id()));
+  }
+
+  // ---- the schedule ----------------------------------------------------
+  // A scheduler-select beat or `steps` sets the COUNT; the curve is the
+  // checkpoint's own, which no scheduler here spells.
+  const int S_req = _scheduler_latched && _scheduler_spec.steps > 0
+                        ? _scheduler_spec.steps
+                        : (_steps_set ? _steps : 50);
+  const double shift = _moss_shift_cfg > 0.0 ? _moss_shift_cfg : _moss_shift;
+  const std::vector<float> sig = genai::moss_image::sigmas(
+      S_req, shift, _moss_train_shift, _moss_train_steps);
+  if (sig.size() < 2) { return {}; }
+  const int S = (int)sig.size() - 1;
+
+  // ---- CFG -------------------------------------------------------------
+  const double g = _moss_guidance_cfg >= 0.0 ? _moss_guidance_cfg : 3.0;
+  const bool want_cfg = g != 1.0;
+  const bool cfg = want_cfg && !txt_neg.empty() && n_real_neg > 0;
+  if (want_cfg && !cfg) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): MOSS-Image guidance {} wants a negative "
+        "conditioning (the conditioner emits the empty prompt's on oport1 "
+        "-- wire it to iport1); running WITHOUT guidance", this->id(), g));
+  }
+  std::vector<int> skip = _moss_skip_set ? _moss_skip_cfg
+                                         : std::vector<int>{22};
+  skip.erase(std::remove_if(skip.begin(), skip.end(),
+                            [&](int L) { return L >= dcfg.n_layers; }),
+             skip.end());
+  const float gs = (float)g;
+  // SKIP-LAYER GUIDANCE on the positive branch, a third forward, inside
+  // [slg_start, slg_stop) of the denoise -- the SAME window that gates the
+  // negative branch's skip (the reference's `skip_active`).
+  std::vector<int> slg = _moss_slg_layers;
+  slg.erase(std::remove_if(slg.begin(), slg.end(),
+                           [&](int L) { return L >= dcfg.n_layers; }),
+            slg.end());
+  const bool slg_on = !slg.empty() && _moss_slg_scale > 0.0;
+  const float ss = (float)_moss_slg_scale;
+
+  // ---- the noise -------------------------------------------------------
+  std::vector<float> x((std::size_t)IMG * C);
+  {
+    genai::TorchCpuRandn rng((std::uint64_t)_seed);
+    const std::vector<float> z = rng.randn(x.size());
+    if (z.size() != x.size()) { return {}; }
+    // [1, C, gh, gw] as drawn -> token-major [IMG, C].
+    for (int c = 0; c < C; ++c) {
+      for (int p = 0; p < IMG; ++p) {
+        x[(std::size_t)p * C + c] = z[(std::size_t)c * IMG + p];
+      }
+    }
+  }
+  if (init_packed != nullptr && init_packed->size() == x.size()) {
+    x = *init_packed;                  // supplied (repro / golden)
+  }
+  SharedBuffer latbuf = mc->make_shared_buffer(x.size() * 2);
+  if (latbuf.empty()) { return {}; }
+
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, S, (cfg ? 2 : 1) + (slg_on ? 1 : 0));
+  ScopedBlockProgress<std::remove_reference_t<decltype(*_moss_dit)>>
+      prog_guard(_moss_dit.get(), prog);
+
+  // ---- how much of the stack this run may KEEP --------------------------
+  if (_moss_dit->streaming()) {
+    const std::size_t peak =
+        flux2_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 128);
+    const auto mb = mc->memory_budget();
+    const bool decode_runs_beside_us =
+        mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
+    _moss_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    _moss_dit->set_residency_schedule(S);
+  }
+
+  bool ane_checked = false;
+  auto run = [&](const SharedBuffer& txt, int rows,
+                 const std::vector<int>& sk, float t,
+                 std::vector<float>* out) -> bool {
+    genai::MetalMossImageTransformer::Request req;
+    req.latents = &latbuf;
+    req.grid_h = gh;
+    req.grid_w = gw;
+    req.text = &txt;
+    req.text_rows = rows;
+    req.timestep = t;
+    req.skip_layers = sk;
+    std::string e;
+    SharedBuffer v = _moss_dit->forward(req, &e);
+    prog.end_forward();
+    // After the first forward, where the ANE tiers arm or decline: book
+    // what is HELD (revise_scratch refuses to create, so a plan that
+    // booked nothing stays so).
+    if (!ane_checked && _moss_dit->ane_attempted()) {
+      ane_checked = true;
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        genai::MetalMossImageTransformer::Config c = dcfg;
+        c.ane_qkv = _moss_dit->ane_qkv_armed();
+        mgr->revise_scratch(
+            "coreml:" + ane_claim_label_(),
+            _moss_dit->ane_armed()
+                ? genai::MetalMossImageTransformer::ane_runtime_bytes(
+                      c, rows + IMG)
+                : 0);
+      }
+    }
+    if (v.empty()) {
+      // A cooperative stop comes back empty with NO reason.
+      if (!e.empty()) {
+        session()->warn(fmt("GenerateImageStage('{}'): MOSS-Image forward "
+                            "failed: {}", this->id(), e));
+      }
+      return false;
+    }
+    const auto* vp = static_cast<const std::uint16_t*>(v.contents());
+    out->resize(x.size());
+    for (std::size_t i = 0; i < out->size(); ++i) {
+      (*out)[i] = bf16_to_f32_(vp[i]);
+    }
+    return true;
+  };
+
+  X0Tap tap;
+  auto unpack = [&](const std::vector<float>& pk) {
+    std::vector<float> latent((std::size_t)C * IMG);
+    for (int p = 0; p < IMG; ++p) {
+      for (int c = 0; c < C; ++c) {
+        latent[(std::size_t)c * IMG + p] = pk[(std::size_t)p * C + c];
+      }
+    }
+    return latent;
+  };
+
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<float> vc, vn;
+  for (int k = 0; k < S; ++k) {
+    tap.arm(_preview && _preview->due(k + 1, S));
+    {
+      auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
+      for (std::size_t i = 0; i < x.size(); ++i) {
+        lb[i] = f32_to_bf16_(x[i]);
+      }
+    }
+    const float t = genai::moss_image::timestep(sig[(std::size_t)k]);
+    // step / steps in the reference's float arithmetic.
+    const double frac = (double)k / (double)S;
+    const bool active = _moss_slg_start <= frac && frac < _moss_slg_stop;
+    if (!run(txt_pos, n_real, {}, t, &vc)) { return {}; }
+    std::vector<float> cond_v;
+    if (slg_on && active) { cond_v = vc; }
+    if (cfg) {
+      if (!run(txt_neg, n_real_neg, active ? skip : std::vector<int>{}, t,
+               &vn)) {
+        return {};
+      }
+      for (std::size_t i = 0; i < vc.size(); ++i) {
+        const float d = vc[i] - vn[i];
+        vc[i] = vn[i] + gs * d;
+      }
+    }
+    if (slg_on && active) {
+      std::vector<float> vs;
+      if (!run(txt_pos, n_real, slg, t, &vs)) { return {}; }
+      if (!cfg) { vc = vs; }
+      for (std::size_t i = 0; i < vc.size(); ++i) {
+        const float d = cond_v[i] - vs[i];
+        vc[i] = vc[i] + ss * d;
+      }
+    }
+    tap.take(x, sig[(std::size_t)k], vc);
+    const float dt = sig[(std::size_t)k + 1] - sig[(std::size_t)k];
+    for (std::size_t i = 0; i < x.size(); ++i) {
+      const float step = dt * vc[i];
+      x[i] = x[i] + step;
+    }
+    if (emit_step) { emit_step(unpack(x)); }
+    if (tap.ready()) {
+      // taef2 reads FLUX.2's latent unpatchified and NOT un-normalized --
+      // the same space this one is in (see generate_flux3_).
+      const std::vector<float> z = unpack(tap.x0);
+      const int L = C / 4, h8 = 2 * gh, w8 = 2 * gw;
+      std::vector<float> lat((std::size_t)L * h8 * w8);
+      for (int cc = 0; cc < C; ++cc) {
+        const int c = cc / 4, ph = (cc % 4) / 2, pw = cc % 2;
+        for (int yy = 0; yy < gh; ++yy) {
+          for (int xx = 0; xx < gw; ++xx) {
+            lat[((std::size_t)c * h8 + 2 * yy + ph) * w8 + 2 * xx + pw] =
+                z[((std::size_t)cc * gh + yy) * gw + xx];
+          }
+        }
+      }
+      _preview->submit(std::move(lat), L, 1, h8, w8, k + 1, S);
+    }
+    prog.end_step(k);
+  }
+  const double secs = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - t0).count();
+  std::string sk_desc;
+  for (int L : skip) {
+    sk_desc += (sk_desc.empty() ? "" : ",") + std::to_string(L);
+  }
+  session()->info(fmt(
+      "GenerateImageStage('{}'): MOSS-Image latent generated in {:.2f}s ({} "
+      "steps, shift {:.2f}, {} image + {} text rows, {})", this->id(), secs,
+      S, shift, IMG, n_real,
+      (cfg ? fmt("cfg {} against {} rows, skipping [{}]", g, n_real_neg,
+                 sk_desc)()
+           : std::string("no cfg")) +
+          (slg_on ? fmt(", slg {} on {} block(s) in [{}, {})",
+                        _moss_slg_scale, slg.size(), _moss_slg_start,
+                        _moss_slg_stop)()
+                  : std::string())));
   return unpack(x);
 }
 
@@ -5863,6 +7204,12 @@ GenerateImageStage::process(RuntimeContext& ctx)
         "prompt", this->id()));
     if (load_flux3_dit_()) { _dit_unloaded = false; }
   }
+  if (_family == "moss-image" && _dit_unloaded && !_moss_dit) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): reloading the MOSS-Image DiT for the "
+        "next prompt", this->id()));
+    if (load_moss_image_dit_()) { _dit_unloaded = false; }
+  }
   if (_family == "boogu-image" && _dit_unloaded && !_boogu_dit) {
     session()->info(fmt(
         "GenerateImageStage('{}'): reloading the Boogu-Image DiT for the next "
@@ -5876,6 +7223,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
       : _family == "qwen-image-21" ? (bool)_qi21_dit
       : _family == "z-image" ? (bool)_zi_dit
       : _family == "flux3" ? (bool)_flux3_dit
+      : _family == "moss-image" ? (bool)_moss_dit
       : _family == "vosr" ? (bool)_vosr
       : (bool)_dit;
   if (!have_dit) {
@@ -6308,8 +7656,14 @@ GenerateImageStage::process(RuntimeContext& ctx)
     session()->info(fmt(
         "GenerateImageStage('{}'): FLUX.2 latent [{}, {}, {}] ({} steps @ {}x{})",
         this->id(), Cdit, fgh, fgw, _scheduler_spec.steps, gen_h, gen_w));
+    // What the DiT held while it denoised, BEFORE the free (a transient).
+    release_idle_slots_();
+    correct_dit_holding_("after a generation");
     // Free the DiT if the downstream vae-decode won't fit alongside it (before
     // publishing the latent, so the decode stage sees the freed working set).
+    if (_release_scratch && _flux2_dit) {
+      _flux2_dit->release_forward_scratch();
+    }
     free_flux2_dit_for_decode_(gen_w, gen_h);
     co_await ctx.write(0, std::move(out));
     co_return;
@@ -6348,6 +7702,9 @@ GenerateImageStage::process(RuntimeContext& ctx)
     // the next prompt (the latent is already read back, so the DiT is
     // idle) -- and BEFORE the write, so the separate vae-decode stage
     // sees the freed room rather than racing it.
+    release_idle_slots_();
+    correct_dit_holding_("after a generation");
+    if (_release_scratch && _qie_dit) { _qie_dit->release_forward_scratch(); }
     free_qie_dit_for_decode_(gen_w, gen_h);
     co_await ctx.write(0, std::move(out));
     co_return;
@@ -6530,7 +7887,9 @@ GenerateImageStage::process(RuntimeContext& ctx)
     // denoised, which is the number a peer has to size against. The
     // free that may follow is a transient (see declare_memory), so it
     // deliberately does not move the holding back down.
+    release_idle_slots_();
     correct_dit_holding_("after a generation");
+    if (_release_scratch && _qi21_dit) { _qi21_dit->release_forward_scratch(); }
     free_qwen_image21_dit_for_decode_(gen_w, gen_h);
     co_await ctx.write(0, std::move(out));
     co_return;
@@ -6568,7 +7927,9 @@ GenerateImageStage::process(RuntimeContext& ctx)
         gen_w));
     // BEFORE the free, not after: this says what the DiT held while it
     // denoised, which is the number a peer has to size against.
+    release_idle_slots_();
     correct_dit_holding_("after a generation");
+    if (_release_scratch && _zi_dit) { _zi_dit->release_forward_scratch(); }
     free_z_image_dit_for_decode_(gen_w, gen_h);
     co_await ctx.write(0, std::move(out));
     co_return;
@@ -6605,8 +7966,49 @@ GenerateImageStage::process(RuntimeContext& ctx)
     session()->info(fmt(
         "GenerateImageStage('{}'): FLUX.3 latent [{}, {}, {}] @ {}x{}",
         this->id(), C3, lh3, lw3, gen_w, gen_h));
+    release_idle_slots_();
     correct_dit_holding_("after a generation");
+    if (_release_scratch && _flux3_dit) {
+      _flux3_dit->release_forward_scratch();
+    }
     free_flux3_dit_for_decode_(gen_w, gen_h);
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
+  // ---- MOSS-Image: text (+ the negative) -> the reference's own loop ->
+  // [128, H/16, W/16], FLUX.2's VAE's latent, which vae-decode takes
+  // unchanged (its small decoder included). ----
+  if (_family == "moss-image") {
+    const int CM = _moss_dit->config().latent_channels;
+    _moss_dit->set_stream_stop(stopping);
+    LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                         0.0, 0);
+    const int lhm = gen_h / 16, lwm = gen_w / 16;
+    const std::vector<float> ml =
+        generate_moss_image_(cond, n_real, cond_neg, n_real_neg, gen_h,
+                             gen_w, init_ptr, step_emitter({CM, lhm, lwm}));
+    _moss_dit->set_stream_stop({});
+    if (ml.empty()) {
+      session()->info(fmt(
+          "GenerateImageStage('{}'): MOSS-Image generation {}; dropping beat",
+          this->id(), ctx.stop_requested() ? "stopped" : "failed"));
+      co_return;
+    }
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {CM, lhm, lwm};
+    out->resize_contiguous(ml.size());
+    std::memcpy(out->as_f32(), ml.data(), ml.size() * sizeof(float));
+    tag_output_(*out);
+    ++_latents_emitted;
+    session()->info(fmt(
+        "GenerateImageStage('{}'): MOSS-Image latent [{}, {}, {}] @ {}x{}",
+        this->id(), CM, lhm, lwm, gen_w, gen_h));
+    release_idle_slots_();
+    correct_dit_holding_("after a generation");
+    if (_release_scratch && _moss_dit) { _moss_dit->release_forward_scratch(); }
+    free_moss_image_dit_for_decode_(gen_w, gen_h);
     co_await ctx.write(0, std::move(out));
     co_return;
   }
@@ -6638,6 +8040,11 @@ GenerateImageStage::process(RuntimeContext& ctx)
     // Before publishing: on a bounded box the resident DiT would leave the
     // downstream vae-decode no working set. Freed here, reloaded on the next
     // prompt (the latent is already read back, so the DiT is idle).
+    release_idle_slots_();
+    correct_dit_holding_("after a generation");
+    if (_release_scratch && _boogu_dit) {
+      _boogu_dit->release_forward_scratch();
+    }
     free_boogu_dit_for_decode_(gen_w, gen_h);
     co_await ctx.write(0, std::move(out));
     co_return;
@@ -6675,6 +8082,8 @@ GenerateImageStage::process(RuntimeContext& ctx)
   // The DiT is idle now (latent read back): on a memory-bounded box first drop
   // its per-forward scratch (DitScratch activations + dequant/split-K + i8
   // accel buffers, ~1-2 GB at 1024px), which regrows on the next generation.
+  release_idle_slots_();
+  correct_dit_holding_("after a generation");
   if (_release_scratch && _dit) { _dit->release_forward_scratch(); }
   // The DiT's ~7 GB of quantized weights are resident (wired), not actually
   // evictable, so dropping the scratch alone leaves a 1024px vae-decode short

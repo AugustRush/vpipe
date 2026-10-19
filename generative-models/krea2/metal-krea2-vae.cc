@@ -28,6 +28,7 @@ using metal_compute::MetalCompute;
 using metal_compute::SharedBuffer;
 using metal_compute::ComputeEncoder;
 using metal_compute::CommandStream;
+using metal_compute::ComputeFunction;
 
 namespace {
 
@@ -230,6 +231,197 @@ MetalKrea2Vae::config_from_json(const FlexData& cfg_obj, Config* out)
   }
 }
 
+void
+MetalKrea2Vae::set_accel(const Accel& a)
+{
+  // VPIPE_I8_GEMM overrides either way, as it does for every int8 GEMM
+  // (I8GemmContext reads it too).
+  bool on = a.i8_gemm;
+  if (const char* e = std::getenv("VPIPE_I8_GEMM")) { on = std::atoi(e) != 0; }
+  _i8_conv = on && _use_hwconv && _fn_conv_i8_s1.valid() &&
+             _fn_conv_i8_s2.valid() && _fn_i8_zero.valid() &&
+             _fn_i8_amax.valid() && _fn_i8_steps.valid() &&
+             _fn_i8_quant.valid() && _fn_i8_fold.valid();
+  // THE TIER, for the convs: accurate takes the resnet convs alone,
+  // whose inputs are RMS-normed; every other tier takes each 3x3 the
+  // route fits, the residual stream's (conv_in, the up / downsamples)
+  // too. MEASURED on two 1024^2 pictures through Qwen-Image-2.1's VAE,
+  // against the f16 codec: accurate 1.15x the decode, 52.6 / 60.3 dB
+  // (encode 49.2 / 58.2); the rest 1.26x, 49.7 / 57.2 (47.2 / 55.9).
+  // VPIPE_VAE_I8_ALL_CONVS (0 | 1) overrides.
+  _i8_all_convs = _i8_conv && a.i8_tier != 0;
+  if (const char* e = std::getenv("VPIPE_VAE_I8_ALL_CONVS")) {
+    _i8_all_convs = _i8_conv && std::atoi(e) != 0;
+  }
+  if (const char* e = std::getenv("VPIPE_VAE_I8_ALPHA")) {
+    _i8_alpha = std::clamp((float)std::atof(e), 0.0f, 1.0f);
+  }
+  _i8.reset();
+  if (on) {
+    auto i8 = std::make_unique<I8GemmContext>(_mc, true, /*bf16=*/false);
+    i8->set_tier(a.i8_tier >= 2   ? I8GemmContext::Tier::kToken
+                 : a.i8_tier == 1 ? I8GemmContext::Tier::kFast
+                                  : I8GemmContext::Tier::kAccurate);
+    i8->set_token_rotation(a.i8_tier == 2);
+    // Kept only if it turned itself on (the kernels, the matrix cores).
+    if (i8->enabled()) { _i8 = std::move(i8); }
+  }
+}
+
+std::string
+MetalKrea2Vae::accel_note() const
+{
+  if (!_i8_conv && !_i8) { return {}; }
+  std::string s = "int8";
+  if (_i8_conv) {
+    s += _i8_all_convs ? ": every 3x3 conv a channel at a time"
+                       : ": the resnet convs a channel at a time";
+  }
+  if (_i8) {
+    const char* t = _i8->tier() == I8GemmContext::Tier::kToken
+                        ? (_i8->token_rotated() ? "token" : "token_plain")
+                    : _i8->tier() == I8GemmContext::Tier::kFast ? "fast"
+                                                                : "accurate";
+    s += _i8_conv ? ", " : ": ";
+    s += _attn_pick == MidAttn::kMat
+             ? fmt("the attention's GEMMs at the {} tier", t)()
+             : fmt("no GEMM taken (the mid attention runs {}, not "
+                   "materialized)", vae_mid_attn::name(_attn_pick))();
+  }
+  return s;
+}
+
+bool
+MetalKrea2Vae::conv3x3_i8_(ComputeEncoder& enc, const SharedBuffer& in,
+                           const Conv& c, const SharedBuffer& out, int H,
+                           int W, int stride, bool silu,
+                           const PoolAlloc& alloc, const PoolRelease& release)
+{
+  if (!_i8_conv || c.w.empty() || (c.cin % 4) != 0 || c.k < 1024) {
+    return false;
+  }
+  const int OH = H / stride, OW = W / stride;
+  const bool s2 = stride == 2;
+  const ComputeFunction& f64 = s2 ? _fn_conv_i8_s2 : _fn_conv_i8_s1;
+  const ComputeFunction& f32 = s2 ? _fn_conv_i8_s2_c32 : _fn_conv_i8_s1_c32;
+  const ComputeFunction& f16 = s2 ? _fn_conv_i8_s2_c16 : _fn_conv_i8_s1_c16;
+  // The tiles conv3x3_hw_ takes, for the same reasons.
+  const int tile = (c.cout % 64 == 0) ? 64
+                 : ((c.cout % 32) == 0 && f32.valid()) ? 32
+                 : ((c.cout % 16) == 0 && f16.valid()) ? 16 : 0;
+  if ((OW % 8) != 0 || (OH % 8) != 0 || tile == 0) { return false; }
+  // The op's int32 byte addressing, as conv3x3_hw_ (the source is 1 byte
+  // an element here).
+  if (!tensor_op_operand_fits((std::size_t)c.cin * W * H, 1) ||
+      !tensor_op_operand_fits((std::size_t)c.cout * OW * OH, 2)) {
+    return false;
+  }
+  const std::size_t rows = (std::size_t)H * W;
+  // The pool counts f16 elements: an int8 or a 4-byte buffer of n
+  // elements is n / 2 or 2n of them. `amax` holds each channel's amax,
+  // then (in place) its step.
+  // The picture-sized copy FIRST: the pool is first-fit, so the three
+  // small buffers asked for ahead of it took the free large slots and
+  // the copy got a fresh full-size allocation -- one more level-sized
+  // tensor at the peak on Qwen-Image-2.1's fast tier.
+  SharedBuffer& xq = alloc((rows * c.cin + 1) / 2);
+  SharedBuffer& wq = alloc(((std::size_t)9 * c.cin * c.cout + 1) / 2);
+  SharedBuffer& amax = alloc((std::size_t)c.cin * 2);
+  SharedBuffer& wscale = alloc((std::size_t)c.cout * 2);
+  if (amax.empty() || wscale.empty() || wq.empty() || xq.empty()) {
+    release(xq); release(wq); release(wscale); release(amax);
+    return false;
+  }
+  const int cin4 = c.cin / 4;
+  const int sil = silu ? 1 : 0;
+  // 1. each channel's amax over the picture
+  enc.set_function(_fn_i8_zero);
+  enc.set_buffer(0, amax); enc.set_constant(1, c.cin);
+  enc.dispatch({(unsigned)c.cin, 1, 1}, {64, 1, 1});
+  const int rows_per = 256;
+  enc.set_function(_fn_i8_amax);
+  enc.set_buffer(0, in); enc.set_buffer(1, amax);
+  enc.set_constant(2, c.cin); enc.set_constant(3, (int)rows);
+  enc.set_constant(4, rows_per); enc.set_constant(5, sil);
+  enc.dispatch({(unsigned)(cin4 * ((rows + rows_per - 1) / rows_per)), 1,
+                1}, {256, 1, 1});
+  // 2. each channel's step, SmoothQuant's migration (conv2d_mma.metal)
+  enc.set_function(_fn_i8_steps);
+  enc.set_buffer(0, amax); enc.set_constant(1, c.cin);
+  enc.set_constant(2, _i8_alpha);
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
+  // 3. the weight, the activation's steps folded in
+  enc.set_function(_fn_i8_fold);
+  enc.set_buffer(0, c.w); enc.set_buffer(1, amax);
+  enc.set_buffer(2, wq); enc.set_buffer(3, wscale);
+  enc.set_constant(4, c.cin); enc.set_constant(5, c.cout);
+  enc.dispatch({(unsigned)c.cout * 256u, 1, 1}, {256, 1, 1});
+  // 4. the activation, a channel at its step
+  const unsigned n4 = (unsigned)(rows * (std::size_t)cin4);
+  enc.set_function(_fn_i8_quant);
+  enc.set_buffer(0, in); enc.set_buffer(1, xq); enc.set_buffer(2, amax);
+  enc.set_constant(3, c.cin); enc.set_constant(4, sil);
+  enc.set_constant(5, n4);
+  enc.dispatch({n4, 1, 1}, {256, 1, 1});
+  // 5. the conv, its scales and bias in its epilogue
+  enc.set_function(tile == 16 ? f16 : tile == 32 ? f32 : f64);
+  enc.set_buffer(0, xq); enc.set_buffer(1, wq); enc.set_buffer(2, out);
+  enc.set_constant(3, W); enc.set_constant(4, H);
+  enc.set_constant(5, c.cin); enc.set_constant(6, c.cout);
+  enc.set_buffer(7, wscale);
+  enc.set_buffer(8, c.b.empty() ? wscale : c.b);
+  enc.set_constant(9, c.b.empty() ? 0 : 1);
+  // Stride 2: the asymmetric (0,1,0,1) downsample pad, as conv3x3_hw_.
+  enc.set_constant(10, 3);
+  enc.dispatch({(unsigned)((OW / 8) * 128), (unsigned)(OH / 8),
+                (unsigned)(c.cout / tile)}, {128, 1, 1});
+  release(xq); release(wq); release(wscale); release(amax);
+  return true;
+}
+
+int
+MetalKrea2Vae::mat_attn_band_(std::size_t hw) const noexcept
+{
+  if (hw == 0) { return 0; }
+  // The largest 64-row-aligned band whose [band, hw] f16 scores fit the
+  // cap, as the FLUX.2 VAE's: a band boundary never splits a GEMM tile.
+  std::size_t band = kMatAttnScoreBytes / (hw * 2);
+  if (band > hw) { band = hw; }
+  band &= ~(std::size_t)63;
+  if (band < 64) { band = std::min<std::size_t>(hw, 64); }
+  return (int)band;
+}
+
+void
+MetalKrea2Vae::attn_gemm_(ComputeEncoder& enc, const SharedBuffer& x,
+                          std::size_t xe, const SharedBuffer& w,
+                          const SharedBuffer& y, std::size_t ye, int M, int N,
+                          int K, const PoolAlloc& alloc,
+                          const PoolRelease& release)
+{
+  if (_i8) {
+    // The tier's own layout where this depth takes it, converted now:
+    // both operands are activations, so nothing is kept between calls.
+    if (_i8->tier() != I8GemmContext::Tier::kAccurate &&
+        _i8->fast_accepts(M, N, K)) {
+      const int gc = _i8->fast_group(K);
+      SharedBuffer& codes = alloc(((std::size_t)N * K + 1) / 2);
+      SharedBuffer& sc =
+          alloc((I8GemmContext::fast_scale_bytes(N, K, gc) + 1) / 2);
+      const bool ok =
+          !codes.empty() && !sc.empty() &&
+          _i8->encode_quant_fast(enc, w, codes, sc, gc, N, K) &&
+          _i8->gemm_fast(enc, x, xe, codes, sc, gc, SharedBuffer{}, y, ye, M,
+                         N, K);
+      release(sc); release(codes);
+      if (ok) { return; }
+    }
+    if (_i8->gemm(enc, x, xe, w, y, ye, M, N, K)) { return; }
+  }
+  conv_gemm_bias_(enc, x.subview(xe * 2, (std::size_t)M * K * 2), w,
+                  SharedBuffer{}, y, M, N, K, (int)(ye / (std::size_t)N));
+}
+
 MetalKrea2Vae::Conv
 MetalKrea2Vae::load_conv3x3_(WeightSet& ws, const std::string& nm,
                              bool from3d)
@@ -343,7 +535,11 @@ MetalKrea2Vae::mid_attn_available_(MidAttn k, int C) const
     case MidAttn::kWide16: return _fn_sdpa_full_wide16.valid();
     case MidAttn::kWide32: return _fn_sdpa_full_wide32.valid();
     case MidAttn::kWide64: return _fn_sdpa_full_wide64.valid();
-    case MidAttn::kMat:    return false;   // no materialized path in this VAE
+    case MidAttn::kMat:
+      return _fn_softmax_rows.valid() && _fn_transpose.valid() &&
+             _fn_attn_colsum.valid() && _fn_attn_colsum_reduce.valid() &&
+             _fn_attn_center.valid() && (C % 4) == 0 &&
+             std::getenv("VPIPE_VAE_NO_MAT_ATTN") == nullptr;
   }
   return false;
 }
@@ -353,8 +549,70 @@ void
 MetalKrea2Vae::encode_mid_attn_(ComputeEncoder& enc, MidAttn kind,
                                 const SharedBuffer& q, const SharedBuffer& k,
                                 const SharedBuffer& v, const SharedBuffer& att,
-                                std::size_t hw, int C, float scale)
+                                std::size_t hw, int C, float scale,
+                                const PoolAlloc& alloc,
+                                const PoolRelease& release)
 {
+  if (kind == MidAttn::kMat) {
+    const std::size_t n = hw * (std::size_t)C;
+    // K centred over the tokens and times the softmax's factor, into a
+    // copy (k is the caller's; the tuner runs every member on one): the
+    // scores are stored f16, and see the header for why that needs both.
+    // The column sums in a FIXED order (a partial a chunk of rows, at
+    // most 256 chunks, then the chunks in turn): see the kernels.
+    const int rows_per = std::max(64, ((int)hw + 255) / 256);
+    const int chunks = ((int)hw + rows_per - 1) / rows_per;
+    SharedBuffer& ksum = alloc((std::size_t)C * 2);    // f32 a channel
+    SharedBuffer& kpart = alloc((std::size_t)chunks * C * 2);
+    SharedBuffer& kc = alloc(n);
+    enc.set_function(_fn_attn_colsum);
+    enc.set_buffer(0, k); enc.set_buffer(1, kpart);
+    enc.set_constant(2, C); enc.set_constant(3, (int)hw);
+    enc.set_constant(4, rows_per);
+    enc.dispatch({(unsigned)(C / 4), (unsigned)chunks, 1},
+                 {(unsigned)std::min(C / 4, 64), 1, 1});
+    enc.set_function(_fn_attn_colsum_reduce);
+    enc.set_buffer(0, kpart); enc.set_buffer(1, ksum);
+    enc.set_constant(2, C); enc.set_constant(3, chunks);
+    enc.dispatch({(unsigned)C, 1, 1}, {64, 1, 1});
+    enc.set_function(_fn_attn_center);
+    enc.set_buffer(0, k); enc.set_buffer(1, kc); enc.set_buffer(2, ksum);
+    enc.set_constant(3, C); enc.set_constant(4, 1.0f / (float)hw);
+    enc.set_constant(5, scale);
+    enc.dispatch({(unsigned)C, (unsigned)hw, 1}, {256, 1, 1});
+    // The GEMM takes its second operand as [N, K], so P.V wants V as
+    // [C, hw].
+    SharedBuffer& vT = alloc(n);
+    enc.set_function(_fn_transpose);
+    enc.set_buffer(0, v); enc.set_buffer(1, vT);
+    enc.set_constant(2, (int)hw);           // A
+    enc.set_constant(3, C);                 // B
+    enc.set_constant(4, 1);                 // D
+    enc.dispatch({1u, (unsigned)C, (unsigned)hw}, {1u, 32u, 8u});
+    const int bq = mat_attn_band_(hw);
+    SharedBuffer& sc = alloc((std::size_t)bq * hw);
+    for (int q0 = 0; q0 < (int)hw; q0 += bq) {
+      const int rows = std::min(bq, (int)hw - q0);
+      // scores[rows, hw] = q[q0.., C] @ kc[hw, C]^T, already scaled
+      attn_gemm_(enc, q, (std::size_t)q0 * C, kc, sc, 0, rows, (int)hw, C,
+                 alloc, release);
+      // A plain row softmax: q_offset = hw puts every key at or below the
+      // causal bound, so the mask never fires.
+      enc.set_function(_fn_softmax_rows);
+      enc.set_buffer(0, sc);
+      enc.set_constant(1, rows); enc.set_constant(2, (int)hw);
+      enc.set_constant(3, (int)hw);
+      enc.set_constant(4, 1.0f);
+      enc.set_constant(5, 0);               // window
+      enc.set_constant(6, 0);               // banded
+      enc.dispatch({256u, (unsigned)rows, 1u}, {256u, 1, 1});
+      // att[q0.., C] = P[rows, hw] @ vT[C, hw]^T
+      attn_gemm_(enc, sc, 0, vT, att, (std::size_t)q0 * C, rows, C,
+                 (int)hw, alloc, release);
+    }
+    release(sc); release(vT); release(kc); release(kpart); release(ksum);
+    return;
+  }
   enc.set_buffer(0, q); enc.set_buffer(1, k); enc.set_buffer(2, v);
   enc.set_buffer(3, att);
   enc.set_constant(4, scale); enc.set_constant(5, (int)hw);
@@ -416,6 +674,10 @@ MetalKrea2Vae::autotune_mid_attn_(MetalCompute* mc, int C)
   if (std::getenv("VPIPE_KREA2_VAE_ATTN_SMM") != nullptr && smm_ok) {
     _attn_pick = MidAttn::kSmm; return;
   }
+  if (std::getenv("VPIPE_VAE_MAT_ATTN_MMA2") != nullptr &&
+      mid_attn_available_(MidAttn::kMat, C)) {
+    _attn_pick = MidAttn::kMat; return;
+  }
   if (const char* e = std::getenv("VPIPE_KREA2_VAE_ATTN_BQ")) {
     const int b = std::atoi(e);
     if (b == 8 && mid_attn_available_(MidAttn::kMma8, C)) {
@@ -433,10 +695,18 @@ MetalKrea2Vae::autotune_mid_attn_(MetalCompute* mc, int C)
     return;
   }
   std::vector<MidAttn> cands;
+  // The scalar member joins only where nothing else but kMat would: it
+  // is the one a 1152-wide mid had, so the tune has to be able to say
+  // the materialized member beats it there (it is also the gate's
+  // reference, which the tuner encodes itself).
   for (MidAttn k : {MidAttn::kSmm, MidAttn::kMma8, MidAttn::kWide16,
-                    MidAttn::kWide32, MidAttn::kWide64}) {
+                    MidAttn::kWide32, MidAttn::kWide64, MidAttn::kMat}) {
     if (k == MidAttn::kSmm && !smm_ok) { continue; }
     if (mid_attn_available_(k, C)) { cands.push_back(k); }
+  }
+  if (cands.size() == 1 && cands[0] == MidAttn::kMat &&
+      mid_attn_available_(MidAttn::kScalar, C)) {
+    cands.insert(cands.begin(), MidAttn::kScalar);
   }
   std::string detail;
   const auto t0 = std::chrono::steady_clock::now();
@@ -445,8 +715,8 @@ MetalKrea2Vae::autotune_mid_attn_(MetalCompute* mc, int C)
       [this](ComputeEncoder& enc, MidAttn kind, const SharedBuffer& qq,
              const SharedBuffer& kk, const SharedBuffer& vv,
              const SharedBuffer& oo, std::size_t hw, int c, float sc,
-             const vae_mid_attn::Alloc&, const vae_mid_attn::Release&) {
-        encode_mid_attn_(enc, kind, qq, kk, vv, oo, hw, c, sc);
+             const vae_mid_attn::Alloc& al, const vae_mid_attn::Release& re) {
+        encode_mid_attn_(enc, kind, qq, kk, vv, oo, hw, c, sc, al, re);
       },
       &detail);
   const double tune_ms = std::chrono::duration<double, std::milli>(
@@ -568,6 +838,15 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_fn_sdpa        = m->_lib_sdpa.function("sdpa_full_f16");
   m->_fn_sdpa_wide   = m->_lib_sdpa.function("sdpa_full_wide_f16");
   m->_fn_sdpa_full_smm = m->_lib_sdpa.function("sdpa_full_mma_f16");
+  // The materialized attention's pieces (kMat): the row softmax from the
+  // sdpa library, the V transpose and Q's scaled copy from the
+  // elementwise one. Loaded before autotune_mid_attn_, which times it.
+  m->_fn_softmax_rows = m->_lib_sdpa.function("causal_softmax_rows_f16");
+  m->_fn_transpose = m->_lib_elt.function("transpose_abd_f16");
+  m->_fn_attn_colsum_reduce =
+      m->_lib_elt.function("vae_attn_colsum_reduce_f32");
+  m->_fn_attn_colsum = m->_lib_elt.function("vae_attn_colsum_f16");
+  m->_fn_attn_center = m->_lib_elt.function("vae_attn_center_f16");
   // Direct small-cout 3x3 (see conv3x3_small_cout_). Loaded HERE, ahead of the
   // first load_conv3x3_, because that decides whether to build the HWIO twin
   // this kernel reads.
@@ -709,6 +988,19 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     }
     m->_use_hwconv = m->_fn_conv_hw_s1.valid() &&
                      m->_fn_conv_hw_s2.valid() && m->_fn_bias_add.valid();
+    // The int8 twins and their quantizers, for set_accel. Loaded here,
+    // unused until it asks: the switch is the stage's, not the box's.
+    m->_fn_conv_i8_s1 = m->_lib_convhw.function("conv2d_hw_3x3_s1_i8");
+    m->_fn_conv_i8_s1_c32 = m->_lib_convhw.function("conv2d_hw_3x3_s1_c32_i8");
+    m->_fn_conv_i8_s1_c16 = m->_lib_convhw.function("conv2d_hw_3x3_s1_c16_i8");
+    m->_fn_conv_i8_s2 = m->_lib_convhw.function("conv2d_hw_3x3_s2_i8");
+    m->_fn_conv_i8_s2_c32 = m->_lib_convhw.function("conv2d_hw_3x3_s2_c32_i8");
+    m->_fn_conv_i8_s2_c16 = m->_lib_convhw.function("conv2d_hw_3x3_s2_c16_i8");
+    m->_fn_i8_zero = m->_lib_convhw.function("vae_i8_zero_u32");
+    m->_fn_i8_amax = m->_lib_convhw.function("vae_i8_chan_amax_f16");
+    m->_fn_i8_steps = m->_lib_convhw.function("vae_i8_steps_f16");
+    m->_fn_i8_quant = m->_lib_convhw.function("vae_i8_quant_chan_f16");
+    m->_fn_i8_fold = m->_lib_convhw.function("vae_i8_weight_fold_f16");
   }
 
   // The DECODER's base width, which is base_dim for every checkpoint
@@ -1427,9 +1719,29 @@ MetalKrea2Vae::decode_peak_bytes(int h8, int w8) const noexcept
   // set. MEASURED the same way: 768 MB at 512x512 and 3072 MB at 1024x1024,
   // i.e. SIXTEEN of those tensors at both sizes against five with the pool.
   // Booked at seventeen.
+  // The int8 route (set_accel) lends a resnet conv an int8 copy of its
+  // input beside it: the top level's 2*base-wide one is base*2 bytes a
+  // pixel, one more of these.
+  //
+  // A RESIDUAL decoder (is_residual, Qwen-Image-2.1's) is not shaped like
+  // that: its resample conv keeps the wide channels at FULL resolution
+  // (288 there, against the plain decoder's halving), and the shortcut
+  // holds the level's input beside the resnets. Its peak is the level
+  // below the top, not the top. MEASURED on the M5 Ultra
+  // (qwen_image_21_vae.decode_peak_against_plan: the footprint sampled
+  // during a decode over a settled baseline), in these units: f16 7.8-
+  // 8.3 at 1024^2 and 8.1-8.7 at 2048^2 against the six booked, the
+  // int8 tiers up to 9.6 -- so the preflight and the tile planner sized
+  // a decode 30-40% short. Booked at nine. The plain decoder measured
+  // 6.7 at 1024^2 (Krea-2), which the fixed term below covers.
+  const std::size_t level = _cfg.is_residual ? 9 : 6;
   const std::size_t acts =
-      std::getenv("VPIPE_KREA2_NO_VAE_POOL") != nullptr ? 17 : 6;
-  return top * acts +
+      (std::getenv("VPIPE_KREA2_NO_VAE_POOL") != nullptr ? 17 : level) +
+      (_i8_conv ? 1 : 0);
+  // And a FIXED term the units cannot see -- the latent's host copy, the
+  // output's channel-first transpose, kernels' constant buffers: 135-320
+  // MB measured over the units at 1024^2, which is where it shows.
+  return top * acts + kDecodeFixedBytes +
          (decode_gathers_(h8, w8) ? decode_band_bytes_(h8, w8) : 0);
 }
 
@@ -1733,13 +2045,27 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
       _flops.gemm(M, N, K);
       conv_gemm_bias_(enc, x, w, b, y, M, N, K);
     };
+    auto silu = [&](const SharedBuffer& x, std::size_t n) {   // in place
+      enc.set_function(_fn_mul_sigmoid);
+      enc.set_buffer(0, x); enc.set_buffer(1, x); enc.set_buffer(2, x);
+      enc.set_constant(3, (int)n);
+      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+    };
     // 3x3 conv2d: im2col (into the shared scratch, or a held buffer if it
-    // overflows) then gemm_bias. Spatial size preserved.
-    auto conv3x3 = [&](const SharedBuffer& in, int H, int W,
-                       const Conv& c) -> SharedBuffer& {
+    // overflows) then gemm_bias. Spatial size preserved. `silu_in`: the
+    // input is a resnet's norm output, SiLU'd first -- by the int8 route's
+    // quantizer when it takes the conv (set_accel), else in place here.
+    auto conv3x3 = [&](const SharedBuffer& in, int H, int W, const Conv& c,
+                       bool silu_in = false) -> SharedBuffer& {
       SharedBuffer& out = alloc((std::size_t)H * W * c.cout);
       // Whichever route runs it: an [H*W, 9*cin] x [9*cin, cout] product.
       _flops.gemm((long long)H * W, c.cout, 9LL * c.cin);
+      if ((silu_in || _i8_all_convs) &&
+          conv3x3_i8_(enc, in, c, out, H, W, /*stride=*/1, silu_in, alloc,
+                      release)) {
+        return out;
+      }
+      if (silu_in) { silu(in, (std::size_t)H * W * c.cin); }
       // NAX hardware conv first; then the (opt-in) fused tgmem conv; else the
       // row-tiled im2col + gemm_bias (bands through im2col_scratch).
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/1)) { return out; }
@@ -1773,12 +2099,6 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
       enc.set_constant(3, C); enc.set_constant(4, eps);
       enc.dispatch({256, (unsigned)hw, 1}, {256, 1, 1});
       return out;
-    };
-    auto silu = [&](const SharedBuffer& x, std::size_t n) {   // in place
-      enc.set_function(_fn_mul_sigmoid);
-      enc.set_buffer(0, x); enc.set_buffer(1, x); enc.set_buffer(2, x);
-      enc.set_constant(3, (int)n);
-      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
     };
     auto resadd = [&](const SharedBuffer& a, const SharedBuffer& b,
                       std::size_t n) -> SharedBuffer& {
@@ -1818,13 +2138,11 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
                         int W) -> SharedBuffer& {
       const std::size_t hw = (std::size_t)H * W;
       SharedBuffer& t = normc(x, hw, rb.cin, rb.n1g);
-      silu(t, hw * rb.cin);
-      SharedBuffer& t1 = conv3x3(t, H, W, rb.c1);
+      SharedBuffer& t1 = conv3x3(t, H, W, rb.c1, /*silu_in=*/true);
       release(t);
       SharedBuffer& t2 = normc(t1, hw, rb.cout, rb.n2g);
       release(t1);
-      silu(t2, hw * rb.cout);
-      SharedBuffer& t3 = conv3x3(t2, H, W, rb.c2);
+      SharedBuffer& t3 = conv3x3(t2, H, W, rb.c2, /*silu_in=*/true);
       release(t2);
       if (rb.has_short) {                          // in != out (up1.resnets.0)
         SharedBuffer& h = conv1x1(x, hw, rb.shortcut);
@@ -1850,7 +2168,8 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
       const float scale = 1.0f / std::sqrt((float)C);
       // The member is chosen ONCE, by measurement, in autotune_mid_attn_.
       _flops.attention(1, (long long)hw * (long long)hw, C);
-      encode_mid_attn_(enc, _attn_pick, q, k, v, att, hw, C, scale);
+      encode_mid_attn_(enc, _attn_pick, q, k, v, att, hw, C, scale, alloc,
+                       release);
       release(q); release(k); release(v);  // consumed by the sdpa
       SharedBuffer& p = conv1x1(att, hw, a.proj);
       release(att);
@@ -1900,7 +2219,9 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
       }
       pool.clear();
       xp = &carry;
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
     };
 
@@ -1968,7 +2289,11 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
   }
   std::string gpu_err;
   _flops.flush(stream);
-  if (!stream.commit().wait_ok(&gpu_err)) {
+  const bool gpu_ok = stream.commit().wait_ok(&gpu_err);
+  // The int8 GEMMs' scratch is sized by this decode's attention; give it
+  // back rather than hold it resident between beats.
+  if (_i8) { _i8->release_scratch(); }
+  if (!gpu_ok) {
     return fail(gpu_err.empty() ? std::string("GPU decode failed") : gpu_err);
   }
   if (dprof && _mc != nullptr && _mc->session() != nullptr) {
@@ -2236,11 +2561,24 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
       _flops.gemm(M, N, K);
       conv_gemm_bias_(enc, x, w, b, y, M, N, K);
     };
+    auto silu = [&](const SharedBuffer& x, std::size_t n) {
+      enc.set_function(_fn_mul_sigmoid);
+      enc.set_buffer(0, x); enc.set_buffer(1, x); enc.set_buffer(2, x);
+      enc.set_constant(3, (int)n);
+      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+    };
+    // `silu_in` as decode()'s conv3x3.
     auto conv3x3g = [&](const SharedBuffer& in, int H, int W, const Conv& c,
-                        bool stride2) -> SharedBuffer& {
+                        bool stride2, bool silu_in = false) -> SharedBuffer& {
       const int OH = stride2 ? H / 2 : H, OW = stride2 ? W / 2 : W;
       SharedBuffer& out = alloc((std::size_t)OH * OW * c.cout);
       _flops.gemm((long long)OH * OW, c.cout, 9LL * c.cin);
+      if ((silu_in || _i8_all_convs) &&
+          conv3x3_i8_(enc, in, c, out, H, W, stride2 ? 2 : 1, silu_in, alloc,
+                      release)) {
+        return out;
+      }
+      if (silu_in) { silu(in, (std::size_t)H * W * c.cin); }
       if (conv3x3_hw_(enc, in, c, out, H, W, stride2 ? 2 : 1)) {
         return out;
       }
@@ -2275,12 +2613,6 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
       enc.dispatch({256, (unsigned)hwv, 1}, {256, 1, 1});
       return out;
     };
-    auto silu = [&](const SharedBuffer& x, std::size_t n) {
-      enc.set_function(_fn_mul_sigmoid);
-      enc.set_buffer(0, x); enc.set_buffer(1, x); enc.set_buffer(2, x);
-      enc.set_constant(3, (int)n);
-      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
-    };
     auto resadd = [&](const SharedBuffer& a, const SharedBuffer& b,
                       std::size_t n) -> SharedBuffer& {
       SharedBuffer& out = alloc(n);
@@ -2294,11 +2626,9 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
                         int W) -> SharedBuffer& {
       const std::size_t hwv = (std::size_t)H * W;
       SharedBuffer& t = normc(x, hwv, rb.cin, rb.n1g);
-      silu(t, hwv * rb.cin);
-      SharedBuffer& t1 = conv3x3g(t, H, W, rb.c1, false);
+      SharedBuffer& t1 = conv3x3g(t, H, W, rb.c1, false, /*silu_in=*/true);
       SharedBuffer& t2 = normc(t1, hwv, rb.cout, rb.n2g);
-      silu(t2, hwv * rb.cout);
-      SharedBuffer& t3 = conv3x3g(t2, H, W, rb.c2, false);
+      SharedBuffer& t3 = conv3x3g(t2, H, W, rb.c2, false, /*silu_in=*/true);
       if (rb.has_short) {
         SharedBuffer& h = conv1x1(x, hwv, rb.shortcut);
         return resadd(t3, h, hwv * rb.cout);
@@ -2321,7 +2651,8 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
       // full-resolution pixel count) and passing that here compiles cleanly
       // while running the attention over a sequence ~64x too long.
       _flops.attention(1, (long long)hwv * (long long)hwv, C);
-      encode_mid_attn_(enc, _attn_pick, q, k, v, att, hwv, C, scale);
+      encode_mid_attn_(enc, _attn_pick, q, k, v, att, hwv, C, scale, alloc,
+                       release);
       release(q); release(k); release(v);  // consumed by the sdpa
       SharedBuffer& p = conv1x1(att, hwv, a.proj);
       release(att);
@@ -2354,7 +2685,9 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
       }
       pool.clear();
       xp = &carry;
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
     };
 
@@ -2416,6 +2749,7 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
   if (!alloc_ok || !split_ok) { return {}; }
   _flops.flush(stream);
   stream.commit().wait();
+  if (_i8) { _i8->release_scratch(); }
 
   // Posterior MODE = first z_dim channels; whiten (x-mean)/std; transpose
   // channel-last [hw', z*2] -> channel-first [z_dim, H/8, W/8].

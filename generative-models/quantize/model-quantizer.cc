@@ -784,6 +784,15 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
       layer_gain[(std::size_t)L] += std::max(e_lo - e_hi, 0.0f);
       layer_names[(std::size_t)L].push_back(name);
     }
+    // A prefix that matches no tensor ranks NOTHING: every gain is 0, no
+    // layer is promoted, and the pack comes out uniform under a log line
+    // that calls it mixed. Refuse rather than write that.
+    std::size_t ranked = 0;
+    for (const auto& v : layer_names) { ranked += v.size(); }
+    if (ranked == 0) {
+      return fail("mixed: no quantizable linear under layer_prefix '" +
+                  opt.layer_prefix + "'");
+    }
     std::vector<int> order((std::size_t)opt.n_layers);
     for (int L = 0; L < opt.n_layers; ++L) { order[(std::size_t)L] = L; }
     std::sort(order.begin(), order.end(), [&](int a, int b) {

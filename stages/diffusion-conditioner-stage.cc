@@ -10,6 +10,7 @@
 #include "common/flex-data.h"
 #include "generative-models/qwen-image/qwen-image21-layout.h"
 #include "generative-models/z-image/z-image-layout.h"
+#include "generative-models/moss-image/metal-moss-image-transformer.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -76,13 +77,18 @@ const ConfigKey kAttrs[] = {
        "wan-t2v,wan-i2v,minimax-h3-fl2va,vosr",
    .model_channel = "diffusion-model"},
   {.key = "encoder_dir", .type = ConfigType::String, .required = false,
-   .doc = "VOSR only: the DINOv2 checkpoint, which is a SEPARATE download "
-          "from the restorer's own weights (facebook/dinov2-large, or the "
-          "same tensors converted out of the reference's torch-hub pickle). "
-          "Unset, `<hf_dir>/dinov2` is tried and then the registry key. "
-          "Every other family's encoder lives inside hf_dir and ignores this",
+   .doc = "the text encoder's WEIGHTS, when they are not hf_dir's own: a "
+          "directory, a registry key, or a single file -- a Draw Things "
+          ".ckpt (Qwen-Image-2.1's Qwen3-VL-8B, MiniMax-H3's Qwen3-VL-32B), "
+          "read under the release's names. The config and tokenizer still "
+          "come from hf_dir. For VOSR it is the DINOv2 checkpoint, a "
+          "SEPARATE download from the restorer's own weights "
+          "(facebook/dinov2-large, or the same tensors converted out of the "
+          "reference's torch-hub pickle); unset, `<hf_dir>/dinov2` is tried "
+          "and then the registry key",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "dinov2"},
+   .suggest_db_type = "dinov2",
+   .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
   {.key = "reference_mode", .type = ConfigType::String, .required = false,
    .doc = "how a reference image on the ref_image iports pairs with the "
           "prompts. \"auto\" (the default) is the rule every input of this "
@@ -114,6 +120,17 @@ const ConfigKey kAttrs[] = {
           "reused without a reload if not) or \"keep\" (hold them pinned). "
           "Legacy: \"always\" = destroy, \"never\" = keep",
    .def_str = "auto", .extra = kUnloadChoices},
+  {.key = "keep_loaded", .type = ConfigType::Real, .required = false,
+   .doc = "seconds to keep the text encoder BUILT once this stage lets it "
+          "go (after a conditioning, or with its graph), where the box "
+          "does not want it destroyed: the next conditioning asking for "
+          "the same encoder -- this graph's or the next one's -- is handed "
+          "it, no read. A language model reads its weights into its own "
+          "buffers, so a park keeps nothing of them; this keeps the model. "
+          "Released sooner when a launch that does not use it needs the "
+          "room. 0 (the default): as before. The Qwen-family encoders so "
+          "far",
+   .def_real = 0.0},
 };
 const PortSpec kIports[] = {
   {.name = "prompt", .doc = "prompt text (FlexData string or {text: ...})",
@@ -219,6 +236,59 @@ inline float bf16_to_f32_(std::uint16_t b)
 {
   std::uint32_t u = (std::uint32_t)b << 16;
   float f; std::memcpy(&f, &u, 4); return f;
+}
+
+// The token-embedding table in the encoder's compute element (bf16 or
+// f16). Its rows are copied STRAIGHT into the encoder's input, so the
+// table must already be that element: a release stores it so, but a
+// Draw Things .ckpt stores f16, and f16 rows read as bf16 are noise --
+// every prompt token garbage, the picture a uniform texture. Converted
+// once, into a derived entry.
+SharedBuffer
+embed_table_(genai::WeightSet& ws, const std::string& nm,
+             metal_compute::MetalCompute* mc, bool bf16)
+{
+  const auto* ti = ws.src().info(nm);
+  if (ti == nullptr) { return {}; }
+  const std::string want = bf16 ? "BF16" : "F16";
+  if (ti->dtype == want) {
+    return ws.tensor(nm, mc, genai::WeightSet::Residency::Copied);
+  }
+  return ws.derived("cond-embed/" + want + "/" + nm, [&]() -> SharedBuffer {
+    SharedBuffer raw = ws.read(nm, mc, genai::WeightSet::Residency::Copied);
+    std::size_t n = 1;
+    for (auto d : ti->shape) { n *= (std::size_t)d; }
+    const std::size_t es = ti->dtype == "F32" ? 4 : 2;
+    if (raw.empty() || raw.byte_size() < n * es ||
+        (ti->dtype != "F32" && ti->dtype != "F16" && ti->dtype != "BF16")) {
+      return {};
+    }
+    SharedBuffer out = mc->make_shared_buffer(n * 2);
+    if (out.empty()) { return {}; }
+    const auto* src = static_cast<const std::uint8_t*>(raw.contents());
+    auto* d = static_cast<std::uint16_t*>(out.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      float f;
+      if (ti->dtype == "F32") {
+        std::memcpy(&f, src + i * 4, 4);
+      } else if (ti->dtype == "F16") {
+        _Float16 h;
+        std::memcpy(&h, src + i * 2, 2);
+        f = (float)h;
+      } else {
+        std::uint16_t b;
+        std::memcpy(&b, src + i * 2, 2);
+        f = bf16_to_f32_(b);
+      }
+      if (bf16) {
+        d[i] = f32_to_bf16_(f);
+      } else {
+        const _Float16 h = (_Float16)f;
+        std::memcpy(&d[i], &h, 2);
+      }
+    }
+    return out;
+  });
 }
 
 // Downscale planar U8 RGB [3,H,W] so the longest side <= `cap`, preserving the
@@ -768,6 +838,33 @@ encoder_config_z_image_(const std::string& enc_dir)
   return encoder_config_flux2_(enc_dir);
 }
 
+// MOSS-Image's text encoder is a stock Qwen3.5-9B -- `Qwen3_5Model`, the
+// HYBRID: 24 gated-DeltaNet and 8 gated full-attention layers, hidden
+// 4096, zero-centred RMSNorms, a quarter of each head rotated -- under a
+// bare `language_model.` wrapper with its vision tower beside it. The
+// first hybrid any image family here conditions on, so it is read
+// through the LM's OWN config mapping (config_from), which is what knows
+// the GDN geometry; this states only how it is READ: no head (it taps),
+// bf16, and the reference's 4096-token cap. The norms stay zero-centred
+// (raw HF, `1 + w`), folded at load.
+genai::MetalQwenModel::Config
+encoder_config_moss_image_(const SessionContextIntf* s,
+                           const std::string& enc_dir)
+{
+  genai::MetalQwenModel::Config c;
+  genai::ModelLoader loader(s);
+  const auto mcfg = loader.load_config(enc_dir);
+  if (mcfg.has_value()) { c = genai::MetalQwenModel::config_from(*mcfg); }
+  c.use_bf16 = true;
+  c.backbone_only = true;
+  c.weight_prefix = "language_model.";
+  c.model_seg = "";
+  c.zero_centered_norm = true;
+  c.max_seq = genai::moss_image::kMaxTextTokens + 256;
+  c.page_tokens = 256;
+  return c;
+}
+
 genai::MetalQwenModel::Config encoder_config_qie_()
 {
   genai::MetalQwenModel::Config c;
@@ -827,6 +924,10 @@ std::string family_(const std::string& transformer_dir)
         // and system prompt instead of one un-normed tap of a bare
         // user turn.
         if (cls == "ZImageTransformer2DModel") { return "z-image"; }
+        // MOSS-Image. Its encoder is a Qwen3.5 HYBRID, which the "krea2"
+        // default would refuse to read as a dense Qwen3-VL -- and its
+        // recipe is the final norm over a templated user turn.
+        if (cls == "MOSSImageTransformer") { return "moss-image"; }
         // Boogu-Image. The t2i and edit repos ship the SAME transformer config
         // (only the weights differ), so there is one family string; the edit
         // path turns on when a reference image is wired, the way a profile
@@ -964,10 +1065,56 @@ DiffusionConditionerStage::DiffusionConditionerStage(
     }
   }
 #endif
+  _keep_loaded = attr_real("keep_loaded");
   allocate_oports(spec().oports.size());
 }
 
-DiffusionConditionerStage::~DiffusionConditionerStage() = default;
+DiffusionConditionerStage::~DiffusionConditionerStage()
+{
+  keep_encoder_warm_();
+}
+
+namespace {
+
+// A Qwen-family encoder kept warm: the model, the set its tensors came
+// from, its embedding table, its width -- what load_encoder_ builds.
+struct WarmEncoder {
+  std::shared_ptr<genai::WeightSet>      ws;
+  std::unique_ptr<genai::MetalQwenModel> encoder;
+  metal_compute::SharedBuffer            embed;
+  int                                    hidden = 0;
+};
+constexpr const char* kWarmEncoderKind = "qwen-text-encoder";
+
+}  // namespace
+
+// The encoder handed to the manager to be kept warm (`keep_loaded`)
+// instead of let go -- not where the box wants it destroyed (a peer
+// streams, or encoder and DiT do not fit together), and never from a
+// BATCH: its encoder goes whatever the policy says (what follows a
+// dataset's encode is a trainer running for hours beside it), and the
+// swap to a resident build mid-batch would only keep the streamed one.
+void
+DiffusionConditionerStage::keep_encoder_warm_()
+{
+  if (_keep_loaded <= 0 || !_encoder || _enc_warm_key.empty() || _batch ||
+      _idle_action == model_memory::UnloadPolicy::kDestroy ||
+      session() == nullptr) {
+    return;
+  }
+  auto* mgr = session()->services()->generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto w = std::make_shared<WarmEncoder>();
+  w->ws = _enc_ws;
+  w->encoder = std::move(_encoder);
+  w->embed = std::move(_embed);
+  w->hidden = _enc_hidden;
+  session()->log_debug(fmt(
+      "DiffusionConditionerStage('{}'): the text encoder kept warm for "
+      "{:.0f} s", this->id(), _keep_loaded));
+  mgr->keep_model_warm(kWarmEncoderKind, _enc_dir, _enc_warm_key,
+                       std::move(w), 0, _keep_loaded);
+}
 
 const StageSpec&
 DiffusionConditionerStage::spec() const noexcept
@@ -1087,7 +1234,8 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   if (_family == "wan") {
     genai::MetalUmt5Encoder::Config ucfg;
     std::string uerr;
-    if (!genai::MetalUmt5Encoder::config_from_json(_enc_dir, ucfg, &uerr)) {
+    if (!genai::MetalUmt5Encoder::config_from_json(_enc_cfg_dir, ucfg,
+                                                   &uerr)) {
       session()->error(fmt("DiffusionConditionerStage('{}'): {}",
                            this->id(), uerr));
       return false;
@@ -1112,13 +1260,15 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   if (_family == "minimax-h3") {
     genai::MiniMaxH3TextEncoder::Config h3cfg;
     std::string h3err;
-    if (!genai::MiniMaxH3TextEncoder::config_from_json(_enc_dir, h3cfg,
+    if (!genai::MiniMaxH3TextEncoder::config_from_json(_enc_cfg_dir, h3cfg,
                                                        &h3err)) {
       session()->error(fmt("DiffusionConditionerStage('{}'): {}", this->id(),
                            h3err));
       return false;
     }
     _enc_hidden = h3cfg.text_dim;
+    // Weights named apart from the config (`encoder_dir`): read there.
+    if (_enc_dir != _enc_cfg_dir) { h3cfg.weights = _enc_dir; }
     // The Qwen3-VL-32B backbone is ~48 GB bf16 (~26 GB at w8) for the 50
     // tapped layers, so on a small box it cannot be resident -- and it
     // only ever PREFILLS, which is exactly what layer streaming serves.
@@ -1129,7 +1279,9 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
       // Comfy-Org repo root holds the 66 GB DiT beside the encoder, and
       // summing the tree would decide to stream on the DiT's bytes.
       const std::string ed =
-          genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_enc_dir);
+          _enc_dir != _enc_cfg_dir
+              ? _enc_dir
+              : genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_enc_dir);
       // kPhaseCondition, not the default: this encoder runs in the
       // CONDITION phase and is gone by denoise, so asking in denoise
       // sizes it against a phase it is not in -- and drops its own
@@ -1156,7 +1308,7 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
           h3cfg.lm.stream_layers ? "STREAM layers" : "PRELOAD",
           h3cfg.lm.pin_frac * 100.0));
     }
-    _h3_enc = genai::MiniMaxH3TextEncoder::load(_enc_dir, mc,
+    _h3_enc = genai::MiniMaxH3TextEncoder::load(_enc_cfg_dir, mc,
                                                 const_cast<SessionContextIntf*>(
                                                     session()), h3cfg);
     if (!_h3_enc) {
@@ -1180,12 +1332,15 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
     return true;
   }
   genai::MetalQwenModel::Config ecfg =
-      _family == "flux2" ? encoder_config_flux2_(_enc_dir)
-      : _family == "flux3" ? encoder_config_flux3_(_enc_dir)
+      _family == "flux2" ? encoder_config_flux2_(_enc_cfg_dir)
+      : _family == "flux3" ? encoder_config_flux3_(_enc_cfg_dir)
       : _family == "qwen-image-edit" ? encoder_config_qie_()
-      : _family == "boogu-image" ? encoder_config_boogu_(_enc_dir)
-      : _family == "qwen-image-21" ? encoder_config_qwen_image21_(_enc_dir)
-      : _family == "z-image" ? encoder_config_z_image_(_enc_dir)
+      : _family == "boogu-image" ? encoder_config_boogu_(_enc_cfg_dir)
+      : _family == "qwen-image-21"
+          ? encoder_config_qwen_image21_(_enc_cfg_dir)
+      : _family == "z-image" ? encoder_config_z_image_(_enc_cfg_dir)
+      : _family == "moss-image"
+          ? encoder_config_moss_image_(session(), _enc_cfg_dir)
       : _profile != nullptr ? encoder_config_profile_(_profile)
       : encoder_config_krea2_();
   // A family with a content screen GENERATES on these weights, so the
@@ -1198,7 +1353,7 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   // to pick the w4g64 vs w8g64 kernel, so read it from the encoder's
   // config.json quantization block (absent => dense bf16, quant_bits unused).
   {
-    std::ifstream in(std::filesystem::path(_enc_dir) / "config.json");
+    std::ifstream in(std::filesystem::path(_enc_cfg_dir) / "config.json");
     if (in) {
       FlexData fd = FlexData::from_json(in);
       if (fd.is_object()) {
@@ -1289,6 +1444,33 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
                          "encoder checkpoint: {}", this->id(), _enc_dir));
     return false;
   }
+  // Kept warm by an earlier conditioning (keep_encoder_warm_), under
+  // what decides the build: the family's profile, the weights, a screen
+  // (which loads the head), a batch (resident) -- and, sized by THIS
+  // launch's plan, whether it streams and how many layers it pins: one
+  // pinned for a roomier box would hold more than this plan admitted.
+  _enc_warm_key = fmt("{}|{}|{}|screen {}|batch {}|stream {} pin {}",
+                      _family, _enc_dir, _enc_cfg_dir,
+                      _screen != nullptr ? 1 : 0, _resident_for_batch ? 1 : 0,
+                      ecfg.stream_layers ? 1 : 0,
+                      genai::MetalQwenModel::pinned_layer_count(
+                          _enc_ws->src(), ecfg))();
+  if (_keep_loaded > 0) {
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      if (auto w = mgr->take_warm<WarmEncoder>(kWarmEncoderKind, _enc_dir,
+                                               _enc_warm_key)) {
+        _enc_ws = std::move(w->ws);
+        _encoder = std::move(w->encoder);
+        _embed = std::move(w->embed);
+        _enc_hidden = w->hidden;
+        _enc_taken_warm = true;
+        session()->log_debug(fmt(
+            "DiffusionConditionerStage('{}'): the text encoder kept warm "
+            "is taken back", this->id()));
+        return true;
+      }
+    }
+  }
   _encoder = genai::MetalQwenModel::load(_enc_ws, mc, ecfg);
   if (!_encoder) {
     session()->error(fmt("DiffusionConditionerStage('{}'): text encoder load "
@@ -1346,7 +1528,7 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   };
   for (const char* nm : kEmbedNames) {
     if (_enc_ws->src().info(nm) == nullptr) { continue; }
-    _embed = _enc_ws->tensor(nm, mc, genai::WeightSet::Residency::Copied);
+    _embed = embed_table_(*_enc_ws, nm, mc, ecfg.use_bf16);
     if (!_embed.empty()) {
       session()->log_debug(fmt(
           "DiffusionConditionerStage('{}'): token embeddings from '{}'",
@@ -1440,6 +1622,13 @@ DiffusionConditionerStage::resolve_component_dirs_(std::string* enc_out,
                   resolve_model(session(), _hf_dir).model_type));
     if (!d.empty() && d != root) { dit = d; }
   }
+  // Weights named apart from the release (`encoder_dir`: a Draw Things
+  // .ckpt, a directory) are what loads, so they are what is claimed.
+  // VOSR's own reading of the key (a DINOv2 checkpoint) follows.
+  if (!_venc_dir.empty()) {
+    const std::string w = resolve_model_dir(session(), _venc_dir);
+    if (!w.empty() && fs::exists(w, ec)) { enc = w; }
+  }
   // VOSR is the family whose ENCODER is not under `root` at all: DINOv2
   // is a separate download, so the text_encoder path above resolves to
   // nothing and the claim would be 0 bytes -- exactly the under-count
@@ -1490,11 +1679,14 @@ DiffusionConditionerStage::declare_resources() const
   if (!enc.empty()) {
     out.push_back(model_memory::weight_claim_streamable(enc, enc_floor));
   }
-  if (!dit.empty()) {
-    for (auto& c : model_memory::weight_claims({dit})) {
-      out.push_back(std::move(c));
-    }
-  }
+  // NOT THE DiT. The stage that loads it declares the one it loads --
+  // generate-image's `dit_dir`, generate-video's partition -- and naming
+  // the release's `transformer/` here as well put a DiT nothing loads in
+  // the plan whenever the graph loads another (a quantized pack, a Draw
+  // Things .ckpt): 13.6 GB of bf16 beside a 4 GB w4 pack, MEASURED on
+  // Qwen-Image-2.1. Every sizing below asks the manager, which holds the
+  // generator's declaration by then.
+  (void)dit;
   return out;
 }
 
@@ -1557,8 +1749,7 @@ DiffusionConditionerStage::decide_resources() const
   const bool releases =
       _unload_cfg == model_memory::UnloadPolicy::kDestroy ||
       (_unload_cfg == model_memory::UnloadPolicy::kAuto &&
-       model_memory::bounded(session(), {enc, dit},
-                             model_memory::kHeadroom));
+       model_memory::bounded(session(), {enc}, model_memory::kHeadroom));
   if (!releases) { return {}; }
   return model_memory::weight_claims_in_phase(
       {enc}, model_memory::kPhaseCondition);
@@ -1849,6 +2040,27 @@ DiffusionConditionerStage::ensure_loaded_()
         genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
     if (!enc.empty() && enc != root) { _enc_dir = enc; }
   }
+  // The config and tokenizer are the release's; the WEIGHTS may be named
+  // apart (`encoder_dir`) -- a Draw Things .ckpt, presented under the
+  // release's names by MetalLlamaWeights. Not VOSR's, whose encoder_dir
+  // is a whole DINOv2 checkpoint and is resolved below.
+  _enc_cfg_dir = _enc_dir;
+  if (!_venc_dir.empty() && _family != "vosr") {
+    const std::string w = resolve_model_dir(session(), _venc_dir);
+    std::error_code wec;
+    if (w.empty() || !std::filesystem::exists(w, wec)) {
+      session()->error(fmt(
+          "DiffusionConditionerStage('{}'): encoder_dir '{}' is neither a "
+          "registered model nor a file or directory; inert", this->id(),
+          _venc_dir));
+      return;
+    }
+    _enc_dir = w;
+    session()->info(fmt(
+        "DiffusionConditionerStage('{}'): the text encoder's weights from "
+        "'{}', its config and tokenizer from '{}'", this->id(), _enc_dir,
+        _enc_cfg_dir));
+  }
   // NOTE: the encoder's phase claim is made in declare_resources(),
   // which is where it belongs and where the planning phase can see it.
   // It used to be repeated here as well, because declare_resources()
@@ -1875,8 +2087,9 @@ DiffusionConditionerStage::ensure_loaded_()
     }
     _root_dir  = root;
     _enc_dir   = _venc_dir;
-    _peer_dirs = {_venc_dir,
-                  genai::MetalVosrTransformer::weights_dir(root)};
+    _enc_cfg_dir = _venc_dir;
+    // The DiT is the generator's declaration, which the manager holds.
+    _peer_dirs = {_venc_dir};
     session()->info(fmt(
         "DiffusionConditionerStage('{}'): family vosr encoder (DINOv2 "
         "ViT-L/14 at {}px, layer {}), hidden {} -- vision only, no prompt",
@@ -1893,7 +2106,7 @@ DiffusionConditionerStage::ensure_loaded_()
     // A checkpoint may ship no separate tokenizer/ or processor/ dir --
     // a Qwen3-VL text encoder keeps its tokenizer and processor configs
     // beside the weights.
-    tok_path = (fs::path(_enc_dir) / "tokenizer.json").string();
+    tok_path = (fs::path(_enc_cfg_dir) / "tokenizer.json").string();
   }
   _tokenizer = genai::Tokenizer::from_huggingface_json(tok_path, session());
   if (!_tokenizer) {
@@ -1916,6 +2129,8 @@ DiffusionConditionerStage::ensure_loaded_()
       : _family == "qwen-image-edit" ? "Qwen2.5-VL"
       : _family == "boogu-image" ? "Qwen3-VL (mllm)"
       : _family == "wan" ? "umT5-XXL"
+      : _family == "z-image" ? "Qwen3 dense"
+      : _family == "moss-image" ? "Qwen3.5 hybrid, final norm"
       : _family == "minimax-h3" ? "Qwen3-VL-32B (layer-50 tap)" : "Qwen3-VL",
       _enc_hidden));
 
@@ -1923,25 +2138,13 @@ DiffusionConditionerStage::ensure_loaded_()
   // DECISION itself is deferred to the first process() -- see
   // resolve_unload_policy_().
   _root_dir  = root;
-  // `transformer/` is the diffusers spelling. A Comfy-Org repack keeps its
-  // DiT under `diffusion_models/`, so naming only the former left the DiT
-  // contributing ZERO to the footprint this decision sizes against -- and
-  // a decision that cannot see the largest peer in the graph always says
-  // there is room.
-  std::string dit = (std::filesystem::path(root) / "transformer").string();
-  {
-    // As resolve_component_dirs_ names it, for the same reason.
-    std::error_code ec;
-    if (!std::filesystem::exists(dit, ec) ||
-        genai::minimax_h3::is_diffusers_pipeline_root(root)) {
-      const std::string d =
-          genai::MetalMiniMaxH3Transformer::resolve_dit_dir(
-              root, genai::MetalMiniMaxH3Transformer::partition_of_model_type(
-                        _model_type));
-      if (!d.empty() && d != root) { dit = d; }
-    }
-  }
-  _peer_dirs = {_enc_dir, dit};
+  // Only the encoder. The DiT is counted from its generator's own
+  // declaration, which the manager holds by now -- weight_footprint()
+  // adds a named directory only when nothing declared it, so naming the
+  // release's `transformer/` here was a no-op when the generator loads
+  // it and a second, phantom DiT whenever the generator loads another
+  // (`dit_dir`: a quantized pack, a Draw Things .ckpt).
+  _peer_dirs = {_enc_dir};
 }
 
 // Decided at the FIRST process(), not at load, because process() runs
@@ -2075,6 +2278,8 @@ void
 DiffusionConditionerStage::unload_encoder_()
 {
   if (!_encoder && !_umt5 && !_h3_enc && !_dinov2) { return; }
+  // Kept warm rather than let go, where it may be (keep_loaded).
+  keep_encoder_warm_();
   // Everything weight-sized: the LM (or the wan family's umT5 tower),
   // either vision tower, and the embedding table. The tokenizer stays
   // (kilobytes, and it is pure CPU state).
@@ -2196,7 +2401,7 @@ single_tap_(const std::string& family, const FlexData* profile)
   return profile != nullptr || family == "qwen-image-edit" ||
          family == "boogu-image" || family == "wan" ||
          family == "minimax-h3" || family == "qwen-image-21" ||
-         family == "z-image";
+         family == "z-image" || family == "moss-image";
 }
 
 SharedBuffer
@@ -2289,7 +2494,7 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
                            "visual.") == "model.visual.");
     if (!_vision3) {
       genai::ModelLoader loader(session());
-      const auto mcfg = loader.load_config(_enc_dir);
+      const auto mcfg = loader.load_config(_enc_cfg_dir);
       if (!mcfg.has_value()) {
         session()->warn(fmt("DiffusionConditionerStage('{}'): Qwen3-VL config "
                             "parse failed; text-only conditioning", this->id()));
@@ -3110,6 +3315,101 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
         "(tap layer {} of {}, un-normed)", this->id(), which, n, EH,
         NL - 2, NL));
     return taps;
+  }
+
+  if (_family == "moss-image") {
+    // MOSS-Image: the encoder's `last_hidden_state` -- the FINAL-NORMED
+    // output of the last layer -- over the WHOLE templated turn
+    //
+    //   <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n
+    //
+    // (apply_chat_template, add_generation_prompt, enable_thinking: the
+    // open <think> is part of what conditions the model). Nothing is
+    // dropped, there is no system prompt, and the negative is the same
+    // turn around an EMPTY prompt.
+    //
+    // THE FINAL NORM IS ZERO-CENTRED: Qwen3_5RMSNorm multiplies by
+    // (1 + w) in f32, then rounds once. `forward_embeddings_taps`
+    // returns the un-normed residual after the last layer, so it is
+    // applied here.
+    const int NL = _encoder->config().n_layers;
+    const std::string tmpl = "<|im_start|>user\n" + text +
+                             "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
+    if (ids.empty()) { return {}; }
+    if ((int)ids.size() > genai::moss_image::kMaxTextTokens) {
+      // The reference TRUNCATES (max_length 4096), so a long prompt is
+      // shortened rather than refused.
+      ids.resize((std::size_t)genai::moss_image::kMaxTextTokens);
+      session()->log_normal(fmt(
+          "DiffusionConditionerStage('{}'): prompt truncated to {} tokens, "
+          "which is this model's limit", this->id(),
+          genai::moss_image::kMaxTextTokens));
+    }
+    const int n = (int)ids.size();
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
+    if (x.empty()) { return {}; }
+    {
+      const auto* tbl = static_cast<const std::uint8_t*>(_embed.contents());
+      auto* xb = static_cast<std::uint8_t*>(x.contents());
+      const std::size_t vocab = _embed.byte_size() / ((std::size_t)EH * 2);
+      for (int i = 0; i < n; ++i) {
+        const std::uint32_t id = (std::uint32_t)ids[(std::size_t)i];
+        if (id >= vocab) { return {}; }
+        std::memcpy(xb + (std::size_t)i * EH * 2,
+                    tbl + (std::size_t)id * EH * 2, (std::size_t)EH * 2);
+      }
+    }
+    genai::ContextManager* cm = _encoder->context_manager();
+    const genai::ContextId cid = cm->acquire_root();
+    SharedBuffer taps;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmDitText,
+                         kPerfLlmDitTextBegin, (std::uint64_t)n);
+      taps = _encoder->forward_embeddings_taps(
+          cid, x, n, std::vector<int>{NL - 1}, /*key_valid_len=*/0, nullptr);
+    }
+    cm->release(cid);
+    if (taps.empty()) { return {}; }
+    std::vector<float> fnorm((std::size_t)EH, 1.0f);
+    if (_enc_ws) {
+      SharedBuffer nw = _enc_ws->tensor("language_model.norm.weight", mc,
+                                        genai::WeightSet::Residency::Copied);
+      if (nw.byte_size() < (std::size_t)EH * 2) {
+        session()->warn(fmt(
+            "DiffusionConditionerStage('{}'): no language_model.norm.weight "
+            "in '{}' -- MOSS-Image conditions on the final-normed state",
+            this->id(), _enc_dir));
+        return {};
+      }
+      const auto* p = static_cast<const std::uint16_t*>(nw.contents());
+      for (int h = 0; h < EH; ++h) {
+        fnorm[(std::size_t)h] = 1.0f + bf16_to_f32_(p[h]);
+      }
+    }
+    const double eps = (double)_encoder->config().rms_eps;
+    SharedBuffer txt = mc->make_shared_buffer((std::size_t)n * EH * 2);
+    if (txt.empty()) { return {}; }
+    const auto* tp = static_cast<const std::uint16_t*>(taps.contents());
+    auto* op = static_cast<std::uint16_t*>(txt.contents());
+    for (int r = 0; r < n; ++r) {
+      const auto* row = tp + (std::size_t)r * EH;
+      double ss = 0.0;
+      for (int h = 0; h < EH; ++h) {
+        const double v = bf16_to_f32_(row[h]);
+        ss += v * v;
+      }
+      const float inv = (float)(1.0 / std::sqrt(ss / (double)EH + eps));
+      for (int h = 0; h < EH; ++h) {
+        op[(std::size_t)r * EH + h] = f32_to_bf16_(
+            bf16_to_f32_(row[h]) * inv * fnorm[(std::size_t)h]);
+      }
+    }
+    n_real_out = n;
+    session()->log_debug(fmt(
+        "DiffusionConditionerStage('{}'): [{}] moss-image -> [{}, {}] bf16 "
+        "(final-normed last hidden)", this->id(), which, n, EH));
+    return txt;
   }
 
   if (_family == "qwen-image-21") {
@@ -4205,9 +4505,13 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // (README: "negative (leave empty) -- only used at CFG > 1"), enabled by
   // `grounded_negative` on an image-aware run. encode_("") still splices the
   // vision tokens, so the empty negative stays image-grounded.
+  // MOSS-Image's CFG is against the EMPTY prompt by default (its
+  // reference encodes '' through the same template), so its negative is
+  // emitted whether or not one was wired.
   const bool emit_neg =
       !_negative_prompt.empty()
-      || (_grounded_negative && n_img > 0 && !vtok.empty());
+      || (_grounded_negative && n_img > 0 && !vtok.empty())
+      || _family == "moss-image";
   if (emit_neg) {
     int n_neg = 0;
     SharedBuffer nc = encode_(_negative_prompt, "negative", n_neg, vtok, n_img);

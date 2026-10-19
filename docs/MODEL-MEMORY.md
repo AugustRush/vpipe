@@ -621,6 +621,7 @@ Coverage, and what each family's plan-time bound is actually worth:
 | FLUX.2, FLUX.3 | `AutoencoderKLFlux2`, `block_out` ×14 | generate-image, vae-decode | exact |
 | Boogu | `AutoencoderKL`, `block_out` ×14 | generate-image, vae-decode | exact |
 | Z-Image | `AutoencoderKL`, `block_out` ×14 | generate-image, vae-decode | exact |
+| MOSS-Image | `AutoencoderKLFlux2`, `decoder_block_out` ×14 (its small decoder) | generate-image, vae-decode | exact |
 | Krea-2 | `AutoencoderKLQwenImage`, `base_dim` ×27 | generate-image, vae-decode | exact |
 | Qwen-Image-Edit | `AutoencoderKLQwenImage`, `base_dim` ×27 | vae-decode | exact |
 | an RGBA `AutoencoderKLQwenImage` (`input_channels` 4, scalar `scaling_factor`) | `base_dim` ×27 | generate-image, vae-decode | as above (4 channels change only `conv_out`) |
@@ -972,6 +973,49 @@ model.
 Take the decision from `plan_streaming()`, never by hand. It also records
 the fact that streaming was chosen, which peers depend on (below).
 
+### Stream, then retain — the default on every box
+
+`plan_streaming()`'s `stream` is a verdict on the BOX: it is tight. The
+mechanism is a separate choice, `stream_blocks_by_default(plan)`, and it
+streams on a box with room too. The first forward reads each block as it
+needs it and block residency (mechanism 6) keeps it — with the wired pool
+on, the schedule's probe is the whole stack, so every block the first pass
+reads is kept. One forward in, the model holds what a preload would,
+having measured the box rather than trusted an estimate, without reading
+the checkpoint before the first step, and without holding it beside a
+text encoder that lets go after the prompt. `VPIPE_PRELOAD=1` preloads
+instead, for an A/B.
+
+Keep the two apart in a stage. What only a TIGHT box wants keys on the
+verdict: deferring the load past the conditioning, revising the
+declaration down to the trunk, releasing the forward's scratch after a
+generation, and the streaming signal peers read. On a box with room the
+declaration stays at the preload, which is what the model converges to;
+the per-generation correction books it as it grows.
+
+**A streamed block must BE the preloaded one** — the same weight layout,
+so the same kernels and the same bytes out. Where the preload transforms
+a weight at load (an int8 layout quantized from a dense weight, a w4
+pack's layout held), the slot keeps the raw source as its refill target
+and converts after every refill, and a promotion keeps what the preload
+keeps — the source dropped, a held layout converted. Ask admission and
+the wired pool for that KEPT size, not the slot's. And run that keep step
+after EVERY promotion, not only inside the slot's clone: without slots
+(or when a slot cannot be allocated) `promote_into` MOVES the per-block
+read into the resident set, source and all, and nothing a clone does
+happens. Once the whole stack is resident the slot pair has
+nothing left to serve and is given back
+(`BlockSlots::release_if_saturated`, at the top of a forward or between
+generations; an eviction later rebuilds it).
+
+MEASURED on an M5 Ultra (256 GB), Qwen-Image-2.1 bf16 at 1024^2: a
+steady forward 562.1 ms streamed-then-kept against 561.5 preloaded,
+bit-identical, both holding 13571 MB; load + first forward 0.09 + 1.97 s
+against 4.5-5.0 + 0.57 s; a 20-step generation 18.85 s wall against
+18.0-19.6, at a peak RSS of 16.3 GB against 28.3. On the token int8
+tier, the bf16 checkpoint and a w4 pack holding its layout are
+pixel-identical both ways (13.4 s against 14.2; 12.5-12.6 against 12.8).
+
 `dit_retires` is what the model will **release** after load and before the
 denoise — weights it reads once and then drops, so they are never part of
 the set that has to coexist. An AdaLN bake is the case it exists for: it
@@ -1145,6 +1189,7 @@ ops.bytes       = ...;
 ops.empty       = ...;
 ops.post_refill = ...;      // OPTIONAL, see "derived tensors" below
 ops.fill_unservable = ...;  // OPTIONAL, for an f32 source
+ops.same_layout = ...;      // OPTIONAL, see "blocks of more than one layout"
 slots.set_weight_set(ws.get());
 slots.configure(mc, std::move(ops), "MyModel", "VPIPE_MYMODEL_NO_SLOTS");
 ```
@@ -1272,6 +1317,45 @@ values for the whole run, which is the quietest possible way to be
 wrong. And resist the alternative of moving the fuse to promotion
 instead: that changes which kernel a *streamed* block runs through,
 which is a numerics change wearing a performance change's clothes.
+
+### Blocks of more than one layout
+
+A slot's layout -- its buffer sizes, each weight's format and width, the
+products `post_refill` derives -- is decided by the block that BUILT it,
+and a refill places bytes, not that description. A checkpoint whose
+blocks are not all laid out alike breaks the assumption: a MIXED pack
+(`model-quantize` `mixed`: whole blocks at w8, the rest at w4), or an
+FP8 file with a dense block. Refilled across widths, a block's codes
+land at the right size (a size mismatch rebuilds the buffer) and are
+then read at the SLOT's width, through the slot's derived products --
+or a derived product of the wrong size makes the refill fail, and the
+slots turn themselves off for the run. The first is a wrong answer and
+the second a lost speed-up; neither announces itself, and no
+single-width checkpoint can show either.
+
+`ops.same_layout(index, slot)` is the answer: say whether block `index`
+is stored as `slot` was built, and when it is not, the slot is BUILT for
+the block -- exactly as its first fill was -- instead of refilled.
+`stored_affine_bits(ws, stem, group)` reads a quantized weight's stored
+width off its shapes, so the usual check is one comparison per weight:
+
+```cpp
+ops.same_layout = [this](int i, const Block& slot) {
+  for (const auto& [w, stem] : weights_of(slot, i)) {
+    if (stored_affine_bits(*ws, stem, group) !=
+        (w->quantized ? w->bits : 0)) {
+      return false;
+    }
+  }
+  return true;
+};
+```
+
+Compare every weight a block holds that can differ, its modulation
+included. Test it with a hold test on a mixed pack whose widths change
+WITHIN a slot pair -- a ranking can keep a whole stack at one width --
+and assert `slots.relaid() > 0` in the streamed arm: holds that agree
+prove nothing if the slots turned themselves off.
 
 > **State the placement per tensor, and get it right.** `Placement`
 > says whether a destination takes the checkpoint's own words
@@ -2189,6 +2273,9 @@ If it streams blocks:
 - [ ] Each one states its `Placement` (`kRaw` / `kBf16` / `kDerived`)
       rather than taking a default; there is none, because the wrong
       answer is silent.
+- [ ] A checkpoint whose blocks differ in layout -- a mixed pack, an FP8
+      file with a dense block -- is answered by `ops.same_layout`, and a
+      hold test on a mixed pack asserts the slots rebuilt (`relaid()`).
 - [ ] The refill fallback is decided **per tensor**, not latched for the
       block.
 - [ ] Admission and the wired pool are asked for what promotion **keeps**,

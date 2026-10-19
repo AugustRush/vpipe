@@ -1517,6 +1517,83 @@ builtin_catalog_()
                "vae/config.json",
                "vae/diffusion_pytorch_model.safetensors"},
      .needs_tokenizer_json = false},
+    // ---- MOSS-Image (text -> image, OpenMOSS) ----------------------------
+    // A 5B single-stream flow-matching DiT. Sub-models:
+    //   transformer/  = MOSSImageTransformer (bf16, 9.5 GB): two
+    //     unmodulated text blocks refine the prompt, then 42 blocks over
+    //     [image | text] share ONE modulation; SITU feed-forward, a
+    //     four-axis half-split rotary.
+    //   text_encoder/ = Qwen3.5-9B (`Qwen3_5Model`, the hybrid: GDN +
+    //     gated attention), its final-normed last hidden state over a
+    //     templated user turn ending in an open <think>. The vision
+    //     tower ships beside it and is not read.
+    //   vae/          = FLUX.2's AutoencoderKLFlux2 with its SMALL
+    //     decoder (decoder widths [96, 192, 384, 384]).
+    // Sampling (the reference's): 50 steps, CFG 3 against the EMPTY
+    // prompt with block 22 skipped in the negative branch, shift 5 on a
+    // grid snapped to the training grid. Two checkpoints, one
+    // model_type: Base and SFT share every config and differ in weights.
+    // Apache-2.0, not gated. SKIPPED: the bundled pipeline code and assets.
+    {.family = "MOSS-Image", .version = "1", .param_class = "5B",
+     .variant = "Base (OpenMOSS)",
+     .hf_path = "OpenMOSS-Team/MOSS-Image-Base",
+     .model_type = "moss-image",
+     .inputs = {"text"},
+     .outputs = {"image"},
+     .files = {"model_index.json",
+               "LICENSE",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00003"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00003"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00003"
+               ".safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00004.safetensors",
+               "text_encoder/model-00002-of-00004.safetensors",
+               "text_encoder/model-00003-of-00004.safetensors",
+               "text_encoder/model-00004-of-00004.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/chat_template.jinja",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
+    // MOSS-Image-SFT: the same network fine-tuned for clearer text
+    // grouping and layout; everything but the weights is Base's.
+    {.family = "MOSS-Image", .version = "1", .param_class = "5B",
+     .variant = "SFT (OpenMOSS)",
+     .hf_path = "OpenMOSS-Team/MOSS-Image-SFT",
+     .model_type = "moss-image",
+     .inputs = {"text"},
+     .outputs = {"image"},
+     .files = {"model_index.json",
+               "LICENSE",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00003"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00003"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00003"
+               ".safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00004.safetensors",
+               "text_encoder/model-00002-of-00004.safetensors",
+               "text_encoder/model-00003-of-00004.safetensors",
+               "text_encoder/model-00004-of-00004.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/chat_template.jinja",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
     // A model whose CODE is out of tree has its catalogue rows out of
     // tree too -- its plugin registers them with register_catalog_entries
     // -- or the browser offers a checkpoint nothing in the process can
@@ -2582,6 +2659,9 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
   } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit"
              || mt == "flux3") {
     set({"text", "image"}, {"image"});
+  } else if (mt == "moss-image") {
+    // Text to image only: no reference path in this family.
+    set({"text"}, {"image"});
   } else if (mt == "qwen-image") {
     // The text-to-image half of the Qwen-Image family: no reference
     // image, which is the whole difference between it and the edit

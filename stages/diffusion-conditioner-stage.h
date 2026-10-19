@@ -149,12 +149,20 @@ public:
   // How many prompts the family's content screen refused. Counted in the
   // emitted total too: a refusal IS a conditioning beat (a blocked one).
   std::uint64_t blocked_by_policy() const noexcept { return _blocked; }
+  // Whether the text encoder was one kept warm, taken back (`keep_loaded`)
+  // -- a test's proof the take ran rather than a load.
+  bool encoder_taken_warm() const noexcept { return _enc_taken_warm; }
 
 private:
   std::string _hf_dir;
+  // The text encoder's WEIGHTS -- what is opened, sized, parked and
+  // claimed -- and the directory its config.json and tokenizer come
+  // from. The same directory unless `encoder_dir` names the weights
+  // elsewhere (a Draw Things .ckpt), when the config stays the release's.
   std::string _enc_dir;
-  // VOSR only: the DINOv2 checkpoint, which is not under _hf_dir. Empty
-  // until initialize() resolves it.
+  std::string _enc_cfg_dir;
+  // `encoder_dir`: VOSR's DINOv2 checkpoint (not under _hf_dir), or any
+  // other family's encoder weights. Empty until initialize() resolves it.
   std::string _venc_dir;
   // How a reference image pairs with the prompts: the `reference_mode`
   // config key, as the mode of each reference input. "auto" is the rule
@@ -360,6 +368,13 @@ private:
   void release_encoder_when_idle_();
   void park_encoder_();
   void unload_encoder_();
+  // The encoder handed to the model manager to be kept warm
+  // (`keep_loaded`), where the box does not want it destroyed.
+  void keep_encoder_warm_();
+  double      _keep_loaded = 0.0;
+  // What it was built with, its warm hold's key; empty before.
+  std::string _enc_warm_key;
+  bool        _enc_taken_warm = false;   // see encoder_taken_warm()
   bool reload_encoder_();
 
   // Encoder / DiT directories for this stage's model. Shared by both

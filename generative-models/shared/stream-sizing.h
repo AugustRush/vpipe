@@ -109,6 +109,21 @@ inline std::size_t stream_physical_ram()
 // as free memory allows and is shed when it does not. That is exactly
 // what a "will this graph fit" question wants, and it is why the number
 // belongs in the plan while the growth does not.
+// A name that is a second VIEW of bytes another name already counts: a
+// Draw Things i8x weight is presented as its dense `.weight` AND as the
+// `.i8x` codes and `.i8x_scales` it is decoded from (shared/
+// drawthings-store.h). The dense view is the one counted -- the larger,
+// which is the safe side.
+inline bool
+stream_sizing_alias(const std::string& nm)
+{
+  auto ends = [&](std::string_view s) {
+    return nm.size() > s.size() &&
+           nm.compare(nm.size() - s.size(), s.size(), s) == 0;
+  };
+  return ends(".i8x") || ends(".i8x_scales");
+}
+
 inline std::size_t
 stream_floor_bytes(const MetalLlamaWeights& wts, std::string_view stem,
                    std::string_view exclude = {})
@@ -116,6 +131,7 @@ stream_floor_bytes(const MetalLlamaWeights& wts, std::string_view stem,
   std::size_t trunk = 0;
   std::vector<std::size_t> layers;
   for (const std::string& nm : wts.tensor_names()) {
+    if (stream_sizing_alias(nm)) { continue; }
     const auto* ti = wts.info(nm);
     const std::size_t nb = ti != nullptr ? (std::size_t)ti->nbytes : 0;
     if (nm.rfind(std::string(stem), 0) != 0) { trunk += nb; continue; }
@@ -165,6 +181,7 @@ stream_floor_bytes(const MetalLlamaWeights& wts,
   std::size_t trunk = 0;
   std::vector<std::vector<std::size_t>> stacks(stems.size());
   for (const std::string& nm : wts.tensor_names()) {
+    if (stream_sizing_alias(nm)) { continue; }
     const auto* ti = wts.info(nm);
     const std::size_t nb = ti != nullptr ? (std::size_t)ti->nbytes : 0;
     std::size_t si = stems.size();
@@ -223,6 +240,9 @@ inline int stream_pin_count(const MetalLlamaWeights& wts,
   std::size_t trunk = 0;
   const std::vector<std::string> names = wts.tensor_names();
   for (const std::string& n : names) {
+    // A second view of a weight already counted (stream_sizing_alias):
+    // counted, a Draw Things i8x layer read ~1.5x and fewer layers pinned.
+    if (stream_sizing_alias(n)) { continue; }
     const auto* ti = wts.info(n);
     const std::size_t nb = ti != nullptr ? (std::size_t)ti->nbytes : 0;
     bool in_block = false;

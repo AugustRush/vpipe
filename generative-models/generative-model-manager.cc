@@ -348,15 +348,18 @@ GenerativeModelManager::~GenerativeModelManager()
   // The warm models first: they hold weight sets of their own. The
   // conversations parked on them are saved before they go.
   std::vector<Warm> warm;
+  std::vector<WarmModel> warm_models;
   {
     lock_guard<mutex> lk(_warm_mu);
     _warm_stop = true;
     warm.swap(_warm);
+    warm_models.swap(_warm_models);
   }
   _warm_cv.notify_all();
   if (_warm_reaper.joinable()) { _warm_reaper.join(); }
   for (auto& w : warm) { spill_parked(w, session()); }
   warm.clear();
+  warm_models.clear();
   // See the declaration: the sets must be released while the registry
   // they deregister from is still alive.
   std::unordered_map<string, shared_ptr<WeightSet>> sets;
@@ -912,6 +915,23 @@ GenerativeModelManager::declare_weights(const string& dir,
   // reverse.
   auto [it, fresh] = _phase.try_emplace(key, phase);
   if (!fresh && phase.empty()) { it->second.clear(); }
+  // What a stage ASSERTED, remembered past the clear above: one store
+  // holding two components (both MiniMax-H3 VAEs in one Draw Things
+  // .ckpt) is claimed by vae-decode for `decode` and, unphased, by
+  // audio-vae-decode -- whose later refinement to `decode-audio` then
+  // replaced the decode claim, and the video VAE was absent from the
+  // phase that runs it.
+  if (!phase.empty()) {
+    const int a = phase_index_(phase);
+    const int b = last_phase.empty() ? a : phase_index_(last_phase);
+    if (a >= 0 && b >= 0) {
+      auto [as, nu] = _phase_asserted.try_emplace(key, a, b);
+      if (!nu) {
+        as->second.first = std::min(as->second.first, a);
+        as->second.second = std::max(as->second.second, b);
+      }
+    }
+  }
   // The interval's END takes the LATER of two claims, mirroring how the
   // wider lifetime wins above: a component two stages describe is alive
   // until the last of them is finished with it.
@@ -938,7 +958,25 @@ GenerativeModelManager::set_declaration_phase(const string& dir,
   // call, so it must not be read as a disagreement -- doing so silently
   // discarded every refinement, and the arithmetic still looked
   // plausible because it fell back to the safe, conservative total.
-  if (it->second.empty()) { it->second = phase; return; }
+  if (it->second.empty()) {
+    // ...unless another stage asserted a phase for these same bytes at
+    // declare time: then the refinement WIDENS to cover both, earliest
+    // start to latest end, rather than replacing what that stage said.
+    const auto as = _phase_asserted.find(key);
+    const int p = phase_index_(phase);
+    if (as != _phase_asserted.end() && p >= 0 &&
+        (as->second.first != p || as->second.second != p)) {
+      const int lo = std::min(as->second.first, p);
+      const int hi = std::max(as->second.second, p);
+      it->second = _phase_order[(std::size_t)lo];
+      if (hi != lo) {
+        _phase_last[key] = _phase_order[(std::size_t)hi];
+      }
+      return;
+    }
+    it->second = phase;
+    return;
+  }
   // A different phase already decided: two stages disagree about when
   // this checkpoint is held, so it is held throughout. Persistent is
   // the only reading consistent with both, and it is the safe one.
@@ -1019,6 +1057,7 @@ GenerativeModelManager::clear_declarations()
   // is stated per launch from the owning stage's policy, and a graph
   // without that stage must not inherit its claim.
   _phase.clear();
+  _phase_asserted.clear();
   _released.clear();
   // Cleared with the declarations, and for the same reason: it is a fact
   // about THIS run's sizing. A relaunch at a different resolution, or
@@ -1432,11 +1471,20 @@ GenerativeModelManager::phase_footprint_(const string& phase,
                                          bool use_floor) const
 {
   const auto per_dir = per_dir_bytes_(use_floor);
-  std::unordered_map<string, string> phase_of;
+  std::unordered_map<string, string> phase_of, last_of;
+  std::vector<string> order;
   {
     lock_guard<mutex> lk(_ws_mu);
     phase_of = _phase;
+    last_of  = _phase_last;
+    order    = _phase_order;
   }
+  auto index_of = [&](const string& p) {
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      if (order[i] == p) { return (int)i; }
+    }
+    return -1;
+  };
 
   std::size_t persistent = 0;                 // held for the whole run
   std::unordered_map<string, std::size_t> by_phase;
@@ -1450,7 +1498,18 @@ GenerativeModelManager::phase_footprint_(const string& phase,
       persistent += b;
       continue;
     }
-    by_phase[it->second] += b;
+    // Over its WHOLE interval, first phase to last, as phase_peak reads
+    // it: counted in its first phase alone, a component alive across
+    // two (one store holding both a decode-audio and a decode VAE) was
+    // missing from the second.
+    const auto lt = last_of.find(dir);
+    const int a = index_of(it->second);
+    const int z = lt != last_of.end() ? index_of(lt->second) : a;
+    if (a < 0 || z <= a) {
+      by_phase[it->second] += b;
+      continue;
+    }
+    for (int i = a; i <= z; ++i) { by_phase[order[(std::size_t)i]] += b; }
   }
 
   if (!phase.empty()) {
@@ -1812,6 +1871,68 @@ GenerativeModelManager::GenerativeModelManager(const SessionContextIntf* s)
   // forward pass, free) is routed through Session::mlx_runtime() so
   // it runs on the dedicated MLX thread, where the (Stream, encoder)
   // TLS map is primed once and stays warm.
+  //
+  // The warm holds' reaper, started by the first keep_warm or
+  // keep_model_warm: each language model and each other model dropped
+  // at its time. A lambda held in a member, not a method (see `_warm`).
+  _warm_reap = [this] {
+    std::unique_lock<mutex> rl(_warm_mu);
+    while (!_warm_stop) {
+      const auto now = std::chrono::steady_clock::now();
+      std::vector<Warm> expired;
+      std::vector<WarmModel> expired_models;
+      auto soonest = std::chrono::steady_clock::time_point::max();
+      for (auto w = _warm.begin(); w != _warm.end();) {
+        if (w->until <= now) {
+          expired.push_back(std::move(*w));
+          w = _warm.erase(w);
+        } else {
+          soonest = std::min(soonest, w->until);
+          ++w;
+        }
+      }
+      for (auto w = _warm_models.begin(); w != _warm_models.end();) {
+        if (w->until <= now) {
+          expired_models.push_back(std::move(*w));
+          w = _warm_models.erase(w);
+        } else {
+          soonest = std::min(soonest, w->until);
+          ++w;
+        }
+      }
+      if (!expired.empty() || !expired_models.empty()) {
+        // Freed with the lock dropped: a 16 GB model's buffers take a
+        // moment, and a keep_warm must not wait on them.
+        rl.unlock();
+        for (auto& w : expired) {
+          spill_parked(w, session());
+          if (session()) {
+            session()->info(fmt(
+                "GenerativeModelManager: '{}' was kept warm and is now "
+                "idle -- unloaded", w.dir));
+          }
+        }
+        for (const auto& w : expired_models) {
+          if (session()) {
+            session()->info(fmt(
+                "GenerativeModelManager: the {} of '{}' was kept warm and "
+                "is now idle -- unloaded ({} MB)", w.kind, w.dir,
+                w.bytes >> 20));
+          }
+        }
+        expired.clear();
+        expired_models.clear();
+        rl.lock();
+        release_external_wired(gone_wired_bytes(_wired_lms));
+        continue;
+      }
+      if (soonest == std::chrono::steady_clock::time_point::max()) {
+        _warm_cv.wait(rl);
+      } else {
+        _warm_cv.wait_until(rl, soonest);
+      }
+    }
+  };
 }
 
 shared_ptr<LoadedLanguageModel>
@@ -2038,45 +2159,7 @@ GenerativeModelManager::keep_warm(const shared_ptr<LoadedLanguageModel>& lm,
         _warm.push_back(Warm{lm, key, until, {}});
       }
       if (!_warm_reaper.joinable()) {
-        _warm_reaper = std::thread([this] {
-          std::unique_lock<mutex> rl(_warm_mu);
-          while (!_warm_stop) {
-            const auto now = std::chrono::steady_clock::now();
-            std::vector<Warm> expired;
-            auto soonest = std::chrono::steady_clock::time_point::max();
-            for (auto w = _warm.begin(); w != _warm.end();) {
-              if (w->until <= now) {
-                expired.push_back(std::move(*w));
-                w = _warm.erase(w);
-              } else {
-                soonest = std::min(soonest, w->until);
-                ++w;
-              }
-            }
-            if (!expired.empty()) {
-              // Freed with the lock dropped: a 16 GB model's buffers take
-              // a moment, and a keep_warm must not wait on them.
-              rl.unlock();
-              for (auto& w : expired) {
-                spill_parked(w, session());
-                if (session()) {
-                  session()->info(fmt(
-                      "GenerativeModelManager: '{}' was kept warm and is "
-                      "now idle -- unloaded", w.dir));
-                }
-              }
-              expired.clear();
-              rl.lock();
-              release_external_wired(gone_wired_bytes(_wired_lms));
-              continue;
-            }
-            if (soonest == std::chrono::steady_clock::time_point::max()) {
-              _warm_cv.wait(rl);
-            } else {
-              _warm_cv.wait_until(rl, soonest);
-            }
-          }
-        });
+        _warm_reaper = std::thread(_warm_reap);
       }
     }
   }
@@ -2096,12 +2179,21 @@ GenerativeModelManager::release_warm_unclaimed()
   }
   if (declared.empty()) { return 0; }
   std::vector<Warm> gone;
+  std::vector<WarmModel> gone_models;
   {
     lock_guard<mutex> lk(_warm_mu);
     for (auto it = _warm.begin(); it != _warm.end();) {
       if (declared.count(it->dir) == 0) {
         gone.push_back(std::move(*it));
         it = _warm.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = _warm_models.begin(); it != _warm_models.end();) {
+      if (declared.count(it->dir) == 0) {
+        gone_models.push_back(std::move(*it));
+        it = _warm_models.erase(it);
       } else {
         ++it;
       }
@@ -2115,8 +2207,17 @@ GenerativeModelManager::release_warm_unclaimed()
           "not use it -- unloaded to make room", w.dir));
     }
   }
-  const std::size_t n = gone.size();
+  for (const auto& w : gone_models) {
+    if (session()) {
+      session()->info(fmt(
+          "GenerativeModelManager: the {} of '{}' was kept warm; this "
+          "launch does not use it -- unloaded to make room ({} MB)",
+          w.kind, w.dir, w.bytes >> 20));
+    }
+  }
+  const std::size_t n = gone.size() + gone_models.size();
   gone.clear();   // the models go now -- and what they had wired with them
+  gone_models.clear();
   {
     lock_guard<mutex> lk(_warm_mu);
     release_external_wired(gone_wired_bytes(_wired_lms));
@@ -2137,7 +2238,97 @@ GenerativeModelManager::warm_dirs() const
   std::vector<string> dirs;
   lock_guard<mutex> lk(_warm_mu);
   for (const auto& w : _warm) { dirs.push_back(w.dir); }
+  for (const auto& w : _warm_models) {
+    if (std::find(dirs.begin(), dirs.end(), w.dir) == dirs.end()) {
+      dirs.push_back(w.dir);
+    }
+  }
   return dirs;
+}
+
+void
+GenerativeModelManager::keep_model_warm(const string& kind, const string& dir,
+                                        const string& key,
+                                        shared_ptr<void> model,
+                                        std::size_t bytes, double seconds)
+{
+  if (!model || kind.empty()) { return; }
+  const string cdir = canonicalize_(session(), dir);
+  // Freed outside the lock: the one replaced, or this one let go now.
+  std::vector<WarmModel> dropped;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    // A build of the same model under other settings goes: the next
+    // stage would build its own anyway.
+    for (auto it = _warm_models.begin(); it != _warm_models.end();) {
+      if (it->kind == kind && it->dir == cdir) {
+        dropped.push_back(std::move(*it));
+        it = _warm_models.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (seconds <= 0 || _warm_stop) {
+      dropped.push_back(WarmModel{kind, cdir, key, std::move(model), bytes,
+                                  {}});
+    } else {
+      const auto until = std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(seconds));
+      _warm_models.push_back(WarmModel{kind, cdir, key, std::move(model),
+                                       bytes, until});
+      if (!_warm_reaper.joinable()) {
+        _warm_reaper = std::thread(_warm_reap);
+      }
+    }
+  }
+  _warm_cv.notify_all();
+  dropped.clear();
+}
+
+shared_ptr<void>
+GenerativeModelManager::take_warm_model(const string& kind, const string& dir,
+                                        const string& key)
+{
+  const string cdir = canonicalize_(session(), dir);
+  shared_ptr<void> got;
+  std::vector<WarmModel> stale;   // freed outside the lock
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (auto it = _warm_models.begin(); it != _warm_models.end();) {
+      if (it->kind != kind || it->dir != cdir) {
+        ++it;
+        continue;
+      }
+      if (!got && it->key == key) {
+        got = std::move(it->model);
+      } else {
+        stale.push_back(std::move(*it));
+      }
+      it = _warm_models.erase(it);
+    }
+  }
+  for (const auto& w : stale) {
+    if (session()) {
+      session()->log_debug(fmt(
+          "GenerativeModelManager: the {} of '{}' kept warm was built "
+          "otherwise -- unloaded ({} MB)", w.kind, w.dir, w.bytes >> 20));
+    }
+  }
+  stale.clear();
+  return got;
+}
+
+size_t
+GenerativeModelManager::warm_model_bytes(const string& dir) const
+{
+  const string cdir = canonicalize_(session(), dir);
+  size_t n = 0;
+  lock_guard<mutex> lk(_warm_mu);
+  for (const auto& w : _warm_models) {
+    if (w.dir == cdir) { n += w.bytes; }
+  }
+  return n;
 }
 
 size_t

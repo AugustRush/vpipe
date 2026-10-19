@@ -101,6 +101,11 @@ public:
                  FlexData                  config);
   ~VaeEncodeStage() override;
 
+  // The settled acceleration bag (i8_gemm, i8_gemm_tier, ...): what a
+  // registered family is handed and the Qwen-Image codec is set from. A
+  // test seam, as GenerateImageStage's.
+  const FlexData& accel_settings() const noexcept { return _accel; }
+
   Job initialize(RuntimeContext& ctx) override;
 
   // The VAE this stage loads. Small next to the DiT and the encoder,
@@ -134,6 +139,11 @@ private:
   encode_one_(const TensorBeat& in, const std::string& what);
 
   std::string _hf_dir;
+  // `vae_dir`: the VAE's WEIGHTS when they are not the model's own (a
+  // Draw Things .ckpt); the config is still the model's. Empty: none.
+  std::string _vae_weights;
+  // `_vae_weights` resolved (a registry key or a path); empty when unset.
+  std::string vae_weights_() const;
   // Optional letterbox resize target (both > 0 => enabled). Multiples of 8.
   int _target_w = 0;
   int _target_h = 0;

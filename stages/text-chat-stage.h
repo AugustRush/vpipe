@@ -104,14 +104,20 @@ namespace vpipe {
 //   decode_ms   (int)    -- decode wall time in milliseconds
 //   decoded     (int)    -- tokens decoded in it (a drafter's accepted
 //                           ones included): decode_ms's tokens a second
+//   prefilled   (int)    -- tokens prefilled this turn: prefill_ms's
 //   ctx_pos     (int)    -- K/V context length after this turn
+// where a drafter decoded (MTP, DFlash):
+//   drafter     (string) -- which
+//   rounds      (int)    -- its verify forwards: decoded / rounds the
+//                           tokens a forward bought
+//   drafted     (int)    -- draft tokens offered to the verifier
+//   accepted    (int)    -- of those, kept
 // and, for a conversation beat:
 //   content     (string) -- the reply less its tool-call blocks
 //   tool_calls  (array)  -- {name, arguments (JSON text)}, in order
 //   finish      (string) -- tool_calls | stop | length | interrupted |
 //                           stopped | error
 //   reused      (int)    -- tokens of the kept context reused
-//   prefilled   (int)    -- tokens prefilled this turn
 //   restored    (string) -- where the context came from: memory (kept
 //                           with the model), disk (read back), stage (the
 //                           stage's own), new
@@ -263,6 +269,11 @@ public:
 private:
   // keep_loaded: the model kept warm from now (end of a reply).
   void renew_warm_();
+  // The speculative verify's pooled scratch (declare_resources): its
+  // arena's name for the model in `dir`, and what it grows to when a
+  // drafter will run (0 when none will).
+  static std::string spec_scratch_label_(const std::string& dir);
+  std::size_t spec_scratch_bytes_(const std::string& dir) const;
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*. Declarations carry no non-zero default.
   std::string _hf_dir;

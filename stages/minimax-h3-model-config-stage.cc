@@ -375,7 +375,7 @@ MiniMaxH3ModelConfigStage::report_config(const FlexData& fd) const
   }
   session()->info(fmt(
       "MiniMaxH3ModelConfigStage('{}'): shifts {:.1f}/{:.1f}, condition "
-      "t {:.3f}/{:.3f}, audio {}{}{}{}", this->id(), _video_shift,
+      "t {:.3f}/{:.3f}, audio {}{}{}", this->id(), _video_shift,
       _audio_shift,
       _cond_timestep, _cond_audio_timestep,
       _audio_seconds > 0.0 ? fmt("{:.3f} s", _audio_seconds)()

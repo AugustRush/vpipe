@@ -18,6 +18,7 @@
 // Env: VPIPE_QWEN_IMAGE21_TEST_MODEL_PATH (uses <root>/transformer).
 
 #include "minitest.h"
+#include "residency-reserve.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
@@ -26,6 +27,7 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
 #include "generative-models/qwen-image/qwen-image21-layout.h"
+#include "generative-models/shared/block-slots.h"
 #include "generative-models/train/lora-params.h"
 #include "generative-models/weight-set.h"
 #include "stages/model-quantize-stage.h"
@@ -45,6 +47,7 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <atomic>
 
 using namespace vpipe;
 using namespace vpipe::genai;
@@ -771,6 +774,206 @@ TEST(qwen_image_21_dit, cache_refuses_a_different_geometry)
 
 // ---- streaming equivalence ----------------------------------------
 
+// A MIXED PACK (VPIPE_QWEN_IMAGE21_MIXED_DIT = the transformer/ of a
+// model-quantize bits 4 + mixed run): whole blocks at w8, the rest at w4,
+// so a slot built for one width is asked to hold the other
+// (BlockSlots::Ops::same_layout). The pack must really mix widths, and
+// its four holds -- preloaded, streamed, no slots, promoted -- must be
+// BYTE-IDENTICAL with i8 off, and on a matrix-core box under the signed
+// layout and (when block 0, which gates the fast tier, is w8) the fast
+// and token tiers. Before the slots rebuilt such a block, preloaded and
+// no-slots agreed and the two slot holds did not.
+TEST(qwen_image_21_dit, a_mixed_pack_holds_agree)
+{
+  const char* qd = std::getenv("VPIPE_QWEN_IMAGE21_MIXED_DIT");
+  if (qd == nullptr || *qd == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalQwenImage21Transformer::Config cfg;
+  Q21D_REQUIRE(MetalQwenImage21Transformer::Config::read_dims(qd, &cfg));
+  int n8 = 0, n4 = 0;
+  {
+    auto ws = genai::WeightSet::open(qd, nullptr);
+    Q21D_REQUIRE(ws != nullptr);
+    for (int L = 0; L < cfg.n_layers; ++L) {
+      const int b = genai::stored_affine_bits(
+          *ws, "transformer_blocks." + std::to_string(L) + ".attn.to_q", 64);
+      n8 += b == 8;
+      n4 += b == 4;
+    }
+  }
+  std::printf("[qwen_image_21_dit] mixed pack: %d blocks w8, %d w4\n", n8,
+              n4);
+  Q21D_REQUIRE(n8 > 0 && n4 > 0);
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int gh = 32, gw = 40, TS = 64;
+  std::vector<std::uint8_t> slot((std::size_t)TS, 0);
+  slot.resize((std::size_t)TS + (std::size_t)(gh * gw / 4), 1);
+  const std::vector<qi21::ImgBlock> blocks = {{1, gh, gw}};
+  qi21::Layout lay;
+  std::string lerr;
+  Q21D_REQUIRE(qi21::build_layout(slot, {}, blocks, &lay, &lerr));
+  auto rnd = [&](std::size_t n, unsigned seed) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    if (b.empty()) { return b; }
+    auto* d = static_cast<std::uint16_t*>(b.contents());
+    unsigned st = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+      st = st * 1664525u + 1013904223u;
+      const float v = ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.5f;
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      d[i] = (std::uint16_t)(u >> 16);
+    }
+    return b;
+  };
+  bool engaged = true;
+  bool fast_on = false;
+  int f8 = 0, f4 = 0;
+  std::uint64_t held = 0, grown_bytes = 0;
+  int promoted = 0, relaid = 0;
+  int stack = 0;
+  auto run = [&](int tier, bool stream, bool slots, bool grow,
+                 bool hold = false) {
+    std::vector<std::uint16_t> v;
+    std::unique_ptr<Env> ns;
+    if (!slots) {
+      ns = std::make_unique<Env>("VPIPE_QWEN_IMAGE21_NO_SLOTS", "1");
+    }
+    MetalQwenImage21Transformer::Config c = cfg;
+    c.i8_gemm = tier >= 0;
+    c.i8_tier = tier < 0 ? 0 : tier;
+    c.i8_hold_w4 = hold;
+    auto m = MetalQwenImage21Transformer::load(qd, mc, c, stream);
+    if (m == nullptr) { return v; }
+    if (tier == 0 && !m->signed_layout()) { engaged = false; }
+    if (!stream) { held = m->resident_bytes(); }
+    if (tier > 0) {
+      fast_on = m->fast_tier();
+      if (!stream) {
+        f8 = m->fast_weights(8);
+        f4 = m->fast_weights(4);
+      }
+    }
+    m->set_residency_reserve(grow ? test_residency_reserve(8ull << 30) : 0);
+    if (grow) { m->set_residency_schedule(4); }
+    metal_compute::SharedBuffer lat =
+        rnd((std::size_t)lay.image_len * cfg.in_channels, 11u);
+    metal_compute::SharedBuffer txt =
+        rnd((std::size_t)slot.size() * cfg.txt_dim, 22u);
+    if (lat.empty() || txt.empty()) { return v; }
+    MetalQwenImage21Transformer::Request req;
+    req.latents = &lat;
+    req.txt = &txt;
+    req.layout = &lay;
+    req.timestep = 0.75f;
+    std::string ferr;
+    metal_compute::SharedBuffer out;
+    for (int it = 0; it < (grow ? 2 : 1); ++it) {
+      out = m->forward(req, &ferr);
+    }
+    if (grow) {
+      promoted = m->resident_block_count();
+      stack = m->config().n_layers;
+      grown_bytes = m->resident_bytes();
+    }
+    if (stream && slots && !grow) { relaid = m->slot_relayouts(); }
+    const std::size_t n = (std::size_t)lay.target_len * cfg.out_channels;
+    if (out.empty() || out.byte_size() < n * 2) { return v; }
+    const auto* d = static_cast<const std::uint16_t*>(out.contents());
+    v.assign(d, d + n);
+    return v;
+  };
+  std::vector<int> tiers = {-1};
+  if (mc->supports_matrix_cores()) { tiers.insert(tiers.end(), {0, 1, 2}); }
+  const char* tname[3] = {"accurate (signed)", "fast", "token"};
+  for (int tier : tiers) {
+    engaged = true;
+    const auto pre = run(tier, false, true, false);
+    Q21D_REQUIRE(!pre.empty());
+    // What the model holds preloaded, against what the plan books for it
+    // (image_memory_plan.the_int8_tiers_book_a_w4_pack_s_scratch).
+    std::printf("[qwen_image_21_dit] mixed pack, %s: preloaded, it holds "
+                "%llu MB\n", tier < 0 ? "no i8" : tname[tier],
+                (unsigned long long)(held >> 20));
+    if (tier > 0) {
+      // BOTH WIDTHS take the tier: a w8 block's codes converted once,
+      // a w4 one's into the scratch before each GEMM. Uniform w8 packs:
+      // fast_tier_matches_accurate.
+      std::printf("[qwen_image_21_dit] mixed pack, %s: %d w8 and %d w4 "
+                  "projections in its layout\n", tname[tier], f8, f4);
+      EXPECT_TRUE(fast_on && f8 > 0 && f4 > 0);
+      if (!fast_on) { continue; }
+    }
+    const auto str = run(tier, true, true, false);
+    const auto flat = run(tier, true, false, false);
+    const auto grown = run(tier, true, true, true);
+    const std::uint64_t grown_pc = grown_bytes;
+    // A HELD layout reached by PROMOTION: residency converts each w4
+    // block it keeps (clone_block_), which then holds more than the
+    // pack -- and must equal the held preload.
+    const auto grown_held =
+        tier > 0 ? run(tier, true, true, true, true) : grown;
+    const std::uint64_t grown_h = grown_bytes;
+    const int grown_n = promoted;
+    // ...and with NO SLOTS, where promote_into MOVES each per-block read
+    // into the resident set: the keep pass (keep_block_) must leave it
+    // holding exactly what the slots' clone does.
+    const auto flat_held =
+        tier > 0 ? run(tier, true, false, true, true) : grown;
+    const std::uint64_t flat_h = tier > 0 ? grown_bytes : grown_h;
+    const int flat_n = tier > 0 ? promoted : grown_n;
+    // The bytes compare only where BOTH kept the whole streamed stack:
+    // a slotted run short of it still holds its slot pair, and a box
+    // with little room (a 16 GB M5) keeps what its budget allows.
+    const bool whole = grown_n == stack && flat_n == stack;
+    // The engine's other answer for a w4 pack: its int8 layout
+    // HELD (Config::i8_hold_w4) where it is converted per GEMM
+    // above -- the same values, so the same bytes.
+    const auto held =
+        tier > 0 ? run(tier, false, true, false, true) : pre;
+    std::printf("[qwen_image_21_dit] mixed pack, %s: streamed %s, no slots "
+                "%s, promoted (%d blocks) %s%s\n",
+                tier < 0 ? "no i8" : tname[tier],
+                str == pre ? "IDENTICAL" : "DIFFERENT",
+                flat == pre ? "IDENTICAL" : "DIFFERENT", promoted,
+                grown == pre ? "IDENTICAL" : "DIFFERENT",
+                engaged ? "" : " -- NOT ENGAGED");
+    EXPECT_TRUE(engaged);
+    EXPECT_TRUE(str == pre);
+    EXPECT_TRUE(flat == pre);
+    EXPECT_TRUE(promoted > 0 && grown == pre);
+    if (tier > 0) {
+      std::printf("[qwen_image_21_dit] ... w4 layout held: %s; held by "
+                  "promotion %s (%llu MB resident against %llu per "
+                  "call); with no slots %s (%llu MB)\n",
+                  held == pre ? "IDENTICAL" : "DIFFERENT",
+                  grown_held == pre ? "IDENTICAL" : "DIFFERENT",
+                  (unsigned long long)(grown_h >> 20),
+                  (unsigned long long)(grown_pc >> 20),
+                  flat_held == pre ? "IDENTICAL" : "DIFFERENT",
+                  (unsigned long long)(flat_h >> 20));
+      EXPECT_TRUE(grown_held == pre && grown_h > grown_pc);
+      // The slots' resident figure carries no slots once residency is
+      // whole (release_if_saturated); the moved blocks must hold the
+      // same bytes the cloned ones do.
+      EXPECT_TRUE(flat_held == pre && (!whole || flat_h == grown_h));
+    }
+    EXPECT_TRUE(held == pre);
+    // The slots crossed widths and REBUILT. A slot that refused such a
+    // block instead turns itself off, and its holds still agree.
+    std::printf("[qwen_image_21_dit] ... %d streamed blocks built into their "
+                "slot\n", relaid);
+    EXPECT_TRUE(relaid > 0);
+  }
+}
+
 // STREAMED MUST EQUAL PRELOADED, BIT FOR BIT. Block streaming rebuilds
 // every block from the checkpoint on the fly, and every way of getting
 // that wrong is silent: a wrong permutation, a slot overwritten while
@@ -858,7 +1061,7 @@ TEST(qwen_image_21_dit, signed_layout_matches_native)
       if (dir.empty() && m->signed_layout() != (sgn && i8)) {
         engaged = false;
       }
-      m->set_residency_reserve(grow ? (4ull << 30) : 0);
+      m->set_residency_reserve(grow ? test_residency_reserve(4ull << 30) : 0);
       if (grow) { m->set_residency_schedule(4); }
       metal_compute::SharedBuffer lat =
           rnd((std::size_t)lay.image_len * cfg.in_channels, 11u);
@@ -937,6 +1140,317 @@ TEST(qwen_image_21_dit, signed_layout_matches_native)
     // Under the int8 floor the old route is the dense one, exactly.
     if (rn > 0.0) { EXPECT_TRUE(rs <= 1.25 * rn); }
   }
+}
+
+// THE INT8 FAST AND TOKEN TIERS on the real pack
+// (VPIPE_QWEN_IMAGE21_QUANT_DIT): the block projections held as rotated
+// int8 at a coarse group (I8GemmContext::Tier::kFast), or as int8 per
+// channel x per token (kToken). Each must ENGAGE, be BYTE-IDENTICAL however
+// the stack is held (preloaded, streamed, no slots, promoted -- every one
+// of them converts somewhere else: the derived entry, the slot's
+// post_refill, a clone), and sit within a gross-error bar of the accurate
+// tier's distance from the dense forward. The geometry clears the int8
+// row floor (1280 + 64 rows); with VPIPE_QWEN_IMAGE21_TEST_MODEL_PATH set
+// the bf16 checkpoint's fast tier (quantized straight from bf16, into the
+// entry) is measured against its own dense forward as well.
+TEST(qwen_image_21_dit, fast_tier_matches_accurate)
+{
+  const char* qd = std::getenv("VPIPE_QWEN_IMAGE21_QUANT_DIT");
+  if (qd == nullptr || *qd == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  MetalQwenImage21Transformer::Config cfg;
+  Q21D_REQUIRE(MetalQwenImage21Transformer::Config::read_dims(qd, &cfg));
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int gh = 32, gw = 40, TS = 64;
+  std::vector<std::uint8_t> slot((std::size_t)TS, 0);
+  slot.resize((std::size_t)TS + (std::size_t)(gh * gw / 4), 1);
+  const std::vector<qi21::ImgBlock> blocks = {{1, gh, gw}};
+  qi21::Layout lay;
+  std::string lerr;
+  Q21D_REQUIRE(qi21::build_layout(slot, {}, blocks, &lay, &lerr));
+  auto rnd = [&](std::size_t n, unsigned seed) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    if (b.empty()) { return b; }
+    auto* d = static_cast<std::uint16_t*>(b.contents());
+    unsigned st = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+      st = st * 1664525u + 1013904223u;
+      const float v = ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.5f;
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      d[i] = (std::uint16_t)(u >> 16);
+    }
+    return b;
+  };
+  bool engaged = true;
+  std::string kernel;                // the token GEMM the last run took
+  auto run = [&](const std::string& dir, bool i8, int tier, bool stream,
+                 bool grow, bool slots, bool db = false, bool wide = false) {
+    std::vector<std::uint16_t> v;
+    std::unique_ptr<Env> e2;
+    if (!slots) {
+      e2 = std::make_unique<Env>("VPIPE_QWEN_IMAGE21_NO_SLOTS", "1");
+    }
+    MetalQwenImage21Transformer::Config c = cfg;
+    c.i8_gemm = i8;
+    c.i8_tier = tier;
+    // The engine's own kernel unless the A/B knob names another.
+    std::unique_ptr<Env> ek;
+    if (db || wide) {
+      ek = std::make_unique<Env>(
+          "VPIPE_I8_TOKEN_KERNEL",
+          db ? (wide ? "d64x128" : "d128x64") : "m64x128");
+    }
+    auto m = MetalQwenImage21Transformer::load(dir, mc, c, stream);
+    if (m == nullptr) { return v; }
+    kernel = m->i8_token_kernel();
+    if (m->fast_tier() != (i8 && tier != 0) ||
+        (i8 && tier >= 2 &&
+         m->fast_group() != I8GemmContext::kTokenGroup)) {
+      engaged = false;
+    }
+    m->set_residency_reserve(grow ? test_residency_reserve(4ull << 30) : 0);
+    if (grow) { m->set_residency_schedule(4); }
+    metal_compute::SharedBuffer lat =
+        rnd((std::size_t)lay.image_len * cfg.in_channels, 11u);
+    metal_compute::SharedBuffer txt =
+        rnd((std::size_t)slot.size() * cfg.txt_dim, 22u);
+    if (lat.empty() || txt.empty()) { return v; }
+    MetalQwenImage21Transformer::Request req;
+    req.latents = &lat;
+    req.txt = &txt;
+    req.layout = &lay;
+    req.timestep = 0.75f;
+    std::string ferr;
+    metal_compute::SharedBuffer out;
+    for (int it = 0; it < (grow ? 2 : 1); ++it) {
+      out = m->forward(req, &ferr);
+    }
+    if (grow && m->resident_block_count() == 0) { engaged = false; }
+    const std::size_t n = (std::size_t)lay.target_len * cfg.out_channels;
+    if (out.empty() || out.byte_size() < n * 2) { return v; }
+    const auto* d = static_cast<const std::uint16_t*>(out.contents());
+    v.assign(d, d + n);
+    return v;
+  };
+  auto f = [](std::uint16_t h) {
+    const std::uint32_t u = (std::uint32_t)h << 16;
+    float x;
+    std::memcpy(&x, &u, 4);
+    return (double)x;
+  };
+  auto rel = [&](const std::vector<std::uint16_t>& a,
+                 const std::vector<std::uint16_t>& b) {
+    double n2 = 0, d2 = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      n2 += (f(a[i]) - f(b[i])) * (f(a[i]) - f(b[i]));
+      d2 += f(b[i]) * f(b[i]);
+    }
+    return std::sqrt(n2 / d2);
+  };
+  const auto dense = run(qd, false, 0, false, false, true);
+  const auto acc = run(qd, true, 0, false, false, true);
+  Q21D_REQUIRE(!acc.empty() && dense.size() == acc.size());
+  const double ra = rel(acc, dense);
+  // A GROSS-ERROR guard (the forward is chaotic on random inputs; see
+  // signed_layout_matches_native): the fast tier's GEMMs are 1.3-1.45x
+  // the accurate tier's error on outlier-free operands
+  // (gemm_i8.coarse_tier), the plain token tier's ~1.7x on real weights
+  // and the rotated one's about the fast tier's, so a misread layout is
+  // what this catches.
+  const double bar[4] = {0.0, 2.5, 3.0, 4.0};
+  const char* tname[4] = {"accurate", "fast", "token", "token_plain"};
+  for (int tier : {1, 2, 3}) {
+    engaged = true;
+    const auto pre = run(qd, true, tier, false, false, true);
+    const auto str = run(qd, true, tier, true, false, true);
+    const auto flat = run(qd, true, tier, true, false, false);
+    const auto grown = run(qd, true, tier, true, true, true);
+    EXPECT_TRUE(engaged);
+    if (pre.size() != acc.size()) { ASSERT_TRUE(false); continue; }
+    const double rf = rel(pre, dense);
+    std::printf("[qwen_image_21_dit] %s tier, %d+%d rows: vs the dense "
+                "forward %.3e, accurate %.3e; streamed %s, no slots %s, "
+                "promoted %s\n", tname[tier], gh * gw, TS, rf, ra,
+                str == pre ? "IDENTICAL" : "DIFFERENT",
+                flat == pre ? "IDENTICAL" : "DIFFERENT",
+                grown == pre ? "IDENTICAL" : "DIFFERENT");
+    EXPECT_TRUE(str == pre);
+    EXPECT_TRUE(flat == pre);
+    EXPECT_TRUE(grown == pre);
+    EXPECT_TRUE(rf <= bar[tier] * ra);
+    if (tier < 2) { continue; }
+    // The token GEMM's other K loop and tile (VPIPE_I8_TOKEN_KERNEL):
+    // one int32 sum and one epilogue whichever kernel runs, so every
+    // pairing is BYTE-IDENTICAL to the engine's own choice -- and must
+    // have been the kernel asked for, or the comparison proves nothing.
+    for (int k = 1; k < 4; ++k) {
+      const bool db = (k & 1) != 0, wide = (k & 2) != 0;
+      const auto alt = run(qd, true, tier, false, false, true, db, wide);
+      const std::string want = std::string(db ? "double-buffered "
+                                              : "blocked ") +
+                               (wide ? "64x128" : "128x64");
+      std::printf("[qwen_image_21_dit]   %s GEMM: %s\n", kernel.c_str(),
+                  alt == pre ? "IDENTICAL" : "DIFFERENT");
+      EXPECT_TRUE(kernel == want);
+      EXPECT_TRUE(alt == pre);
+    }
+  }
+  const std::string bdir = dit_dir_();
+  if (!bdir.empty()) {
+    const auto bd = run(bdir, false, 0, false, false, true);
+    const auto ba = run(bdir, true, 0, false, false, true);
+    for (int tier : {1, 2, 3}) {
+      engaged = true;
+      const auto bf = run(bdir, true, tier, false, false, true);
+      if (bd.empty() || ba.size() != bd.size() || bf.size() != bd.size()) {
+        continue;
+      }
+      // A STREAMED bf16 block quantizes its refilled source into the
+      // layout (QWeight::ds) and a promotion keeps the layout alone, so
+      // every hold of the checkpoint runs the tier the preload runs.
+      const auto bs = run(bdir, true, tier, true, false, true);
+      const auto bn = run(bdir, true, tier, true, false, false);
+      const auto bg = run(bdir, true, tier, true, true, true);
+      std::printf("[qwen_image_21_dit]   bf16 checkpoint: vs its dense "
+                  "forward %s %.3e, accurate %.3e; streamed %s, no slots "
+                  "%s, promoted %s\n", tname[tier], rel(bf, bd),
+                  rel(ba, bd), bs == bf ? "IDENTICAL" : "DIFFERENT",
+                  bn == bf ? "IDENTICAL" : "DIFFERENT",
+                  bg == bf ? "IDENTICAL" : "DIFFERENT");
+      EXPECT_TRUE(engaged);
+      EXPECT_TRUE(rel(bf, bd) <= bar[tier] * rel(ba, bd));
+      EXPECT_TRUE(bs == bf && bn == bf && bg == bf);
+    }
+  }
+}
+
+// A DRAW THINGS i8x CHECKPOINT (VPIPE_DRAWTHINGS_QI21_CKPT, Draw Things'
+// qwen_image_2.1_i8x.ckpt) as the DiT: on the unrotated token tier its
+// codes and row scales are read as stored -- it must ENGAGE there, be
+// BYTE-IDENTICAL preloaded, streamed and with no slots (the slot refills
+// the codes raw and rebuilds the f32 scales by name), and sit near the
+// bf16 forward (dit_dir_()) -- and with int8 off it runs DENSE from the
+// same file, dequantized on the way out. Same geometry as the tier test.
+TEST(qwen_image_21_dit, drawthings_i8x_runs_native)
+{
+  const char* ck = std::getenv("VPIPE_DRAWTHINGS_QI21_CKPT");
+  const std::string bdir = dit_dir_();
+  if (ck == nullptr || *ck == '\0' || bdir.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  MetalQwenImage21Transformer::Config cfg;
+  Q21D_REQUIRE(MetalQwenImage21Transformer::Config::read_dims(ck, &cfg));
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int gh = 32, gw = 40, TS = 64;
+  std::vector<std::uint8_t> slot((std::size_t)TS, 0);
+  slot.resize((std::size_t)TS + (std::size_t)(gh * gw / 4), 1);
+  qi21::Layout lay;
+  std::string lerr;
+  Q21D_REQUIRE(qi21::build_layout(slot, {}, {{1, gh, gw}}, &lay, &lerr));
+  auto rnd = [&](std::size_t n, unsigned seed) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    auto* d = static_cast<std::uint16_t*>(b.contents());
+    unsigned st = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+      st = st * 1664525u + 1013904223u;
+      const float v = ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.5f;
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      d[i] = (std::uint16_t)(u >> 16);
+    }
+    return b;
+  };
+  bool native = true;
+  auto run = [&](const std::string& dir, bool i8, int tier, bool stream,
+                 bool slots) {
+    std::vector<std::uint16_t> v;
+    std::unique_ptr<Env> e2;
+    if (!slots) {
+      e2 = std::make_unique<Env>("VPIPE_QWEN_IMAGE21_NO_SLOTS", "1");
+    }
+    MetalQwenImage21Transformer::Config c = cfg;
+    c.i8_gemm = i8;
+    c.i8_tier = tier;
+    auto m = MetalQwenImage21Transformer::load(dir, mc, c, stream);
+    if (m == nullptr) { return v; }
+    if (i8 && tier == 3 &&
+        m->fast_group() != I8GemmContext::kTokenGroup) {
+      native = false;
+    }
+    metal_compute::SharedBuffer lat =
+        rnd((std::size_t)lay.image_len * cfg.in_channels, 11u);
+    metal_compute::SharedBuffer txt =
+        rnd((std::size_t)slot.size() * cfg.txt_dim, 22u);
+    MetalQwenImage21Transformer::Request req;
+    req.latents = &lat;
+    req.txt = &txt;
+    req.layout = &lay;
+    req.timestep = 0.75f;
+    std::string ferr;
+    metal_compute::SharedBuffer out = m->forward(req, &ferr);
+    const std::size_t n = (std::size_t)lay.target_len * cfg.out_channels;
+    if (out.empty() || out.byte_size() < n * 2) { return v; }
+    const auto* d = static_cast<const std::uint16_t*>(out.contents());
+    v.assign(d, d + n);
+    return v;
+  };
+  auto rel = [&](const std::vector<std::uint16_t>& a,
+                 const std::vector<std::uint16_t>& b) {
+    auto f = [](std::uint16_t h) {
+      const std::uint32_t u = (std::uint32_t)h << 16;
+      float x;
+      std::memcpy(&x, &u, 4);
+      return (double)x;
+    };
+    double n2 = 0, d2 = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      n2 += (f(a[i]) - f(b[i])) * (f(a[i]) - f(b[i]));
+      d2 += f(b[i]) * f(b[i]);
+    }
+    return std::sqrt(n2 / d2);
+  };
+  const auto dense = run(bdir, false, 0, false, true);
+  const auto acc = run(bdir, true, 0, false, true);
+  const auto pre = run(ck, true, 3, false, true);
+  const auto str = run(ck, true, 3, true, true);
+  const auto flat = run(ck, true, 3, true, false);
+  const auto deq = run(ck, false, 0, false, true);
+  const auto rot = run(ck, true, 2, false, true);
+  Q21D_REQUIRE(!dense.empty() && acc.size() == dense.size() &&
+               pre.size() == dense.size() && deq.size() == dense.size() &&
+               rot.size() == dense.size());
+  EXPECT_TRUE(native);
+  const double ra = rel(acc, dense), rt = rel(pre, dense);
+  const double rd = rel(deq, dense), rr = rel(rot, dense);
+  std::printf("[qwen_image_21_dit] Draw Things i8x, %d+%d rows: vs the "
+              "bf16 forward native token %.3e, requantized rotated %.3e, "
+              "dense from the file %.3e (bf16 accurate tier %.3e); "
+              "streamed %s, no slots %s\n",
+              gh * gw, TS, rt, rr, rd, ra,
+              str == pre ? "IDENTICAL" : "DIFFERENT",
+              flat == pre ? "IDENTICAL" : "DIFFERENT");
+  EXPECT_TRUE(str == pre);
+  EXPECT_TRUE(flat == pre);
+  // Gross-error bars (the forward is chaotic on random inputs): the
+  // file's weights are an int8 per row, and the native route adds the
+  // per-token activation on top.
+  EXPECT_TRUE(rd <= 4.0 * ra);
+  EXPECT_TRUE(rt <= 5.0 * ra);
+  EXPECT_TRUE(rr <= 5.0 * ra);
 }
 
 // THE SIGNED LAYOUT'S WORTH in the Qwen-Image-2.1 forward, i8_gemm on, at
@@ -3504,4 +4018,342 @@ TEST(qwen_image_21_dit, eight_adapters_ride_one_dit)
     EXPECT_TRUE(hole == 0.0);
   }
   fs::remove_all(dir, ec);
+}
+
+// FORWARD A/B over environment arms, one model load per arm per round,
+// interleaved with the order reversed every round, median of each arm's
+// timed forwards. VPIPE_QI21_AB names the DiT; VPIPE_QI21_AB_ARMS is
+// "name:ENV=v,ENV=v;name:..." (an arm with no assignments is the
+// baseline); _ROUNDS, _SIDE (pixels, 1024), _CACHED=1 times cached steps
+// (target rows against the kept prefix) as a generation's steps 2.. run,
+// _STOP=1 installs a stop check as generate-image does, _STREAM=1 streams
+// every block; an arm's VPIPE_I8_W4_HOLD=1 holds a w4 pack's int8 layout.
+TEST(qwen_image_21_dit, forward_ab)
+{
+  const char* dir = std::getenv("VPIPE_QI21_AB");
+  const char* spec = std::getenv("VPIPE_QI21_AB_ARMS");
+  if (dir == nullptr || *dir == '\0' || spec == nullptr) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  struct Arm {
+    std::string name;
+    std::vector<std::pair<std::string, std::string>> env;
+    std::vector<double> ms;
+  };
+  std::vector<Arm> arms;
+  {
+    std::string s(spec);
+    std::size_t p = 0;
+    while (p <= s.size()) {
+      const std::size_t q = std::min(s.find(';', p), s.size());
+      const std::string a = s.substr(p, q - p);
+      if (!a.empty()) {
+        Arm arm;
+        const std::size_t c = a.find(':');
+        arm.name = a.substr(0, c);
+        if (c != std::string::npos) {
+          std::string kv = a.substr(c + 1);
+          std::size_t r = 0;
+          while (r < kv.size()) {
+            const std::size_t e = std::min(kv.find(',', r), kv.size());
+            const std::string one = kv.substr(r, e - r);
+            const std::size_t eq = one.find('=');
+            if (eq != std::string::npos) {
+              arm.env.emplace_back(one.substr(0, eq), one.substr(eq + 1));
+            }
+            r = e + 1;
+          }
+        }
+        arms.push_back(std::move(arm));
+      }
+      p = q + 1;
+    }
+  }
+  int rounds = 2, side = 1024, fwd = 3;
+  if (const char* e = std::getenv("VPIPE_QI21_AB_ROUNDS")) {
+    rounds = std::max(1, std::atoi(e));
+  }
+  if (const char* e = std::getenv("VPIPE_QI21_AB_SIDE")) {
+    side = std::max(256, std::atoi(e));
+  }
+  if (const char* e = std::getenv("VPIPE_QI21_AB_FORWARDS")) {
+    fwd = std::max(1, std::atoi(e));
+  }
+  const bool cached = std::getenv("VPIPE_QI21_AB_CACHED") != nullptr;
+  MetalQwenImage21Transformer::Config cfg;
+  Q21D_REQUIRE(MetalQwenImage21Transformer::Config::read_dims(dir, &cfg));
+  // One slot per kImgTokensPerSlot (4) image tokens.
+  std::vector<std::uint8_t> slot(42, 0);
+  slot.resize(42 + (std::size_t)(side / 16) * (side / 16) / 4, 1);
+  const std::vector<qi21::ImgBlock> blocks = {{1, side / 16, side / 16}};
+  qi21::Layout lay;
+  std::string lerr;
+  Q21D_REQUIRE(qi21::build_layout(slot, {}, blocks, &lay, &lerr));
+  // Every arm's last output against the FIRST arm's, as rel-L2 -- an arm
+  // that changes the arithmetic says by how much.
+  std::vector<float> ref_out;
+  auto bf = [](std::uint16_t v) {
+    const std::uint32_t u = (std::uint32_t)v << 16;
+    float f = 0.0f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  for (int r = 0; r < rounds; ++r) {
+    for (std::size_t k = 0; k < arms.size(); ++k) {
+      Arm& a = arms[(r % 2 == 0) ? k : arms.size() - 1 - k];
+      for (const auto& kv : a.env) {
+        ::setenv(kv.first.c_str(), kv.second.c_str(), 1);
+      }
+      MetalQwenImage21Transformer::Config c = cfg;
+      c.i8_gemm = true;
+      // A w4 pack's int8 layout held (VPIPE_I8_W4_HOLD=1) or converted
+      // per GEMM (the model's default), as generate-image decides it.
+      if (const char* h = std::getenv("VPIPE_I8_W4_HOLD")) {
+        c.i8_hold_w4 = std::atoi(h) != 0;
+      }
+      // VPIPE_QI21_AB_STREAM=1 streams every block (no residency: each
+      // forward reads the whole stack through the slot pair);
+      // =retain streams, THEN RETAINS -- generate-image's default on a
+      // box with room: a 20-step schedule, so residency keeps every block
+      // its first pass reads (the wired pool on).
+      const char* sm = std::getenv("VPIPE_QI21_AB_STREAM");
+      const bool streamed = sm != nullptr;
+      const bool retain = streamed && std::string(sm) == "retain";
+      const auto tl0 = std::chrono::steady_clock::now();
+      auto m = MetalQwenImage21Transformer::load(dir, mc, c, streamed);
+      Q21D_REQUIRE(m != nullptr);
+      if (streamed) { m->set_residency_reserve(0); }
+      if (retain) { m->set_residency_schedule(20); }
+      const double load_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - tl0)
+                                 .count();
+      // As generate-image drives it (VPIPE_QI21_AB_STOP=1): a stop check
+      // installed, so a held stack drains every few blocks.
+      if (std::getenv("VPIPE_QI21_AB_STOP") != nullptr) {
+        m->set_stream_stop([] { return false; });
+      }
+      metal_compute::SharedBuffer lat = mc->make_shared_buffer(
+          (std::size_t)lay.image_len * cfg.in_channels * 2);
+      metal_compute::SharedBuffer txt = mc->make_shared_buffer(
+          slot.size() * (std::size_t)cfg.txt_dim * 2);
+      Q21D_REQUIRE(!lat.empty() && !txt.empty());
+      auto* lp = static_cast<std::uint16_t*>(lat.contents());
+      auto* tp = static_cast<std::uint16_t*>(txt.contents());
+      std::uint32_t h = 12345u;
+      auto rnd = [&]() {
+        h = h * 1664525u + 1013904223u;
+        const float f = ((float)(h >> 8) / 16777216.0f) * 2.0f - 1.0f;
+        std::uint32_t u = 0;
+        std::memcpy(&u, &f, 4);
+        return (std::uint16_t)(u >> 16);
+      };
+      for (std::size_t i = 0; i < lat.byte_size() / 2; ++i) { lp[i] = rnd(); }
+      for (std::size_t i = 0; i < txt.byte_size() / 2; ++i) { tp[i] = rnd(); }
+      MetalQwenImage21Transformer::KvCache kv;
+      MetalQwenImage21Transformer::Request req;
+      req.latents = &lat;
+      req.txt = &txt;
+      req.layout = &lay;
+      req.timestep = 0.75f;
+      std::string ferr;
+      // The FIRST forward on its own: on a streamed model it is the one
+      // that reads the stack (and, retaining, keeps it).
+      double first_ms = 0.0;
+      {
+        const auto tf0 = std::chrono::steady_clock::now();
+        if (cached) {
+          req.kv = &kv;
+          req.kv_mode = MetalQwenImage21Transformer::KvMode::kFill;
+        }
+        Q21D_REQUIRE(!m->forward(req, &ferr).empty());
+        first_ms = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - tf0)
+                       .count();
+        if (cached) {
+          req.kv_mode = MetalQwenImage21Transformer::KvMode::kCached;
+        }
+      }
+      for (int w = 0; w < 2; ++w) {
+        Q21D_REQUIRE(!m->forward(req, &ferr).empty());
+      }
+      std::vector<double> t;
+      metal_compute::SharedBuffer out;
+      for (int i = 0; i < fwd; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        out = m->forward(req, &ferr);
+        Q21D_REQUIRE(!out.empty());
+        t.push_back(std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count());
+      }
+      std::sort(t.begin(), t.end());
+      a.ms.push_back(t[t.size() / 2]);
+      const auto* op = static_cast<const std::uint16_t*>(out.contents());
+      const std::size_t on = out.byte_size() / 2;
+      double rel = 0.0;
+      if (ref_out.empty()) {
+        ref_out.resize(on);
+        for (std::size_t i = 0; i < on; ++i) { ref_out[i] = bf(op[i]); }
+      } else if (ref_out.size() == on) {
+        double num = 0.0, den = 0.0;
+        for (std::size_t i = 0; i < on; ++i) {
+          const double d = (double)bf(op[i]) - ref_out[i];
+          num += d * d;
+          den += (double)ref_out[i] * ref_out[i];
+        }
+        rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+      }
+      std::printf("[qi21_ab] round %d %-14s %8.1f ms/forward (rows %d%s) "
+                  "rel-L2 %.3g vs first; load %.0f ms, first forward %.0f "
+                  "ms, %zu MB resident\n",
+                  r, a.name.c_str(), t[t.size() / 2],
+                  cached ? lay.target_len : lay.joint_len,
+                  m->signed_layout() ? ", signed" : "", rel, load_ms,
+                  first_ms, (std::size_t)(m->resident_bytes() >> 20));
+      m.reset();
+      for (const auto& kv2 : a.env) { ::unsetenv(kv2.first.c_str()); }
+    }
+  }
+  const double base = [&] {
+    double s = 0.0;
+    for (double v : arms[0].ms) { s += v; }
+    return s / (double)arms[0].ms.size();
+  }();
+  for (const Arm& a : arms) {
+    double s = 0.0;
+    for (double v : a.ms) { s += v; }
+    s /= (double)a.ms.size();
+    std::printf("[qi21_ab]   %-14s %8.1f ms (mean of %zu)  %.3fx %s\n",
+                a.name.c_str(), s, a.ms.size(), base / s,
+                arms[0].name.c_str());
+  }
+}
+
+// DOES A REGULAR IMAGE FILL THE GPU? Two measurements on the cached step
+// a generation's steps 2.. run. (1) Throughput against the picture: the
+// forward's arithmetic (GEMMs 2*rows*(4H^2 + 3H*FF) a block, attention
+// 4*rows*joint*H) over its time, per side in VPIPE_QI21_FILL_SIDES
+// ("512,768,1024,1536,2048") -- a rate that keeps climbing with the side
+// is a GPU the smaller pictures leave partly idle. (2) Spare capacity:
+// VPIPE_QI21_FILL_STREAMS (2) model instances each running forwards on
+// its own thread and queue at once, against one alone -- aggregate
+// throughput above one stream's is capacity a single forward leaves on
+// the table. VPIPE_QI21_FILL names the DiT.
+TEST(qwen_image_21_dit, fill_study)
+{
+  const char* dir = std::getenv("VPIPE_QI21_FILL");
+  if (dir == nullptr || *dir == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  std::vector<int> sides = {512, 768, 1024, 1536, 2048};
+  if (const char* e = std::getenv("VPIPE_QI21_FILL_SIDES")) {
+    sides.clear();
+    for (const char* p = e; *p != '\0';) {
+      sides.push_back(std::atoi(p));
+      while (*p != '\0' && *p != ',') { ++p; }
+      if (*p == ',') { ++p; }
+    }
+  }
+  int streams = 2;
+  if (const char* e = std::getenv("VPIPE_QI21_FILL_STREAMS")) {
+    streams = std::max(1, std::atoi(e));
+  }
+  MetalQwenImage21Transformer::Config cfg;
+  Q21D_REQUIRE(MetalQwenImage21Transformer::Config::read_dims(dir, &cfg));
+  cfg.i8_gemm = true;
+  std::vector<std::unique_ptr<MetalQwenImage21Transformer>> ms;
+  for (int i = 0; i < streams; ++i) {
+    ms.push_back(MetalQwenImage21Transformer::load(dir, mc, cfg, false));
+    Q21D_REQUIRE(ms.back() != nullptr);
+  }
+  const double H = cfg.hidden, FF = (double)cfg.hidden * cfg.mlp_ratio;
+  for (int side : sides) {
+    // One slot per kImgTokensPerSlot (4) image tokens.
+    std::vector<std::uint8_t> slot(42, 0);
+    slot.resize(42 + (std::size_t)(side / 16) * (side / 16) / 4, 1);
+    const std::vector<qi21::ImgBlock> blocks = {{1, side / 16, side / 16}};
+    qi21::Layout lay;
+    std::string lerr;
+    Q21D_REQUIRE(qi21::build_layout(slot, {}, blocks, &lay, &lerr));
+    struct Run {
+      metal_compute::SharedBuffer lat, txt;
+      MetalQwenImage21Transformer::KvCache kv;
+      MetalQwenImage21Transformer::Request req;
+    };
+    std::vector<Run> runs((std::size_t)streams);
+    for (int i = 0; i < streams; ++i) {
+      Run& r = runs[(std::size_t)i];
+      r.lat = mc->make_shared_buffer((std::size_t)lay.image_len *
+                                     cfg.in_channels * 2);
+      r.txt = mc->make_shared_buffer(slot.size() * (std::size_t)cfg.txt_dim *
+                                     2);
+      Q21D_REQUIRE(!r.lat.empty() && !r.txt.empty());
+      auto* lp = static_cast<std::uint16_t*>(r.lat.contents());
+      auto* tp = static_cast<std::uint16_t*>(r.txt.contents());
+      for (std::size_t k = 0; k < r.lat.byte_size() / 2; ++k) {
+        lp[k] = (std::uint16_t)(0x3c00u + (k * 2654435761u >> 24) % 64u);
+      }
+      for (std::size_t k = 0; k < r.txt.byte_size() / 2; ++k) {
+        tp[k] = (std::uint16_t)(0x3c00u + (k * 2246822519u >> 24) % 64u);
+      }
+      r.req.latents = &r.lat;
+      r.req.txt = &r.txt;
+      r.req.layout = &lay;
+      r.req.timestep = 0.75f;
+      r.req.kv = &r.kv;
+      r.req.kv_mode = MetalQwenImage21Transformer::KvMode::kFill;
+      std::string ferr;
+      Q21D_REQUIRE(!ms[(std::size_t)i]->forward(r.req, &ferr).empty());
+      r.req.kv_mode = MetalQwenImage21Transformer::KvMode::kCached;
+      Q21D_REQUIRE(!ms[(std::size_t)i]->forward(r.req, &ferr).empty());
+    }
+    const double rows = lay.target_len, joint = lay.joint_len;
+    const double flop = (double)cfg.n_layers *
+        (2.0 * rows * (4.0 * H * H + 3.0 * H * FF) + 4.0 * rows * joint * H);
+    const int fwd = side >= 1536 ? 3 : 6;
+    // One stream alone.
+    std::vector<double> t1;
+    for (int k = 0; k < fwd; ++k) {
+      std::string ferr;
+      const auto t0 = std::chrono::steady_clock::now();
+      Q21D_REQUIRE(!ms[0]->forward(runs[0].req, &ferr).empty());
+      t1.push_back(std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t0).count());
+    }
+    std::sort(t1.begin(), t1.end());
+    const double one = t1[t1.size() / 2];
+    // All streams at once, each `fwd` forwards on its own thread.
+    double all = 0.0;
+    if (streams > 1) {
+      std::vector<std::thread> th;
+      std::atomic<int> bad{0};
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < streams; ++i) {
+        th.emplace_back([&, i]() {
+          for (int k = 0; k < fwd; ++k) {
+            std::string ferr;
+            if (ms[(std::size_t)i]->forward(runs[(std::size_t)i].req, &ferr)
+                    .empty()) {
+              ++bad;
+            }
+          }
+        });
+      }
+      for (auto& t : th) { t.join(); }
+      all = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+      Q21D_REQUIRE(bad.load() == 0);
+    }
+    std::printf("[qi21_fill] side %4d rows %5d joint %5d: one stream %8.1f "
+                "ms = %6.1f TOP/s", side, lay.target_len, lay.joint_len, one,
+                flop / one * 1e-9);
+    if (streams > 1) {
+      const double per = all / fwd;   // wall per round of `streams` forwards
+      std::printf("; %d streams %8.1f ms a round = %6.1f TOP/s (%.2fx one)",
+                  streams, per, flop * streams / per * 1e-9,
+                  (one * streams) / per);
+    }
+    std::printf("\n");
+  }
 }

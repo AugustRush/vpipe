@@ -259,10 +259,14 @@ if(VPIPE_SOURCES)
         # the raw blocks inside the frames the HuggingFace content store
         # wraps its chunks in, so the model fetch needs no third-party
         # LZ4 to read them.
+        #
+        # libsqlite3 is the system's: a Draw Things checkpoint's table of
+        # contents is an SQLite database (shared/drawthings-store.h).
         target_link_libraries(vpipe_link INTERFACE
             "-framework Security"
             "-framework CoreFoundation"
-            compression)
+            compression
+            sqlite3)
     endif()
     if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         # metal-cpp's NS::ProcessInfo references constants
@@ -400,7 +404,7 @@ endif()
 target_link_options(vpipe_test PRIVATE "LINKER:-export_dynamic")
 if(APPLE)
     # The xet-fetch tests build their own LZ4 frames to decode.
-    target_link_libraries(vpipe_test PRIVATE compression)
+    target_link_libraries(vpipe_test PRIVATE compression sqlite3)
 endif()
 if(APPLE)
     target_link_libraries(vpipe_test PRIVATE

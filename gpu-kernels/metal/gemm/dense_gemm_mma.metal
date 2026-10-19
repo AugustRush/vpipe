@@ -2379,6 +2379,698 @@ GI8_I8S_ENTRY(gemm_i8s_w4g64, 4)
 GI8_I8S_SK(gemm_i8s_w8g64_sk, 8)
 GI8_I8S_SK(gemm_i8s_w4g64_sk, 4)
 
+// (d) THE COARSE TIER (I8GemmContext's "fast" tier): symmetric int8 x int8
+// at a group of GC along K for BOTH operands -- per (row, group) and per
+// (column, group) scales, no zero point -- so the fold runs once per GC
+// rather than once per 64, and a group's whole contraction is ONE matmul
+// into the i32 destination. The weight is held in this layout (converted
+// once from a g64 pack or a bf16 checkpoint, affine_to_i8c_* /
+// quant_i8_row_gc*), so no per-call weight pass. The trade is
+// precision: a group's scale follows its largest element over GC.
+//
+// A thread's destination elements are the outer product of 4 rows and
+// 4*NCB columns (gemm_i8.coarse_tier's probe; NCB 2 is the 32-element
+// layout of 64x64/4, 64x128/8 and 128x64/8, NCB 4 the 64-element one of
+// 128x128/8):
+//   element i -> row slot ((i >> 2) & 1) | ((i >> (3 + log2 NCB)) << 1)
+//                col slot (i & 3) | (((i >> 3) & (NCB - 1)) << 2)
+//   0:xq[M,K] i8 1:wq[N,K] i8 2:as[M,K/GC] 3:ws[N,K/GC] 4:y 5:K 6:N 7:M
+//   8:bias 9:has_bias   grid {ceil(N/BN)*32*SG, ceil(M/BM), 1} threads,
+//   tg {32*SG, 1, 1}.
+template <int GC, int BM, int BN, int SG, int NCB>
+static inline void gemm_i8c_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device VPIPE_ELT* as, const device VPIPE_ELT* ws,
+    device VPIPE_ELT* y, const device VPIPE_ELT* bias, int has_bias,
+    int K, int N, int M, uint3 tgid)
+{
+  constexpr int CAP = 16 * NCB;
+  constexpr int LN = NCB == 2 ? 1 : 2;
+  static_assert(NCB == 2 || NCB == 4, "4x8 or 4x16 per thread");
+  static_assert(BM * BN / (32 * SG) == CAP, "CAP mismatch");
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device int8_t*>(wq), dextents<int32_t, 2>(K, N));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, GC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  const int G = K / GC;
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), int32_t>();
+  int rr[4], cc[4 * NCB];
+#pragma clang loop unroll(full)
+  for (int k = 0; k < 4; ++k) {
+    const auto ids = cP.get_multidimensional_index(
+        (uint16_t)(((k & 1) << 2) | ((k >> 1) << (3 + LN))));
+    rr[k] = m0 + (int)ids[1];
+  }
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 4 * NCB; ++j) {
+    const auto ids = cP.get_multidimensional_index(
+        (uint16_t)((j & 3) | ((j >> 2) << 3)));
+    cc[j] = n0 + (int)ids[0];
+  }
+  // Clamped row/column for the scale loads: a tile past M or N reads a
+  // real row's scale and its output is never stored.
+  int ra[4], ca[4 * NCB];
+#pragma clang loop unroll(full)
+  for (int k = 0; k < 4; ++k) { ra[k] = min(rr[k], M - 1) * G; }
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 4 * NCB; ++j) { ca[j] = min(cc[j], N - 1) * G; }
+  float facc[CAP];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) { facc[i] = 0.0f; }
+  for (int g = 0; g < G; ++g) {
+    auto mX = tX.slice(g * GC, m0);
+    auto mW = tW.slice(g * GC, n0);
+    op.run(mX, mW, cP);
+    float a[4], sc[4 * NCB];
+#pragma clang loop unroll(full)
+    for (int k = 0; k < 4; ++k) { a[k] = (float)as[ra[k] + g]; }
+#pragma clang loop unroll(full)
+    for (int j = 0; j < 4 * NCB; ++j) { sc[j] = (float)ws[ca[j] + g]; }
+#pragma clang loop unroll(full)
+    for (int i = 0; i < CAP; ++i) {
+      const int ri = ((i >> 2) & 1) | ((i >> (3 + LN)) << 1);
+      const int ci = (i & 3) | (((i >> 3) & (NCB - 1)) << 2);
+      facc[i] = fma((float)cP[(uint16_t)i] * sc[ci], a[ri], facc[i]);
+    }
+  }
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const int ri = ((i >> 2) & 1) | ((i >> (3 + LN)) << 1);
+    const int ci = (i & 3) | (((i >> 3) & (NCB - 1)) << 2);
+    const int gn = cc[ci], gm = rr[ri];
+    if (gm < M && gn < N) {
+      float v = facc[i];
+      if (has_bias != 0) { v += (float)bias[gn]; }
+      y[(int64_t)gm * N + gn] = (VPIPE_ELT)v;
+    }
+  }
+}
+
+#define GI8_I8C_ENTRY(NAME, GC, BM, BN, SG, NCB)                         \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device VPIPE_ELT* as [[buffer(2)]],                          \
+      const device VPIPE_ELT* ws [[buffer(3)]],                          \
+      device VPIPE_ELT* y [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      const device VPIPE_ELT* bias [[buffer(8)]],                        \
+      const constant int& has_bias [[buffer(9)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    gemm_i8c_impl<GC, BM, BN, SG, NCB>(xq, wq, as, ws, y, bias,          \
+                                       has_bias, K, N, M, tgid);         \
+  }
+// The study set (gemm_i8.coarse_tier): three groups at four tiles.
+GI8_I8C_ENTRY(gemm_i8c_g256_t64x64, 256, 64, 64, 4, 2)
+GI8_I8C_ENTRY(gemm_i8c_g512_t64x64, 512, 64, 64, 4, 2)
+GI8_I8C_ENTRY(gemm_i8c_g1024_t64x64, 1024, 64, 64, 4, 2)
+GI8_I8C_ENTRY(gemm_i8c_g256_t64x128, 256, 64, 128, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g512_t64x128, 512, 64, 128, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g1024_t64x128, 1024, 64, 128, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g256_t128x64, 256, 128, 64, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g512_t128x64, 512, 128, 64, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g1024_t128x64, 1024, 128, 64, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g256_t128x128, 256, 128, 128, 8, 4)
+GI8_I8C_ENTRY(gemm_i8c_g512_t128x128, 512, 128, 128, 8, 4)
+GI8_I8C_ENTRY(gemm_i8c_g1024_t128x128, 1024, 128, 128, 8, 4)
+
+// THE PER-TOKEN TIER (gemm_i8pt_*): the i8x layout. Weights int8 per
+// output CHANNEL over all of K (one scale a row, as Draw Things stores
+// them), activations int8 per TOKEN over all of K. Nothing varies along
+// K, so the whole reduction is ONE int32 accumulation and the scales
+// are applied once, at the store: y = acc * as[m] * ws[n] (+ bias).
+// |acc| <= 127^2 K, inside int32 for K < 133144.
+//   0:xq[M,K] i8  1:wq[N,K] i8  2:as[M] f32  3:ws[N] f32  4:y[M,N]
+//   5:K 6:N 7:M 8:bias[N] 9:has_bias.  K % BK == 0 (K % 64 for _p/_d).
+//
+// _t<BM>x<BN>_k<BK>: one matmul2d over execution_simdgroups<SG>,
+// stepping K by BK into a cooperative i32 destination; the compact
+// epilogue of gemm_i8c_impl.
+//   dispatch {ceil(N/BN) * 32 * SG, ceil(M/BM)}, tg {32 * SG}
+template <int BM, int BN, int SG, int NCB, int BK>
+static inline void gemm_i8pt_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device float* as, const device float* ws,
+    device VPIPE_ELT* y, const device VPIPE_ELT* bias, int has_bias,
+    int K, int N, int M, uint3 tgid)
+{
+  constexpr int CAP = 16 * NCB;
+  constexpr int LN = NCB == 2 ? 1 : 2;
+  static_assert(NCB == 2 || NCB == 4, "4x8 or 4x16 per thread");
+  static_assert(BM * BN / (32 * SG) == CAP, "CAP mismatch");
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device int8_t*>(wq), dextents<int32_t, 2>(K, N));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, BK, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), int32_t>();
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) { cP[(uint16_t)i] = 0; }
+  for (int k0 = 0; k0 < K; k0 += BK) {
+    auto mX = tX.slice(k0, m0);
+    auto mW = tW.slice(k0, n0);
+    op.run(mX, mW, cP);
+  }
+  int rr[4], cc[4 * NCB];
+#pragma clang loop unroll(full)
+  for (int k = 0; k < 4; ++k) {
+    const auto ids = cP.get_multidimensional_index(
+        (uint16_t)(((k & 1) << 2) | ((k >> 1) << (3 + LN))));
+    rr[k] = m0 + (int)ids[1];
+  }
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 4 * NCB; ++j) {
+    const auto ids = cP.get_multidimensional_index(
+        (uint16_t)((j & 3) | ((j >> 2) << 3)));
+    cc[j] = n0 + (int)ids[0];
+  }
+  float a[4], sc[4 * NCB], bv[4 * NCB];
+#pragma clang loop unroll(full)
+  for (int k = 0; k < 4; ++k) { a[k] = as[min(rr[k], M - 1)]; }
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 4 * NCB; ++j) {
+    const int n = min(cc[j], N - 1);
+    sc[j] = ws[n];
+    bv[j] = has_bias != 0 ? (float)bias[n] : 0.0f;
+  }
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const int ri = ((i >> 2) & 1) | ((i >> (3 + LN)) << 1);
+    const int ci = (i & 3) | (((i >> 3) & (NCB - 1)) << 2);
+    const int gn = cc[ci], gm = rr[ri];
+    if (gm < M && gn < N) {
+      const float v = fma((float)cP[(uint16_t)i] * a[ri], sc[ci], bv[ci]);
+      y[(int64_t)gm * N + gn] = (VPIPE_ELT)v;
+    }
+  }
+}
+
+#define GI8_PT_ENTRY(NAME, BM, BN, SG, NCB, BK)                          \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device float* as [[buffer(2)]],                              \
+      const device float* ws [[buffer(3)]],                              \
+      device VPIPE_ELT* y [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      const device VPIPE_ELT* bias [[buffer(8)]],                        \
+      const constant int& has_bias [[buffer(9)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    gemm_i8pt_impl<BM, BN, SG, NCB, BK>(xq, wq, as, ws, y, bias,         \
+                                        has_bias, K, N, M, tgid);        \
+  }
+GI8_PT_ENTRY(gemm_i8pt_t64x64_k128, 64, 64, 4, 2, 128)
+GI8_PT_ENTRY(gemm_i8pt_t64x128_k128, 64, 128, 8, 2, 128)
+GI8_PT_ENTRY(gemm_i8pt_t128x64_k128, 128, 64, 8, 2, 128)
+GI8_PT_ENTRY(gemm_i8pt_t128x128_k128, 128, 128, 8, 4, 128)
+GI8_PT_ENTRY(gemm_i8pt_t128x64_k64, 128, 64, 8, 2, 64)
+GI8_PT_ENTRY(gemm_i8pt_t128x64_k256, 128, 64, 8, 2, 256)
+GI8_PT_ENTRY(gemm_i8pt_t128x128_k64, 128, 128, 8, 4, 64)
+GI8_PT_ENTRY(gemm_i8pt_t128x128_k256, 128, 128, 8, 4, 256)
+
+// The lane's coordinate in a 16x16 matmul2d register fragment: eight
+// values, four adjacent columns in each of two rows eight apart. This is
+// the hardware's cooperative-tensor layout as MLX's steel NAX tiles
+// spell it (BaseNAXFrag::get_coord, vendored MIT under
+// gpu-kernels/metal/vendored/mlx/.../steel/attn/nax.h).
+static inline short2 i8pt_frag_coord(ushort lane) {
+  const short qid = (short)(lane >> 2);
+  return short2((short)(((qid & 2) | (lane & 1)) * 4),
+                (short)((qid & 4) | ((lane >> 1) & 3)));
+}
+
+// gemm_i8pt_m<BM>x<BN>: the token tier's register kernel. Each
+// simdgroup owns SM x SN = 32 x 32 of the output as TM x TN 16x16 int32
+// fragments and loads its own operands straight from device memory, WM x
+// WN simdgroups a tile; the K loop is MLX's NAX GEMM loop (gemm_loop in
+// mlx/backend/metal/kernels/steel/gemm/gemm_nax.h, MIT): 512-deep
+// blocks, one threadgroup barrier each to keep the simdgroups that share
+// a row or column of the tile in step, the steps inside not unrolled,
+// and MLX's (32, WN, WM) threadgroups. What is this kernel's own is the operand path: int8 x
+// int8 into one int32 accumulation with the two scales applied at the
+// store, and K PERMUTED inside each 64-deep step. An int8 dot product
+// does not care which order its K terms come in, only that both operands
+// use the same one, so the logical column (kk, 4q + j) of fragment kk --
+// what a lane at o.x = 4q holds -- is read from physical column 16q + 4kk
+// + j. A lane's four fragments' values for one row are then 16
+// CONTIGUOUS bytes, one int4 load where a plain fragment load issues
+// four.
+//   dispatch {ceil(N/BN) * 32, ceil(M/BM) * WN, WM}, tg {32, WN, WM}
+//   K % 64 == 0, N % 4 == 0
+template <int TM, bool FULL>
+static inline void i8pt_load_p(thread int4 (&f)[TM][2],
+                               const device int8_t* src, int K, int rows,
+                               short2 o)
+{
+#pragma clang loop unroll(full)
+  for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+    for (int r = 0; r < 2; ++r) {
+      const int row = m * 16 + r * 8 + o.y;
+      f[m][r] = int4(0);
+      if (FULL || row < rows) {
+        f[m][r] = *reinterpret_cast<const device int4*>(
+            src + (int64_t)row * K + o.x * 4);
+      }
+    }
+  }
+}
+
+// One 64-deep step of the permuted K: each of the four 16-deep fragments
+// of the step, every (m, n pair) of the simdgroup's block, one 16x32x16
+// op (the fragment layout is MLX's, see i8pt_frag_coord).
+template <int TM, int TN, class Op>
+static inline void i8pt_p_step(thread vec<int32_t, 8> (&acc)[TM][TN],
+                               thread const int4 (&a)[TM][2],
+                               thread const int4 (&b)[TN][2], thread Op& op)
+{
+#pragma clang loop unroll(full)
+  for (int kk = 0; kk < 4; ++kk) {
+#pragma clang loop unroll(full)
+    for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+      for (int n = 0; n < TN; n += 2) {
+        auto aT = op.template get_left_input_cooperative_tensor<
+            int8_t, int8_t, int32_t>();
+        auto bT = op.template get_right_input_cooperative_tensor<
+            int8_t, int8_t, int32_t>();
+        auto cT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(aT)>,
+            metal::remove_addrspace_t<decltype(bT)>, int32_t>();
+#pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+          const int r = i >> 2, j = i & 3;
+          aT[i] = as_type<char4>(a[m][r][kk])[j];
+          bT[i] = as_type<char4>(b[n][r][kk])[j];
+          bT[8 + i] = as_type<char4>(b[n + 1][r][kk])[j];
+          cT[i] = acc[m][n][i];
+          cT[8 + i] = acc[m][n + 1][i];
+        }
+        op.run(aT, bT, cT);
+#pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+          acc[m][n][i] = cT[i];
+          acc[m][n + 1][i] = cT[8 + i];
+        }
+      }
+    }
+  }
+}
+
+// DB (gemm_i8pt_d<BM>x<BN>, the A/B arm): the K loop DOUBLE-BUFFERED in
+// registers with no barrier -- the next 64-deep step's operands loaded
+// before this step's ops are issued. MEASURED slower than the blocked
+// loop in the Qwen-Image-2.1 forward (M5 Ultra 0.965-0.986x, base M5
+// 0.945x): with nothing re-aligning them, the simdgroups sharing a
+// tile's rows drift apart along K and stop meeting each other's lines in
+// cache, and re-aligning every 256-1024 of K cost more than it gave
+// (0.88-0.90x).
+template <int TM, int TN, bool FM, bool FN, bool DB>
+static inline void gemm_i8pt_p_body(
+    const device int8_t* A, const device int8_t* B,
+    const device float* as, const device float* ws, device VPIPE_ELT* y,
+    const device VPIPE_ELT* bias, int has_bias, int K, int N, int rows,
+    int cols, ushort lane)
+{
+  static_assert(TN % 2 == 0, "pairs of n fragments a matmul");
+  const short2 o = i8pt_frag_coord(lane);
+  vec<int32_t, 8> acc[TM][TN];
+#pragma clang loop unroll(full)
+  for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+    for (int n = 0; n < TN; ++n) { acc[m][n] = vec<int32_t, 8>(0); }
+  }
+  constexpr auto desc = matmul2d_descriptor(
+      16, 32, 16, false, true, true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  const bool live = rows > 0 && cols > 0;
+  if constexpr (DB) {
+    if (!live) { return; }
+    int4 a0[TM][2], b0[TN][2], a1[TM][2], b1[TN][2];
+    i8pt_load_p<TM, FM>(a0, A, K, rows, o);
+    i8pt_load_p<TN, FN>(b0, B, K, cols, o);
+#pragma clang loop unroll(disable)
+    for (int k = 0; k < K; k += 128) {
+      const bool two = k + 64 < K;
+      if (two) {
+        i8pt_load_p<TM, FM>(a1, A + k + 64, K, rows, o);
+        i8pt_load_p<TN, FN>(b1, B + k + 64, K, cols, o);
+      }
+      i8pt_p_step<TM, TN>(acc, a0, b0, op);
+      if (!two) { break; }
+      if (k + 128 < K) {
+        i8pt_load_p<TM, FM>(a0, A + k + 128, K, rows, o);
+        i8pt_load_p<TN, FN>(b0, B + k + 128, K, cols, o);
+      }
+      i8pt_p_step<TM, TN>(acc, a1, b1, op);
+    }
+  } else {
+#pragma clang loop unroll(disable)
+    for (int kb = 0; kb < K; kb += 512) {
+      threadgroup_barrier(mem_flags::mem_none);
+      if ((!FM || !FN) && !live) { continue; }
+      const int ke = min(K - kb, 512);
+#pragma clang loop unroll(disable)
+      for (int k = 0; k < ke; k += 64) {
+        int4 a[TM][2], b[TN][2];
+        i8pt_load_p<TM, FM>(a, A + kb + k, K, rows, o);
+        i8pt_load_p<TN, FN>(b, B + kb + k, K, cols, o);
+        i8pt_p_step<TM, TN>(acc, a, b, op);
+      }
+    }
+  }
+  if (!live) { return; }
+#pragma clang loop unroll(full)
+  for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+    for (int r = 0; r < 2; ++r) {
+      const int row = m * 16 + r * 8 + o.y;
+      if (!FM && row >= rows) { continue; }
+      const float ar = as[row];
+      device VPIPE_ELT* yr = y + (int64_t)row * N;
+#pragma clang loop unroll(full)
+      for (int n = 0; n < TN; ++n) {
+        const int c0 = n * 16 + o.x;
+        if (FN || c0 + 3 < cols) {
+          const float4 w4 = *reinterpret_cast<const device float4*>(ws + c0);
+          float4 b4 = float4(0.0f);
+          if (has_bias != 0) {
+            b4 = float4(*reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(
+                bias + c0));
+          }
+          const float4 v = fma(float4(acc[m][n][r * 4 + 0],
+                                      acc[m][n][r * 4 + 1],
+                                      acc[m][n][r * 4 + 2],
+                                      acc[m][n][r * 4 + 3]) * ar,
+                               w4, b4);
+          *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(yr + c0) =
+              vec<VPIPE_ELT, 4>(v);
+        } else {
+#pragma clang loop unroll(full)
+          for (int c = 0; c < 4; ++c) {
+            if (c0 + c < cols) {
+              const float b = has_bias != 0 ? (float)bias[c0 + c] : 0.0f;
+              yr[c0 + c] = (VPIPE_ELT)fma(
+                  (float)acc[m][n][r * 4 + c] * ar, ws[c0 + c], b);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+template <int WM, int WN, int TM, int TN, bool DB>
+static inline void gemm_i8pt_p_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device float* as, const device float* ws, device VPIPE_ELT* y,
+    const device VPIPE_ELT* bias, int has_bias, int K, int N, int M,
+    uint3 tgid, ushort sgid, ushort lane)
+{
+  constexpr int SM = 16 * TM, SN = 16 * TN;
+  constexpr int BM = SM * WM, BN = SN * WN;
+  const int row = (int)tgid.y * BM + (int)(sgid / WN) * SM;
+  const int col = (int)tgid.x * BN + (int)(sgid % WN) * SN;
+  const int rows = min(SM, M - row), cols = min(SN, N - col);
+  const device int8_t* A = xq + (int64_t)max(row, 0) * K;
+  const device int8_t* B = wq + (int64_t)max(col, 0) * K;
+  device VPIPE_ELT* Y = y + (int64_t)row * N + col;
+  const bool fm = (M % BM) == 0 || ((int)tgid.y + 1) * BM <= M;
+  const bool fn = (N % BN) == 0 || ((int)tgid.x + 1) * BN <= N;
+  const device float* AS = as + row;
+  const device float* WS = ws + col;
+  const device VPIPE_ELT* BI = bias + (has_bias != 0 ? col : 0);
+  if (fm) {
+    if (fn) {
+      gemm_i8pt_p_body<TM, TN, true, true, DB>(A, B, AS, WS, Y, BI,
+                                               has_bias, K, N, rows, cols,
+                                               lane);
+    } else {
+      gemm_i8pt_p_body<TM, TN, true, false, DB>(A, B, AS, WS, Y, BI,
+                                                has_bias, K, N, rows, cols,
+                                                lane);
+    }
+  } else {
+    if (fn) {
+      gemm_i8pt_p_body<TM, TN, false, true, DB>(A, B, AS, WS, Y, BI,
+                                                has_bias, K, N, rows, cols,
+                                                lane);
+    } else {
+      gemm_i8pt_p_body<TM, TN, false, false, DB>(A, B, AS, WS, Y, BI,
+                                                 has_bias, K, N, rows,
+                                                 cols, lane);
+    }
+  }
+}
+
+#define GI8_PT_P_ENTRY(NAME, WM, WN, TM, TN, DB)                         \
+  [[kernel, max_total_threads_per_threadgroup(32 * WM * WN)]]            \
+  void NAME(                                                             \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device float* as [[buffer(2)]],                              \
+      const device float* ws [[buffer(3)]],                              \
+      device VPIPE_ELT* y [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      const device VPIPE_ELT* bias [[buffer(8)]],                        \
+      const constant int& has_bias [[buffer(9)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      ushort sgid [[simdgroup_index_in_threadgroup]],                    \
+      ushort lane [[thread_index_in_simdgroup]]) {                       \
+    gemm_i8pt_p_impl<WM, WN, TM, TN, DB>(xq, wq, as, ws, y, bias,        \
+                                         has_bias, K, N, M, tgid, sgid,  \
+                                         lane);                          \
+  }
+// 32x32 a simdgroup. m128x64 is the tier's (VPIPE_I8_TOKEN_TILE=64x128
+// the other); the d entries are the double-buffered A/B
+// (VPIPE_I8_TOKEN_KERNEL=d128x64).
+GI8_PT_P_ENTRY(gemm_i8pt_m128x64, 4, 2, 2, 2, false)
+GI8_PT_P_ENTRY(gemm_i8pt_m64x128, 2, 4, 2, 2, false)
+GI8_PT_P_ENTRY(gemm_i8pt_d128x64, 4, 2, 2, 2, true)
+GI8_PT_P_ENTRY(gemm_i8pt_d64x128, 2, 4, 2, 2, true)
+
+// THE W4 UNPACK STUDY (gemm_i8.w4_unpack_cost): what it costs the token
+// tier's GEMM to read a 4-bit weight and widen it to int8 ITSELF, against
+// reading the int8 layout it holds. The m128x64 tile, full tiles only
+// (M % 128, N % 64, K % 128 == 0); dispatched by no model.
+//   WF 0: int8 [N, K], the layout as held.
+//   WF 1: int4 per row in offset binary (u = q + 8), [N, K/2]: each
+//         32-bit word holds 8 elements, byte i = e_i | e_{i+4} << 4, so a
+//         word widens with two masks, an add and an xor per half.
+//   WF 2: the w4 g64 AFFINE pack as stored (byte b = k 2b low, 2b + 1
+//         high) with its bf16 scales and biases, requantized per element
+//         to the token_plain code against the row's 127 / amax (`inv`):
+//         the held conversion (affine_to_i8pt_w4) done inside the GEMM.
+//   ST false: each simdgroup widens its own fragments in registers.
+//   ST true: the threadgroup widens a 64 x 128 block of the weight into
+//         threadgroup memory once a 128-deep chunk (two barriers), and
+//         every simdgroup reads its fragments from there.
+//   0:xq[M,K] i8 1:w 2:as[M] f32 3:ws[N] f32 4:y[M,N] 5:K 6:N 7:M
+//   8:scales[N,K/64] 9:biases[N,K/64] 10:inv[N] f32 (WF 2)
+//   dispatch {N/64 * 32, M/128 * 2, 4}, tg {32, 2, 4}
+static inline uint i8pt_w4_widen(uint w)
+{
+  return ((w & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u;
+}
+
+// Four consecutive elements of an affine g64 pack from two bytes, as the
+// held conversion computes them: the pack's element-type dequant, then
+// the row's code.
+static inline int i8pt_affine4(uint p, float s, float b, float inv)
+{
+  const float4 c = float4(p & 0xfu, (p >> 4) & 0xfu, (p >> 8) & 0xfu,
+                          (p >> 12) & 0xfu);
+  const float4 v = float4(vec<VPIPE_ELT, 4>(c * s + b));
+  return as_type<int>(char4(clamp(int4(rint(v * inv)), int4(-127),
+                                  int4(127))));
+}
+
+// 16 elements of weight row `row` from element k (a multiple of 16).
+template <int WF>
+static inline int4 i8pt_wx_row16(const device uchar* w,
+                                 const device VPIPE_ELT* sc,
+                                 const device VPIPE_ELT* bi,
+                                 const device float* inv, int row, int k,
+                                 int K)
+{
+  if constexpr (WF == 0) {
+    return *reinterpret_cast<const device int4*>(w + (int64_t)row * K + k);
+  } else {
+    const uint2 p = *reinterpret_cast<const device uint2*>(
+        w + (int64_t)row * (K / 2) + k / 2);
+    if constexpr (WF == 1) {
+      return int4(as_type<int>(i8pt_w4_widen(p.x)),
+                  as_type<int>(i8pt_w4_widen(p.x >> 4)),
+                  as_type<int>(i8pt_w4_widen(p.y)),
+                  as_type<int>(i8pt_w4_widen(p.y >> 4)));
+    } else {
+      const int64_t g = (int64_t)row * (K / 64) + k / 64;
+      const float s = (float)sc[g], b = (float)bi[g], iv = inv[row];
+      return int4(i8pt_affine4(p.x & 0xffffu, s, b, iv),
+                  i8pt_affine4(p.x >> 16, s, b, iv),
+                  i8pt_affine4(p.y & 0xffffu, s, b, iv),
+                  i8pt_affine4(p.y >> 16, s, b, iv));
+    }
+  }
+}
+
+template <int WF, bool ST>
+static inline void gemm_i8pt_wx_impl(
+    const device int8_t* xq, const device uchar* w, const device float* as,
+    const device float* ws, device VPIPE_ELT* y, int K, int N,
+    const device VPIPE_ELT* sc, const device VPIPE_ELT* bi,
+    const device float* inv, threadgroup int8_t* tgw, uint3 tgid,
+    ushort sgid, ushort lane)
+{
+  constexpr int TM = 2, TN = 2, WN = 2, CH = 128, STR = CH + 16;
+  const short2 o = i8pt_frag_coord(lane);
+  const int row0 = (int)tgid.y * 128 + (int)(sgid / WN) * 32;
+  const int tcol = (int)tgid.x * 64;
+  const int scol = (int)(sgid % WN) * 32;   // within the tile
+  const device int8_t* A = xq + (int64_t)row0 * K;
+  vec<int32_t, 8> acc[TM][TN];
+#pragma clang loop unroll(full)
+  for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+    for (int n = 0; n < TN; ++n) { acc[m][n] = vec<int32_t, 8>(0); }
+  }
+  constexpr auto desc = matmul2d_descriptor(
+      16, 32, 16, false, true, true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  if constexpr (ST) {
+    const int tid = (int)sgid * 32 + (int)lane;
+    const int fr = tid >> 2, fs = (tid & 3) * 32;   // row, 32 elements
+#pragma clang loop unroll(disable)
+    for (int kc = 0; kc < K; kc += CH) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup int8_t* dst = tgw + fr * STR + fs;
+      const int4 lo = i8pt_wx_row16<WF>(w, sc, bi, inv, tcol + fr,
+                                        kc + fs, K);
+      const int4 hi = i8pt_wx_row16<WF>(w, sc, bi, inv, tcol + fr,
+                                        kc + fs + 16, K);
+      *reinterpret_cast<threadgroup int4*>(dst) = lo;
+      *reinterpret_cast<threadgroup int4*>(dst + 16) = hi;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma clang loop unroll(full)
+      for (int k = 0; k < CH; k += 64) {
+        int4 a[TM][2], b[TN][2];
+        i8pt_load_p<TM, true>(a, A + kc + k, K, 32, o);
+#pragma clang loop unroll(full)
+        for (int n = 0; n < TN; ++n) {
+#pragma clang loop unroll(full)
+          for (int r = 0; r < 2; ++r) {
+            const int row = scol + n * 16 + r * 8 + o.y;
+            b[n][r] = *reinterpret_cast<const threadgroup int4*>(
+                tgw + row * STR + k + o.x * 4);
+          }
+        }
+        i8pt_p_step<TM, TN>(acc, a, b, op);
+      }
+    }
+  } else {
+#pragma clang loop unroll(disable)
+    for (int kb = 0; kb < K; kb += 512) {
+      threadgroup_barrier(mem_flags::mem_none);
+      const int ke = min(K - kb, 512);
+#pragma clang loop unroll(disable)
+      for (int k = 0; k < ke; k += 64) {
+        int4 a[TM][2], b[TN][2];
+        i8pt_load_p<TM, true>(a, A + kb + k, K, 32, o);
+        // DESCENDING, and only because ascending MEASURED wrong for WF 2
+        // on the M5's compiler: the first fragment widened (8 of every 32
+        // output columns) came out different from the threadgroup form of
+        // the same helper, while WF 0 / 1 were exact either way. No
+        // undefined behaviour found; reversing the order is exact.
+#pragma clang loop unroll(full)
+        for (int n = TN - 1; n >= 0; --n) {
+#pragma clang loop unroll(full)
+          for (int r = 1; r >= 0; --r) {
+            const int row = tcol + scol + n * 16 + r * 8 + o.y;
+            b[n][r] = i8pt_wx_row16<WF>(w, sc, bi, inv, row,
+                                        kb + k + o.x * 4, K);
+          }
+        }
+        i8pt_p_step<TM, TN>(acc, a, b, op);
+      }
+    }
+  }
+#pragma clang loop unroll(full)
+  for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+    for (int r = 0; r < 2; ++r) {
+      const int row = row0 + m * 16 + r * 8 + o.y;
+      const float ar = as[row];
+      device VPIPE_ELT* yr = y + (int64_t)row * N + tcol + scol;
+#pragma clang loop unroll(full)
+      for (int n = 0; n < TN; ++n) {
+        const int c0 = n * 16 + o.x;
+        const float4 w4 = *reinterpret_cast<const device float4*>(
+            ws + tcol + scol + c0);
+        const float4 v = fma(float4(acc[m][n][r * 4 + 0],
+                                    acc[m][n][r * 4 + 1],
+                                    acc[m][n][r * 4 + 2],
+                                    acc[m][n][r * 4 + 3]) * ar,
+                             w4, float4(0.0f));
+        *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(yr + c0) =
+            vec<VPIPE_ELT, 4>(v);
+      }
+    }
+  }
+}
+
+#define GI8_PT_WX_ENTRY(NAME, WF, ST)                                    \
+  [[kernel, max_total_threads_per_threadgroup(256)]]                     \
+  void NAME(                                                             \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device uchar* w [[buffer(1)]],                               \
+      const device float* as [[buffer(2)]],                              \
+      const device float* ws [[buffer(3)]],                              \
+      device VPIPE_ELT* y [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      const device VPIPE_ELT* sc [[buffer(8)]],                          \
+      const device VPIPE_ELT* bi [[buffer(9)]],                          \
+      const device float* inv [[buffer(10)]],                            \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      ushort sgid [[simdgroup_index_in_threadgroup]],                    \
+      ushort lane [[thread_index_in_simdgroup]]) {                       \
+    threadgroup int8_t tgw[ST ? 64 * 144 : 16];                          \
+    (void)M;                                                             \
+    gemm_i8pt_wx_impl<WF, ST>(xq, w, as, ws, y, K, N, sc, bi, inv, tgw,  \
+                              tgid, sgid, lane);                         \
+  }
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_i8_reg, 0, false)
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_i8_tg, 0, true)
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_w4_reg, 1, false)
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_w4_tg, 1, true)
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_aff_reg, 2, false)
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_aff_tg, 2, true)
+
 // THE UNSIGNED MMA CEILINGS: the kaccr loop over uint8 x uint8 and
 // uint8 x uint4, raw multiply_accumulate into a cooperative i32 tensor
 // with no scales at all, so the gap between them is what the 4-bit
@@ -2595,6 +3287,36 @@ DGV_STUB(gemm_i8s_w8g64)
 DGV_STUB(gemm_i8s_w4g64)
 DGV_STUB(gemm_i8s_w8g64_sk)
 DGV_STUB(gemm_i8s_w4g64_sk)
+DGV_STUB(gemm_i8c_g256_t64x64)
+DGV_STUB(gemm_i8c_g256_t64x128)
+DGV_STUB(gemm_i8c_g256_t128x64)
+DGV_STUB(gemm_i8c_g256_t128x128)
+DGV_STUB(gemm_i8c_g512_t64x64)
+DGV_STUB(gemm_i8c_g512_t64x128)
+DGV_STUB(gemm_i8c_g512_t128x64)
+DGV_STUB(gemm_i8c_g512_t128x128)
+DGV_STUB(gemm_i8c_g1024_t64x64)
+DGV_STUB(gemm_i8c_g1024_t64x128)
+DGV_STUB(gemm_i8c_g1024_t128x64)
+DGV_STUB(gemm_i8c_g1024_t128x128)
+DGV_STUB(gemm_i8pt_t64x64_k128)
+DGV_STUB(gemm_i8pt_t64x128_k128)
+DGV_STUB(gemm_i8pt_t128x64_k128)
+DGV_STUB(gemm_i8pt_t128x128_k128)
+DGV_STUB(gemm_i8pt_t128x64_k64)
+DGV_STUB(gemm_i8pt_t128x64_k256)
+DGV_STUB(gemm_i8pt_t128x128_k64)
+DGV_STUB(gemm_i8pt_t128x128_k256)
+DGV_STUB(gemm_i8pt_m128x64)
+DGV_STUB(gemm_i8pt_m64x128)
+DGV_STUB(gemm_i8pt_d128x64)
+DGV_STUB(gemm_i8pt_d64x128)
+DGV_STUB(gemm_i8pt_wx_i8_reg)
+DGV_STUB(gemm_i8pt_wx_i8_tg)
+DGV_STUB(gemm_i8pt_wx_w4_reg)
+DGV_STUB(gemm_i8pt_wx_w4_tg)
+DGV_STUB(gemm_i8pt_wx_aff_reg)
+DGV_STUB(gemm_i8pt_wx_aff_tg)
 DGV_STUB(gemm_u8q_w4g64_s4)
 DGV_STUB(gemm_u8q_w4g64_s2)
 DGV_STUB(gemm_u8q_w8g64_s4)

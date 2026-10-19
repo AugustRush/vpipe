@@ -208,6 +208,66 @@ kernel void rms_norm_fast_f16(
   }
 }
 
+// rms_norm_vec_f16 -- rms_norm_fast_f16 for short rows (a decode step's
+// residual stream, a head): one threadgroup a row as there, but each thread
+// reads its share as 4-element vectors and keeps them in registers for the
+// scaled write -- a 5120 row at 256 threads in 5 loads and 5 stores a
+// thread, not 20 loads for the sum and 40 more for the write. On an M5
+// Ultra the scalar form spent ~17 us a norm on those round trips (2.9 of a
+// 27B's 23.7 ms decode step went to its 129 norms). Its own reduction order
+// (the vec4 lanes summed per thread, then the simd_sums), so a model runs
+// every norm its decode, verify and prefill share on one kernel or the
+// other. H % 4 == 0, H <= tg * 4 * 8; offsets 8-byte aligned.
+//   0:x[R,H] 1:weight[H] 2:out[R,H] 3:H 4:eps. grid (256, R); tg (256, 1, 1).
+kernel void rms_norm_vec_f16(
+    const device VPIPE_ELT*  x      [[buffer(0)]],
+    const device VPIPE_ELT*  weight [[buffer(1)]],
+    device VPIPE_ELT*        out    [[buffer(2)]],
+    constant int&       H      [[buffer(3)]],
+    constant float&     eps    [[buffer(4)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint3 ltid     [[thread_position_in_threadgroup]],
+    uint3 tptg     [[threads_per_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]])
+{
+  constexpr int MAXV = 8;                 // vec4s a thread holds
+  typedef vec<VPIPE_ELT, 4> e4;
+  const uint row = tid.y;
+  const int lid = (int)ltid.x;
+  const int tg = (int)tptg.x;
+  const uint nsg = (uint)tg / 32;
+  const int nv = H / 4;
+  const device e4* xr = (const device e4*)(x + (uint)row * H);
+  const device e4* wr = (const device e4*)weight;
+  device e4* outr = (device e4*)(out + (uint)row * H);
+  float4 v[MAXV];
+  float acc = 0.0f;
+#pragma clang loop unroll(full)
+  for (int j = 0; j < MAXV; ++j) {
+    const int i = lid + j * tg;
+    v[j] = i < nv ? float4(xr[i]) : float4(0.0f);
+    acc += v[j].x * v[j].x + v[j].y * v[j].y + v[j].z * v[j].z
+           + v[j].w * v[j].w;
+  }
+  acc = simd_sum(acc);
+  threadgroup float partial[32];
+  if (simd_lid == 0) { partial[simd_gid] = acc; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float p = (simd_lid < nsg) ? partial[simd_lid] : 0.0f;
+    p = simd_sum(p);
+    if (simd_lid == 0) { partial[0] = p; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = rsqrt(partial[0] / float(H) + eps);
+#pragma clang loop unroll(full)
+  for (int j = 0; j < MAXV; ++j) {
+    const int i = lid + j * tg;
+    if (i < nv) { outr[i] = e4(v[j] * inv * float4(wr[i])); }
+  }
+}
+
 kernel void rms_add_fast_f16(
     const device VPIPE_ELT*  x        [[buffer(0)]],
     const device VPIPE_ELT*  weight   [[buffer(1)]],

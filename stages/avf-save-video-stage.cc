@@ -54,7 +54,8 @@ constexpr ConfigKey kAttrs[] = {
    .def_real = 0},
   {.key = "alpha", .type = ConfigType::String, .required = false,
    .doc = "keep | drop. keep (the default) writes a 4-channel picture's "
-          "alpha into ProRes 4444; other codecs have none",
+          "alpha into ProRes 4444; dropped -- or a 3-channel picture -- "
+          "it has no alpha plane. Other codecs have none",
    .def_str = "keep", .extra = kAlphaChoices},
   {.key = "quality", .type = ConfigType::Real, .required = false,
    .doc = "HEVC / H.264 quality 0..1; 0 (the default) = the encoder's",

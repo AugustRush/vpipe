@@ -1198,7 +1198,9 @@ MetalYue2Model::eval_(Chunk& c, const std::vector<float>& state,
       *ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t0).count();
     }
-    stream = _mc->make_command_stream();
+    // The same stream: a fresh one is a new queue, and its first
+    // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+    // stream_per_commit_costs).
     enc = stream.begin_compute();
     if (!ok && err != nullptr) {
       *err = ge.empty() ? "NAR evaluation failed" : ge;
@@ -1453,7 +1455,9 @@ MetalYue2Model::eval_(Chunk& c, const std::vector<float>& state,
       enc.end();
       std::string ge;
       const bool ok = stream.commit().wait_ok(&ge);
-      stream = _mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       gpu_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t_g0).count();

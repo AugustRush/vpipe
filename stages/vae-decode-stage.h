@@ -98,6 +98,11 @@ public:
                  FlexData                  config);
   ~VaeDecodeStage() override;
 
+  // The settled acceleration bag (i8_gemm, i8_gemm_tier, ...): what a
+  // registered family is handed and the Qwen-Image codec is set from. A
+  // test seam, as GenerateImageStage's.
+  const FlexData& accel_settings() const noexcept { return _accel; }
+
   Job initialize(RuntimeContext& ctx) override;
 
   // The VAE this stage loads. Small next to the DiT and the encoder,
@@ -187,6 +192,11 @@ private:
   mutable int _oport0_group = -1;
 
   std::string _hf_dir;
+  // `vae_dir`: the VAE's WEIGHTS when they are not the model's own (a
+  // Draw Things .ckpt); the config is still the model's. Empty: none.
+  std::string _vae_weights;
+  // `_vae_weights` resolved (a registry key or a path); empty when unset.
+  std::string vae_weights_() const;
   // "krea2" (Qwen-Image VAE) | "flux2" (AutoencoderKLFlux2) |
   // "wan" (AutoencoderKLWan, the VIDEO one) | "minimax-h3" | a registered
   // family's tag
@@ -209,8 +219,13 @@ private:
   // from initialize() when the model comes from config, or from process() when
   // it arrives on the model iport. Left null on failure so the stage stays
   // inert (process() warns + emits nothing).
-  std::unique_ptr<genai::MetalKrea2Vae> _vae;
-  std::unique_ptr<genai::MetalFlux2Vae> _flux2_vae;
+  // Shared, so it can outlive the stage kept warm (~VaeDecodeStage).
+  std::shared_ptr<genai::MetalKrea2Vae> _vae;
+  double      _keep_loaded = 0.0;    // s it is kept warm after the stage
+  std::string _vae_warm_key;         // what it was built with
+  static constexpr const char* kKrea2VaeWarmKind = "krea2-vae-decoder";
+  static constexpr const char* kFlux2VaeWarmKind = "flux2-vae-decoder";
+  std::shared_ptr<genai::MetalFlux2Vae> _flux2_vae;
   std::unique_ptr<genai::MetalWanVae>   _wan_vae;
   // A STREAM's decode carries (sideband::kStreamContinues), held from one
   // latent beat to the next so the decode continues across the cut. Kept

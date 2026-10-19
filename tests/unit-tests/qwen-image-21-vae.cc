@@ -27,20 +27,26 @@
 
 #include "minitest.h"
 
+#include <mach/mach.h>
+
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "generative-models/krea2/metal-krea2-vae.h"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <random>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 using namespace vpipe;
@@ -426,22 +432,35 @@ TEST(qwen_image_21_vae, avg_down_shortcut_matches_cpu)
 
 // ---- the real checkpoint --------------------------------------------
 
-TEST(qwen_image_21_vae, loads_and_round_trips)
+// The round trip below, as a function so a second test can run it with
+// the conv route forced: its PSNR, kSkipped where the model is not set,
+// or kBroken where something failed before there was a picture (said).
+constexpr double kSkipped = -1.0, kBroken = -2.0;
+#define Q21_RT_REQUIRE(cond)                                               \
+  do {                                                                     \
+    if (!(cond)) {                                                         \
+      std::printf("[qwen_image_21_vae] %s:%d: %s\n", __FILE__, __LINE__,   \
+                  #cond);                                                  \
+      return kBroken;                                                      \
+    }                                                                      \
+  } while (0)
+static double
+round_trip_psnr_(const char* tag)
 {
   const std::string root = model_root_();
-  if (root.empty()) { return; }
+  if (root.empty()) { return kSkipped; }
   const FlexData fd = vae_config_json_();
-  if (!fd.is_object()) { return; }
+  if (!fd.is_object()) { return kSkipped; }
   Session sess;
   MetalCompute* mc = sess.metal_compute();
-  if (mc == nullptr) { return; }
+  if (mc == nullptr) { return kSkipped; }
 
   MetalKrea2Vae::Config cfg;
   MetalKrea2Vae::config_from_json(fd, &cfg);
   auto m = MetalKrea2Vae::load(root + "/vae", mc, cfg, /*with_encoder=*/true);
-  Q21_REQUIRE(m != nullptr);
-  Q21_REQUIRE(m->has_encoder());
-  EXPECT_TRUE(m->config().spatial_factor() == 16);
+  Q21_RT_REQUIRE(m != nullptr);
+  Q21_RT_REQUIRE(m->has_encoder());
+  Q21_RT_REQUIRE(m->config().spatial_factor() == 16);
 
   // A picture the encoder can actually round-trip: smooth, so the test
   // is about the architecture rather than about high-frequency loss.
@@ -461,29 +480,29 @@ TEST(qwen_image_21_vae, loads_and_round_trips)
     }
   }
   SharedBuffer ib = mc->make_shared_buffer(img.size() * 2);
-  Q21_REQUIRE(!ib.empty());
+  Q21_RT_REQUIRE(!ib.empty());
   {
     auto* d = static_cast<_Float16*>(ib.contents());
     for (std::size_t i = 0; i < img.size(); ++i) { d[i] = (_Float16)img[i]; }
   }
 
   SharedBuffer lat = m->encode(ib, H, W);
-  Q21_REQUIRE(!lat.empty());
+  Q21_RT_REQUIRE(!lat.empty());
   const int hL = H / 16, wL = W / 16;
   // z_dim channels at the /16 grid, and nothing else would be this size.
-  Q21_REQUIRE(lat.byte_size() >=
+  Q21_RT_REQUIRE(lat.byte_size() >=
               (std::size_t)cfg.z_dim * hL * wL * 2);
 
   // encode() whitens; decode() wants the raw latent back.
   SharedBuffer raw = m->unwhiten(lat, hL, wL);
-  Q21_REQUIRE(!raw.empty());
+  Q21_RT_REQUIRE(!raw.empty());
   std::string err;
   SharedBuffer rgb = m->decode(raw, hL, wL, &err);
   if (rgb.empty()) {
     std::printf("[qwen_image_21_vae] decode failed: %s\n", err.c_str());
   }
-  Q21_REQUIRE(!rgb.empty());
-  Q21_REQUIRE(rgb.byte_size() >= (std::size_t)cfg.out_channels * H * W * 2);
+  Q21_RT_REQUIRE(!rgb.empty());
+  Q21_RT_REQUIRE(rgb.byte_size() >= (std::size_t)cfg.out_channels * H * W * 2);
 
   const auto* rp = static_cast<const _Float16*>(rgb.contents());
   std::vector<float> got((std::size_t)cfg.out_channels * H * W);
@@ -492,7 +511,7 @@ TEST(qwen_image_21_vae, loads_and_round_trips)
     got[i] = (float)rp[i];
     if (!std::isfinite(got[i])) { finite = false; }
   }
-  EXPECT_TRUE(finite);
+  Q21_RT_REQUIRE(finite);
 
   // PSNR over the channels the input actually carried.
   double se = 0.0;
@@ -503,11 +522,80 @@ TEST(qwen_image_21_vae, loads_and_round_trips)
   }
   const double mse = se / (double)n;
   const double psnr = mse > 0.0 ? 10.0 * std::log10(4.0 / mse) : 99.0;
-  std::printf("[qwen_image_21_vae] round trip %dx%d -> [%d,%d,%d] PSNR %.2f dB\n",
-              H, W, cfg.z_dim, hL, wL, psnr);
-  // A loose floor on purpose: this says the architecture is wired, not
-  // that it is numerically right. The golden below is what pins that.
+  std::printf("[qwen_image_21_vae] round trip%s %dx%d -> [%d,%d,%d] PSNR "
+              "%.2f dB\n", tag, H, W, cfg.z_dim, hL, wL, psnr);
+  return psnr;
+}
+#undef Q21_RT_REQUIRE
+
+// A loose floor on purpose: this says the architecture is wired, not
+// that it is numerically right. The golden below is what pins that.
+TEST(qwen_image_21_vae, loads_and_round_trips)
+{
+  const double psnr = round_trip_psnr_("");
+  if (psnr == kSkipped) { return; }
   EXPECT_TRUE(psnr > 18.0);
+}
+
+// THE ON-CHIP CONV'S STRIDE 2, END TO END. Every conv the hardware op
+// declines goes to conv2d_mma_3x3_* (VPIPE_KREA2_CONV2D) -- at 64x64 the
+// encoder's last downsample has a 4x4 output, under the hardware op's 8.
+// That kernel padded a downsample (1,1,1,1) where the encoders pad
+// (0,1,0,1), so the round trip read 17.4 dB on an M5 whenever the timed
+// route tune happened to pick it, and 35 when it did not.
+TEST(qwen_image_21_vae, a_round_trip_on_the_on_chip_conv)
+{
+  ::setenv("VPIPE_KREA2_CONV2D", "1", 1);
+  const double psnr = round_trip_psnr_(" (on-chip conv)");
+  ::unsetenv("VPIPE_KREA2_CONV2D");
+  if (psnr == kSkipped) { return; }
+  EXPECT_TRUE(psnr > 18.0);
+}
+
+// A DECODE IS THE SAME RUN TO RUN. The materialized mid attention centres
+// K by its column sums, and those were summed with atomic adds in
+// whatever order the row chunks finished -- two identical generations
+// came out ~70 dB apart. Two decodes of one latent through that member,
+// BYTE-IDENTICAL, at a size whose mid has many chunks (64x64 latent
+// cells: 4096 rows).
+TEST(qwen_image_21_vae, a_decode_is_the_same_run_to_run)
+{
+  const std::string root = model_root_();
+  if (root.empty()) { return; }
+  const FlexData fd = vae_config_json_();
+  if (!fd.is_object()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalKrea2Vae::Config cfg;
+  MetalKrea2Vae::config_from_json(fd, &cfg);
+  // The materialized member, whatever the tune would say.
+  ::setenv("VPIPE_VAE_MAT_ATTN_MMA2", "1", 1);
+  auto m = MetalKrea2Vae::load(root + "/vae", mc, cfg, /*with_encoder=*/false);
+  ::unsetenv("VPIPE_VAE_MAT_ATTN_MMA2");
+  Q21_REQUIRE(m != nullptr);
+  const int hL = 64, wL = 64;
+  const std::size_t n = (std::size_t)cfg.z_dim * hL * wL;
+  SharedBuffer z = mc->make_shared_buffer(n * 2);
+  Q21_REQUIRE(!z.empty());
+  {
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* d = static_cast<_Float16*>(z.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)nd(rng); }
+  }
+  std::string err;
+  SharedBuffer a = m->decode(z, hL, wL, &err);
+  Q21_REQUIRE(!a.empty());
+  SharedBuffer b = m->decode(z, hL, wL, &err);
+  Q21_REQUIRE(!b.empty());
+  const std::size_t bytes =
+      (std::size_t)cfg.out_channels * hL * 16 * wL * 16 * 2;
+  Q21_REQUIRE(a.byte_size() >= bytes && b.byte_size() >= bytes);
+  const bool same = std::memcmp(a.contents(), b.contents(), bytes) == 0;
+  std::printf("[qwen_image_21_vae] two decodes of one latent (%dx%d): %s\n",
+              hL * 16, wL * 16, same ? "IDENTICAL" : "DIFFERENT");
+  EXPECT_TRUE(same);
 }
 
 TEST(qwen_image_21_vae, decode_matches_golden)
@@ -663,4 +751,230 @@ TEST(qwen_image_21_vae, decode_bench)
   }
   std::printf("[qwen_image_21_vae] decode %dx%d (latent %dx%d, /%d): "
               "%.0f ms\n", px, px, hL, hL, cfg.spatial_factor(), best);
+}
+
+// WHAT A DECODE HOLDS AGAINST decode_peak_bytes
+// (VPIPE_QWEN_IMAGE21_VAE_PEAK=<side>[:<tier>], tier off | accurate |
+// fast | token; side 0 loads and decodes nothing). Run each arm in a
+// process of its own under /usr/bin/time -l and take the side-0 arm's
+// peak footprint off: what is left is the decode's own, against the
+// figure the preflight books, printed here.
+TEST(qwen_image_21_vae, decode_peak_against_plan)
+{
+  const char* e = std::getenv("VPIPE_QWEN_IMAGE21_VAE_PEAK");
+  if (e == nullptr || *e == '\0') { return; }
+  const std::string root = model_root_();
+  if (root.empty()) { return; }
+  const FlexData fd = vae_config_json_();
+  if (!fd.is_object()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalKrea2Vae::Config cfg;
+  MetalKrea2Vae::config_from_json(fd, &cfg);
+  auto m = MetalKrea2Vae::load(root + "/vae", mc, cfg, /*with_encoder=*/false);
+  Q21_REQUIRE(m != nullptr);
+  const int side = std::atoi(e);
+  const char* colon = std::strchr(e, ':');
+  const std::string tier = colon != nullptr ? colon + 1 : "off";
+  if (tier != "off") {
+    MetalKrea2Vae::Accel a;
+    a.i8_gemm = true;
+    a.i8_tier = tier == "accurate" ? 0 : tier == "fast" ? 1
+              : tier == "token"    ? 2 : 3;
+    m->set_accel(a);
+  }
+  if (side <= 0) {
+    std::printf("[qwen_image_21_vae peak] load only (%s)\n", tier.c_str());
+    return;
+  }
+  const int hL = side / cfg.spatial_factor();
+  const std::size_t n = (std::size_t)cfg.z_dim * hL * hL;
+  SharedBuffer z = mc->make_shared_buffer(n * 2);
+  Q21_REQUIRE(!z.empty());
+  {
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* d = static_cast<_Float16*>(z.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)nd(rng); }
+  }
+  // The footprint sampled every half millisecond during each decode,
+  // against what it was just before: the first decode carries the conv
+  // route tune, the second is the steady state.
+  auto footprint = []() -> std::size_t {
+    task_vm_info_data_t vi{};
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) !=
+        KERN_SUCCESS) {
+      return 0;
+    }
+    return (std::size_t)vi.phys_footprint;
+  };
+  std::string err;
+  std::size_t peaks[2] = {0, 0};
+  for (int i = 0; i < 2; ++i) {
+    // Freed Metal memory leaves the footprint asynchronously (~1 s for
+    // 8 GB on an M5): settle first, or the previous decode's pages are
+    // in this one's baseline.
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    const std::size_t before = footprint();
+    std::atomic<bool> done{false};
+    std::atomic<std::size_t> hi{before};
+    std::thread sampler([&] {
+      while (!done.load()) {
+        const std::size_t f = footprint();
+        if (f > hi.load()) { hi.store(f); }
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+      }
+    });
+    SharedBuffer rgb = m->decode(z, hL, hL, &err);
+    done.store(true);
+    sampler.join();
+    Q21_REQUIRE(!rgb.empty());
+    peaks[i] = hi.load() - before;
+  }
+  std::printf("[qwen_image_21_vae peak] %d^2 %s: decode_peak_bytes %zu MB, "
+              "measured first %zu MB / warm %zu MB (%s)\n", side,
+              tier.c_str(), m->decode_peak_bytes(hL, hL) >> 20,
+              peaks[0] >> 20, peaks[1] >> 20, m->accel_note().c_str());
+}
+
+// INT8 AGAINST F16, ON A REAL PICTURE (MetalKrea2Vae::set_accel).
+//
+// VPIPE_QWEN_IMAGE21_VAE_IMAGE names a picture as raw f32, channel-first
+// [in_channels, H, W] in [-1, 1] (a square side, a multiple of 16). It
+// is encoded, then decoded in f16 -- the reference -- and again at each
+// int8 tier, each decode timed (best of two after a warm one) and held
+// to the reference by PSNR; the int8 ENCODE is held to the f16 one by
+// the picture its latent decodes to. A real picture's latent, not noise:
+// the activations' channel statistics are what the int8 route's scales
+// are made of.
+TEST(qwen_image_21_vae, int8_against_f16)
+{
+  const char* img_env = std::getenv("VPIPE_QWEN_IMAGE21_VAE_IMAGE");
+  if (img_env == nullptr || *img_env == '\0') { return; }
+  const std::string root = model_root_();
+  if (root.empty()) { return; }
+  const FlexData fd = vae_config_json_();
+  if (!fd.is_object()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  MetalKrea2Vae::Config cfg;
+  MetalKrea2Vae::config_from_json(fd, &cfg);
+  const std::vector<float> img = read_f32_(img_env);
+  const int IC = cfg.in_channels;
+  Q21_REQUIRE(!img.empty() && img.size() % (std::size_t)IC == 0);
+  int H = 1;
+  while ((std::size_t)H * H < img.size() / IC) { ++H; }
+  Q21_REQUIRE((std::size_t)H * H * IC == img.size());
+  const int sf = cfg.spatial_factor();
+  const int hL = H / sf;
+
+  auto m = MetalKrea2Vae::load(root + "/vae", mc, cfg, /*with_encoder=*/true);
+  Q21_REQUIRE(m != nullptr);
+  SharedBuffer ib = mc->make_shared_buffer(img.size() * 2);
+  Q21_REQUIRE(!ib.empty());
+  {
+    auto* d = static_cast<_Float16*>(ib.contents());
+    for (std::size_t i = 0; i < img.size(); ++i) { d[i] = (_Float16)img[i]; }
+  }
+  const std::size_t nrgb = (std::size_t)cfg.out_channels * H * H;
+  auto to_f32 = [&](const SharedBuffer& b, std::size_t n) {
+    std::vector<float> v(n);
+    const auto* p = static_cast<const _Float16*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) { v[i] = (float)p[i]; }
+    return v;
+  };
+  // PSNR over [-1, 1] (peak-to-peak 2) on the colour channels.
+  auto psnr = [&](const std::vector<float>& a, const std::vector<float>& b) {
+    const std::size_t n = (std::size_t)3 * H * H;
+    double se = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      se += d * d;
+    }
+    const double mse = se / (double)n;
+    return mse > 0.0 ? 10.0 * std::log10(4.0 / mse) : 99.0;
+  };
+  std::string err;
+  auto decode_timed = [&](const SharedBuffer& z, double* ms) {
+    SharedBuffer warm = m->decode(z, hL, hL, &err);
+    if (warm.empty()) { return std::vector<float>{}; }
+    double best = 0.0;
+    SharedBuffer rgb;
+    for (int i = 0; i < 2; ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      rgb = m->decode(z, hL, hL, &err);
+      const double t = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (rgb.empty()) { return std::vector<float>{}; }
+      if (best == 0.0 || t < best) { best = t; }
+    }
+    *ms = best;
+    return to_f32(rgb, nrgb);
+  };
+
+  // The f16 reference.
+  SharedBuffer lat = m->encode(ib, H, H);
+  Q21_REQUIRE(!lat.empty());
+  SharedBuffer raw = m->unwhiten(lat, hL, hL);
+  Q21_REQUIRE(!raw.empty());
+  double ms16 = 0.0;
+  const std::vector<float> ref = decode_timed(raw, &ms16);
+  Q21_REQUIRE(!ref.empty());
+  std::printf("[qwen_image_21_vae] %dx%d f16: decode %.0f ms, %.2f dB "
+              "against the picture\n", H, H, ms16, psnr(ref, img));
+
+  const char* tiers[] = {"accurate", "fast", "token", "token_plain"};
+  for (int t = 0; t < 4; ++t) {
+    m->set_accel({/*i8_gemm=*/true, /*i8_tier=*/t});
+    double ms8 = 0.0;
+    const std::vector<float> got = decode_timed(raw, &ms8);
+    Q21_REQUIRE(!got.empty());
+    const double p = psnr(got, ref);
+    std::printf("[qwen_image_21_vae]   int8 %-11s decode %.0f ms (%.2fx), "
+                "%.2f dB against f16 [%s]\n", tiers[t], ms8, ms16 / ms8, p,
+                m->accel_note().c_str());
+    // Lossy by design, but a picture: an int8 route gone wrong (a scale
+    // misplaced, a channel dropped) lands far under this.
+    EXPECT_TRUE(p > 30.0);
+  }
+  // The int8 ENCODE, decoded in f16: what an edit's reference latent
+  // loses. Timed as the decodes are.
+  auto encode_timed = [&](double* ms) {
+    SharedBuffer warm = m->encode(ib, H, H);
+    if (warm.empty()) { return SharedBuffer{}; }
+    double best = 0.0;
+    SharedBuffer l;
+    for (int i = 0; i < 2; ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      l = m->encode(ib, H, H);
+      const double t = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (l.empty()) { return SharedBuffer{}; }
+      if (best == 0.0 || t < best) { best = t; }
+    }
+    *ms = best;
+    return l;
+  };
+  m->set_accel({});
+  double enc16 = 0.0;
+  Q21_REQUIRE(!encode_timed(&enc16).empty());
+  for (int t = 0; t < 2; ++t) {
+    m->set_accel({true, t});
+    double enc8 = 0.0;
+    SharedBuffer lat8 = encode_timed(&enc8);
+    Q21_REQUIRE(!lat8.empty());
+    m->set_accel({});
+    SharedBuffer raw8 = m->unwhiten(lat8, hL, hL);
+    double ms_d = 0.0;
+    const std::vector<float> got8 = decode_timed(raw8, &ms_d);
+    Q21_REQUIRE(!got8.empty());
+    const double pe = psnr(got8, ref);
+    std::printf("[qwen_image_21_vae]   int8 %-11s encode %.0f ms against "
+                "%.0f (%.2fx), decoded in f16 %.2f dB against f16\n",
+                tiers[t], enc8, enc16, enc16 / enc8, pe);
+    EXPECT_TRUE(pe > 30.0);
+  }
 }

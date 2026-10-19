@@ -605,9 +605,35 @@ MetalFlux3Transformer::configure_slots_()
     }
     return true;
   };
+  ops.same_layout = [this](int L, const Block& b) {
+    return same_layout_(L, b);
+  };
   _slots.set_weight_set(_ws.get());
   _slots.configure(_mc, std::move(ops), "MetalFlux3Transformer",
                    "VPIPE_FLUX3_NO_SLOTS");
+}
+
+// A slot built for a block of the OTHER width -- a mixed pack holds
+// whole joint blocks at w8 and the rest at w4, and one slot pair streams
+// the per-mode and joint blocks alike -- is rebuilt rather than refilled
+// (BlockSlots::Ops::same_layout): the refill would place the codes and
+// keep the slot's width and signed flag.
+bool
+MetalFlux3Transformer::same_layout_(int L, const Block& b) const
+{
+  if (_quant_bits == 0 || _ws == nullptr) { return true; }
+  const std::string p = prefix_(L);
+  const std::pair<const QWeight*, const char*> all[] = {
+      {&b.q, "attn.to_q"},          {&b.k, "attn.to_k"},
+      {&b.v, "attn.to_v"},          {&b.o, "attn.to_out.0"},
+      {&b.ff_in, "ff.linear_in"},   {&b.ff_out, "ff.linear_out"}};
+  for (const auto& [w, nm] : all) {
+    if (stored_affine_bits(*_ws, p + nm, _quant_group) !=
+        (w->quantized ? w->bits : 0)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool
@@ -1220,7 +1246,9 @@ MetalFlux3Transformer::forward(const Request& req, std::string* err)
                 (std::streamsize)(v.size() * sizeof(float)));
       }
     }
-    stream = mc->make_command_stream();
+    // The same stream: a fresh one is a new queue, and its first
+    // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+    // stream_per_commit_costs).
     enc = stream.begin_compute();
   };
 
@@ -1252,7 +1280,9 @@ MetalFlux3Transformer::forward(const Request& req, std::string* err)
       }
     }
     if (!found) { pbuckets.push_back(Bucket{bucket, ms, 1}); }
-    stream = mc->make_command_stream();
+    // The same stream: a fresh one is a new queue, and its first
+    // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+    // stream_per_commit_costs).
     enc = stream.begin_compute();
     pclock = std::chrono::steady_clock::now();
   };
@@ -1563,7 +1593,9 @@ MetalFlux3Transformer::forward(const Request& req, std::string* err)
             "flux3: staging block {}'s weights for the ANE failed; it keeps "
             "the GPU feed-forward", L));
       }
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
     }
     const auto t_g0 = std::chrono::steady_clock::now();
@@ -1621,7 +1653,9 @@ MetalFlux3Transformer::forward(const Request& req, std::string* err)
         ff_lost = _ane->lost_row0();
         if (ff_lost < 0 || ff_lost >= R) { return false; }
       }
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       if (ff_lost >= 0) { gpu_ff(ff_lost, R - ff_lost); }
     }
@@ -1687,7 +1721,10 @@ MetalFlux3Transformer::forward(const Request& req, std::string* err)
     bool on;
     ~SlotJoin() { if (on) { s->join(); } }
   } slot_join{&_slots, _stream_blocks};
-  if (_stream_blocks) { _slots.begin_forward(); }
+  if (_stream_blocks) {
+    (void)_slots.release_if_saturated(_blocks);
+    _slots.begin_forward();
+  }
 
   if (_stream_blocks) {
     if (_wire.on()) {
@@ -1825,7 +1862,9 @@ MetalFlux3Transformer::forward(const Request& req, std::string* err)
       if (!stream.commit().wait_ok(&ge2)) {
         return fail("flux3 forward: " + ge2);
       }
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
     }
     if (ane_plan == AneFeedForward::Plan::kSplit) { ane_stage_(L, *b); }
@@ -1872,7 +1911,9 @@ MetalFlux3Transformer::forward(const Request& req, std::string* err)
         _resid.note_admitted(nb);
       }
       sp_add(sp_gpu_ms, gp0);
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       if (!enc.valid()) { return fail("flux3 forward: no encoder"); }
       mark("stream");
@@ -1887,7 +1928,9 @@ MetalFlux3Transformer::forward(const Request& req, std::string* err)
       if (!stream.commit().wait_ok(&ge)) {
         return fail("flux3 forward: " + ge);
       }
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       if (!enc.valid()) { return fail("flux3 forward: no encoder"); }
     }
@@ -2410,7 +2453,18 @@ MetalFlux3Transformer::resident_bytes() const
   // `_blocks` IS the answer in both modes: preloaded it holds the stack,
   // streaming exactly what residency promoted.
   for (const Block& b : _blocks) { n += block_bytes_(b); }
+  // And the slot pair while it exists: it stays allocated beside every
+  // promoted block, and a holding taken without it dropped two blocks
+  // from both ledgers once the promoted set passed the floor.
+  n += _slots.held_bytes();
   return n;
+}
+
+void
+MetalFlux3Transformer::release_forward_scratch()
+{
+  _w_deq = {};
+  if (_i8) { _i8->release_scratch(); }
 }
 
 }  // namespace genai

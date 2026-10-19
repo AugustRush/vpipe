@@ -548,6 +548,7 @@ MetalQwenModelExec::generate(const SpecDecodeRequest& rq,
   if (rq.is_stop) { c.is_stop = *rq.is_stop; }
   if (rq.on_tokens) { c.on_round = *rq.on_tokens; }
   c.hit_stop = &r.hit_stop;
+  c.drafted = &r.drafted;
   c.sampler = rq.sampler;
   c.prime = rq.prime;
   std::vector<std::int32_t> ids;

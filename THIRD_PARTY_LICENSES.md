@@ -398,7 +398,10 @@ MLX's Metal kernel headers (<https://github.com/ml-explore/mlx>) — the
 `gpu-kernels/metal/vendored/mlx/`. Those headers are `#include`d by
 vpipe's own `.metal` kernel sources and compiled into the embedded
 metallibs shipped in `libvpipe`. No other MLX code is present or
-compiled.
+compiled. A few of vpipe's own kernels follow MLX kernel designs without
+including them (the int8 per-token GEMM's K loop, in
+`gpu-kernels/metal/gemm/dense_gemm_mma.metal`, is the loop of MLX's
+steel `gemm_nax`); the same notice covers them.
 
 MLX is distributed under the MIT License. The vendored headers carry
 `Copyright © 2023-2025 Apple Inc.`; the verbatim license text is

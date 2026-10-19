@@ -98,6 +98,169 @@ TEST(image_memory_plan, the_dit_is_claimed_at_its_streaming_floor)
   EXPECT_TRUE(plan_floor == claim_floor);
 }
 
+// THE INT8 LAYOUTS ARE BOOKED. On the fast and token tiers a w4 pack's
+// block projections are either HELD at int8 -- twice their bytes, where
+// the box has room (the engine's call at load) -- or kept as stored and
+// converted, before each GEMM, into one int8 scratch the size of the
+// largest -- memory the pack's bytes on disk do not show either way, so
+// a plan that booked only those would admit a DiT holding more than it
+// said. Booked: the held layout in the preload figure (a preloaded
+// model may hold it), the scratch in the floor (a streamed one converts
+// per GEMM), and the two ledgers' floors equal. Only where the tiers
+// engage: the accurate tier and a box without matrix cores book the
+// bytes on disk.
+//
+// Env: any of VPIPE_{Z_IMAGE,QWEN_IMAGE21,KREA2,FLUX2,MOSS_IMAGE}
+// _MIXED_DIT -- a mixed (or w4) pack's transformer/, whose parent is the
+// root model-quantize wrote. Loads no weights.
+TEST(image_memory_plan, the_int8_tiers_book_a_w4_pack_s_scratch)
+{
+  namespace fs = std::filesystem;
+  Session sess;
+  auto* mc = sess.metal_compute();
+  const bool engages = mc != nullptr && mc->supports_matrix_cores();
+  int ran = 0;
+  for (const char* var :
+       {"VPIPE_Z_IMAGE_MIXED_DIT", "VPIPE_QWEN_IMAGE21_MIXED_DIT",
+        "VPIPE_KREA2_MIXED_DIT", "VPIPE_FLUX2_MIXED_DIT",
+        "VPIPE_MOSS_IMAGE_MIXED_DIT"}) {
+    const char* e = std::getenv(var);
+    if (e == nullptr || *e == '\0') { continue; }
+    const std::string dit = fs::path(e).lexically_normal().string();
+    const std::string root = fs::path(dit).parent_path().string();
+    struct Plan {
+      std::size_t preload = 0, floor = 0, claim = 0, scratch = 0;
+    };
+    auto plan = [&](const char* tier) {
+      FlexData cfg = FlexData::make_object();
+      cfg.as_object().insert("hf_dir", FlexData::make_string(root));
+      cfg.as_object().insert("i8_gemm", FlexData::make_bool(tier != nullptr));
+      if (tier != nullptr) {
+        cfg.as_object().insert("i8_gemm_tier", FlexData::make_string(tier));
+      }
+      // A picture to size the activations at: without one the denoise
+      // books only the presence marker.
+      cfg.as_object().insert("width", FlexData::make_int(1024));
+      cfg.as_object().insert("height", FlexData::make_int(1024));
+      GenerateImageStage stage(&sess, "t2i", std::vector<InEdge>{},
+                               std::move(cfg));
+      Plan p;
+      for (const ResourceClaim& c : stage.declare_resources()) {
+        if (fs::path(c.key).lexically_normal() == fs::path(dit)) {
+          p.claim = c.floor_bytes;
+        }
+        // The DiT's activations, "<family>-dit:<id>|<bytes>": where the
+        // int8 context's scratch -- a w4 pack's per-GEMM conversion
+        // among it -- is booked.
+        if (c.kind == model_memory::kScratchKind &&
+            c.phase == model_memory::kPhaseDenoise &&
+            c.key.find("-dit:t2i|") != std::string::npos) {
+          p.scratch = std::strtoull(
+              c.key.substr(c.key.rfind('|') + 1).c_str(), nullptr, 10);
+        }
+      }
+      for (const auto& h : stage.declare_memory().holdings) {
+        if (fs::path(h.source).lexically_normal() == fs::path(dit)) {
+          p.preload = h.preload;
+          p.floor = h.floor;
+        }
+      }
+      return p;
+    };
+    const Plan acc = plan("accurate"), tok = plan("token"),
+               fast = plan("fast"), none = plan(nullptr);
+    std::printf("[image_memory_plan] %s: preload %zu -> %zu MB, floor %zu "
+                "MB, denoise scratch %zu (no i8) / %zu (accurate) / %zu MB "
+                "(token)%s\n",
+                var, acc.preload >> 20, tok.preload >> 20, acc.floor >> 20,
+                none.scratch >> 20, acc.scratch >> 20, tok.scratch >> 20,
+                engages ? "" : " (no matrix cores: not engaged)");
+    ASSERT_TRUE(acc.preload > 0 && acc.floor > 0);
+    EXPECT_TRUE(acc.claim == acc.floor && tok.claim == tok.floor);
+    EXPECT_TRUE(fast.preload == tok.preload && fast.floor == tok.floor);
+    // The floor is the weights' alone on every tier: the conversion
+    // scratch is the forward's, booked with its activations.
+    EXPECT_TRUE(tok.floor == acc.floor);
+    if (engages) {
+      // The held layout (every w4 projection again) over the preload; the
+      // int8 context, w4 conversion scratch included, in the denoise.
+      EXPECT_TRUE(tok.preload > acc.preload);
+      EXPECT_TRUE(none.scratch > 0 && tok.scratch > none.scratch &&
+                  acc.scratch > none.scratch);
+    } else {
+      EXPECT_TRUE(tok.preload == acc.preload);
+      EXPECT_TRUE(tok.scratch == none.scratch);
+    }
+    ++ran;
+  }
+  if (ran == 0) {
+    std::printf("[image_memory_plan] no *_MIXED_DIT set, skipped\n");
+  }
+}
+
+// A DENSE checkpoint STREAMED on the int8 layouts keeps, in each slot,
+// its bf16 source as the refill target AND the layout quantized from it,
+// so the floor -- trunk plus slot pairs -- carries that layout too
+// (int8_slot_bytes_). On matrix cores the token tier's floor sits above
+// the accurate tier's by it, and by much less than the preload; where the
+// tiers do not engage the two floors are one.
+//
+// Env: any of VPIPE_{QWEN_IMAGE21,KREA2,Z_IMAGE,FLUX2,MOSS_IMAGE}
+// _TEST_MODEL_PATH -- a release root (bf16 or F32 DiT). Loads no weights.
+TEST(image_memory_plan, a_dense_checkpoint_s_slots_book_their_int8_layout)
+{
+  namespace fs = std::filesystem;
+  Session sess;
+  auto* mc = sess.metal_compute();
+  const bool engages = mc != nullptr && mc->supports_matrix_cores();
+  int ran = 0;
+  for (const char* var :
+       {"VPIPE_QWEN_IMAGE21_TEST_MODEL_PATH", "VPIPE_KREA2_TEST_MODEL_PATH",
+        "VPIPE_Z_IMAGE_TEST_MODEL_PATH", "VPIPE_FLUX2_TEST_MODEL_PATH",
+        "VPIPE_MOSS_IMAGE_TEST_MODEL_PATH"}) {
+    const char* e = std::getenv(var);
+    if (e == nullptr || *e == '\0') { continue; }
+    const std::string root = fs::path(e).lexically_normal().string();
+    const std::string dit = (fs::path(root) / "transformer").string();
+    auto floor_of = [&](const char* tier, std::size_t* preload) {
+      FlexData cfg = FlexData::make_object();
+      cfg.as_object().insert("hf_dir", FlexData::make_string(root));
+      cfg.as_object().insert("i8_gemm", FlexData::make_bool(true));
+      cfg.as_object().insert("i8_gemm_tier", FlexData::make_string(tier));
+      GenerateImageStage stage(&sess, "t2i", std::vector<InEdge>{},
+                               std::move(cfg));
+      std::size_t floor = 0;
+      for (const ResourceClaim& c : stage.declare_resources()) {
+        if (fs::path(c.key).lexically_normal() == fs::path(dit)) {
+          floor = c.floor_bytes;
+        }
+      }
+      for (const auto& h : stage.declare_memory().holdings) {
+        if (fs::path(h.source).lexically_normal() == fs::path(dit)) {
+          *preload = h.preload;
+        }
+      }
+      return floor;
+    };
+    std::size_t pre = 0, pre_tok = 0;
+    const std::size_t acc = floor_of("accurate", &pre);
+    const std::size_t tok = floor_of("token", &pre_tok);
+    std::printf("[image_memory_plan] %s: floor %zu MB accurate, %zu MB "
+                "token (preload %zu MB)%s\n", var, acc >> 20, tok >> 20,
+                pre >> 20, engages ? "" : " (no matrix cores: not engaged)");
+    ASSERT_TRUE(acc > 0 && pre > acc);
+    if (engages) {
+      EXPECT_TRUE(tok > acc && tok - acc < pre / 4);
+    } else {
+      EXPECT_TRUE(tok == acc);
+    }
+    ++ran;
+  }
+  if (ran == 0) {
+    std::printf("[image_memory_plan] no *_TEST_MODEL_PATH set, skipped\n");
+  }
+}
+
 // The ANE tier's memory is CoreML's, so the only thing that can keep it
 // honest is the claim. Two halves, and both have to hold: the stage
 // claims when the tier is on, and does NOT when it is off -- a claim for
@@ -508,10 +671,18 @@ TEST(image_memory_plan, ane_module_grant_by_box)
                 "flat %zu)\n", gb,
                 unit >> 20, granted > 0 ? "GRANTED" : "refused",
                 phases.c_str(), peak >> 20, peak_after >> 20, flat >> 20);
-    // Granted on every box, 16 GB included: the module lives in the
-    // denoise, which stays under the decode's peak.
-    EXPECT_TRUE(granted == 1);
-    EXPECT_TRUE(peak_after == peak);
+    // The module lives in the DENOISE, and that phase books the DiT's
+    // activations (forward_scratch_bytes) beside the weights -- so the
+    // module can make it the box's peak, by at most its own size. A
+    // 16 GB box at 1024^2 then has no room for it (the denoise reads
+    // ~15.7 GB with it), which is the right answer: the tier is for the
+    // M4 series, never judged on a 16 GB M5. Every larger box grants.
+    if (gb >= 24) { EXPECT_TRUE(granted == 1); }
+    if (granted == 1) {
+      EXPECT_TRUE(peak_after >= peak && peak_after <= peak + unit);
+    } else {
+      EXPECT_TRUE(peak_after == peak);
+    }
     mgr->clear_scratch();
     mgr->clear_declarations();
   }

@@ -36,6 +36,7 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <tuple>
 #include <vector>
 
 using namespace vpipe;
@@ -507,10 +508,12 @@ TEST(qmm_mma, correctness) {
 // Matrix-core fused 3x3 conv2d (im2col staged in threadgroup memory -> matmul2d,
 // no DRAM column matrix) == zero-padded CPU conv oracle. Pins the semantics the
 // Krea-2 VAE relies on: the 3x3 halo (read from neighbouring tiles), border
-// reads supplied as 0 (pad-1 zero padding), the K=9*Cin tail (K need not be a
-// multiple of BK), and Cout/pixel tail masking. Both stride 1 (resnet/upsample)
-// and stride 2 (encoder downsample) at VAE-shaped and deliberately
-// non-tile-multiple sizes. f16 = exactly what the VAE binds.
+// reads supplied as 0, the K=9*Cin tail (K need not be a multiple of BK), and
+// Cout/pixel tail masking. Stride 1 (resnet/upsample, pad 1) and stride 2
+// (encoder downsample, pad (0,1,0,1) -- im2col_hwc_3x3_s2's convention; this
+// oracle read stride 2 as pad 1 and so pinned the kernel's wrong one) at
+// VAE-shaped and deliberately non-tile-multiple sizes, down to the 4x4
+// output the hardware op declines. f16 = exactly what the VAE binds.
 TEST(conv2d_mma, matches_im2col) {
   Session sess;
   auto* mc = get_mc_(sess);
@@ -542,8 +545,8 @@ TEST(conv2d_mma, matches_im2col) {
           float acc = 0.0f;
           for (int ky = 0; ky < 3; ++ky) {
             for (int kx = 0; kx < 3; ++kx) {
-              const int iy = oy * stride + ky - 1;
-              const int ix = ox * stride + kx - 1;
+              const int iy = stride == 2 ? 2 * oy + ky : oy + ky - 1;
+              const int ix = stride == 2 ? 2 * ox + kx : ox + kx - 1;
               if (iy < 0 || iy >= H || ix < 0 || ix >= W) { continue; }
               for (int ci = 0; ci < Cin; ++ci) {
                 const float a = (float)in[((std::size_t)iy * W + ix) * Cin + ci];
@@ -594,6 +597,8 @@ TEST(conv2d_mma, matches_im2col) {
   test(16, 16, 32, 48, 1, "s1-basic");
   test(32, 32, 96, 96, 1, "s1-vae");
   test(16, 16, 64, 64, 2, "s2-down");
+  test(8, 8, 768, 768, 2, "s2-4x4");       // a 64^2 picture's last downsample
+  test(20, 12, 96, 96, 2, "s2-odd");       // outputs not multiples of 8
   test(12, 20, 48, 80, 1, "s1-oddtail");   // non-tile-multiple spatial+channels
   test(16, 16, 3, 96, 1, "s1-cin3");       // K=27 < BK (VAE conv_in / conv_out)
   test(16, 16, 16, 64, 1, "s1-cin16");     // K=144 (VAE z-channel convs)
@@ -6032,6 +6037,95 @@ TEST(gemm_i8, g64_register_acc) {
 // 64-channel tile, the 32-channel one (the 96-channel full-resolution
 // convs), and the deep-K GEMM (C=384). VPIPE_HWCONV_WAN_BENCH times both
 // routes at the three real level shapes.
+// THE NARROW HARDWARE-CONV TILES AT SMALL PLANES: the 32- and 16-channel
+// destination tiles (conv2d_hw_3x3_s{1,2}_c{32,16}_f16) against a CPU
+// conv, at planes from 8 to 128 a side -- a Qwen-Image VAE round trip of
+// a 64x64 picture read 17.4 dB on an M5 with the 32 tile and 35.0 with
+// it off. Stride 2 in offset mode 3 (pad (0,1,0,1)).
+TEST(conv2d_mma, narrow_hw_tiles_agree_at_small_planes) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib = mc->load_library("conv2d_mma");
+  struct F { const char* fn; int tile, stride; };
+  const F fs[] = {{"conv2d_hw_3x3_s1_c32_f16", 32, 1},
+                  {"conv2d_hw_3x3_s1_c16_f16", 16, 1},
+                  {"conv2d_hw_3x3_s2_c32_f16", 32, 2},
+                  {"conv2d_hw_3x3_s2_c16_f16", 16, 2}};
+  int bad = 0;
+  for (const F& f : fs) {
+    ComputeFunction fn = lib.function(f.fn);
+    ASSERT_TRUE(fn.valid());
+    if (!fn.valid()) { return; }
+    for (int side : {16, 32, 64, 128}) {
+      for (int cin : {96, 192}) {
+        const int Cout = 96, H = side, W = side;
+        const int OH = H / f.stride, OW = W / f.stride;
+        if (OH % 8 != 0 || OW % 8 != 0) { continue; }
+        std::mt19937 rng(5u + (unsigned)(side * 3 + cin));
+        std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+        std::vector<_Float16> x((std::size_t)H * W * cin);
+        std::vector<_Float16> w((std::size_t)9 * cin * Cout);
+        for (auto& v : x) { v = (_Float16)d(rng); }
+        const float ws = 1.0f / std::sqrt(9.0f * cin);
+        for (auto& v : w) { v = (_Float16)(d(rng) * ws); }
+        SharedBuffer bx = mc->make_shared_buffer(x.size() * 2);
+        SharedBuffer bw = mc->make_shared_buffer(w.size() * 2);
+        SharedBuffer by =
+            mc->make_shared_buffer((std::size_t)OH * OW * Cout * 2);
+        std::memcpy(bx.contents(), x.data(), x.size() * 2);
+        std::memcpy(bw.contents(), w.data(), w.size() * 2);
+        std::memset(by.contents(), 0, by.byte_size());
+        CommandStream st = mc->make_command_stream();
+        {
+          ComputeEncoder e = st.begin_compute();
+          e.set_function(fn);
+          e.set_buffer(0, bx); e.set_buffer(1, bw); e.set_buffer(2, by);
+          e.set_constant(3, W); e.set_constant(4, H);
+          e.set_constant(5, cin); e.set_constant(6, Cout);
+          if (f.stride == 2) { e.set_constant(7, 3); }
+          e.dispatch({(unsigned)((OW / 8) * 128), (unsigned)(OH / 8),
+                      (unsigned)(Cout / f.tile)}, {128, 1, 1});
+        }
+        st.commit().wait();
+        const auto* yp = static_cast<const _Float16*>(by.contents());
+        double num = 0.0, den = 0.0;
+        for (int oy = 0; oy < OH; ++oy) {
+          for (int ox = 0; ox < OW; ++ox) {
+            for (int co = 0; co < Cout; ++co) {
+              double a = 0.0;
+              for (int ky = 0; ky < 3; ++ky) {
+                for (int kx = 0; kx < 3; ++kx) {
+                  const int iy = f.stride == 1 ? oy + ky - 1 : 2 * oy + ky;
+                  const int ix = f.stride == 1 ? ox + kx - 1 : 2 * ox + kx;
+                  if (iy < 0 || ix < 0 || iy >= H || ix >= W) { continue; }
+                  const _Float16* xp = &x[((std::size_t)iy * W + ix) * cin];
+                  const _Float16* wp =
+                      &w[((std::size_t)(ky * 3 + kx) * cin) * Cout + co];
+                  for (int ci = 0; ci < cin; ++ci) {
+                    a += (double)xp[ci] * (double)wp[(std::size_t)ci * Cout];
+                  }
+                }
+              }
+              const double g =
+                  (double)yp[((std::size_t)oy * OW + ox) * Cout + co];
+              num += (g - a) * (g - a);
+              den += a * a;
+            }
+          }
+        }
+        const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+        const bool ok = rel < 2e-3;
+        if (!ok) { ++bad; }
+        std::printf("[conv2d_mma narrow] %s %3dx%-3d cin %3d: rel-L2 %.3g%s\n",
+                    f.fn, side, side, cin, rel, ok ? "" : "  WRONG");
+        EXPECT_TRUE(ok);
+      }
+    }
+  }
+  std::printf("[conv2d_mma narrow] %d wrong\n", bad);
+}
+
 TEST(conv2d_mma, hw_op_wan_causal_conv3d) {
   Session sess;
   auto* mc = get_mc_(sess);
@@ -6648,4 +6742,2026 @@ TEST(conv2d_mma, hw_op_causal3d_vs_gemm_sustained) {
   std::printf("[c3d-sus] %d rounds, %.1f s: conv %.2f TFLOP/s, gemm %.2f "
               "TFLOP/s -- conv at %.0f%% of the GEMM's rate\n", rounds,
               (tc + tg) * 1e-3, rc, rg, 100.0 * rc / rg);
+}
+
+// THE COARSE TIER (gemm_i8c_*, quant_i8_row_gc*, affine_to_i8c_w8_gc*,
+// i8c_dequant_gc*): symmetric int8 at a group of GC for both operands.
+// (1) Always: every kernel against a CPU replica of its own arithmetic,
+// at a ragged M and N -- the GEMM to a bf16 ulp from the integer sums
+// folded in the kernel's order, the quantizers to one code.
+// (2) VPIPE_I8_COARSE_STUDY=1: the ROUTE's accuracy against an f64
+// product with the original weight -- g64 (a w8 g64 pack in the signed
+// layout), coarse requantized from that pack, coarse quantized straight
+// from the bf16 weight, and the bf16 matmul2d floor -- then its speed at
+// Qwen-Image-2.1's projection shapes (activation quantizer + GEMM, two
+// weights cycled so each call reads cold).
+TEST(gemm_i8, coarse_tier) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lg = mc->load_library("dense_gemm_mma_bf16");
+  ComputeLibrary lq = mc->load_library("affine_dequant_bf16");
+  const int kGroups[] = {256, 512, 1024};
+  const char* kTiles[] = {"64x64", "64x128", "128x64", "128x128"};
+  const int kTileBM[] = {64, 64, 128, 128}, kTileBN[] = {64, 128, 64, 128};
+  const int kTileSG[] = {4, 8, 8, 8};
+  auto fn = [&](ComputeLibrary& l, const std::string& n) {
+    ComputeFunction f = l.function(n.c_str());
+    if (!f.valid()) { std::printf("[gemm_i8c] %s missing\n", n.c_str()); }
+    return f;
+  };
+  auto up = [&](const void* p, std::size_t n) {
+    SharedBuffer b = mc->make_shared_buffer(n);
+    if (!b.empty() && p != nullptr) { std::memcpy(b.contents(), p, n); }
+    return b;
+  };
+  auto run = [&](const std::function<void(ComputeEncoder&)>& f) {
+    CommandStream st = mc->make_command_stream();
+    { ComputeEncoder e = st.begin_compute(); f(e); }
+    st.commit().wait();
+  };
+  // gc 0: the g64 quantizers' grid ({256, rows}); otherwise the coarse
+  // tier's -- one simdgroup per (row, group), four groups a threadgroup.
+  auto rows_pass = [&](ComputeEncoder& e, const ComputeFunction& f,
+                       int rows, int K = 0, int gc = 0) {
+    e.set_function(f);
+    if (gc == 0) {
+      e.dispatch({256u, (unsigned)rows, 1}, {256, 1, 1});
+    } else {
+      const unsigned tgs = (unsigned)((K / gc + 3) / 4);
+      e.dispatch({tgs * 128u, (unsigned)rows, 1}, {128, 1, 1});
+    }
+  };
+  auto gemm = [&](ComputeEncoder& e, const ComputeFunction& f, int t,
+                  const SharedBuffer& xq, const SharedBuffer& wq,
+                  const SharedBuffer& as, const SharedBuffer& ws,
+                  const SharedBuffer& y, int M, int N, int K) {
+    e.set_function(f);
+    e.set_buffer(0, xq); e.set_buffer(1, wq); e.set_buffer(2, as);
+    e.set_buffer(3, ws); e.set_buffer(4, y);
+    e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, M);
+    e.set_buffer(8, ws); e.set_constant(9, 0);
+    const unsigned tg = (unsigned)(32 * kTileSG[t]);
+    e.dispatch({(unsigned)((N + kTileBN[t] - 1) / kTileBN[t]) * tg,
+                (unsigned)((M + kTileBM[t] - 1) / kTileBM[t]), 1},
+               {tg, 1, 1});
+  };
+
+  // ---- (1) the kernels against their CPU replicas ----------------------
+  {
+    const int M = 200, N = 136, K = 2048;
+    std::mt19937 rng(3);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::uint16_t> x((std::size_t)M * K), w((std::size_t)N * K);
+    for (auto& v : x) { v = f32_to_bf16(nd(rng)); }
+    for (auto& v : w) { v = f32_to_bf16(nd(rng) * 0.05f); }
+    SharedBuffer xb = up(x.data(), x.size() * 2);
+    SharedBuffer wb = up(w.data(), w.size() * 2);
+    for (int GC : kGroups) {
+      const int G = K / GC;
+      const std::string sfx = std::to_string(GC);
+      ComputeFunction fq = fn(lq, "quant_i8_row_gc" + sfx);
+      ComputeFunction fdq = fn(lq, "i8c_dequant_gc" + sfx);
+      if (!fq.valid() || !fdq.valid()) { ASSERT_TRUE(false); return; }
+      SharedBuffer xq = up(nullptr, (std::size_t)M * K);
+      SharedBuffer as = up(nullptr, (std::size_t)M * G * 2);
+      SharedBuffer wq = up(nullptr, (std::size_t)N * K);
+      SharedBuffer ws = up(nullptr, (std::size_t)N * G * 2);
+      SharedBuffer wd = up(nullptr, (std::size_t)N * K * 2);
+      run([&](ComputeEncoder& e) {
+        e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, as);
+        e.set_constant(3, K);
+        rows_pass(e, fq, M, K, GC);
+        e.set_buffer(0, wb); e.set_buffer(1, wq); e.set_buffer(2, ws);
+        e.set_constant(3, K);
+        rows_pass(e, fq, N, K, GC);
+        e.set_buffer(0, wq); e.set_buffer(1, ws); e.set_buffer(2, wd);
+        e.set_constant(3, K);
+        rows_pass(e, fdq, N, K, GC);
+      });
+      // The quantizer, against its replica: one code at most, rarely.
+      const auto* q8 = static_cast<const std::int8_t*>(xq.contents());
+      const auto* asp = static_cast<const std::uint16_t*>(as.contents());
+      std::size_t off1 = 0, offmore = 0, sbad = 0;
+      for (int m = 0; m < M; ++m) {
+        for (int g = 0; g < G; ++g) {
+          float am = 0.0f;
+          for (int k = g * GC; k < (g + 1) * GC; ++k) {
+            const float v = bf16_to_f32(x[(std::size_t)m * K + k]);
+            am = std::max(am, std::fabs(v));
+          }
+          if (asp[(std::size_t)m * G + g] != f32_to_bf16(am / 127.0f)) {
+            ++sbad;
+          }
+          const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+          for (int k = g * GC; k < (g + 1) * GC; ++k) {
+            const std::size_t i = (std::size_t)m * K + k;
+            int r = (int)std::nearbyint(bf16_to_f32(x[i]) * inv);
+            r = std::clamp(r, -127, 127);
+            const int d = std::abs(r - (int)q8[i]);
+            off1 += d == 1 ? 1 : 0;
+            offmore += d > 1 ? 1 : 0;
+          }
+        }
+      }
+      // The GEMM, against the integer sums folded in its order.
+      const auto* w8 = static_cast<const std::int8_t*>(wq.contents());
+      const auto* wsp = static_cast<const std::uint16_t*>(ws.contents());
+      std::vector<float> ref((std::size_t)M * N);
+      for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+          float acc = 0.0f;
+          for (int g = 0; g < G; ++g) {
+            std::int32_t p = 0;
+            for (int k = g * GC; k < (g + 1) * GC; ++k) {
+              p += (std::int32_t)q8[(std::size_t)m * K + k] *
+                   (std::int32_t)w8[(std::size_t)n * K + k];
+            }
+            const float a = bf16_to_f32(asp[(std::size_t)m * G + g]);
+            const float s = bf16_to_f32(wsp[(std::size_t)n * G + g]);
+            acc = std::fma((float)p * s, a, acc);
+          }
+          ref[(std::size_t)m * N + n] = acc;
+        }
+      }
+      // The dequant, against codes * scale.
+      std::size_t dbad = 0;
+      const auto* wdp = static_cast<const std::uint16_t*>(wd.contents());
+      for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; ++k) {
+          const float v = (float)w8[(std::size_t)n * K + k] *
+                          bf16_to_f32(wsp[(std::size_t)n * G + k / GC]);
+          if (wdp[(std::size_t)n * K + k] != f32_to_bf16(v)) { ++dbad; }
+        }
+      }
+      std::printf("[gemm_i8c] gc%-4d quant: %zu/%zu codes 1 off, %zu more, "
+                  "%zu scales off; dequant %zu off\n", GC, off1, x.size(),
+                  offmore, sbad, dbad);
+      EXPECT_TRUE(offmore == 0 && off1 * 1000 < x.size() && sbad == 0 &&
+                  dbad == 0);
+      for (int t = 0; t < 4; ++t) {
+        const std::string nm =
+            "gemm_i8c_g" + sfx + "_t" + std::string(kTiles[t]);
+        ComputeFunction fg = fn(lg, nm);
+        if (!fg.valid()) { ASSERT_TRUE(false); continue; }
+        SharedBuffer y = up(nullptr, (std::size_t)M * N * 2);
+        std::memset(y.contents(), 0xff, y.byte_size());
+        run([&](ComputeEncoder& e) {
+          gemm(e, fg, t, xq, wq, as, ws, y, M, N, K);
+        });
+        const auto* yp = static_cast<const std::uint16_t*>(y.contents());
+        std::size_t bad = 0;
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+          const float r = ref[i], u = bf16_to_f32(yp[i]);
+          if (!(std::fabs(u - r) <= std::fabs(r) * (1.0f / 128.0f) + 1e-6f)) {
+            ++bad;
+          }
+        }
+        std::printf("[gemm_i8c]   %-24s %zu of %zu past a bf16 ulp\n",
+                    nm.c_str(), bad, ref.size());
+        EXPECT_TRUE(bad == 0);
+      }
+    }
+    // The converter from a g64 affine w8 pack, in place, against its
+    // replica (dequantize, requantize at GC): one code at most.
+    for (int GC : kGroups) {
+      const int G = K / GC, G64 = K / 64;
+      ComputeFunction fc = fn(lq, "affine_to_i8c_w8_gc" + std::to_string(GC));
+      if (!fc.valid()) { ASSERT_TRUE(false); continue; }
+      std::vector<std::uint8_t> codes((std::size_t)N * K);
+      std::vector<std::uint16_t> sc((std::size_t)N * G64), bi(sc.size());
+      std::uniform_int_distribution<int> cd(0, 255);
+      std::uniform_real_distribution<float> sd(0.0005f, 0.002f);
+      std::uniform_real_distribution<float> bd(-0.15f, -0.05f);
+      for (auto& c : codes) { c = (std::uint8_t)cd(rng); }
+      for (std::size_t i = 0; i < sc.size(); ++i) {
+        sc[i] = f32_to_bf16(sd(rng));
+        bi[i] = f32_to_bf16(bd(rng));
+      }
+      SharedBuffer cb = up(codes.data(), codes.size());
+      SharedBuffer sb = up(sc.data(), sc.size() * 2);
+      SharedBuffer bb = up(bi.data(), bi.size() * 2);
+      SharedBuffer cs = up(nullptr, (std::size_t)N * G * 2);
+      run([&](ComputeEncoder& e) {
+        e.set_buffer(0, cb); e.set_buffer(1, sb); e.set_buffer(2, bb);
+        e.set_buffer(3, cb); e.set_buffer(4, cs); e.set_constant(5, K);
+        rows_pass(e, fc, N, K, GC);
+      });
+      const auto* q = static_cast<const std::int8_t*>(cb.contents());
+      std::size_t off1 = 0, offmore = 0;
+      for (int n = 0; n < N; ++n) {
+        for (int g = 0; g < G; ++g) {
+          std::vector<float> v(GC);
+          float am = 0.0f;
+          for (int i = 0; i < GC; ++i) {
+            const int k = g * GC + i;
+            const std::size_t s = (std::size_t)n * G64 + k / 64;
+            v[i] = (float)codes[(std::size_t)n * K + k] * bf16_to_f32(sc[s]) +
+                   bf16_to_f32(bi[s]);
+            am = std::max(am, std::fabs(v[i]));
+          }
+          const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+          for (int i = 0; i < GC; ++i) {
+            const int r = std::clamp((int)std::nearbyint(v[i] * inv), -127,
+                                     127);
+            const int d =
+                std::abs(r - (int)q[(std::size_t)n * K + g * GC + i]);
+            off1 += d == 1 ? 1 : 0;
+            offmore += d > 1 ? 1 : 0;
+          }
+        }
+      }
+      std::printf("[gemm_i8c] affine_to_i8c_w8_gc%-4d in place: %zu codes "
+                  "1 off, %zu more\n", GC, off1, offmore);
+      EXPECT_TRUE(offmore == 0 && off1 * 1000 < codes.size());
+    }
+  }
+
+  if (std::getenv("VPIPE_I8_COARSE_STUDY") == nullptr) { return; }
+
+  // ---- (2) accuracy of the routes, against f64 ---------------------------
+  ComputeFunction f_qs = fn(lq, "quant_f16_i8s_row_g64");
+  ComputeFunction f_gs = fn(lg, "gemm_i8s_w8g64");
+  ComputeFunction f_bf = fn(lg, "dense_gemm_mma_t_n128_f16");
+  if (!f_qs.valid() || !f_gs.valid() || !f_bf.valid()) { return; }
+  // A w8 g64 affine pack of a bf16 weight, as model-quantize writes one:
+  // per (channel, 64) min/max, codes 0..255 -- then the signed layout.
+  auto pack_g64 = [](const std::vector<std::uint16_t>& w, int N, int K,
+                     std::vector<std::uint8_t>* codes,
+                     std::vector<std::uint16_t>* sc,
+                     std::vector<std::uint16_t>* bi) {
+    const int G = K / 64;
+    codes->resize((std::size_t)N * K);
+    sc->resize((std::size_t)N * G);
+    bi->resize((std::size_t)N * G);
+    for (int n = 0; n < N; ++n) {
+      for (int g = 0; g < G; ++g) {
+        float lo = 1e30f, hi = -1e30f;
+        for (int k = g * 64; k < g * 64 + 64; ++k) {
+          const float v = bf16_to_f32(w[(std::size_t)n * K + k]);
+          lo = std::min(lo, v);
+          hi = std::max(hi, v);
+        }
+        const float s = std::max((hi - lo) / 255.0f, 1e-12f);
+        const std::uint16_t sb = f32_to_bf16(s), bb = f32_to_bf16(lo);
+        (*sc)[(std::size_t)n * G + g] = sb;
+        (*bi)[(std::size_t)n * G + g] = bb;
+        const float sf = bf16_to_f32(sb), bf = bf16_to_f32(bb);
+        for (int k = g * 64; k < g * 64 + 64; ++k) {
+          const float v = bf16_to_f32(w[(std::size_t)n * K + k]);
+          (*codes)[(std::size_t)n * K + k] = (std::uint8_t)std::clamp(
+              (int)std::nearbyint((v - bf) / sf), 0, 255);
+        }
+      }
+    }
+  };
+  {
+    const int M = 256, N = 512, K = 4096;
+    struct Case { const char* name; int every; float boost; };
+    for (const Case& cs : {Case{"no outliers", 0, 1.0f},
+                           Case{"1/64 channels x24", 64, 24.0f},
+                           Case{"1/512 channels x64", 512, 64.0f}}) {
+      std::mt19937 rng(11);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      std::vector<std::uint16_t> x((std::size_t)M * K), w((std::size_t)N * K);
+      for (int m = 0; m < M; ++m) {
+        for (int k = 0; k < K; ++k) {
+          float v = nd(rng);
+          if (cs.every > 0 && (k % cs.every) == 37) { v *= cs.boost; }
+          x[(std::size_t)m * K + k] = f32_to_bf16(v);
+        }
+      }
+      for (auto& v : w) { v = f32_to_bf16(nd(rng) * 0.02f); }
+      std::vector<double> ref((std::size_t)M * N, 0.0);
+      for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+          double a = 0.0;
+          for (int k = 0; k < K; ++k) {
+            a += (double)bf16_to_f32(x[(std::size_t)m * K + k]) *
+                 (double)bf16_to_f32(w[(std::size_t)n * K + k]);
+          }
+          ref[(std::size_t)m * N + n] = a;
+        }
+      }
+      auto rel = [&](const SharedBuffer& y) {
+        const auto* yp = static_cast<const std::uint16_t*>(y.contents());
+        double num = 0.0, den = 0.0;
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+          const double d = (double)bf16_to_f32(yp[i]) - ref[i];
+          num += d * d;
+          den += ref[i] * ref[i];
+        }
+        return std::sqrt(num / den);
+      };
+      SharedBuffer xb = up(x.data(), x.size() * 2);
+      SharedBuffer wb = up(w.data(), w.size() * 2);
+      SharedBuffer y = up(nullptr, (std::size_t)M * N * 2);
+      // bf16 floor.
+      run([&](ComputeEncoder& e) {
+        e.set_function(f_bf);
+        e.set_buffer(0, xb); e.set_buffer(1, wb); e.set_buffer(2, wb);
+        e.set_buffer(3, y);
+        e.set_constant(4, K); e.set_constant(5, N); e.set_constant(6, M);
+        e.set_constant(7, 0);
+        e.dispatch({(unsigned)(((N + 127) / 128) * 256),
+                    (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+      });
+      const double r_bf = rel(y);
+      // g64: the pack, signed.
+      std::vector<std::uint8_t> codes;
+      std::vector<std::uint16_t> sc, bi;
+      pack_g64(w, N, K, &codes, &sc, &bi);
+      std::vector<std::uint8_t> scodes(codes.size());
+      std::vector<std::uint16_t> zb(sc.size());
+      for (std::size_t i = 0; i < codes.size(); ++i) {
+        scodes[i] = (std::uint8_t)(codes[i] ^ 0x80u);
+      }
+      for (std::size_t i = 0; i < sc.size(); ++i) {
+        zb[i] = f32_to_bf16(bf16_to_f32(bi[i]) +
+                            128.0f * bf16_to_f32(sc[i]));
+      }
+      const int G64 = K / 64;
+      SharedBuffer scb = up(scodes.data(), scodes.size());
+      SharedBuffer ssb = up(sc.data(), sc.size() * 2);
+      SharedBuffer szb = up(zb.data(), zb.size() * 2);
+      SharedBuffer xq = up(nullptr, (std::size_t)M * K);
+      SharedBuffer as = up(nullptr, (std::size_t)M * G64 * 2);
+      SharedBuffer uf = up(nullptr, (std::size_t)M * G64 * 2);
+      run([&](ComputeEncoder& e) {
+        e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, as);
+        e.set_buffer(3, uf); e.set_constant(4, K);
+        rows_pass(e, f_qs, M);
+        e.set_function(f_gs);
+        e.set_buffer(0, xq); e.set_buffer(1, scb); e.set_buffer(2, as);
+        e.set_buffer(3, ssb); e.set_buffer(4, szb); e.set_buffer(5, uf);
+        e.set_buffer(6, y);
+        e.set_constant(7, K); e.set_constant(8, N); e.set_constant(9, M);
+        e.set_buffer(10, ssb); e.set_constant(11, 0);
+        e.dispatch({(unsigned)(((N + 63) / 64) * 128),
+                    (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+      });
+      const double r_g64 = rel(y);
+      std::printf("[gemm_i8c] accuracy, %s (%dx%dx%d), rel-L2 vs f64: bf16 "
+                  "%.3e, g64 route %.3e\n", cs.name, M, N, K, r_bf, r_g64);
+      for (int GC : kGroups) {
+        const int G = K / GC;
+        const std::string sfx = std::to_string(GC);
+        ComputeFunction fq = fn(lq, "quant_i8_row_gc" + sfx);
+        ComputeFunction fc = fn(lq, "affine_to_i8c_w8_gc" + sfx);
+        ComputeFunction fg = fn(lg, "gemm_i8c_g" + sfx + "_t64x64");
+        SharedBuffer cxq = up(nullptr, (std::size_t)M * K);
+        SharedBuffer cas = up(nullptr, (std::size_t)M * G * 2);
+        SharedBuffer pwq = up(codes.data(), codes.size());
+        SharedBuffer pws = up(nullptr, (std::size_t)N * G * 2);
+        SharedBuffer bwq = up(nullptr, (std::size_t)N * K);
+        SharedBuffer bws = up(nullptr, (std::size_t)N * G * 2);
+        SharedBuffer ub = up(sc.data(), sc.size() * 2);
+        SharedBuffer bb = up(bi.data(), bi.size() * 2);
+        SharedBuffer y2 = up(nullptr, (std::size_t)M * N * 2);
+        run([&](ComputeEncoder& e) {
+          e.set_buffer(0, xb); e.set_buffer(1, cxq); e.set_buffer(2, cas);
+          e.set_constant(3, K);
+          rows_pass(e, fq, M, K, GC);
+          e.set_buffer(0, wb); e.set_buffer(1, bwq); e.set_buffer(2, bws);
+          e.set_constant(3, K);
+          rows_pass(e, fq, N, K, GC);
+          e.set_buffer(0, pwq); e.set_buffer(1, ub); e.set_buffer(2, bb);
+          e.set_buffer(3, pwq); e.set_buffer(4, pws); e.set_constant(5, K);
+          rows_pass(e, fc, N, K, GC);
+          gemm(e, fg, 0, cxq, pwq, cas, pws, y, M, N, K);
+          gemm(e, fg, 0, cxq, bwq, cas, bws, y2, M, N, K);
+        });
+        std::printf("[gemm_i8c]   gc%-4d from the w8 pack %.3e (%.2fx g64), "
+                    "from bf16 %.3e (%.2fx)\n", GC, rel(y), rel(y) / r_g64,
+                    rel(y2), rel(y2) / r_g64);
+        // ROTATED: the same, with the group Walsh-Hadamard on both sides.
+        ComputeFunction fqr = fn(lq, "quant_i8_row_gc" + sfx + "_r");
+        ComputeFunction fcr = fn(lq, "affine_to_i8c_w8_gc" + sfx + "_r");
+        ComputeFunction fdr = fn(lq, "i8c_dequant_gc" + sfx + "_r");
+        if (!fqr.valid() || !fcr.valid() || !fdr.valid()) { continue; }
+        SharedBuffer pwq2 = up(codes.data(), codes.size());
+        SharedBuffer wrt = up(nullptr, (std::size_t)N * K * 2);
+        run([&](ComputeEncoder& e) {
+          e.set_buffer(0, xb); e.set_buffer(1, cxq); e.set_buffer(2, cas);
+          e.set_constant(3, K);
+          rows_pass(e, fqr, M, K, GC);
+          e.set_buffer(0, wb); e.set_buffer(1, bwq); e.set_buffer(2, bws);
+          e.set_constant(3, K);
+          rows_pass(e, fqr, N, K, GC);
+          e.set_buffer(0, pwq2); e.set_buffer(1, ub); e.set_buffer(2, bb);
+          e.set_buffer(3, pwq2); e.set_buffer(4, pws); e.set_constant(5, K);
+          rows_pass(e, fcr, N, K, GC);
+          gemm(e, fg, 0, cxq, pwq2, cas, pws, y, M, N, K);
+          gemm(e, fg, 0, cxq, bwq, cas, bws, y2, M, N, K);
+          // The rotated dequant must give the weight back.
+          e.set_buffer(0, bwq); e.set_buffer(1, bws); e.set_buffer(2, wrt);
+          e.set_constant(3, K);
+          rows_pass(e, fdr, N, K, GC);
+        });
+        double wn = 0.0, wd = 0.0;
+        const auto* wrp = static_cast<const std::uint16_t*>(wrt.contents());
+        for (std::size_t i = 0; i < w.size(); ++i) {
+          const double d = (double)bf16_to_f32(wrp[i]) - bf16_to_f32(w[i]);
+          wn += d * d;
+          wd += (double)bf16_to_f32(w[i]) * bf16_to_f32(w[i]);
+        }
+        std::printf("[gemm_i8c]   gc%-4d ROTATED: from the w8 pack %.3e "
+                    "(%.2fx g64), from bf16 %.3e (%.2fx); weight round trip "
+                    "%.3e\n", GC, rel(y), rel(y) / r_g64, rel(y2),
+                    rel(y2) / r_g64, std::sqrt(wn / wd));
+        EXPECT_TRUE(std::sqrt(wn / wd) < 2e-2);
+        // THE ROTATION BLOCK at g512: both operands rotated in blocks of
+        // RB (the same entry quantizes the bf16 weight).
+        if (GC != 512) { continue; }
+        for (int RB : {16, 64, 128, 256}) {
+          ComputeFunction fb =
+              fn(lq, "quant_i8_row_gc512_rb" + std::to_string(RB));
+          if (!fb.valid()) { continue; }
+          run([&](ComputeEncoder& e) {
+            e.set_buffer(0, xb); e.set_buffer(1, cxq); e.set_buffer(2, cas);
+            e.set_constant(3, K);
+            rows_pass(e, fb, M, K, GC);
+            e.set_buffer(0, wb); e.set_buffer(1, bwq); e.set_buffer(2, bws);
+            e.set_constant(3, K);
+            rows_pass(e, fb, N, K, GC);
+            gemm(e, fg, 0, cxq, bwq, cas, bws, y2, M, N, K);
+          });
+          std::printf("[gemm_i8c]   gc512 rotated in blocks of %-3d: from "
+                      "bf16 %.3e (%.2fx g64)\n", RB, rel(y2),
+                      rel(y2) / r_g64);
+        }
+      }
+    }
+  }
+
+  // ---- (2b) speed at Qwen-Image-2.1's shapes -----------------------------
+  struct Sh { int M, N, K; const char* tag; };
+  for (const Sh& sh : {Sh{4096, 4096, 4096, "q/k/v/out"},
+                       Sh{4096, 12288, 4096, "ff gate/up"},
+                       Sh{4096, 4096, 12288, "ff down"}}) {
+    const int M = sh.M, N = sh.N, K = sh.K, G64 = K / 64;
+    std::vector<std::uint16_t> hx((std::size_t)M * K);
+    std::mt19937 rng(5);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : hx) { v = f32_to_bf16(nd(rng)); }
+    SharedBuffer xb = up(hx.data(), hx.size() * 2);
+    SharedBuffer y = up(nullptr, (std::size_t)M * N * 2);
+    std::uniform_int_distribution<int> cd(-127, 127);
+    auto rnd8 = [&](std::size_t n) {
+      SharedBuffer b = up(nullptr, n);
+      auto* p = static_cast<std::int8_t*>(b.contents());
+      for (std::size_t i = 0; i < n; ++i) { p[i] = (std::int8_t)cd(rng); }
+      return b;
+    };
+    auto rndbf = [&](std::size_t n, float s) {
+      std::vector<std::uint16_t> v(n);
+      for (auto& e : v) { e = f32_to_bf16(s * (1.0f + 0.1f * nd(rng))); }
+      return up(v.data(), n * 2);
+    };
+    SharedBuffer w8[2] = {rnd8((std::size_t)N * K), rnd8((std::size_t)N * K)};
+    SharedBuffer xq = up(nullptr, (std::size_t)M * K);
+    SharedBuffer as = up(nullptr, (std::size_t)M * G64 * 2);
+    SharedBuffer uf = up(nullptr, (std::size_t)M * G64 * 2);
+    SharedBuffer s64[2] = {rndbf((std::size_t)N * G64, 1e-3f),
+                           rndbf((std::size_t)N * G64, 1e-3f)};
+    struct Arm { std::string name; std::function<void(ComputeEncoder&, int)> f;
+                 std::vector<double> ms; };
+    std::vector<Arm> arms;
+    arms.push_back({"g64 signed (today)", [&](ComputeEncoder& e, int wi) {
+      e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, as);
+      e.set_buffer(3, uf); e.set_constant(4, K);
+      rows_pass(e, f_qs, M);
+      e.set_function(f_gs);
+      e.set_buffer(0, xq); e.set_buffer(1, w8[wi]); e.set_buffer(2, as);
+      e.set_buffer(3, s64[wi]); e.set_buffer(4, s64[wi]);
+      e.set_buffer(5, uf); e.set_buffer(6, y);
+      e.set_constant(7, K); e.set_constant(8, N); e.set_constant(9, M);
+      e.set_buffer(10, s64[wi]); e.set_constant(11, 0);
+      e.dispatch({(unsigned)(((N + 63) / 64) * 128),
+                  (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+    }, {}});
+    // Kept alive for the arms' lifetime: the closures hold references.
+    static std::vector<SharedBuffer> keep;
+    static std::vector<ComputeFunction> fkeep;
+    keep.clear();
+    fkeep.clear();
+    keep.reserve(64);
+    fkeep.reserve(64);
+    for (int GC : kGroups) {
+      if (K % GC != 0) { continue; }
+      const int G = K / GC;
+      const std::string sfx = std::to_string(GC);
+      fkeep.push_back(fn(lq, "quant_i8_row_gc" + sfx));
+      const ComputeFunction* fq = &fkeep.back();
+      keep.push_back(up(nullptr, (std::size_t)M * G * 2));
+      const SharedBuffer* cas = &keep.back();
+      keep.push_back(rndbf((std::size_t)N * G, 1e-3f));
+      const SharedBuffer* cws = &keep.back();
+      fkeep.push_back(fn(lq, "quant_i8_row_gc" + sfx + "_r"));
+      const ComputeFunction* fqr = &fkeep.back();
+      for (int t = 0; t < 4; ++t) {
+        fkeep.push_back(fn(lg, "gemm_i8c_g" + sfx + "_t" + kTiles[t]));
+        const ComputeFunction* fg = &fkeep.back();
+        for (int rot = 0; rot < 2; ++rot) {
+          // The rotated quantizer at the two tiles that matter only.
+          if (rot == 1 && t != 1 && t != 2) { continue; }
+          const ComputeFunction* qf = rot == 1 ? fqr : fq;
+          arms.push_back({"gc" + sfx + " " + kTiles[t] + (rot ? " rot" : ""),
+                          [&, qf, fg, cas, cws, t, GC](ComputeEncoder& e,
+                                                       int wi) {
+            e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, *cas);
+            e.set_constant(3, K);
+            rows_pass(e, *qf, M, K, GC);
+            gemm(e, *fg, t, xq, w8[wi], *cas, *cws, y, M, N, K);
+          }, {}});
+        }
+      }
+    }
+    // The quantizers alone, plain and rotated, at this shape's input.
+    for (int GC : kGroups) {
+      if (K % GC != 0) { continue; }
+      const std::string sfx = std::to_string(GC);
+      keep.push_back(up(nullptr, (std::size_t)M * (K / GC) * 2));
+      const SharedBuffer* qs = &keep.back();
+      for (int rot = 0; rot < 2 + (GC == 512 ? 4 : 0); ++rot) {
+        static const int kRb[4] = {16, 64, 128, 256};
+        const std::string fname =
+            rot < 2 ? "quant_i8_row_gc" + sfx + (rot ? "_r" : "")
+                    : "quant_i8_row_gc512_rb" + std::to_string(kRb[rot - 2]);
+        const std::string aname =
+            rot < 2 ? "quant gc" + sfx + (rot ? " rot" : "")
+                    : "quant gc512 rb" + std::to_string(kRb[rot - 2]);
+        fkeep.push_back(fn(lq, fname));
+        const ComputeFunction* qf = &fkeep.back();
+        arms.push_back({aname, [&, qf, qs, GC](ComputeEncoder& e, int) {
+          e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, *qs);
+          e.set_constant(3, K);
+          rows_pass(e, *qf, M, K, GC);
+        }, {}});
+      }
+    }
+    // VPIPE_I8_COARSE_ARMS="gc512 128x64 rot,gc256 64x128 rot": only the
+    // named arms beside today's, for a box that must not run long.
+    if (const char* only = std::getenv("VPIPE_I8_COARSE_ARMS")) {
+      std::vector<Arm> kept;
+      for (std::size_t i = 0; i < arms.size(); ++i) {
+        if (i == 0 || std::strstr(only, arms[i].name.c_str()) != nullptr) {
+          kept.push_back(std::move(arms[i]));
+        }
+      }
+      arms = std::move(kept);
+    }
+    const double gop = 2.0 * M * (double)N * K * 1e-9;
+    for (int r = 0; r < 4; ++r) {
+      for (std::size_t k = 0; k < arms.size(); ++k) {
+        Arm& a = arms[(r % 2 == 0) ? k : arms.size() - 1 - k];
+        run([&](ComputeEncoder& e) { a.f(e, 0); });
+        const auto t0 = std::chrono::steady_clock::now();
+        run([&](ComputeEncoder& e) {
+          for (int i = 0; i < 6; ++i) { a.f(e, i & 1); }
+        });
+        a.ms.push_back(secs_(t0, std::chrono::steady_clock::now()) * 1e3 /
+                       6.0);
+      }
+    }
+    std::printf("[gemm_i8c] speed %s M=%d N=%d K=%d (quantizer + GEMM)\n",
+                sh.tag, M, N, K);
+    double base = 0.0;
+    for (Arm& a : arms) {
+      std::sort(a.ms.begin(), a.ms.end());
+      const double ms = a.ms[a.ms.size() / 2];
+      if (base == 0.0) { base = ms; }
+      std::printf("[gemm_i8c]   %-20s %7.3f ms %6.1f TOP/s %.3fx\n",
+                  a.name.c_str(), ms, gop / ms, base / ms);
+    }
+  }
+}
+
+// THE PER-TOKEN TIER (gemm_i8pt_*, the i8x layout): int8 weights per
+// output channel and activations per token, both over all of K, so the
+// GEMM is one int32 accumulation with the scales applied at the store.
+// (1) every quantizer and GEMM entry against its CPU replica -- always.
+// (2) VPIPE_I8_PT_SPEED=1: quantizer + GEMM at Qwen-Image-2.1's shapes
+// against the rotated g512 tier, interleaved, medians of 4 rounds;
+// VPIPE_I8_PT_ARMS="a,b" keeps only the named arms beside g512.
+TEST(gemm_i8, per_token) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lg = mc->load_library("dense_gemm_mma_bf16");
+  ComputeLibrary lq = mc->load_library("affine_dequant_bf16");
+  auto up = [&](const void* p, std::size_t n) {
+    SharedBuffer b = mc->make_shared_buffer(n);
+    if (!b.empty() && p != nullptr) { std::memcpy(b.contents(), p, n); }
+    return b;
+  };
+  auto run = [&](const std::function<void(ComputeEncoder&)>& f) {
+    CommandStream st = mc->make_command_stream();
+    { ComputeEncoder e = st.begin_compute(); f(e); }
+    st.commit().wait();
+  };
+  // Every GEMM entry: name, tile, register layout, K step.
+  // reg: a register-fragment kernel, wm x wn simdgroups; flat: dispatched
+  // as one 1-D threadgroup of 32 * wm * wn threads instead of
+  // {32, wn, wm} (the kernel reads its simdgroup index either way).
+  struct G { std::string name; int bm, bn, sg, bk; bool reg;
+             int wm = 0, wn = 0; bool flat = false; };
+  std::vector<G> gs;
+  for (const char* t : {"64x64", "64x128", "128x64", "128x128"}) {
+    const int bm = t[0] == '6' ? 64 : 128;
+    const int bn = std::strcmp(t + (bm == 64 ? 3 : 4), "64") == 0 ? 64 : 128;
+    const int sg = bm * bn == 64 * 64 ? 4 : 8;
+    gs.push_back({std::string("gemm_i8pt_t") + t + "_k128", bm, bn, sg, 128,
+                  false});
+  }
+  for (int bk : {64, 256}) {
+    gs.push_back({"gemm_i8pt_t128x64_k" + std::to_string(bk), 128, 64, 8,
+                  bk, false});
+    gs.push_back({"gemm_i8pt_t128x128_k" + std::to_string(bk), 128, 128,
+                  8, bk, false});
+  }
+  // The permuted-K register kernels (32x32 a simdgroup): MLX's blocked
+  // loop (the tier's), then the double-buffered A/B, each 3-D and flat.
+  struct P { const char* n; int bm, bn; };
+  for (const P& p : {P{"m128x64", 128, 64}, P{"m64x128", 64, 128},
+                     P{"d128x64", 128, 64}, P{"d64x128", 64, 128}}) {
+    const int wm = p.bm / 32, wn = p.bn / 32;
+    for (int flat = 0; flat < 2; ++flat) {
+      gs.push_back({std::string("gemm_i8pt_") + p.n, p.bm, p.bn, wm * wn,
+                    64, true, wm, wn, flat != 0});
+    }
+  }
+  auto gfn = [&](const G& g, int) { return lg.function(g.name.c_str()); };
+  auto gemm = [&](ComputeEncoder& e, const ComputeFunction& f, const G& g,
+                  const SharedBuffer& xq, const SharedBuffer& wq,
+                  const SharedBuffer& as, const SharedBuffer& ws,
+                  const SharedBuffer& y, const SharedBuffer& bias,
+                  bool has_bias, int M, int N, int K) {
+    e.set_function(f);
+    e.set_buffer(0, xq); e.set_buffer(1, wq); e.set_buffer(2, as);
+    e.set_buffer(3, ws); e.set_buffer(4, y);
+    e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, M);
+    e.set_buffer(8, bias); e.set_constant(9, has_bias ? 1 : 0);
+    const unsigned nt = (unsigned)((N + g.bn - 1) / g.bn);
+    const unsigned mt = (unsigned)((M + g.bm - 1) / g.bm);
+    if (g.reg && g.flat) {
+      const unsigned tg = 32u * (unsigned)(g.wm * g.wn);
+      e.dispatch({nt * tg, mt, 1}, {tg, 1, 1});
+    } else if (g.reg) {
+      const unsigned wn = (unsigned)g.wn, wm = (unsigned)g.wm;
+      e.dispatch({nt * 32u, mt * wn, wm}, {32u, wn, wm});
+    } else {
+      const unsigned tg = (unsigned)(32 * g.sg);
+      e.dispatch({nt * tg, mt, 1}, {tg, 1, 1});
+    }
+  };
+  // K > 0: the quantizers' grid, a threadgroup of K/16 threads a row;
+  // K < 0: the rotated ones', a simdgroup per 256-block of -K.
+  auto rows_pass = [&](ComputeEncoder& e, const ComputeFunction& f,
+                       int rows, int K = 0) {
+    e.set_function(f);
+    const unsigned T =
+        K < 0   ? 32u * (unsigned)std::min(-K / 256, 32)
+        : K > 0 ? (unsigned)std::max(32, (K / 16 + 31) / 32 * 32)
+                : 256u;
+    e.dispatch({T, (unsigned)rows, 1}, {T, 1, 1});
+  };
+  ComputeFunction fq = lq.function("quant_i8_tok");
+  ComputeFunction fsq = lq.function("swiglu_quant_i8_tok");
+  ComputeFunction faq = lq.function("affine_to_i8pt_w8");
+  ComputeFunction fdq = lq.function("i8pt_dequant");
+  ComputeFunction fqr = lq.function("quant_i8_tok_r");
+  ComputeFunction fsqr = lq.function("swiglu_quant_i8_tok_r");
+  ComputeFunction faqr = lq.function("affine_to_i8pt_w8_r");
+  ComputeFunction fdqr = lq.function("i8pt_dequant_r");
+  if (!fq.valid() || !fsq.valid() || !faq.valid() || !fdq.valid() ||
+      !fqr.valid() || !fsqr.valid() || !faqr.valid() || !fdqr.valid()) {
+    ASSERT_TRUE(false);
+    return;
+  }
+
+  // ---- (1) replicas -------------------------------------------------------
+  {
+    // Edges on both sides of every tile, K a multiple of every step.
+    const int M = 203, N = 196, K = 1024;
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::uint16_t> x((std::size_t)M * K), x2(x.size());
+    for (auto& v : x) { v = f32_to_bf16(nd(rng)); }
+    for (auto& v : x2) { v = f32_to_bf16(nd(rng)); }
+    SharedBuffer xb = up(x.data(), x.size() * 2);
+    SharedBuffer x2b = up(x2.data(), x2.size() * 2);
+    SharedBuffer xq = up(nullptr, (std::size_t)M * K);
+    SharedBuffer as = up(nullptr, (std::size_t)M * 4);
+    SharedBuffer sq = up(nullptr, (std::size_t)M * K);
+    SharedBuffer ss = up(nullptr, (std::size_t)M * 4);
+    // A g64 w8 pack for the weight side.
+    const int G64 = K / 64;
+    std::vector<std::uint8_t> codes((std::size_t)N * K);
+    std::vector<std::uint16_t> psc((std::size_t)N * G64), pbi(psc.size());
+    std::uniform_int_distribution<int> cd(0, 255);
+    for (auto& c : codes) { c = (std::uint8_t)cd(rng); }
+    for (std::size_t i = 0; i < psc.size(); ++i) {
+      const float s = 1e-3f * (1.0f + 0.5f * std::fabs(nd(rng)));
+      psc[i] = f32_to_bf16(s);
+      pbi[i] = f32_to_bf16(-128.0f * s + 0.02f * nd(rng));
+    }
+    SharedBuffer cb = up(codes.data(), codes.size());
+    SharedBuffer scb = up(psc.data(), psc.size() * 2);
+    SharedBuffer bib = up(pbi.data(), pbi.size() * 2);
+    SharedBuffer wq = up(nullptr, (std::size_t)N * K);
+    SharedBuffer ws = up(nullptr, (std::size_t)N * 4);
+    SharedBuffer wd = up(nullptr, (std::size_t)N * K * 2);
+    // In place too: the conversion may overwrite its own codes.
+    SharedBuffer cip = up(codes.data(), codes.size());
+    SharedBuffer wsip = up(nullptr, (std::size_t)N * 4);
+    run([&](ComputeEncoder& e) {
+      e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, as);
+      e.set_constant(3, K);
+      rows_pass(e, fq, M, K);
+      e.set_buffer(0, xb); e.set_buffer(1, x2b); e.set_buffer(2, sq);
+      e.set_buffer(3, ss); e.set_constant(4, K);
+      rows_pass(e, fsq, M, K);
+      e.set_buffer(0, cb); e.set_buffer(1, scb); e.set_buffer(2, bib);
+      e.set_buffer(3, wq); e.set_buffer(4, ws); e.set_constant(5, K);
+      rows_pass(e, faq, N, K);
+      e.set_buffer(0, cip); e.set_buffer(1, scb); e.set_buffer(2, bib);
+      e.set_buffer(3, cip); e.set_buffer(4, wsip); e.set_constant(5, K);
+      rows_pass(e, faq, N, K);
+      e.set_buffer(0, wq); e.set_buffer(1, ws); e.set_buffer(2, wd);
+      e.set_constant(3, K);
+      rows_pass(e, fdq, N);
+    });
+    // Rows -> (codes, scale) on the CPU, as the kernels do it.
+    auto quant_rows = [&](const std::vector<float>& v, int rows,
+                          const std::int8_t* q, const float* sc,
+                          const char* what) {
+      std::size_t off1 = 0, offmore = 0, sbad = 0;
+      for (int r = 0; r < rows; ++r) {
+        float am = 0.0f;
+        for (int k = 0; k < K; ++k) {
+          am = std::max(am, std::fabs(v[(std::size_t)r * K + k]));
+        }
+        if (sc[r] != am * (1.0f / 127.0f)) { ++sbad; }
+        const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+        for (int k = 0; k < K; ++k) {
+          const std::size_t i = (std::size_t)r * K + k;
+          const int c = std::clamp((int)std::nearbyint(v[i] * inv), -127,
+                                   127);
+          const int d = std::abs(c - (int)q[i]);
+          off1 += d == 1 ? 1 : 0;
+          offmore += d > 1 ? 1 : 0;
+        }
+      }
+      std::printf("[gemm_i8pt] %-22s scales off %zu/%d, codes off by 1 "
+                  "%zu, by more %zu of %zu\n", what, sbad, rows, off1,
+                  offmore, (std::size_t)rows * K);
+      EXPECT_TRUE(sbad == 0);
+      EXPECT_TRUE(offmore == 0);
+      EXPECT_TRUE(off1 * 10000 <= (std::size_t)rows * K);
+    };
+    std::vector<float> xf(x.size()), hf(x.size()), wf((std::size_t)N * K);
+    for (std::size_t i = 0; i < x.size(); ++i) {
+      xf[i] = bf16_to_f32(x[i]);
+      const float g = bf16_to_f32(x[i]), u = bf16_to_f32(x2[i]);
+      hf[i] = bf16_to_f32(f32_to_bf16(g / (1.0f + std::exp(-g)) * u));
+    }
+    for (int n = 0; n < N; ++n) {
+      for (int k = 0; k < K; ++k) {
+        const std::size_t i = (std::size_t)n * K + k;
+        const std::size_t gi = (std::size_t)n * G64 + k / 64;
+        wf[i] = bf16_to_f32(f32_to_bf16(
+            (float)codes[i] * bf16_to_f32(psc[gi]) + bf16_to_f32(pbi[gi])));
+      }
+    }
+    const auto* q8 = static_cast<const std::int8_t*>(xq.contents());
+    const auto* asp = static_cast<const float*>(as.contents());
+    const auto* w8 = static_cast<const std::int8_t*>(wq.contents());
+    const auto* wsp = static_cast<const float*>(ws.contents());
+    quant_rows(xf, M, q8, asp, "quant_i8_tok");
+    quant_rows(hf, M, static_cast<const std::int8_t*>(sq.contents()),
+               static_cast<const float*>(ss.contents()),
+               "swiglu_quant_i8_tok");
+    quant_rows(wf, N, w8, wsp, "affine_to_i8pt_w8");
+    EXPECT_TRUE(std::memcmp(cip.contents(), wq.contents(),
+                            (std::size_t)N * K) == 0);
+    EXPECT_TRUE(std::memcmp(wsip.contents(), ws.contents(),
+                            (std::size_t)N * 4) == 0);
+    std::size_t dbad = 0;
+    const auto* wdp = static_cast<const std::uint16_t*>(wd.contents());
+    for (int n = 0; n < N; ++n) {
+      for (int k = 0; k < K; ++k) {
+        const std::size_t i = (std::size_t)n * K + k;
+        if (wdp[i] != f32_to_bf16((float)w8[i] * wsp[n])) { ++dbad; }
+      }
+    }
+    EXPECT_TRUE(dbad == 0);
+    // The GEMMs: integer sums, scaled as the store does.
+    std::vector<std::uint16_t> bias(N);
+    for (auto& b : bias) { b = f32_to_bf16(0.1f * nd(rng)); }
+    SharedBuffer bb = up(bias.data(), bias.size() * 2);
+    std::vector<std::int32_t> acc((std::size_t)M * N);
+    for (int m = 0; m < M; ++m) {
+      for (int n = 0; n < N; ++n) {
+        std::int32_t p = 0;
+        for (int k = 0; k < K; ++k) {
+          p += (std::int32_t)q8[(std::size_t)m * K + k] *
+               (std::int32_t)w8[(std::size_t)n * K + k];
+        }
+        acc[(std::size_t)m * N + n] = p;
+      }
+    }
+    SharedBuffer y = up(nullptr, (std::size_t)M * N * 2);
+    for (const G& g : gs) {
+      ComputeFunction f = gfn(g, K);
+      if (!f.valid()) {
+        std::printf("[gemm_i8pt] %s missing\n", g.name.c_str());
+        ASSERT_TRUE(false);
+        continue;
+      }
+      for (int hb = 0; hb < 2; ++hb) {
+        std::memset(y.contents(), 0xff, (std::size_t)M * N * 2);
+        run([&](ComputeEncoder& e) {
+          gemm(e, f, g, xq, wq, as, ws, y, bb, hb != 0, M, N, K);
+        });
+        const auto* yp = static_cast<const std::uint16_t*>(y.contents());
+        std::size_t bad = 0;
+        double worst = 0.0;
+        for (int m = 0; m < M; ++m) {
+          for (int n = 0; n < N; ++n) {
+            const std::size_t i = (std::size_t)m * N + n;
+            const float b = hb != 0 ? bf16_to_f32(bias[n]) : 0.0f;
+            const float r = std::fma((float)acc[i] * asp[m], wsp[n], b);
+            const float gv = bf16_to_f32(yp[i]);
+            // One bf16 ulp: the edge columns' scalar store rounds in a
+            // different order.
+            const double d = std::fabs((double)gv - r) /
+                             std::max(std::fabs((double)r), 1e-6);
+            worst = std::max(worst, d);
+            if (yp[i] != f32_to_bf16(r) && d > 1.0 / 128.0) { ++bad; }
+          }
+        }
+        std::printf("[gemm_i8pt] %-28s%s bias %d: %zu bad, worst rel "
+                    "%.2e\n", g.name.c_str(), g.flat ? " flat" : "", hb, bad,
+                    worst);
+        EXPECT_TRUE(bad == 0);
+      }
+    }
+    // THE ROTATED QUANTIZERS: each 256-block Walsh-Hadamard transformed
+    // (natural order, orthonormal, the GPU's butterfly order) before the
+    // row's scale is taken; the dequant transforms back.
+    auto fwht = [](float* v) {
+      for (int h = 1; h < 256; h <<= 1) {
+        for (int i = 0; i < 256; i += 2 * h) {
+          for (int j = i; j < i + h; ++j) {
+            const float a = v[j], b = v[j + h];
+            v[j] = a + b;
+            v[j + h] = a - b;
+          }
+        }
+      }
+      for (int i = 0; i < 256; ++i) { v[i] *= 0.0625f; }
+    };
+    auto rotated = [&](const std::vector<float>& v) {
+      std::vector<float> r = v;
+      for (std::size_t o = 0; o < r.size(); o += 256) { fwht(&r[o]); }
+      return r;
+    };
+    SharedBuffer rq = up(nullptr, (std::size_t)M * K);
+    SharedBuffer rs = up(nullptr, (std::size_t)M * 4);
+    SharedBuffer rsq = up(nullptr, (std::size_t)M * K);
+    SharedBuffer rss = up(nullptr, (std::size_t)M * 4);
+    SharedBuffer rwq = up(nullptr, (std::size_t)N * K);
+    SharedBuffer rws = up(nullptr, (std::size_t)N * 4);
+    SharedBuffer rwd = up(nullptr, (std::size_t)N * K * 2);
+    run([&](ComputeEncoder& e) {
+      e.set_buffer(0, xb); e.set_buffer(1, rq); e.set_buffer(2, rs);
+      e.set_constant(3, K);
+      rows_pass(e, fqr, M, -K);
+      e.set_buffer(0, xb); e.set_buffer(1, x2b); e.set_buffer(2, rsq);
+      e.set_buffer(3, rss); e.set_constant(4, K);
+      rows_pass(e, fsqr, M, -K);
+      e.set_buffer(0, cb); e.set_buffer(1, scb); e.set_buffer(2, bib);
+      e.set_buffer(3, rwq); e.set_buffer(4, rws); e.set_constant(5, K);
+      rows_pass(e, faqr, N, -K);
+      e.set_buffer(0, rwq); e.set_buffer(1, rws); e.set_buffer(2, rwd);
+      e.set_constant(3, K);
+      rows_pass(e, fdqr, N, -K);
+    });
+    const auto* rw8 = static_cast<const std::int8_t*>(rwq.contents());
+    const auto* rwsp = static_cast<const float*>(rws.contents());
+    quant_rows(rotated(xf), M, static_cast<const std::int8_t*>(rq.contents()),
+               static_cast<const float*>(rs.contents()), "quant_i8_tok_r");
+    quant_rows(rotated(hf), M,
+               static_cast<const std::int8_t*>(rsq.contents()),
+               static_cast<const float*>(rss.contents()),
+               "swiglu_quant_i8_tok_r");
+    quant_rows(rotated(wf), N, rw8, rwsp, "affine_to_i8pt_w8_r");
+    {
+      std::size_t rbad = 0;
+      const auto* p = static_cast<const std::uint16_t*>(rwd.contents());
+      std::vector<float> row(256);
+      for (int n = 0; n < N; ++n) {
+        for (int b = 0; b < K; b += 256) {
+          for (int k = 0; k < 256; ++k) {
+            row[k] = (float)rw8[(std::size_t)n * K + b + k] * rwsp[n];
+          }
+          fwht(row.data());
+          for (int k = 0; k < 256; ++k) {
+            if (p[(std::size_t)n * K + b + k] != f32_to_bf16(row[k])) {
+              ++rbad;
+            }
+          }
+        }
+      }
+      std::printf("[gemm_i8pt] i8pt_dequant_r         %zu of %zu off\n",
+                  rbad, (std::size_t)N * K);
+      EXPECT_TRUE(rbad == 0);
+    }
+  }
+
+  // ---- (1b) what the rotation buys -----------------------------------------
+  // x with OUTLIER channels (1 in 64 scaled x24, as gemm_i8.coarse_tier),
+  // an outlier-free weight, against the f64 product of the bf16 operands:
+  // plain per token, rotated per token.
+  {
+    const int M = 256, N = 512, K = 4096;
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::uint16_t> x((std::size_t)M * K), w((std::size_t)N * K);
+    for (int m = 0; m < M; ++m) {
+      for (int k = 0; k < K; ++k) {
+        const float s = (k % 64) == 7 ? 24.0f : 1.0f;
+        x[(std::size_t)m * K + k] = f32_to_bf16(s * nd(rng));
+      }
+    }
+    for (auto& v : w) { v = f32_to_bf16(0.02f * nd(rng)); }
+    SharedBuffer xb = up(x.data(), x.size() * 2);
+    SharedBuffer wb = up(w.data(), w.size() * 2);
+    std::vector<double> ref((std::size_t)M * N);
+    for (int m = 0; m < M; ++m) {
+      for (int n = 0; n < N; ++n) {
+        double a = 0.0;
+        for (int k = 0; k < K; ++k) {
+          a += (double)bf16_to_f32(x[(std::size_t)m * K + k]) *
+               bf16_to_f32(w[(std::size_t)n * K + k]);
+        }
+        ref[(std::size_t)m * N + n] = a;
+      }
+    }
+    const G& g = *std::find_if(gs.begin(), gs.end(), [](const G& c) {
+      return c.name == "gemm_i8pt_m128x64";
+    });
+    ComputeFunction fg = gfn(g, K);
+    SharedBuffer xq = up(nullptr, (std::size_t)M * K);
+    SharedBuffer as = up(nullptr, (std::size_t)M * 4);
+    SharedBuffer wq = up(nullptr, (std::size_t)N * K);
+    SharedBuffer ws = up(nullptr, (std::size_t)N * 4);
+    SharedBuffer y = up(nullptr, (std::size_t)M * N * 2);
+    double err[2] = {0.0, 0.0};
+    for (int rot = 0; rot < 2; ++rot) {
+      const ComputeFunction& q = rot ? fqr : fq;
+      run([&](ComputeEncoder& e) {
+        e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, as);
+        e.set_constant(3, K);
+        rows_pass(e, q, M, rot ? -K : K);
+        e.set_buffer(0, wb); e.set_buffer(1, wq); e.set_buffer(2, ws);
+        e.set_constant(3, K);
+        rows_pass(e, q, N, rot ? -K : K);
+        gemm(e, fg, g, xq, wq, as, ws, y, y, false, M, N, K);
+      });
+      const auto* yp = static_cast<const std::uint16_t*>(y.contents());
+      double n2 = 0.0, d2 = 0.0;
+      for (std::size_t i = 0; i < ref.size(); ++i) {
+        const double d = bf16_to_f32(yp[i]) - ref[i];
+        n2 += d * d;
+        d2 += ref[i] * ref[i];
+      }
+      err[rot] = std::sqrt(n2 / d2);
+    }
+    std::printf("[gemm_i8pt] outlier channels (1/64 x24), %s: plain "
+                "%.3e, rotated %.3e (%.2fx)\n", g.name.c_str(), err[0],
+                err[1], err[0] / err[1]);
+    EXPECT_TRUE(err[1] < err[0]);
+  }
+
+  // ---- (2) speed ----------------------------------------------------------
+  const char* sp = std::getenv("VPIPE_I8_PT_SPEED");
+  if (sp == nullptr || std::atoi(sp) == 0) { return; }
+  ComputeFunction fc_q = lq.function("quant_i8_row_gc512_r");
+  ComputeFunction fc_g = lg.function("gemm_i8c_g512_t128x64");
+  if (!fc_q.valid() || !fc_g.valid()) { ASSERT_TRUE(false); return; }
+  struct Sh { int M, N, K; const char* tag; };
+  const int rows = [] {
+    const char* e = std::getenv("VPIPE_I8_PT_ROWS");
+    return e != nullptr ? std::atoi(e) : 4096;
+  }();
+  for (const Sh& sh : {Sh{rows, 4096, 4096, "q/k/v/out"},
+                       Sh{rows, 12288, 4096, "ff gate/up"},
+                       Sh{rows, 4096, 12288, "ff down"}}) {
+    const int M = sh.M, N = sh.N, K = sh.K;
+    std::mt19937 rng(5);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::uint16_t> hx((std::size_t)M * K);
+    for (auto& v : hx) { v = f32_to_bf16(nd(rng)); }
+    SharedBuffer xb = up(hx.data(), hx.size() * 2);
+    SharedBuffer y = up(nullptr, (std::size_t)M * N * 2);
+    std::uniform_int_distribution<int> cd(-127, 127);
+    auto rnd8 = [&](std::size_t n) {
+      SharedBuffer b = up(nullptr, n);
+      auto* p = static_cast<std::int8_t*>(b.contents());
+      for (std::size_t i = 0; i < n; ++i) { p[i] = (std::int8_t)cd(rng); }
+      return b;
+    };
+    auto rndf = [&](std::size_t n, bool bf) {
+      SharedBuffer b = up(nullptr, n * (bf ? 2 : 4));
+      for (std::size_t i = 0; i < n; ++i) {
+        const float v = 1e-3f * (1.0f + 0.1f * nd(rng));
+        if (bf) {
+          static_cast<std::uint16_t*>(b.contents())[i] = f32_to_bf16(v);
+        } else {
+          static_cast<float*>(b.contents())[i] = v;
+        }
+      }
+      return b;
+    };
+    // Two weights alternated, so no arm runs out of a warm cache.
+    SharedBuffer w8[2] = {rnd8((std::size_t)N * K), rnd8((std::size_t)N * K)};
+    SharedBuffer xq = up(nullptr, (std::size_t)M * K);
+    SharedBuffer as = up(nullptr, (std::size_t)M * (K / 512) * 2 + M * 4);
+    SharedBuffer cws[2] = {rndf((std::size_t)N * (K / 512), true),
+                           rndf((std::size_t)N * (K / 512), true)};
+    SharedBuffer pws[2] = {rndf(N, false), rndf(N, false)};
+    struct Arm { std::string name; std::function<void(ComputeEncoder&, int)> f;
+                 std::vector<double> ms; };
+    std::vector<Arm> arms;
+    arms.push_back({"g512 rot 128x64", [&](ComputeEncoder& e, int wi) {
+      e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, as);
+      e.set_constant(3, K);
+      e.set_function(fc_q);
+      e.dispatch({(unsigned)((K / 512 + 3) / 4) * 128u, (unsigned)M, 1},
+                 {128, 1, 1});
+      e.set_function(fc_g);
+      e.set_buffer(0, xq); e.set_buffer(1, w8[wi]); e.set_buffer(2, as);
+      e.set_buffer(3, cws[wi]); e.set_buffer(4, y);
+      e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, M);
+      e.set_buffer(8, cws[wi]); e.set_constant(9, 0);
+      e.dispatch({(unsigned)((N + 63) / 64) * 256u, (unsigned)((M + 127) /
+                  128), 1}, {256, 1, 1});
+    }, {}});
+    arms.push_back({"g512 gemm only", [&](ComputeEncoder& e, int wi) {
+      e.set_function(fc_g);
+      e.set_buffer(0, xq); e.set_buffer(1, w8[wi]); e.set_buffer(2, as);
+      e.set_buffer(3, cws[wi]); e.set_buffer(4, y);
+      e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, M);
+      e.set_buffer(8, cws[wi]); e.set_constant(9, 0);
+      e.dispatch({(unsigned)((N + 63) / 64) * 256u, (unsigned)((M + 127) /
+                  128), 1}, {256, 1, 1});
+    }, {}});
+    arms.push_back({"quant tok", [&](ComputeEncoder& e, int) {
+      e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, as);
+      e.set_constant(3, K);
+      rows_pass(e, fq, M, K);
+    }, {}});
+    arms.push_back({"quant tok rot", [&](ComputeEncoder& e, int) {
+      e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, as);
+      e.set_constant(3, K);
+      rows_pass(e, fqr, M, -K);
+    }, {}});
+    static std::vector<ComputeFunction> fkeep;
+    fkeep.clear();
+    fkeep.reserve(gs.size());
+    for (const G& g : gs) {
+      fkeep.push_back(gfn(g, K));
+      const ComputeFunction* f = &fkeep.back();
+      const std::string nm = g.name.substr(std::strlen("gemm_i8pt_")) +
+                             (g.flat ? " flat" : "");
+      arms.push_back({nm, [&, f, g](ComputeEncoder& e, int wi) {
+        e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, as);
+        e.set_constant(3, K);
+        rows_pass(e, fq, M, K);
+        gemm(e, *f, g, xq, w8[wi], as, pws[wi], y, y, false, M, N, K);
+      }, {}});
+    }
+    if (const char* only = std::getenv("VPIPE_I8_PT_ARMS")) {
+      std::vector<Arm> kept;
+      for (std::size_t i = 0; i < arms.size(); ++i) {
+        if (i == 0 || std::strstr(only, arms[i].name.c_str()) != nullptr) {
+          kept.push_back(std::move(arms[i]));
+        }
+      }
+      arms = std::move(kept);
+    }
+    // VPIPE_I8_PT_ITERS: dispatches a timed batch (6); a small shape
+    // wants more, or the commit's own latency is the measurement.
+    const int iters = [] {
+      const char* e = std::getenv("VPIPE_I8_PT_ITERS");
+      return e != nullptr && std::atoi(e) > 0 ? std::atoi(e) : 6;
+    }();
+    // VPIPE_I8_PT_ROUNDS: interleaved rounds (4), more on a box that
+    // will not sit still.
+    const int rounds = [] {
+      const char* e = std::getenv("VPIPE_I8_PT_ROUNDS");
+      return e != nullptr && std::atoi(e) > 0 ? std::atoi(e) : 4;
+    }();
+    const double gop = 2.0 * M * (double)N * K * 1e-9;
+    for (int r = 0; r < rounds; ++r) {
+      for (std::size_t k = 0; k < arms.size(); ++k) {
+        Arm& a = arms[(r % 2 == 0) ? k : arms.size() - 1 - k];
+        run([&](ComputeEncoder& e) { a.f(e, 0); });
+        const auto t0 = std::chrono::steady_clock::now();
+        run([&](ComputeEncoder& e) {
+          for (int i = 0; i < iters; ++i) { a.f(e, i & 1); }
+        });
+        a.ms.push_back(secs_(t0, std::chrono::steady_clock::now()) * 1e3 /
+                       iters);
+      }
+    }
+    std::printf("[gemm_i8pt] speed %s M=%d N=%d K=%d (quantizer + GEMM)\n",
+                sh.tag, M, N, K);
+    double base = 0.0;
+    for (Arm& a : arms) {
+      std::sort(a.ms.begin(), a.ms.end());
+      const double ms = a.ms[a.ms.size() / 2];
+      if (base == 0.0) { base = ms; }
+      std::printf("[gemm_i8pt]   %-20s %7.3f ms %6.1f TOP/s %.3fx\n",
+                  a.name.c_str(), ms, gop / ms, base / ms);
+    }
+  }
+}
+
+// A W4 PACK INTO THE FAST AND TOKEN LAYOUTS (I8GemmContext::
+// encode_to_fast at bits 4, out of place: the int8 codes are twice the
+// nibbles' size). The w4 converters read a code as a nibble where the w8
+// ones read a byte, and that is all they differ by -- so the same codes
+// widened one a byte must convert BYTE-IDENTICAL through the w8 form, at
+// every group and both token readings, which also settles the nibble
+// order. And the layout dequantized back must be the pack's own dequant
+// to within int8's step.
+TEST(gemm_i8, a_w4_pack_converts_into_the_fast_layouts) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  using vpipe::genai::I8GemmContext;
+  // The conversions are plain compute (no matrix cores); a box whose
+  // context loaded no fast tier at all has nothing to convert into.
+  I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/false);
+  if (!ctx.fast_converts(8, 512)) {
+    std::printf("[gemm_i8 w4->fast] no fast tier on this box, skipped\n");
+    return;
+  }
+  const int N = 80, K = 3072;
+  std::mt19937 rng(11);
+  std::vector<std::uint8_t> p4;
+  std::vector<_Float16> sc, bi;
+  std::vector<float> deq;
+  std::vector<int> q;
+  pack_affine_(4, N, K, rng, &p4, &sc, &bi, &deq, &q);
+  // Zero-centred, as a weight is: a rotation gathers a row's mean into
+  // one coefficient per block, and the skewed minima pack_affine_ draws
+  // would make that coefficient -- not int8's step -- set the scale.
+  {
+    std::uniform_real_distribution<float> jd(-0.002f, 0.002f);
+    const int G = K / 64;
+    for (std::size_t i = 0; i < bi.size(); ++i) {
+      bi[i] = (_Float16)(-7.5f * (float)sc[i] + jd(rng));
+    }
+    for (int n = 0; n < N; ++n) {
+      for (int k = 0; k < K; ++k) {
+        const std::size_t gi = (std::size_t)n * G + k / 64;
+        deq[(std::size_t)n * K + k] =
+            (float)sc[gi] * (float)q[(std::size_t)n * K + k] +
+            (float)bi[gi];
+      }
+    }
+  }
+  std::vector<std::uint8_t> p8(q.begin(), q.end());
+  auto up = [&](const void* p, std::size_t n) {
+    SharedBuffer b = mc->make_shared_buffer(n);
+    if (!b.empty() && p != nullptr) { std::memcpy(b.contents(), p, n); }
+    return b;
+  };
+  auto run = [&](const std::function<bool(ComputeEncoder&)>& f) {
+    CommandStream st = mc->make_command_stream();
+    bool ok = false;
+    { ComputeEncoder e = st.begin_compute(); ok = f(e); }
+    return ok && st.commit().wait_ok(nullptr);
+  };
+  SharedBuffer c4 = up(p4.data(), p4.size());
+  SharedBuffer c8 = up(p8.data(), p8.size());
+  SharedBuffer s = up(sc.data(), sc.size() * 2);
+  SharedBuffer b = up(bi.data(), bi.size() * 2);
+  struct Arm { const char* tag; int gc; bool rot; };
+  const int tok = I8GemmContext::kTokenGroup;
+  for (const Arm& a : {Arm{"g256", 256, false}, Arm{"g512", 512, false},
+                       Arm{"g1024", 1024, false}, Arm{"token", tok, false},
+                       Arm{"token_r", tok, true}}) {
+    ctx.set_token_rotation(a.rot);
+    if (a.gc == tok && ctx.token_rotated() != a.rot) {
+      std::printf("[gemm_i8 w4->fast] %s: VPIPE_I8_TOKEN_ROT pins the "
+                  "other reading, skipped\n", a.tag);
+      continue;
+    }
+    ASSERT_TRUE(ctx.fast_converts(4, a.gc));
+    ASSERT_TRUE(ctx.fast_converts(8, a.gc));
+    const std::size_t nk = (std::size_t)N * K;
+    const std::size_t sb = I8GemmContext::fast_scale_bytes(N, K, a.gc);
+    SharedBuffer q4 = mc->make_shared_buffer(nk);
+    SharedBuffer q8 = mc->make_shared_buffer(nk);
+    SharedBuffer s4 = mc->make_shared_buffer(sb);
+    SharedBuffer s8 = mc->make_shared_buffer(sb);
+    SharedBuffer back = mc->make_shared_buffer(nk * 2);
+    const bool ok4 = run([&](ComputeEncoder& e) {
+      return ctx.encode_to_fast(e, c4, s, b, q4, s4, a.gc, N, K, 4);
+    });
+    const bool ok8 = run([&](ComputeEncoder& e) {
+      return ctx.encode_to_fast(e, c8, s, b, q8, s8, a.gc, N, K, 8);
+    });
+    const bool okd = run([&](ComputeEncoder& e) {
+      return ctx.encode_dequant_fast(e, q4, s4, a.gc, back, N, K);
+    });
+    // In place is refused at w4 (each row's writes would land on rows
+    // other threadgroups are still reading), with nothing encoded.
+    SharedBuffer wide = mc->make_shared_buffer(nk);
+    std::memcpy(wide.contents(), p4.data(), p4.size());
+    bool encoded_in_place = true;
+    run([&](ComputeEncoder& e) {
+      encoded_in_place =
+          ctx.encode_to_fast(e, wide, s, b, wide, s4, a.gc, N, K, 4);
+      return true;
+    });
+    EXPECT_TRUE(!encoded_in_place);
+    ASSERT_TRUE(ok4 && ok8 && okd);
+    if (!(ok4 && ok8 && okd)) { continue; }
+    const bool same_codes =
+        std::memcmp(q4.contents(), q8.contents(), nk) == 0;
+    const bool same_scales =
+        std::memcmp(s4.contents(), s8.contents(), sb) == 0;
+    const auto* h = static_cast<const _Float16*>(back.contents());
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < nk; ++i) {
+      const double d = (double)h[i] - (double)deq[i];
+      num += d * d;
+      den += (double)deq[i] * (double)deq[i];
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    std::printf("[gemm_i8 w4->fast] %-7s codes %s, scales %s against the "
+                "w8 form; dequantized back %.3e from the pack's dequant\n",
+                a.tag, same_codes ? "IDENTICAL" : "DIFFERENT",
+                same_scales ? "IDENTICAL" : "DIFFERENT", rel);
+    EXPECT_TRUE(same_codes);
+    EXPECT_TRUE(same_scales);
+    EXPECT_TRUE(rel < 2e-2);
+  }
+}
+
+// WHAT UNPACKING A 4-BIT WEIGHT INSIDE THE TOKEN GEMM COSTS (the
+// gemm_i8pt_wx_* study kernels, m128x64): against the int8 layout held,
+//   i8 reg / tg   the int8 weight read as the tier reads it, and staged
+//                 through threadgroup memory (what the staging alone costs)
+//   w4 reg / tg   an int4-per-row weight (offset binary) widened to int8
+//                 in registers, or once a block into threadgroup memory
+//   aff reg / tg  the w4 g64 affine PACK as stored, requantized to the
+//                 token_plain code per element inside the GEMM -- the held
+//                 conversion (affine_to_i8pt_w4) moved into the kernel
+//   cvt + gemm    the pack converted into an int8 scratch before every
+//                 GEMM (affine_to_i8pt_w4, and its rotated twin for the
+//                 `token` tier), then the tier's GEMM
+// Correctness (any matrix-core box): every arm BYTE-IDENTICAL to the
+// tier's own kernel on the same values. Timing: VPIPE_I8_W4_UNPACK=1, at
+// Qwen-Image-2.1's block shapes, 4096 rows (VPIPE_I8_PT_ROWS), the arms
+// interleaved with the order reversed every round, median kept.
+TEST(gemm_i8, w4_unpack_cost) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lg = mc->load_library("dense_gemm_mma_bf16");
+  ComputeLibrary lq = mc->load_library("affine_dequant_bf16");
+  ComputeFunction prod = lg.function("gemm_i8pt_m128x64");
+  ComputeFunction cvt = lq.function("affine_to_i8pt_w4");
+  ComputeFunction cvtr = lq.function("affine_to_i8pt_w4_r");
+  ComputeFunction cvt512 = lq.function("affine_to_i8c_w4_gc512_r");
+  struct Wx { const char* name; int wf; ComputeFunction f; };
+  std::vector<Wx> wx;
+  for (const auto& [name, wf, fn] :
+       {std::tuple<const char*, int, const char*>{"i8 reg", 0,
+                                                  "gemm_i8pt_wx_i8_reg"},
+        {"i8 tg", 0, "gemm_i8pt_wx_i8_tg"},
+        {"w4 reg", 1, "gemm_i8pt_wx_w4_reg"},
+        {"w4 tg", 1, "gemm_i8pt_wx_w4_tg"},
+        {"aff reg", 2, "gemm_i8pt_wx_aff_reg"},
+        {"aff tg", 2, "gemm_i8pt_wx_aff_tg"}}) {
+    wx.push_back(Wx{name, wf, lg.function(fn)});
+  }
+  ASSERT_TRUE(prod.valid() && cvt.valid() && cvtr.valid() &&
+              cvt512.valid());
+  for (const Wx& w : wx) { ASSERT_TRUE(w.f.valid()); }
+  if (!prod.valid() || !cvt.valid() || !cvtr.valid()) { return; }
+  auto up = [&](const void* p, std::size_t n) {
+    SharedBuffer b = mc->make_shared_buffer(n);
+    if (!b.empty() && p != nullptr) { std::memcpy(b.contents(), p, n); }
+    return b;
+  };
+  auto gemm_prod = [&](ComputeEncoder& e, const SharedBuffer& xq,
+                       const SharedBuffer& wq, const SharedBuffer& as,
+                       const SharedBuffer& ws, const SharedBuffer& y, int M,
+                       int N, int K) {
+    e.set_function(prod);
+    e.set_buffer(0, xq); e.set_buffer(1, wq); e.set_buffer(2, as);
+    e.set_buffer(3, ws); e.set_buffer(4, y);
+    e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, M);
+    e.set_buffer(8, ws); e.set_constant(9, 0);
+    e.dispatch({(unsigned)(N / 64) * 32u, (unsigned)(M / 128) * 2u, 4u},
+               {32u, 2u, 4u});
+  };
+  auto gemm_wx = [&](ComputeEncoder& e, const Wx& a, const SharedBuffer& xq,
+                     const SharedBuffer& w, const SharedBuffer& as,
+                     const SharedBuffer& ws, const SharedBuffer& y,
+                     const SharedBuffer& sc, const SharedBuffer& bi,
+                     const SharedBuffer& inv, int M, int N, int K) {
+    e.set_function(a.f);
+    e.set_buffer(0, xq); e.set_buffer(1, w); e.set_buffer(2, as);
+    e.set_buffer(3, ws); e.set_buffer(4, y);
+    e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, M);
+    e.set_buffer(8, sc); e.set_buffer(9, bi); e.set_buffer(10, inv);
+    e.dispatch({(unsigned)(N / 64) * 32u, (unsigned)(M / 128) * 2u, 4u},
+               {32u, 2u, 4u});
+  };
+  // The conversions' grid: a row a threadgroup of K/16 threads (plain), a
+  // simdgroup per 256-block (rotated).
+  auto convert = [&](ComputeEncoder& e, bool rot, const SharedBuffer& c,
+                     const SharedBuffer& sc, const SharedBuffer& bi,
+                     const SharedBuffer& q, const SharedBuffer& qs, int N,
+                     int K) {
+    e.set_function(rot ? cvtr : cvt);
+    e.set_buffer(0, c); e.set_buffer(1, sc); e.set_buffer(2, bi);
+    e.set_buffer(3, q); e.set_buffer(4, qs); e.set_constant(5, K);
+    const unsigned T =
+        rot ? 32u * (unsigned)std::min(K / 256, 32)
+            : (unsigned)std::max(32, (K / 16 + 31) / 32 * 32);
+    e.dispatch({T, (unsigned)N, 1}, {T, 1, 1});
+  };
+  auto run = [&](const std::function<void(ComputeEncoder&)>& f) {
+    CommandStream st = mc->make_command_stream();
+    { ComputeEncoder e = st.begin_compute(); f(e); }
+    st.commit().wait();
+  };
+  // Everything one shape needs: activations, the three weight forms of
+  // one random w4 pack and of one random int4-per-row weight.
+  struct Op {
+    SharedBuffer xq, as, w8, w4, ws, pc, psc, pbi, pinv, h8, hs, y;
+  };
+  auto make = [&](int M, int N, int K, unsigned seed) {
+    Op o;
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> c8(-127, 127), c4(-8, 7), cu(0, 15);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::int8_t> xq((std::size_t)M * K);
+    for (auto& v : xq) { v = (std::int8_t)c8(rng); }
+    std::vector<float> as(M), ws(N);
+    for (auto& v : as) { v = 1e-2f * (1.0f + 0.1f * nd(rng)); }
+    for (auto& v : ws) { v = 1e-3f * (1.0f + 0.1f * nd(rng)); }
+    // int4 per row: the widened int8 and the packed nibbles, byte i of a
+    // word = e_i | e_{i+4} << 4 in offset binary.
+    std::vector<std::int8_t> w8((std::size_t)N * K);
+    std::vector<std::uint8_t> w4((std::size_t)N * K / 2, 0);
+    for (int n = 0; n < N; ++n) {
+      for (int k = 0; k < K; ++k) {
+        const int q = c4(rng);
+        w8[(std::size_t)n * K + k] = (std::int8_t)q;
+        const int word = k / 8, j = k % 8;
+        const std::size_t byte = (std::size_t)n * K / 2 + word * 4 + (j % 4);
+        w4[byte] |= (std::uint8_t)((q + 8) << (j < 4 ? 0 : 4));
+      }
+    }
+    // A w4 g64 affine pack (MLX nibble order) and the row's 127 / amax
+    // over its element-type dequant -- what the held conversion uses.
+    const int G = K / 64;
+    std::vector<std::uint8_t> pc((std::size_t)N * K / 2, 0);
+    std::vector<std::uint16_t> psc((std::size_t)N * G), pbi(psc.size());
+    for (std::size_t i = 0; i < psc.size(); ++i) {
+      const float s = 2e-3f * (1.0f + 0.5f * std::fabs(nd(rng)));
+      psc[i] = f32_to_bf16(s);
+      pbi[i] = f32_to_bf16(-7.5f * s + 2e-3f * nd(rng));
+    }
+    std::vector<float> pinv(N);
+    for (int n = 0; n < N; ++n) {
+      float am = 0.0f;
+      for (int k = 0; k < K; ++k) {
+        const int c = cu(rng);
+        pc[((std::size_t)n * K + k) / 2] |=
+            (std::uint8_t)(c << ((k & 1) ? 4 : 0));
+        const std::size_t g = (std::size_t)n * G + k / 64;
+        const float v = bf16_to_f32(f32_to_bf16(
+            (float)c * bf16_to_f32(psc[g]) + bf16_to_f32(pbi[g])));
+        am = std::max(am, std::fabs(v));
+      }
+      pinv[n] = am > 0.0f ? 127.0f / am : 0.0f;
+    }
+    o.xq = up(xq.data(), xq.size());
+    o.as = up(as.data(), as.size() * 4);
+    o.ws = up(ws.data(), ws.size() * 4);
+    o.w8 = up(w8.data(), w8.size());
+    o.w4 = up(w4.data(), w4.size());
+    o.pc = up(pc.data(), pc.size());
+    o.psc = up(psc.data(), psc.size() * 2);
+    o.pbi = up(pbi.data(), pbi.size() * 2);
+    o.pinv = up(pinv.data(), pinv.size() * 4);
+    o.h8 = up(nullptr, (std::size_t)N * K);
+    o.hs = up(nullptr, (std::size_t)N * 4);
+    o.y = up(nullptr, (std::size_t)M * N * 2);
+    // The held token_plain layout of the pack, as the tier converts it.
+    run([&](ComputeEncoder& e) {
+      convert(e, false, o.pc, o.psc, o.pbi, o.h8, o.hs, N, K);
+    });
+    return o;
+  };
+
+  // ---- correctness ------------------------------------------------------
+  {
+    const int M = 256, N = 192, K = 1024;
+    Op o = make(M, N, K, 3);
+    const std::size_t yb = (std::size_t)M * N * 2;
+    std::vector<std::uint8_t> ref_i4(yb), ref_aff(yb);
+    run([&](ComputeEncoder& e) {
+      gemm_prod(e, o.xq, o.w8, o.as, o.ws, o.y, M, N, K);
+    });
+    std::memcpy(ref_i4.data(), o.y.contents(), yb);
+    run([&](ComputeEncoder& e) {
+      gemm_prod(e, o.xq, o.h8, o.as, o.hs, o.y, M, N, K);
+    });
+    std::memcpy(ref_aff.data(), o.y.contents(), yb);
+    for (const Wx& a : wx) {
+      std::memset(o.y.contents(), 0xff, yb);
+      const SharedBuffer& w = a.wf == 0 ? o.w8 : a.wf == 1 ? o.w4 : o.pc;
+      const SharedBuffer& ws = a.wf == 2 ? o.hs : o.ws;
+      run([&](ComputeEncoder& e) {
+        gemm_wx(e, a, o.xq, w, o.as, ws, o.y, o.psc, o.pbi, o.pinv, M, N,
+                K);
+      });
+      const auto& ref = a.wf == 2 ? ref_aff : ref_i4;
+      const bool same = std::memcmp(o.y.contents(), ref.data(), yb) == 0;
+      std::size_t ndiff = 0;
+      double worst = 0.0;
+      {
+        const auto* g = static_cast<const std::uint16_t*>(o.y.contents());
+        const auto* r = reinterpret_cast<const std::uint16_t*>(ref.data());
+        for (std::size_t i = 0; i < yb / 2; ++i) {
+          if (g[i] == r[i]) { continue; }
+          ++ndiff;
+          const double rv = bf16_to_f32(r[i]);
+          worst = std::max(worst, std::fabs(bf16_to_f32(g[i]) - rv) /
+                                      std::max(std::fabs(rv), 1e-6));
+        }
+      }
+      std::printf("[gemm_i8 w4 unpack] %-8s %s the tier's kernel on %s"
+                  " (%zu of %zu outputs differ, worst rel %.2e)\n",
+                  a.name, same ? "IDENTICAL to" : "DIFFERENT from",
+                  a.wf == 2 ? "the held conversion of the pack"
+                            : "the widened weight", ndiff, yb / 2, worst);
+      EXPECT_TRUE(same);
+    }
+  }
+
+  // ---- timing -----------------------------------------------------------
+  if (std::getenv("VPIPE_I8_W4_UNPACK") == nullptr) {
+    std::printf("[gemm_i8 w4 unpack] VPIPE_I8_W4_UNPACK unset -- timing "
+                "skipped\n");
+    return;
+  }
+  const int rows = [] {
+    const char* e = std::getenv("VPIPE_I8_PT_ROWS");
+    return e != nullptr ? std::atoi(e) : 4096;
+  }();
+  const int rounds = [] {
+    const char* e = std::getenv("VPIPE_I8_PT_ROUNDS");
+    return e != nullptr && std::atoi(e) > 0 ? std::atoi(e) : 5;
+  }();
+  struct Sh { int N, K; const char* tag; };
+  for (const Sh& sh : {Sh{4096, 4096, "q/k/v/out"},
+                       Sh{12288, 4096, "ff gate/up"},
+                       Sh{4096, 12288, "ff down"}}) {
+    const int M = rows, N = sh.N, K = sh.K;
+    // Two weights cycled so no call finds its weight warm in cache.
+    Op o[2] = {make(M, N, K, 7), make(M, N, K, 8)};
+    SharedBuffer scratch = up(nullptr, (std::size_t)N * K);
+    SharedBuffer sscale = up(nullptr, std::max((std::size_t)N * 4,
+                                               (std::size_t)N * (K / 512) * 2));
+    struct Arm {
+      std::string name;
+      std::function<void(ComputeEncoder&, Op&)> f;
+      std::vector<double> ms;
+    };
+    std::vector<Arm> arms;
+    arms.push_back({"tier (int8 held)", [&](ComputeEncoder& e, Op& p) {
+      gemm_prod(e, p.xq, p.w8, p.as, p.ws, p.y, M, N, K);
+    }, {}});
+    for (const Wx& a : wx) {
+      const Wx* ap = &a;
+      arms.push_back({a.name, [&, ap](ComputeEncoder& e, Op& p) {
+        const SharedBuffer& w =
+            ap->wf == 0 ? p.w8 : ap->wf == 1 ? p.w4 : p.pc;
+        gemm_wx(e, *ap, p.xq, w, p.as, ap->wf == 2 ? p.hs : p.ws, p.y,
+                p.psc, p.pbi, p.pinv, M, N, K);
+      }, {}});
+    }
+    for (int rot = 0; rot < 2; ++rot) {
+      arms.push_back({rot ? "cvt_r + gemm" : "cvt + gemm",
+                      [&, rot](ComputeEncoder& e, Op& p) {
+        convert(e, rot != 0, p.pc, p.psc, p.pbi, scratch, sscale, N, K);
+        gemm_prod(e, p.xq, scratch, p.as, sscale, p.y, M, N, K);
+      }, {}});
+    }
+    // The conversions ALONE, against the GEMM they feed: the token
+    // tier's plain and rotated, and the fast tier's (group 512, rotated).
+    for (int rot = 0; rot < 2; ++rot) {
+      arms.push_back({rot ? "cvt_r only" : "cvt only",
+                      [&, rot](ComputeEncoder& e, Op& p) {
+        convert(e, rot != 0, p.pc, p.psc, p.pbi, scratch, sscale, N, K);
+      }, {}});
+    }
+    arms.push_back({"cvt_g512 only", [&](ComputeEncoder& e, Op& p) {
+      e.set_function(cvt512);
+      e.set_buffer(0, p.pc); e.set_buffer(1, p.psc); e.set_buffer(2, p.pbi);
+      e.set_buffer(3, scratch); e.set_buffer(4, sscale);
+      e.set_constant(5, K);
+      e.dispatch({(unsigned)((K / 512 + 3) / 4) * 128u, (unsigned)N, 1},
+                 {128u, 1u, 1u});
+    }, {}});
+    const int iters = 6;
+    for (int r = 0; r < rounds; ++r) {
+      for (std::size_t k = 0; k < arms.size(); ++k) {
+        Arm& a = arms[(r % 2 == 0) ? k : arms.size() - 1 - k];
+        run([&](ComputeEncoder& e) { a.f(e, o[0]); });
+        const auto t0 = std::chrono::steady_clock::now();
+        run([&](ComputeEncoder& e) {
+          for (int i = 0; i < iters; ++i) { a.f(e, o[i & 1]); }
+        });
+        a.ms.push_back(secs_(t0, std::chrono::steady_clock::now()) * 1e3 /
+                       iters);
+      }
+    }
+    std::printf("[gemm_i8 w4 unpack] %s M=%d N=%d K=%d\n", sh.tag, M, N, K);
+    double base = 0.0;
+    const double gop = 2.0 * M * (double)N * K * 1e-9;
+    for (Arm& a : arms) {
+      std::sort(a.ms.begin(), a.ms.end());
+      const double ms = a.ms[a.ms.size() / 2];
+      if (base == 0.0) { base = ms; }
+      std::printf("[gemm_i8 w4 unpack]   %-17s %7.3f ms %6.1f TOP/s %.3fx\n",
+                  a.name.c_str(), ms, gop / ms, base / ms);
+    }
+  }
+}
+
+// WHAT A W4 PACK'S CONVERSION INTO THE INT8 LAYOUTS COSTS, kernel by
+// kernel (VPIPE_I8_CVT_RATE=1): each converter 32 times in one command
+// buffer over a [N, K] weight, against the activation quantizers that do
+// the same rotation over a bf16 [N, K] -- the bound a converter that
+// rotates should come near. Median of interleaved rounds; GB/s counts
+// the bytes each must move (codes in, int8 out; bf16 in for the
+// quantizers).
+TEST(gemm_i8, fast_conversion_rate) {
+  if (std::getenv("VPIPE_I8_CVT_RATE") == nullptr) { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lq = mc->load_library("affine_dequant_bf16");
+  // sdiv: a rotated token kernel's simdgroups a row, ceil(G / sdiv)
+  // (each takes sdiv 256-blocks; the kernel holds up to two). The
+  // context dispatches two.
+  struct K { const char* name; const char* fn; int kind; int sdiv = 2; };
+  // kind 0: token plain (K/16 threads a row), 1: token rotated (32 S a
+  // row), 2: g512 (128 a threadgroup, 4 groups); input w4 pack (codes,
+  // scales, biases) or, `+ 3`, a bf16 activation; 6 / 7: g256 / g1024
+  // from a pack, 10: g256 from bf16.
+  const std::vector<K> ks = {
+      {"w4 -> token plain", "affine_to_i8pt_w4", 0},
+      {"w4 -> token rotated", "affine_to_i8pt_w4_r", 1},
+      {"w4 -> token rotated, a block each", "affine_to_i8pt_w4_r", 1, 1},
+      {"w4 -> g512 plain", "affine_to_i8c_w4_gc512", 2},
+      {"w4 -> g256 rotated", "affine_to_i8c_w4_gc256_r", 6},
+      {"w4 -> g512 rotated", "affine_to_i8c_w4_gc512_r", 2},
+      {"w4 -> g1024 rotated", "affine_to_i8c_w4_gc1024_r", 7},
+      {"bf16 -> token plain", "quant_i8_tok", 3},
+      {"bf16 -> token rotated", "quant_i8_tok_r", 4},
+      {"bf16 -> token rotated, a block each", "quant_i8_tok_r", 4, 1},
+      {"bf16 -> g512 plain", "quant_i8_row_gc512", 5},
+      {"bf16 -> g256 rotated", "quant_i8_row_gc256_r", 10},
+      {"bf16 -> g512 rotated", "quant_i8_row_gc512_r", 5}};
+  for (int N : {12288, 4096}) {
+    const int Kd = N == 12288 ? 4096 : 12288;
+    const std::size_t nk = (std::size_t)N * Kd;
+    SharedBuffer codes = mc->make_shared_buffer(nk / 2);
+    SharedBuffer sc = mc->make_shared_buffer(nk / 64 * 2);
+    SharedBuffer bi = mc->make_shared_buffer(nk / 64 * 2);
+    SharedBuffer x = mc->make_shared_buffer(nk * 2);
+    SharedBuffer q = mc->make_shared_buffer(nk);
+    // Scales of every shape benched: up to f32 per 256-block.
+    SharedBuffer qs = mc->make_shared_buffer(nk / 64);
+    std::memset(codes.contents(), 0x5a, nk / 2);
+    for (std::size_t i = 0; i < nk / 64; ++i) {
+      static_cast<std::uint16_t*>(sc.contents())[i] = f32_to_bf16(1e-3f);
+      static_cast<std::uint16_t*>(bi.contents())[i] = f32_to_bf16(-7e-3f);
+    }
+    for (std::size_t i = 0; i < nk; ++i) {
+      static_cast<std::uint16_t*>(x.contents())[i] =
+          f32_to_bf16((float)((i * 2654435761u) % 1000) * 1e-3f - 0.5f);
+    }
+    std::vector<std::vector<double>> ms(ks.size());
+    auto one = [&](ComputeEncoder& e, const K& k, const ComputeFunction& f) {
+      e.set_function(f);
+      const bool pack = (k.kind < 3 || k.kind >= 6) && k.kind != 10;
+      if (pack) {
+        e.set_buffer(0, codes); e.set_buffer(1, sc); e.set_buffer(2, bi);
+        e.set_buffer(3, q); e.set_buffer(4, qs); e.set_constant(5, Kd);
+      } else {
+        e.set_buffer(0, x); e.set_buffer(1, q); e.set_buffer(2, qs);
+        e.set_constant(3, Kd);
+      }
+      const int c = k.kind >= 6 ? 2 : k.kind % 3;
+      const int gc = k.kind == 6 || k.kind == 10 ? 256
+                     : k.kind == 7                ? 1024
+                                                  : 512;
+      if (c == 2) {
+        e.dispatch({(unsigned)((Kd / gc + 3) / 4) * 128u, (unsigned)N, 1},
+                   {128u, 1u, 1u});
+      } else {
+        const int G = Kd / 256;
+        const unsigned T =
+            c == 1 ? 32u * (unsigned)std::min((G + k.sdiv - 1) / k.sdiv, 32)
+                   : (unsigned)std::max(32, (Kd / 16 + 31) / 32 * 32);
+        e.dispatch({T, (unsigned)N, 1}, {T, 1, 1});
+      }
+    };
+    std::vector<ComputeFunction> fs;
+    for (const K& k : ks) { fs.push_back(lq.function(k.fn)); }
+    for (std::size_t i = 0; i < ks.size(); ++i) {
+      ASSERT_TRUE(fs[i].valid());
+      if (!fs[i].valid()) { return; }
+    }
+    const int reps = 32;
+    // One stream: a fresh one is a new queue whose first commit costs
+    // ~1-2 ms (a_fresh_stream_per_commit_costs), 0.05 ms a rep here.
+    CommandStream st = mc->make_command_stream();
+    for (int r = 0; r < 5; ++r) {
+      for (std::size_t j = 0; j < ks.size(); ++j) {
+        const std::size_t i = (r % 2 == 0) ? j : ks.size() - 1 - j;
+        {
+          { ComputeEncoder e = st.begin_compute(); one(e, ks[i], fs[i]); }
+          st.commit().wait();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+          ComputeEncoder e = st.begin_compute();
+          for (int k = 0; k < reps; ++k) { one(e, ks[i], fs[i]); }
+        }
+        st.commit().wait();
+        ms[i].push_back(secs_(t0, std::chrono::steady_clock::now()) * 1e3 /
+                        reps);
+      }
+    }
+    std::printf("[gemm_i8 cvt] [%d, %d]\n", N, Kd);
+    for (std::size_t i = 0; i < ks.size(); ++i) {
+      std::sort(ms[i].begin(), ms[i].end());
+      const double m = ms[i][ms[i].size() / 2];
+      const bool pack = (ks[i].kind < 3 || ks[i].kind >= 6) &&
+                        ks[i].kind != 10;
+      const double bytes = pack ? nk * 1.5 : nk * 3.0;
+      std::printf("[gemm_i8 cvt]   %-34s %7.3f ms %6.0f GB/s\n", ks[i].name,
+                  m, bytes / (m * 1e6));
+    }
+  }
+}
+
+// THE ROTATED TOKEN KERNELS ARE THE SAME BYTES AT EITHER DISPATCH: a
+// simdgroup a 256-block (up to 32 of them) or two (what the context
+// dispatches) --
+// activation, SwiGLU and a w4 / w8 pack's conversion -- BYTE-IDENTICAL
+// codes and row scales at K values with an even and an odd block count,
+// and the dequant back. Outlier channels in the activations, so the
+// scales are not all alike.
+TEST(gemm_i8, rotated_token_kernels_agree_at_either_dispatch) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeLibrary lq = mc->load_library("affine_dequant_bf16");
+  std::mt19937 rng(23);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::uniform_int_distribution<int> cu(0, 255);
+  int checked = 0;
+  for (int K : {1024, 3072, 3840, 4096, 12288}) {
+    const int M = 40, G = K / 256;
+    const std::size_t mk = (std::size_t)M * K;
+    std::vector<std::uint16_t> x(mk), u(mk);
+    for (std::size_t i = 0; i < mk; ++i) {
+      float v = nd(rng);
+      if ((i % (std::size_t)K) % 97 == 5) { v *= 30.0f; }
+      x[i] = f32_to_bf16(v);
+      u[i] = f32_to_bf16(nd(rng));
+    }
+    std::vector<std::uint8_t> codes(mk);
+    for (auto& c : codes) { c = (std::uint8_t)cu(rng); }
+    std::vector<std::uint16_t> sc(mk / 64), bi(mk / 64);
+    for (std::size_t i = 0; i < sc.size(); ++i) {
+      const float s = 2e-3f * (1.0f + std::fabs(nd(rng)));
+      sc[i] = f32_to_bf16(s);
+      bi[i] = f32_to_bf16(-7.5f * s + 1e-3f * nd(rng));
+    }
+    auto up = [&](const void* p, std::size_t n) {
+      SharedBuffer b = mc->make_shared_buffer(n);
+      if (p != nullptr) { std::memcpy(b.contents(), p, n); }
+      return b;
+    };
+    SharedBuffer bx = up(x.data(), mk * 2), bu = up(u.data(), mk * 2);
+    SharedBuffer bs = up(sc.data(), sc.size() * 2);
+    SharedBuffer bb = up(bi.data(), bi.size() * 2);
+    const std::size_t sb = (std::size_t)M * 4;
+    struct Case { const char* what; const char* fn; int mode; };
+    for (const Case& c : {Case{"activation", "quant_i8_tok_r", 0},
+                          Case{"swiglu", "swiglu_quant_i8_tok_r", 1},
+                          Case{"w4 pack", "affine_to_i8pt_w4_r", 2},
+                          Case{"w8 pack", "affine_to_i8pt_w8_r", 3}}) {
+      ComputeFunction f = lq.function(c.fn);
+      ComputeFunction fd = lq.function("i8pt_dequant_r");
+      ASSERT_TRUE(f.valid() && fd.valid());
+      if (!f.valid() || !fd.valid()) { return; }
+      SharedBuffer q[2] = {up(nullptr, mk), up(nullptr, mk)};
+      SharedBuffer s2[2] = {up(nullptr, sb), up(nullptr, sb)};
+      SharedBuffer w[2] = {up(nullptr, mk * 2), up(nullptr, mk * 2)};
+      for (int a = 0; a < 2; ++a) {
+        // A w8 pack converts in place.
+        SharedBuffer bc = up(codes.data(), c.mode == 2 ? mk / 2 : mk);
+        std::memset(q[a].contents(), 0x55, mk);
+        std::memset(s2[a].contents(), 0x55, sb);
+        // The old dispatch (a block each up to 32 simdgroups) and the
+        // context's (two each).
+        const unsigned T =
+            32u * (unsigned)(a == 0 ? std::min(G, 32) : (G + 1) / 2);
+        CommandStream st = mc->make_command_stream();
+        {
+          ComputeEncoder e = st.begin_compute();
+          e.set_function(f);
+          int slot = 0;
+          if (c.mode == 0) {
+            e.set_buffer(0, bx); slot = 1;
+          } else if (c.mode == 1) {
+            e.set_buffer(0, bx); e.set_buffer(1, bu); slot = 2;
+          } else {
+            e.set_buffer(0, bc); e.set_buffer(1, bs); e.set_buffer(2, bb);
+            slot = 3;
+          }
+          e.set_buffer(slot, c.mode == 3 ? bc : q[a]);
+          e.set_buffer(slot + 1, s2[a]);
+          e.set_constant(slot + 2, K);
+          e.dispatch({T, (unsigned)M, 1}, {T, 1, 1});
+        }
+        st.commit().wait();
+        if (c.mode == 3) { std::memcpy(q[a].contents(), bc.contents(), mk); }
+        {
+          ComputeEncoder e = st.begin_compute();
+          e.set_function(fd);
+          e.set_buffer(0, q[a]); e.set_buffer(1, s2[a]);
+          e.set_buffer(2, w[a]); e.set_constant(3, K);
+          e.dispatch({T, (unsigned)M, 1}, {T, 1, 1});
+        }
+        st.commit().wait();
+      }
+      const bool same =
+          std::memcmp(q[0].contents(), q[1].contents(), mk) == 0 &&
+          std::memcmp(s2[0].contents(), s2[1].contents(), sb) == 0 &&
+          std::memcmp(w[0].contents(), w[1].contents(), mk * 2) == 0;
+      if (!same) {
+        std::printf("[gemm_i8 tok_r] K=%d %s: DIFFERENT\n", K, c.what);
+      }
+      EXPECT_TRUE(same);
+      ++checked;
+    }
+  }
+  std::printf("[gemm_i8 tok_r] %d (K, kernel) cases checked\n", checked);
+}
+
+// WHAT ENCODING A PER-CALL CONVERSION COSTS THE CPU (VPIPE_I8_CVT_RATE=1):
+// a held stack that drains every few blocks (a stop check installed)
+// leaves the GPU idle while the next blocks are encoded, so the encode
+// is on the clock there. encode_to_fast_scratch against a plain
+// dispatch of the same kernel, timed over many encodes without a commit.
+TEST(gemm_i8, conversion_encode_cost) {
+  if (std::getenv("VPIPE_I8_CVT_RATE") == nullptr) { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  vpipe::genai::I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/true);
+  ctx.set_tier(vpipe::genai::I8GemmContext::Tier::kToken);
+  ctx.set_token_rotation(true);
+  const int N = 3072, K = 3072, gc = vpipe::genai::I8GemmContext::kTokenGroup;
+  SharedBuffer c = mc->make_shared_buffer((std::size_t)N * K / 2);
+  SharedBuffer s2 = mc->make_shared_buffer((std::size_t)N * K / 64 * 2);
+  SharedBuffer b = mc->make_shared_buffer((std::size_t)N * K / 64 * 2);
+  ComputeLibrary lq = mc->load_library("affine_dequant_bf16");
+  ComputeFunction fr = lq.function("affine_to_i8pt_w4_r");
+  ASSERT_TRUE(fr.valid());
+  if (!fr.valid()) { return; }
+  const int reps = 2000;
+  for (int arm = 0; arm < 2; ++arm) {
+    CommandStream st = mc->make_command_stream();
+    double us = 0.0;
+    {
+      ComputeEncoder e = st.begin_compute();
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < reps; ++i) {
+        if (arm == 0) {
+          ctx.encode_to_fast_scratch(e, c, s2, b, gc, N, K);
+        } else {
+          e.set_function(fr);
+          e.set_buffer(0, c); e.set_buffer(1, s2); e.set_buffer(2, b);
+          e.set_buffer(3, c); e.set_buffer(4, s2); e.set_constant(5, K);
+          e.dispatch({256u, (unsigned)N, 1}, {256u, 1, 1});
+        }
+      }
+      us = secs_(t0, std::chrono::steady_clock::now()) * 1e6 / reps;
+    }
+    std::printf("[gemm_i8 enc] %s: %.2f us of CPU an encode\n",
+                arm == 0 ? "encode_to_fast_scratch" : "bare dispatch", us);
+    // Not committed: the buffers are only bound, nothing need run.
+  }
+}
+
+// CAN A W4 CONVERSION HIDE UNDER THE GEMM BEFORE IT? (VPIPE_I8_CVT_RATE=1)
+// The rotated converters are shuffle-bound and the int8 GEMM matrix-unit
+// bound, so the two might share the GPU. A block's six K = 3072
+// projections at 4096 rows (q, k, v, out 3072 wide, gate and up 12288),
+// one activation quantized for all: held layouts; converted per call
+// into one scratch, in order; and converted one GEMM AHEAD into the
+// other of two scratches, each conversion in a concurrent scope with the
+// GEMM before it.
+TEST(gemm_i8, a_conversion_overlaps_the_gemm) {
+  if (std::getenv("VPIPE_I8_CVT_RATE") == nullptr) { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  using Ctx = vpipe::genai::I8GemmContext;
+  const int M = 4096, K = 3072;
+  const std::vector<int> Ns = {3072, 3072, 3072, 3072, 12288, 12288};
+  const int n = (int)Ns.size();
+  SharedBuffer x = mc->make_shared_buffer((std::size_t)M * K * 2);
+  SharedBuffer y = mc->make_shared_buffer((std::size_t)M * 12288 * 2);
+  for (std::size_t i = 0; i < (std::size_t)M * K; ++i) {
+    static_cast<std::uint16_t*>(x.contents())[i] =
+        f32_to_bf16((float)((i * 2654435761u) % 1000) * 1e-3f - 0.5f);
+  }
+  std::vector<SharedBuffer> c(n), sc(n), bi(n);
+  for (int i = 0; i < n; ++i) {
+    const std::size_t nk = (std::size_t)Ns[i] * K;
+    c[i] = mc->make_shared_buffer(nk / 2);
+    sc[i] = mc->make_shared_buffer(nk / 64 * 2);
+    bi[i] = mc->make_shared_buffer(nk / 64 * 2);
+    auto* cp = static_cast<std::uint8_t*>(c[i].contents());
+    for (std::size_t j = 0; j < nk / 2; ++j) {
+      cp[j] = (std::uint8_t)((j * 2654435761u + i) >> 7);
+    }
+    for (std::size_t j = 0; j < nk / 64; ++j) {
+      static_cast<std::uint16_t*>(sc[i].contents())[j] = f32_to_bf16(1e-2f);
+      static_cast<std::uint16_t*>(bi[i].contents())[j] =
+          f32_to_bf16(-7.5e-2f);
+    }
+  }
+  for (int tier = 0; tier < 2; ++tier) {
+    Ctx ctx(mc, /*want=*/true, /*bf16=*/true);
+    ctx.set_tier(tier == 0 ? Ctx::Tier::kToken : Ctx::Tier::kFast);
+    ctx.set_token_rotation(true);
+    const int gc = ctx.fast_group(K);
+    if (gc <= 0 || !ctx.fast_converts(4, gc)) { continue; }
+    std::vector<SharedBuffer> hq(n), hs(n);
+    SharedBuffer sq[2], ss[2];
+    for (int k = 0; k < 2; ++k) {
+      sq[k] = mc->make_shared_buffer((std::size_t)12288 * K);
+      ss[k] = mc->make_shared_buffer(Ctx::fast_scale_bytes(12288, K, gc));
+    }
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      for (int i = 0; i < n; ++i) {
+        hq[i] = mc->make_shared_buffer((std::size_t)Ns[i] * K);
+        hs[i] = mc->make_shared_buffer(Ctx::fast_scale_bytes(Ns[i], K, gc));
+        ASSERT_TRUE(ctx.encode_to_fast(e, c[i], sc[i], bi[i], hq[i], hs[i],
+                                       gc, Ns[i], K, 4));
+      }
+    }
+    st.commit().wait();
+    const SharedBuffer none;
+    auto gemm = [&](ComputeEncoder& e, const SharedBuffer& q,
+                    const SharedBuffer& s, int i) {
+      return ctx.gemm_fast_quantized(e, q, s, gc, none, y, 0, M, Ns[i], K);
+    };
+    auto cvt = [&](ComputeEncoder& e, int i, int slot) {
+      return ctx.encode_to_fast(e, c[i], sc[i], bi[i], sq[slot], ss[slot],
+                                gc, Ns[i], K, 4);
+    };
+    const char* names[3] = {"held", "per call", "one ahead, concurrent"};
+    auto run = [&](ComputeEncoder& e, int arm) {
+      bool ok = ctx.quantize_fast(e, x, 0, M, K, gc);
+      if (arm == 0) {
+        for (int i = 0; i < n; ++i) { ok = gemm(e, hq[i], hs[i], i) && ok; }
+      } else if (arm == 1) {
+        for (int i = 0; i < n; ++i) {
+          ok = cvt(e, i, 0) && ok;
+          ok = gemm(e, sq[0], ss[0], i) && ok;
+        }
+      } else {
+        ok = cvt(e, 0, 0) && ok;
+        for (int i = 0; i < n; ++i) {
+          auto scope = e.concurrent_scope();
+          ok = gemm(e, sq[i % 2], ss[i % 2], i) && ok;
+          if (i + 1 < n) { ok = cvt(e, i + 1, (i + 1) % 2) && ok; }
+        }
+      }
+      return ok;
+    };
+    const int reps = 8;
+    std::vector<double> ms[3];
+    for (int r = 0; r < 7; ++r) {
+      for (int j = 0; j < 3; ++j) {
+        const int arm = r % 2 == 0 ? j : 2 - j;
+        {
+          ComputeEncoder e = st.begin_compute();
+          ASSERT_TRUE(run(e, arm));
+        }
+        st.commit().wait();
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+          ComputeEncoder e = st.begin_compute();
+          for (int k = 0; k < reps; ++k) { run(e, arm); }
+        }
+        st.commit().wait();
+        ms[arm].push_back(secs_(t0, std::chrono::steady_clock::now()) *
+                          1e3 / reps);
+      }
+    }
+    double base = 0.0;
+    for (int arm = 0; arm < 3; ++arm) {
+      std::sort(ms[arm].begin(), ms[arm].end());
+      const double m = ms[arm][ms[arm].size() / 2];
+      if (arm == 0) { base = m; }
+      std::printf("[gemm_i8 overlap] %s, %-22s %7.3f ms  %.3fx held\n",
+                  tier == 0 ? "token" : "fast ", names[arm], m, base / m);
+    }
+  }
+}
+
+// WHAT A FRESH COMMAND STREAM COSTS (VPIPE_I8_CVT_RATE=1): every
+// make_command_stream() is a new MTLCommandQueue, and the DiTs' stop
+// drains and streamed blocks make one per chunk / per block. A tiny
+// dispatch committed and waited on fresh streams against one stream
+// reused for every commit.
+TEST(gemm_i8, a_fresh_stream_per_commit_costs) {
+  if (std::getenv("VPIPE_I8_CVT_RATE") == nullptr) { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeLibrary lq = mc->load_library("affine_dequant_bf16");
+  ComputeFunction f = lq.function("quant_i8_tok");
+  ASSERT_TRUE(f.valid());
+  if (!f.valid()) { return; }
+  SharedBuffer x = mc->make_shared_buffer(4096 * 2);
+  SharedBuffer q = mc->make_shared_buffer(4096);
+  SharedBuffer s = mc->make_shared_buffer(64);
+  auto tiny = [&](ComputeEncoder& e) {
+    e.set_function(f);
+    e.set_buffer(0, x); e.set_buffer(1, q); e.set_buffer(2, s);
+    e.set_constant(3, 4096);
+    e.dispatch({256u, 1u, 1u}, {256u, 1u, 1u});
+  };
+  const int reps = 200;
+  for (int round = 0; round < 2; ++round) {
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < reps; ++i) {
+        CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute(); tiny(e); }
+        st.commit().wait();
+      }
+      std::printf("[gemm_i8 stream] fresh stream a commit: %.1f us\n",
+                  secs_(t0, std::chrono::steady_clock::now()) * 1e6 / reps);
+    }
+    {
+      CommandStream st = mc->make_command_stream();
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < reps; ++i) {
+        { ComputeEncoder e = st.begin_compute(); tiny(e); }
+        st.commit().wait();
+      }
+      std::printf("[gemm_i8 stream] one stream reused: %.1f us\n",
+                  secs_(t0, std::chrono::steady_clock::now()) * 1e6 / reps);
+    }
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < reps; ++i) {
+        CommandStream st = mc->make_command_stream();
+        (void)st;
+      }
+      std::printf("[gemm_i8 stream] make_command_stream alone: %.1f us\n",
+                  secs_(t0, std::chrono::steady_clock::now()) * 1e6 / reps);
+    }
+  }
 }

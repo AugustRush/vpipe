@@ -73,6 +73,7 @@
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <functional>
@@ -103,6 +104,25 @@ enum class Placement {
   // the quietest possible way to be wrong.
   kDerived,
 };
+
+// The width a model-quantize'd affine weight is STORED at -- 4 or 8 --
+// read off the shapes of `<stem>.weight` (codes, [N, K * bits / 32]) and
+// `<stem>.scales` ([N, K / group]); 0 when `stem` is no affine pair
+// (dense, FP8, absent). What a `same_layout` compares: a MIXED pack
+// (model-quantize `mixed`) stores whole blocks at w8 and the rest at w4.
+inline int
+stored_affine_bits(const WeightSet& ws, const std::string& stem, int group)
+{
+  const auto* ci = ws.src().info(stem + ".weight");
+  const auto* si = ws.src().info(stem + ".scales");
+  if (ci == nullptr || si == nullptr || ci->shape.size() != 2 ||
+      si->shape.size() != 2 || group <= 0) {
+    return 0;
+  }
+  const long K = (long)si->shape[1] * group;
+  const long b = K > 0 ? (long)ci->shape[1] * 32 / K : 0;
+  return (b == 4 || b == 8) ? (int)b : 0;
+}
 
 template <class Block>
 class BlockSlots {
@@ -157,6 +177,21 @@ class BlockSlots {
     // Empty means the block has no derived tensors, which is the
     // simplest and fastest case.
     std::function<bool(int index, Block&)> post_refill;
+
+    // OPTIONAL. Is block `index` laid out as `slot` is -- the same weight
+    // formats and widths, hence the same buffers, flags and derived
+    // products? A raw refill places BYTES, not that description. A
+    // MIXED pack (whole blocks at w8, the rest w4) refilled across
+    // widths gets codes of the checkpoint's size read at the slot's
+    // width, and every product the slot derived from them -- a weave, a
+    // split, a fast-tier scale buffer -- sized for the other. When this
+    // says no, the slot is BUILT for the block instead, exactly as its
+    // first fill was: one block read the per-block way, the slots kept.
+    //
+    // Empty means every block shares block 0's layout. A single-width
+    // checkpoint guarantees that and a mixed one does not -- and every
+    // hold test passes on the first, so only a mixed pack can show it.
+    std::function<bool(int index, const Block& slot)> same_layout;
   };
 
   BlockSlots() = default;
@@ -193,6 +228,10 @@ class BlockSlots {
 
   int prefetch_hits() const { return _hit; }
   int prefetch_started() const { return _started; }
+  // Refills that BUILT the block because its layout was not the slot's
+  // (see Ops::same_layout), over the object's life. For a test to show
+  // a mixed pack actually crossed widths.
+  int relaid() const { return _relaid.load(); }
   bool on() const { return _ready && !_off; }
   bool paired() const { return _pair; }
 
@@ -207,6 +246,30 @@ class BlockSlots {
     _ready = false;
     _pair  = false;
     _cur   = 0;
+  }
+
+  // EVERY BLOCK KEPT: give the pair back. `resident` is the stack
+  // residency promotes into, where an empty entry is a block still
+  // streamed; with none empty the slots have nothing left to serve --
+  // two blocks a preload never held. Call with no forward running (no
+  // GPU work on a slot, no read in flight): at the top of the next one,
+  // or between generations. An eviction later rebuilds the pair at its
+  // next acquire. Returns the bytes given back.
+  template <class Vec>
+  std::size_t release_if_saturated(const Vec& resident)
+  {
+    if (!_ready || !_ops.empty || resident.empty()) { return 0; }
+    for (const Block& b : resident) {
+      if (_ops.empty(b)) { return 0; }
+    }
+    const std::size_t n = held_bytes();
+    reset();
+    if (n > 0 && _mc != nullptr && _mc->session() != nullptr) {
+      _mc->session()->log_debug(fmt(
+          "{}: all {} blocks resident -- the slot pair ({} MB) is released",
+          _label, resident.size(), n >> 20));
+    }
+    return n;
   }
 
   // The block to run for `index`.
@@ -327,6 +390,20 @@ class BlockSlots {
     return true;
   }
 
+  // What the slots hold now: both, while the pair exists. A model's
+  // resident figure adds it -- the slots stay allocated beside every
+  // block residency promotes, and a holding taken without them dropped
+  // two blocks from both ledgers once the promoted set passed the floor.
+  std::size_t held_bytes() const
+  {
+    if (!_ops.bytes || !_ops.empty) { return 0; }
+    std::size_t n = 0;
+    for (const Block& b : _slot) {
+      if (!_ops.empty(b)) { n += _ops.bytes(b); }
+    }
+    return n;
+  }
+
   // The bytes of the block just run, for the residency policy.
   std::size_t last_bytes() const
   {
@@ -386,6 +463,19 @@ class BlockSlots {
   // recover, since the replacement is sized from the checkpoint.
   bool refill_(int index, Block& b)
   {
+    // A block laid out differently from the slot is BUILT into it --
+    // safe for the same reason a refill is: this slot is never the one
+    // the GPU is reading (see prefetch()).
+    if (_ops.same_layout && !_ops.same_layout(index, b)) {
+      // The old layout goes FIRST: built beside it, the pair briefly held
+      // three blocks where the floor books two (+117 MB on QI21's mixed
+      // pack). A failed build gives the slots up either way.
+      b = Block{};
+      if (!_ops.build(index, b)) { return false; }
+      ++_relaid;
+      _last_from_slot = true;
+      return true;
+    }
     bool ok = true;
     _ops.each(index, b, [&](const std::string& nm,
                             metal_compute::SharedBuffer& dst, Placement how) {
@@ -481,6 +571,7 @@ class BlockSlots {
   std::future<bool> _pf_fut;
   int               _hit = 0;
   int               _started = 0;
+  std::atomic<int>  _relaid{0};   // written on the reader thread
 };
 
 }  // namespace vpipe::genai

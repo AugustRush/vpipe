@@ -305,6 +305,257 @@ class I8GemmContext {
                    const metal_compute::SharedBuffer& y, std::size_t ye,
                    int M, int N, int K);
 
+  // ---- THE FAST TIER ---------------------------------------------
+  //
+  // Two tiers of int8 GEMM. ACCURATE (the default) is everything above:
+  // groups of 64 on both operands. FAST runs symmetric int8 at a COARSE
+  // group gc (512 by default) on both operands, so the per-group fold
+  // runs once per gc instead of once per 64 and a group's contraction is
+  // one matmul -- and it ROTATES each group with an orthonormal
+  // Walsh-Hadamard transform first (both operands, so the product is
+  // unchanged), which spreads an outlier channel over its group instead
+  // of letting it set the group's scale. MEASURED (gemm_i8.coarse_tier,
+  // 256x512x4096 against f64): with no outliers the fast tier is 1.30-
+  // 1.45x the accurate tier's error; with outlier channels (1/64 x24,
+  // 1/512 x64) it is 0.5-0.6x of it, where unrotated it was 1.8-2.7x.
+  // MEASURED on Qwen-Image-2.1's cached step (forward_ab), against the
+  // accurate tier with split-K off (the fast tier never splits, and the
+  // split tuner's picks move the accurate tier 1-7% load to load): 1.041x
+  // on the M5 Ultra at 1024^2, 1.156-1.183x on the base M5 at 512^2.
+  // g1024 is SLOWER than g512 on both (0.974x / 1.098x) and further from
+  // the accurate output: at g512 the fold is already nearly free, and 32
+  // values a lane in the rotated quantizer cost more than half the folds
+  // save. Pictures as close to the dense ones as the accurate tier's
+  // (median PSNR 35 dB over two prompts x three seeds, none under 30).
+  //
+  // The weight is HELD in the fast layout: int8 codes [N, K] in the
+  // rotated basis and scales [N, K/gc] in the element type, converted
+  // once (encode_to_fast from a w8 g64 pack, encode_quant_fast from a
+  // dense weight). No zero point, no split, no tuning.
+  //
+  // TOKEN is the same layout at its limit: the group is the WHOLE ROW
+  // (gc == kTokenGroup) and nothing rotates -- int8 weights per output
+  // channel and activations per token, each over all of K, which is how
+  // Draw Things stores its "8-bit" (i8x) checkpoints. Nothing varies
+  // along K, so a GEMM is one int32 accumulation with the two scales
+  // applied at the store, and the activation quantizer is a plain amax a
+  // row. Scales are f32: [N] for a weight, [M] for an activation. The
+  // GEMM is a register-fragment kernel (gemm_i8pt_m128x64: each
+  // simdgroup loads its own operands, K permuted inside each 64-deep
+  // step so a lane's four fragments are one 16-byte load, the K loop
+  // MLX's gemm_nax one).
+  //   MEASURED (gemm_i8.per_token, quantizer + GEMM against the g512
+  //   fast tier at Qwen-Image-2.1's shapes, 4096 rows): M5 Ultra 1.29x
+  //   q/k/v/out, 1.35x gate/up, 1.62x down; base M5 (throttled, ratios
+  //   only) 2.0 / 1.49 / 1.73x. The matmul2d tile kernels at the same
+  //   layout reach only 1.0-1.4x.
+  //   The price is accuracy: with no rotation an outlier channel sets
+  //   its token's scale for all of K (gemm_i8.coarse_tier's study).
+  //   ROTATED (set_token_rotation, VPIPE_I8_TOKEN_ROT): both operands
+  //   Walsh-Hadamard transformed in blocks of 256 along K before their
+  //   row scale is taken -- Draw Things' "Hadamard-256" i8x -- which
+  //   costs only the quantizers (the GEMM is the same kernel) and needs
+  //   K % 256 == 0. A rotated weight and a plain one are different
+  //   bytes: layout_tag() names which a cache entry holds.
+  enum class Tier { kAccurate = 0, kFast = 1, kToken = 2 };
+  static constexpr int kTokenGroup = 1 << 30;
+  // The caller's choice; VPIPE_I8_TIER (accurate | fast | token)
+  // overrides it.
+  void set_tier(Tier t) { _tier = _tier_env >= 0 ? (Tier)_tier_env : t; }
+  Tier tier() const { return _tier; }
+  // The token tier's rotation; VPIPE_I8_TOKEN_ROT (0 | 1) overrides it.
+  void set_token_rotation(bool r) { _tok_rot = _tok_rot_env >= 0
+                                                   ? _tok_rot_env != 0 : r; }
+  bool token_rotated() const { return _tok_rot; }
+  // The token tiers' GEMM kernel: its K loop -- MLX's blocked one (512
+  // deep, a barrier each) or, double_buffered, one with no barrier that
+  // loads the next step's operands under this step's matmuls -- and its
+  // tile, 128x64 (4x2 simdgroups) or, wide_n, 64x128 (2x4). The context
+  // DECIDES THIS ITSELF -- blocked 128x64, the fastest in the measured
+  // forwards (Qwen-Image-2.1 1024^2 on the M5 Ultra: double-buffered
+  // 0.965x at 128x64, 0.986x at 64x128; base M5 512^2 0.945x) -- and no
+  // stage exposes it; this is for an A/B, and VPIPE_I8_TOKEN_KERNEL /
+  // VPIPE_I8_TOKEN_TILE override it. Every choice computes the same
+  // int32 sums and applies the scales the same way, so the output is
+  // BIT-IDENTICAL, and the weight layout does not depend on it. Call
+  // before the first GEMM.
+  void set_token_kernel(bool double_buffered, bool wide_n);
+  // The kernel set_token_kernel (or the env) settled on, for a log line:
+  // "blocked 128x64", "double-buffered 64x128", ...
+  std::string token_kernel() const;
+  // What a fast-layout weight at group gc holds, for a cache key:
+  // "fast<gc>", "tok" or "tokr" (rotated).
+  std::string layout_tag(int gc) const
+  {
+    return gc == kTokenGroup ? (_tok_rot ? "tokr" : "tok")
+                             : "fast" + std::to_string(gc);
+  }
+  // The group a K takes on the fast tier: the largest of 1024 / 512 /
+  // 256 that is no more than the target (VPIPE_I8_FAST_GROUP, 512) and
+  // divides K; on the token tier kTokenGroup where K % 64 == 0 (256
+  // rotated) and K <= 16384 -- 0 where none does, or the tier is
+  // accurate, or its kernels are missing. Such a weight stays on the
+  // accurate tier.
+  int fast_group(int K) const;
+  // Bytes of a fast-layout weight's (or activation's) scales, [N, K]
+  // at group gc: N * K/gc elements, or N f32 at kTokenGroup.
+  static std::size_t fast_scale_bytes(int N, int K, int gc)
+  {
+    return gc == kTokenGroup ? (std::size_t)N * 4
+                             : (std::size_t)N * (std::size_t)(K / gc) * 2;
+  }
+  // A PLAN-TIME bound on what one forward's context holds at M rows, for
+  // a stage that has no context to ask (a DiT's forward_scratch_bytes):
+  // the activation codes and g64 scales at the widest K the int8 GEMMs
+  // read (`k_act`), one [n_w, k_w] weight's codes and scales -- the
+  // accurate tier's per-call requant, a w4 pack's per-call conversion --
+  // the tuner's [2048, n_w] output, and the split-K planes: the accurate
+  // tier's deep-K GEMMs fill the default budget (512 MB), the coarse
+  // tiers keep only the narrow model-level GEMMs on the requant route
+  // (an [M, 128] at 16 splits at most). All grow-only, held until
+  // release_scratch(). Inline: it adds no symbol.
+  static std::size_t forward_bytes_bound(int M, int k_act, int n_w,
+                                         int k_w, bool accurate) noexcept
+  {
+    const std::size_t m = M > 0 ? (std::size_t)M : 0;
+    const std::size_t ka = k_act > 0 ? (std::size_t)k_act : 0;
+    const std::size_t nw = n_w > 0 ? (std::size_t)n_w : 0;
+    const std::size_t kw = k_w > 0 ? (std::size_t)k_w : 0;
+    std::size_t n = m * ka + 2 * m * (ka / 64) * 2;
+    n += nw * kw + nw * (kw / 64) * 2;
+    n += (std::size_t)kTuneRows * nw * 2;
+    const std::size_t budget = (std::size_t)512 << 20;
+    const std::size_t narrow = (std::size_t)16 * ((m + 63) / 64 * 64) * 128 * 4;
+    n += accurate ? budget : (narrow < budget ? narrow : budget);
+    return n;
+  }
+  // Whether a GEMM takes the fast route: the int8 route's row floor, as
+  // the accurate tier's, and a K fast_group admits.
+  bool fast_accepts(int M, int N, int K) const
+  {
+    return _on && fast_group(K) > 0 && M >= _min_m && N >= 16 &&
+           (_tier != Tier::kToken || (N % 4) == 0);
+  }
+  // y[M,N] = x[M,K] @ w^T for a weight in the fast layout at group gc.
+  // False with nothing encoded where fast_accepts declines.
+  bool gemm_fast(metal_compute::ComputeEncoder& enc,
+                 const metal_compute::SharedBuffer& x, std::size_t xe,
+                 const metal_compute::SharedBuffer& codes,
+                 const metal_compute::SharedBuffer& scales, int gc,
+                 const metal_compute::SharedBuffer& b,
+                 const metal_compute::SharedBuffer& y, std::size_t ye,
+                 int M, int N, int K);
+  // THE ACTIVATION ONCE for several fast GEMMs over one input (q|k|v,
+  // gate|up): quantize_fast fills the scratch, and each
+  // gemm_fast_quantized after it reads that scratch rather than running
+  // its own rotated quantizer -- three passes saved a block on a DiT.
+  // The second declines (nothing encoded) unless M, K and gc are the
+  // ones quantized.
+  bool quantize_fast(metal_compute::ComputeEncoder& enc,
+                     const metal_compute::SharedBuffer& x, std::size_t xe,
+                     int M, int K, int gc);
+  bool gemm_fast_quantized(metal_compute::ComputeEncoder& enc,
+                           const metal_compute::SharedBuffer& codes,
+                           const metal_compute::SharedBuffer& scales, int gc,
+                           const metal_compute::SharedBuffer& b,
+                           const metal_compute::SharedBuffer& y,
+                           std::size_t ye, int M, int N, int K);
+  // ...the down projection of a SwiGLU from its two halves, as
+  // gemm_signed_swiglu (the product rounded to the element type first).
+  bool gemm_fast_swiglu(metal_compute::ComputeEncoder& enc,
+                        const metal_compute::SharedBuffer& gate,
+                        std::size_t ge,
+                        const metal_compute::SharedBuffer& up,
+                        std::size_t ue,
+                        const metal_compute::SharedBuffer& codes,
+                        const metal_compute::SharedBuffer& scales, int gc,
+                        const metal_compute::SharedBuffer& y,
+                        std::size_t ye, int M, int N, int K);
+  // A g64 AFFINE pack (scales and biases [N, K/64]) into the fast
+  // layout: each element dequantized, its group rotated and requantized.
+  // At bits 8 the codes are u8 [N, K] and codes_out may BE codes_in (in
+  // place). At bits 4 they are nibbles [N, K/2] (byte b holding k = 2b
+  // low, 2b + 1 high) and codes_out [N, K] -- twice their size -- must
+  // be a buffer of its own. out_scales is [N, K/gc]. False with nothing
+  // encoded where fast_converts(bits, gc) is not.
+  bool encode_to_fast(metal_compute::ComputeEncoder& enc,
+                      const metal_compute::SharedBuffer& codes_in,
+                      const metal_compute::SharedBuffer& scales,
+                      const metal_compute::SharedBuffer& biases,
+                      const metal_compute::SharedBuffer& codes_out,
+                      const metal_compute::SharedBuffer& out_scales, int gc,
+                      int N, int K, int bits = 8) const;
+  // Whether a g64 pack at `bits` (4 or 8) converts into the layout at
+  // group gc: the tier's kernels are there, and at w4 its converters
+  // (newer than the tier: a host without them keeps a w4 weight on the
+  // accurate tier).
+  bool fast_converts(int bits, int gc) const;
+  // A W4 PACK CONVERTED PER CALL. Its layout is twice its size, so a w4
+  // weight on the fast or token tier is HELD as its pack and converted
+  // (encode_to_fast, bits 4) into the context's weight scratch right
+  // before each GEMM that reads it: fast_scratch_codes() /
+  // fast_scratch_scales(), grown to the largest weight asked and valid
+  // until the next call. Dispatches on one encoder run in order -- which
+  // the activation scratch already relies on -- so each GEMM reads its
+  // weight before the next conversion overwrites it. The same values as
+  // a layout held, so every route over them agrees. MEASURED, a block's
+  // six K = 3072 projections at 4096 rows on the M5 Ultra
+  // (gemm_i8.a_conversion_overlaps_the_gemm): 0.96x the held layout's
+  // GEMMs on the token tier, 0.99x fast -- and converting one GEMM AHEAD
+  // in a concurrent scope bought 0.4% / 2%, so it is not done. False
+  // with nothing encoded where encode_to_fast declines or the scratch
+  // cannot be had.
+  bool encode_to_fast_scratch(metal_compute::ComputeEncoder& enc,
+                              const metal_compute::SharedBuffer& codes,
+                              const metal_compute::SharedBuffer& scales,
+                              const metal_compute::SharedBuffer& biases,
+                              int gc, int N, int K);
+  const metal_compute::SharedBuffer& fast_scratch_codes() const
+  {
+    return _wq;
+  }
+  const metal_compute::SharedBuffer& fast_scratch_scales() const
+  {
+    return _ws;
+  }
+  // What that scratch holds for an [N, K] weight at group gc: a plan's
+  // figure for a model whose w4 weights take the tier.
+  static std::size_t fast_scratch_bytes(int N, int K, int gc)
+  {
+    return (std::size_t)N * (std::size_t)K + fast_scale_bytes(N, K, gc);
+  }
+  // A DENSE weight [N, K] (the element type) into the fast layout.
+  bool encode_quant_fast(metal_compute::ComputeEncoder& enc,
+                         const metal_compute::SharedBuffer& w,
+                         const metal_compute::SharedBuffer& codes_out,
+                         const metal_compute::SharedBuffer& out_scales,
+                         int gc, int N, int K) const;
+  // A fast-layout weight back to dense [N, K] in the element type (the
+  // rotation undone), for the routes that do not read the layout.
+  bool encode_dequant_fast(metal_compute::ComputeEncoder& enc,
+                           const metal_compute::SharedBuffer& codes,
+                           const metal_compute::SharedBuffer& scales, int gc,
+                           const metal_compute::SharedBuffer& out, int N,
+                           int K) const;
+
+  // A SwiGLU's DOWN PROJECTION from its two halves: gemm_signed over
+  // silu(gate) * up without storing the product -- the quantizer reads
+  // gate and up ([M, K] at element offsets ge / ue) and rounds their
+  // product to the element type exactly as swiglu_v4_f16 stores it, so
+  // the result is that kernel followed by gemm_signed, less one write and
+  // one read of the [M, K] product. False with nothing encoded where
+  // gemm_signed would decline or the fused quantizer is not there.
+  bool gemm_signed_swiglu(metal_compute::ComputeEncoder& enc,
+                          const metal_compute::SharedBuffer& gate,
+                          std::size_t ge,
+                          const metal_compute::SharedBuffer& up,
+                          std::size_t ue,
+                          const metal_compute::SharedBuffer& codes,
+                          const metal_compute::SharedBuffer& scales,
+                          const metal_compute::SharedBuffer& zb, int bits,
+                          const metal_compute::SharedBuffer& y,
+                          std::size_t ye, int M, int N, int K);
+
   // Whether a weight of this shape would take gemm_signed at `M` rows --
   // the gate a caller asks BEFORE choosing between it and a dense route.
   //
@@ -557,10 +808,32 @@ class I8GemmContext {
   int _signed = 12;                  // VPIPE_I8_SIGNED: 8 | 4 mask
   // The signed layout: its activation quantizer, conversion, dequant and
   // GEMM (+ split twins).
-  metal_compute::ComputeFunction _fn_quant_s8, _fn_to_s8, _fn_to_s4;
+  metal_compute::ComputeFunction _fn_quant_s8, _fn_to_s8, _fn_to_s4,
+      _fn_quant_swiglu_s8;
+  // The fast tier's kernels, per group (index 0/1/2 = 256/512/1024,
+  // 3 = the token tier's).
+  struct FastFns {
+    metal_compute::ComputeFunction quant, swiglu, to_fast, dequant, gemm;
+    metal_compute::ComputeFunction to_fast4;   // from a w4 pack; optional
+  };
+  FastFns _fast[5];                  // [4]: the token tier, rotated
+  int _tok_wm = 4, _tok_wn = 2;      // the token GEMM's simdgroup grid
+  bool _tok_db = false;              // ...its double-buffered K loop
+  bool _tok_kernel_env = false;      // VPIPE_I8_TOKEN_KERNEL / _TILE set
+  bool _tok_rot = false;
+  int _tok_rot_env = -1;             // VPIPE_I8_TOKEN_ROT; -1 = caller's
+  int tok_wm_(int gc) const { return gc == kTokenGroup ? _tok_wm : 0; }
+  const FastFns* fast_fns_(int gc) const;
+  Tier _tier = Tier::kAccurate;
+  int _tier_env = -1;                // VPIPE_I8_TIER; -1 = the caller's
+  int _fast_group = 512;             // VPIPE_I8_FAST_GROUP
+  int _fast_bm = 128, _fast_bn = 64; // the coarse GEMM's tile
+  // What quantize_fast last left in the scratch (0 = nothing usable).
+  int _fq_m = 0, _fq_k = 0, _fq_gc = 0;
   metal_compute::ComputeFunction _fn_dq_s8, _fn_dq_s4;
   metal_compute::ComputeFunction _fn_s8_w8, _fn_s8_w4;
   metal_compute::ComputeFunction _fn_s8_w8_sk, _fn_s8_w4_sk;
+
   // gemm_affine's per-call conversion targets: codes and zero points.
   metal_compute::SharedBuffer _sc, _szb;
   metal_compute::ComputeFunction _fn_quant_u8, _fn_wsum8, _fn_wsum4;
@@ -690,6 +963,17 @@ class I8GemmContext {
     const std::size_t r = _plane_budget / per_row;
     return (int)((r / 64u) * 64u);
   }
+  // ...and for a GEMM of M rows: no block wider than the GEMM (rounded
+  // to the 64-row tile), which is the same single block below the
+  // budget's rows -- the same dispatches -- but planes sized for the
+  // rows there are rather than the budget. Sized by the budget alone, a
+  // 64-wide proj_out tuned on the fast tier held 512 MB of planes all run.
+  int rows_per_block_(int S, int N, int M) const
+  {
+    const int r = rows_per_block_(S, N);
+    const int m = ((M > 0 ? M : 0) + 63) / 64 * 64;
+    return r < m ? r : (m > 0 ? m : r);
+  }
   // The split this call will use: the tuner's answer when there is one,
   // else the measured-safe default. See the note on `tune`.
   int plan_(int M, int N, int K) const;
@@ -705,8 +989,11 @@ class I8GemmContext {
     return ((K + _group - 1) / _group) * _group;
   }
   // Grow-only scratches: xq[M,K] i8 + as[M,G] scales (activations),
-  // wq[N,K] i8 + ws[N,G] scales (per-call weight re-quant). Scales are the
-  // element type (2 bytes either way), so the byte sizes are format-agnostic.
+  // wq[N,K] i8 + ws[N,G] scales (per-call weight re-quant, and a w4
+  // pack's per-call conversion into the fast layout --
+  // encode_to_fast_scratch). Scales are the element type (2 bytes either
+  // way; the token tier's f32 per row), so the byte sizes are
+  // format-agnostic.
   metal_compute::SharedBuffer _xq, _as, _wq, _ws;
 };
 

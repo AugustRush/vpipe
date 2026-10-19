@@ -35,6 +35,7 @@ set(LOCAL_SOURCES
   shared/comfy-checkpoint.cc
   shared/comfy-output-config.cc
   shared/dflash-drafter.cc
+  shared/drawthings-store.cc
   shared/gguf-convert.cc
   shared/gguf-file.cc
   shared/grounded-encode-params.cc
@@ -104,6 +105,7 @@ set(LOCAL_SOURCES
   qwen-image/metal-qwen25-vision.cc
   z-image/z-image-layout.cc
   z-image/metal-z-image-transformer.cc
+  moss-image/metal-moss-image-transformer.cc
   yue2/yue2-protocol.cc
   yue2/metal-yue2-model.cc
   yue2/metal-oobleck-decoder.cc
@@ -178,6 +180,7 @@ set(LOCAL_HEADERS
   video-turn.h
   shared/comfy-checkpoint.h
   shared/comfy-output-config.h
+  shared/drawthings-store.h
   shared/gguf-convert.h
   shared/gguf-file.h
   shared/grounded-encode-params.h
@@ -213,6 +216,7 @@ set(LOCAL_HEADERS
   qwen-image/qwen-image21-lora-trainer.h
   z-image/z-image-layout.h
   z-image/metal-z-image-transformer.h
+  moss-image/metal-moss-image-transformer.h
   flux3/metal-flux3-transformer.h
   llama3/metal-llama-model.h
   llama3/metal-llama-model-exec.h

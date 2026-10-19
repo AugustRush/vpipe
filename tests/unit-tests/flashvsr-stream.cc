@@ -183,6 +183,9 @@ struct Run {
   std::vector<std::vector<std::uint8_t>> frames;
   FlashVsrSrcEncoderStage::Continuity mode =
       FlashVsrSrcEncoderStage::Continuity::kAuto;
+  // The colour fix the loaded release resolved.
+  FlashVsrSrcEncoderStage::ColorFix fix =
+      FlashVsrSrcEncoderStage::ColorFix::kAuto;
   // generate-video's latents, when tapped.
   std::vector<std::vector<float>> latents;
   std::vector<std::vector<std::int64_t>> shapes;
@@ -190,7 +193,7 @@ struct Run {
 };
 
 // The graph, run to the end.
-// `color_fix` < 0 leaves the key unset, for the release's own default.
+// `color_fix` < 0 leaves the key unset, for the stage's default (on).
 // `extra` adds encoder keys; `refs` wires the encoder's color_reference
 // output to vae-decode's input, which the wavelet colour fix and the tiny
 // decoder read; `tap` also collects generate-video's latents.
@@ -286,6 +289,7 @@ restore_(const std::string& root,
   Run r;
   r.frames = std::move(sink->frames);
   r.mode = enc->continuity();
+  r.fix = enc->color_fix();
   if (lat != nullptr) {
     r.latents = std::move(lat->latents);
     r.shapes = std::move(lat->shapes);
@@ -465,7 +469,8 @@ TEST(flashvsr_stream, auto_streams_where_the_carries_fit)
 // The same graph and the same promises on FlashVSR+ Turbo, whose chunks
 // take 16 source frames where v1.1's take 8 (17 to open, not 25), whose
 // stream carries a window per LAYER of two sizes, and whose reference
-// restores every source frame with no colour fix. Env:
+// restores every source frame with no colour fix unless asked (the stage
+// fixes it unless told not to). Env:
 // VPIPE_FLASHVSR_PLUS_TEST_MODEL_PATH (the repository root), and for the
 // rows VPIPE_FLASHVSR_PLUS_GOLDEN (tools/dump_flashvsr_plus_golden.py).
 
@@ -522,8 +527,9 @@ TEST(flashvsr_stream, plus_groups_restore_as_one_pass)
   const std::string root = plus_turbo_();
   if (root.empty()) { return; }
   const auto src = source_();
-  // The colour fix left to the release: off for FlashVSR+, as its
-  // reference has it -- so the default and an explicit `false` agree.
+  // The colour fix left to the default: on, FlashVSR+'s wavelet one. Its
+  // pictures are not wired here, so it goes without (said in the log) and
+  // the default's frames are an explicit `false`'s.
   const Run one = restore_(root, src, kFrames, 0, "stream", -1, 0);
   const Run off = restore_(root, src, kFrames, 0, "stream", 0, 0);
   const Run cut = restore_(root, src, 20, 0, "stream", -1, 0);
@@ -534,6 +540,8 @@ TEST(flashvsr_stream, plus_groups_restore_as_one_pass)
   EXPECT_TRUE((int)one.frames.size() == kFrames);
   EXPECT_TRUE(one.frames == cut.frames);
   EXPECT_TRUE(one.frames == off.frames);
+  EXPECT_TRUE(one.fix == FlashVsrSrcEncoderStage::ColorFix::kWavelet);
+  EXPECT_TRUE(off.fix == FlashVsrSrcEncoderStage::ColorFix::kOff);
   // Clips at the release's own length (49): every frame, exactly once.
   const Run clips = restore_(root, src, 25, 0, "clips", -1, 0, 8);
   ASSERT_TRUE(clips.mode == FlashVsrSrcEncoderStage::Continuity::kClips);
@@ -768,6 +776,7 @@ TEST(flashvsr_stream, plus_temporal_compression_merges_runs)
 // (The arithmetic itself is held to the reference's own corrector by
 // flashvsr_plus.wavelet_fix_matches_reference; this is the plumbing.)
 // Unwired, the fix is said to be missing and the frames are the raw ones.
+// And it is the default: `color_fix` unset restores as `true` does.
 TEST(flashvsr_stream, plus_wavelet_color_fix)
 {
   const std::string root = plus_turbo_();
@@ -792,11 +801,15 @@ TEST(flashvsr_stream, plus_wavelet_color_fix)
                            /*refs=*/true);
   const Run unwired = restore_(root, src, kFrames, 0, "stream", 1, 0, 8,
                                vae);
+  const Run dflt = restore_(root, src, kFrames, 0, "stream", -1, 0, 8, vae,
+                            /*refs=*/true);
   ASSERT_TRUE((int)raw.frames.size() == kFrames &&
               (int)fix.frames.size() == kFrames);
   if ((int)fix.frames.size() != kFrames) { return; }
   EXPECT_TRUE(unwired.frames == raw.frames);
   EXPECT_TRUE(fix.frames != raw.frames);
+  EXPECT_TRUE(dflt.fix == FlashVsrSrcEncoderStage::ColorFix::kWavelet);
+  EXPECT_TRUE(dflt.frames == fix.frames);
 
   Session sess;
   auto* mc = sess.metal_compute();

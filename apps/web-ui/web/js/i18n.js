@@ -1767,6 +1767,15 @@ const STRINGS = {
       + '入端口上的 model-select 源会覆盖它',
       '含音訊 VAE 的模型目錄（從 <hf_dir>/audio_vae 讀取）。可選：model 輸'
       + '入埠上的 model-select 來源會覆寫它'],
+  'cfg.audio-vae-decode.vae_dir': ['',
+      '音频 VAE 的权重，当它们不是 hf_dir 自带的那份时使用：可以是目录、注册'
+      + '表键或单个文件——Draw Things 的 .ckpt（MiniMax-H3 的，视频 VAE 也在'
+      + '同一个文件里），按原版的名称读取。配置（潜变量统计量）仍取自 hf_dir'
+      + ' 的音频 VAE',
+      '音訊 VAE 的權重，當它們不是 hf_dir 自帶的那份時使用：可以是目錄、登錄'
+      + '檔鍵或單個檔案——Draw Things 的 .ckpt（MiniMax-H3 的，影片 VAE 也在'
+      + '同一個檔案裡），按原版的名稱讀取。設定（潛變數統計量）仍取自 hf_dir'
+      + ' 的音訊 VAE'],
   'cfg.audio-vae-decode.unload_when_idle': ['',
       '每个节拍处理完就释放 VAE 权重，下一个节拍再重新加载。"auto"（默认）'
       + '根据物理内存与流水线的权重字节数自行判断；"always" / "never" 可强'
@@ -1884,14 +1893,20 @@ const STRINGS = {
       + '的 _class_name 決定模型族與編碼器。可選：model 輸入埠上的 '
       + 'model-select 來源會覆寫它'],
   'cfg.diffusion-conditioner.encoder_dir': ['',
-      '仅 VOSR：DINOv2 检查点，它与修复器自身的权重是分开下载的'
-      + '（facebook/dinov2-large，或从参考实现的 torch-hub pickle 转换出来的同'
-      + '一批张量）。不填时先试 `<hf_dir>/dinov2`，再试注册表键。其余模型族的'
-      + '编码器都在 hf_dir 里面，会忽略这一项',
-      '僅 VOSR：DINOv2 檢查點，它與修復器自身的權重是分開下載的'
-      + '（facebook/dinov2-large，或從參考實作的 torch-hub pickle 轉換出來的同'
-      + '一批張量）。不填時先試 `<hf_dir>/dinov2`，再試登錄檔鍵。其餘模型族的'
-      + '編碼器都在 hf_dir 裡面，會忽略這一項'],
+      '文本编码器的权重，当它们不是 hf_dir 自带的那份时使用：可以是目录、注'
+      + '册表键或单个文件——Draw Things 的 .ckpt（Qwen-Image-2.1 的 '
+      + 'Qwen3-VL-8B、MiniMax-H3 的 Qwen3-VL-32B），按原版的名称读取。配置与'
+      + '分词器仍取自 hf_dir。对 VOSR 来说它是 DINOv2 检查点，与修复器自身的'
+      + '权重是分开下载的（facebook/dinov2-large，或从参考实现的 torch-hub '
+      + 'pickle 转换出来的同一批张量）；不填时先试 `<hf_dir>/dinov2`，再试注'
+      + '册表键',
+      '文字編碼器的權重，當它們不是 hf_dir 自帶的那份時使用：可以是目錄、登'
+      + '錄檔鍵或單個檔案——Draw Things 的 .ckpt（Qwen-Image-2.1 的 '
+      + 'Qwen3-VL-8B、MiniMax-H3 的 Qwen3-VL-32B），按原版的名稱讀取。設定與'
+      + '分詞器仍取自 hf_dir。對 VOSR 來說它是 DINOv2 檢查點，與修復器自身的'
+      + '權重是分開下載的（facebook/dinov2-large，或從參考實作的 torch-hub '
+      + 'pickle 轉換出來的同一批張量）；不填時先試 `<hf_dir>/dinov2`，再試登'
+      + '錄檔鍵'],
   'cfg.diffusion-conditioner.reference_mode': ['',
       'ref_image 输入端口上的参考图如何与提示词配对。“auto”（默认）即本阶段'
       + '每个输入都遵循的规则：来源只发一个节拍就结束的图，用于每一条提示词（'
@@ -2530,11 +2545,13 @@ const STRINGS = {
       '覆盖 DiT 目录（例如一个量化过的 4/8 位 DiT）；否则取 <hf_dir>/'
       + 'transformer。Krea-2 也接受 Krea 自有布局的单个 .safetensors 文件'
       + '——社区微调模型，包括 FP8；Qwen-Image-2.1 也接受以 diffusers 名称'
-      + '存放的单文件 DiT（unsloth 的 FP8）——均按原样读取，无需转换',
+      + '存放的单文件 DiT（unsloth 的 FP8）或 Draw Things 的 .ckpt——均按原'
+      + '样读取，无需转换',
       '覆寫 DiT 目錄（例如一個量化過的 4/8 位元 DiT）；否則取 <hf_dir>/'
       + 'transformer。Krea-2 也接受 Krea 自有佈局的單個 .safetensors 檔案'
       + '——社群微調模型，包括 FP8；Qwen-Image-2.1 也接受以 diffusers 名稱'
-      + '存放的單檔 DiT（unsloth 的 FP8）——均按原樣讀取，無需轉換'],
+      + '存放的單檔 DiT（unsloth 的 FP8）或 Draw Things 的 .ckpt——均按原'
+      + '樣讀取，無需轉換'],
   'cfg.generate-image.strength': ['',
       '图生图强度，取值 [0,1]；0（默认）表示从噪声开始的文生图（初始潜变量'
       + '由 vae-encode 从 `latent` 输入端口送入）',
@@ -2673,6 +2690,33 @@ const STRINGS = {
       '加速模式（失真）：DiT 大塊矩陣乘改用動態 int8 GEMM，速率約為 f16 的 '
       + '2 倍，精度即 int8 水準；沒有 NAX matmul2d（矩陣核心 GPU + 相應核心'
       + '）時會被忽略。預設 false；環境變數 VPIPE_I8_GEMM 可覆寫'],
+  'cfg.generate-image.i8_gemm_tier': ['',
+      'i8_gemm 使用哪一档 int8 GEMM：accurate（默认；两侧操作数都按 64 分组）、'
+      + 'fast（块权重以旋转后的 int8 按 512 分组存放：在 M5 的矩阵核心上'
+      + '更快，在 Ultra 上约为 accurate 的 1.1 倍）、token（权重按行、激活按 '
+      + 'token 各取一个 int8 尺度，先做 256 宽的 Hadamard 旋转：最快，在 M5 '
+      + 'Ultra 上 1024^2 约为 accurate 的 1.4 倍）或 token_plain（同上但不旋转：'
+      + '并不更快，画面离稠密结果明显更远；直接读取 Draw Things i8x 检查点的'
+      + '原始编码，而 token 会把它们重新量化）。w4 量化包的块权重同样采用 fast '
+      + '与两档 token：机器内存充足时由引擎常驻其 int8 副本（占 w4 的两倍），'
+      + '否则每次 GEMM 前再转换成 int8，代价约为去噪时间的 3-5%。'
+      + 'qwen-image-21、krea2、flux2、z-image 与 moss-image 在图像行的投影上'
+      + '支持，其他模型'
+      + '按 accurate 运行。环境变量 '
+      + 'VPIPE_I8_TIER 可覆盖',
+      'i8_gemm 使用哪一檔 int8 GEMM：accurate（預設；兩側運算元都按 64 分組）、'
+      + 'fast（區塊權重以旋轉後的 int8 按 512 分組存放：在 M5 的矩陣核心上'
+      + '更快，在 Ultra 上約為 accurate 的 1.1 倍）、token（權重按列、活化按 '
+      + 'token 各取一個 int8 尺度，先做 256 寬的 Hadamard 旋轉：最快，在 M5 '
+      + 'Ultra 上 1024^2 約為 accurate 的 1.4 倍）或 token_plain（同上但不旋轉：'
+      + '並不更快，畫面離稠密結果明顯更遠；直接讀取 Draw Things i8x 檢查點的'
+      + '原始編碼，而 token 會把它們重新量化）。w4 量化包的區塊權重同樣採用 fast '
+      + '與兩檔 token：機器記憶體充足時由引擎常駐其 int8 副本（佔 w4 的兩倍），'
+      + '否則每次 GEMM 前再轉換成 int8，代價約為去噪時間的 3-5%。'
+      + 'qwen-image-21、krea2、flux2、z-image 與 moss-image 在影像列的投影上'
+      + '支援，其他模型'
+      + '按 accurate 執行。環境變數 '
+      + 'VPIPE_I8_TIER 可覆寫'],
   'cfg.generate-image.sol_attn': ['',
       '加速注意力（有损）：Sol-Attn 在在线 softmax 的过程中按整块 key 做路由，'
       + '只对代理分数保留下来的那些块做注意力，其余的则用每块 key 的质心与 '
@@ -2933,13 +2977,15 @@ const STRINGS = {
       '仅限 MiniMax-H3：用来替代 hf_dir 下那份 DiT 运行的检查点，hf_dir 的'
       + '文本编码器和 VAE 仍照常使用——可以是单个 .safetensors（Comfy-Org 重'
       + '打包，或 diffusers 命名，例如 lightx2v 的 FP8 turbo DiT，按原样读取，'
-      + 'FP8 保持为 FP8），也可以是 transformer 目录。留空：使用 hf_dir 自带'
-      + '的那份',
+      + 'FP8 保持为 FP8），可以是 Draw Things 的 .ckpt（在 i8_gemm_tier '
+      + 'token_plain 下按原样运行它的 i8x 编码），也可以是 transformer 目录。'
+      + '留空：使用 hf_dir 自带的那份',
       '僅限 MiniMax-H3：用來替代 hf_dir 下那份 DiT 執行的檢查點，hf_dir 的'
       + '文字編碼器和 VAE 仍照常使用——可以是單個 .safetensors（Comfy-Org 重'
       + '新打包，或 diffusers 命名，例如 lightx2v 的 FP8 turbo DiT，按原樣讀'
-      + '取，FP8 保持為 FP8），也可以是 transformer 目錄。留空：使用 hf_dir '
-      + '自帶的那份'],
+      + '取，FP8 保持為 FP8），可以是 Draw Things 的 .ckpt（在 i8_gemm_tier '
+      + 'token_plain 下按原樣執行它的 i8x 編碼），也可以是 transformer 目錄。'
+      + '留空：使用 hf_dir 自帶的那份'],
   'cfg.generate-video.height': ['',
       '视频高度（像素）。会向上取整到常驻模型族的 VAE 步幅乘以其 DiT patch '
       + '的倍数，各族不同，因此任何正值都接受，阶段会记录实际使用的值',
@@ -2983,6 +3029,19 @@ const STRINGS = {
       + '一段都能單獨重跑，只要把它的號碼填回 `seed`。「randomize」：忽略 `seed`'
       + '，每段都由時鐘取一個；用過的每個種子都會記入日誌，且都能填回 `seed` '
       + '重跑。「keep」：每段都用 `seed`，適合在同一份雜訊上比較提示詞'],
+  'cfg.generate-video.i8_gemm_tier': ['',
+      'i8_gemm 使用哪一档 int8 GEMM：accurate（默认；权重与激活每次调用时按 64 '
+      + '分组量化）、fast（块权重以旋转后的 int8 按粗分组存放）、token（权重按'
+      + '行、激活按 token 各取一个 int8 尺度，先做 256 宽的 Hadamard 旋转：最'
+      + '快）或 token_plain（同上但不旋转，直接读取 Draw Things i8x 检查点的'
+      + '原始编码）。minimax-h3 支持，其他模型按 accurate 运行。环境变量 '
+      + 'VPIPE_I8_TIER 可覆盖',
+      'i8_gemm 使用哪一檔 int8 GEMM：accurate（預設；權重與活化每次呼叫時按 64 '
+      + '分組量化）、fast（區塊權重以旋轉後的 int8 按粗分組存放）、token（權重按'
+      + '列、活化按 token 各取一個 int8 尺度，先做 256 寬的 Hadamard 旋轉：最'
+      + '快）或 token_plain（同上但不旋轉，直接讀取 Draw Things i8x 檢查點的'
+      + '原始編碼）。minimax-h3 支援，其他模型按 accurate 執行。環境變數 '
+      + 'VPIPE_I8_TIER 可覆寫'],
   'cfg.generate-video.i8_gemm': ['',
       '加速模式（有损）：DiT 大块矩阵乘改用动态 int8 GEMM 代替 bf16，精度即'
       + ' int8 水平。只有前向会为矩阵核心物化稠密权重的模型族才会采用；纯 '
@@ -3669,6 +3728,15 @@ const STRINGS = {
       + 'hf_dir>/vae）。可选：model 输入端口上的 model-select 源会覆盖它',
       '要解碼其 VAE 的模型根目錄；常駐模型族會在其中定位 VAE（慣例是 <'
       + 'hf_dir>/vae）。可選：model 輸入埠上的 model-select 來源會覆寫它'],
+  'cfg.vae-decode.vae_dir': ['',
+      'VAE 的权重，当它们不是 hf_dir 自带的那份时使用：可以是目录、注册表键'
+      + '或单个文件——Draw Things 的 .ckpt（Qwen-Image-2.1 的 VAE、MiniMax-H3'
+      + ' 的视频 VAE），按原版的名称读取。配置（潜变量统计量、几何结构）仍取'
+      + '自 hf_dir 的 VAE',
+      'VAE 的權重，當它們不是 hf_dir 自帶的那份時使用：可以是目錄、登錄檔鍵'
+      + '或單個檔案——Draw Things 的 .ckpt（Qwen-Image-2.1 的 VAE、MiniMax-H3'
+      + ' 的影片 VAE），按原版的名稱讀取。設定（潛變數統計量、幾何結構）仍取'
+      + '自 hf_dir 的 VAE'],
   'cfg.vae-decode.fps': ['',
       '当潜变量本身没有携带帧率时，打在每个解码出的视频帧边带上的帧率。来自'
       + ' generate-video 的潜变量是携带的，因此这只是从别处读入时的后备值。'
@@ -3803,6 +3871,15 @@ const STRINGS = {
       'Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit 模型目錄，或本階段能讀取其 '
       + 'VAE 的其他模型目錄（VAE 從 <hf_dir>/vae 讀取）。可選：model 輸入埠上的 model-select 來源會覆'
       + '寫它'],
+  'cfg.vae-encode.vae_dir': ['',
+      'VAE 的权重，当它们不是 hf_dir 自带的那份时使用：可以是目录、注册表键'
+      + '或单个文件——Draw Things 的 .ckpt（Qwen-Image-2.1 的 VAE、MiniMax-H3'
+      + ' 的视频 VAE），按原版的名称读取。配置（潜变量统计量、几何结构）仍取'
+      + '自 hf_dir 的 VAE',
+      'VAE 的權重，當它們不是 hf_dir 自帶的那份時使用：可以是目錄、登錄檔鍵'
+      + '或單個檔案——Draw Things 的 .ckpt（Qwen-Image-2.1 的 VAE、MiniMax-H3'
+      + ' 的影片 VAE），按原版的名稱讀取。設定（潛變數統計量、幾何結構）仍取'
+      + '自 hf_dir 的 VAE'],
   'cfg.vae-encode.target_width': ['',
       '编码前先把输入按信箱模式缩放到这个宽度（须为 8 的倍数；需同时设置 '
       + 'target_height）。0/未设置 = 按原始尺寸编码',
@@ -3915,6 +3992,20 @@ const STRINGS = {
       + 'model 输入端口上的 model-select 源会覆盖它',
       'MiniMax-H3 模型目錄（text_encoder/、video_vae/、audio_vae/）。可選：'
       + 'model 輸入埠上的 model-select 來源會覆寫它'],
+  'cfg.video-ref-encoder.encoder_dir': ['',
+      '文本编码器的权重，当它们不是 hf_dir 自带的那份时使用：可以是目录、注'
+      + '册表键或单个文件——Draw Things 的 .ckpt（MiniMax-H3 的 Qwen3-VL-32B'
+      + '，含视觉塔），按原版的名称读取。配置与分词器仍取自 hf_dir',
+      '文字編碼器的權重，當它們不是 hf_dir 自帶的那份時使用：可以是目錄、登'
+      + '錄檔鍵或單個檔案——Draw Things 的 .ckpt（MiniMax-H3 的 Qwen3-VL-32B'
+      + '，含視覺塔），按原版的名稱讀取。設定與分詞器仍取自 hf_dir'],
+  'cfg.video-ref-encoder.vae_dir': ['',
+      '视频与音频 VAE 的权重，当它们不是 hf_dir 自带的那份时使用：一个同时'
+      + '含有两者的 Draw Things .ckpt（MiniMax-H3 的），按原版的名称读取。配'
+      + '置仍取自 hf_dir',
+      '影片與音訊 VAE 的權重，當它們不是 hf_dir 自帶的那份時使用：一個同時'
+      + '含有兩者的 Draw Things .ckpt（MiniMax-H3 的），按原版的名稱讀取。設'
+      + '定仍取自 hf_dir'],
   'cfg.video-ref-encoder.frames': ['',
       '以 24 fps 计的生成帧数，向上取整到下一个 17n+5。必须与 '
       + 'generate-video 阶段的 `frames` 一致：所有参考都会被截断到这个时长'
@@ -4647,11 +4738,13 @@ const STRINGS = {
       + '影格都要多修復一次（8）'],
   'cfg.flashvsr-src-encoder.color_fix': ['',
       '把每个修复出的帧的颜色向其源帧校正（方式见 color_fix_method）。'
-      + '不填时跟随该版本自己的参考实现：FlashVSR-v1.1 默认施加其校正，开启'
-      + '；FlashVSR+ 的校正需要手动开启（其 --cf），关闭',
+      + '两个版本都默认开启：FlashVSR-v1.1 的参考实现默认施加其校正；'
+      + 'FlashVSR+ 的参考实现需要手动开启（其 --cf），但不校正时修复出的'
+      + '颜色会偏离源帧。设为 false 得到未校正的输出',
       '把每個修復出的影格的色彩向其來源影格校正（方式見 color_fix_method）'
-      + '。不填時跟隨該版本自己的參考實作：FlashVSR-v1.1 預設施加其校正，開'
-      + '啟；FlashVSR+ 的校正需要手動開啟（其 --cf），關閉'],
+      + '。兩個版本都預設開啟：FlashVSR-v1.1 的參考實作預設施加其校正；'
+      + 'FlashVSR+ 的參考實作需要手動開啟（其 --cf），但不校正時修復出的'
+      + '色彩會偏離來源影格。設為 false 得到未校正的輸出'],
   'cfg.flashvsr-src-encoder.color_fix_method': ['',
       'auto | adain | wavelet。`adain`：把每个通道的均值和离散度移到源'
       + '帧的值——v1.1 的校正，每帧六个数放在边带上。`wavelet`：从源图取帧的'
@@ -4937,6 +5030,122 @@ const STRINGS = {
       'FLUX.3 參數，作為一個 FlexData 物件 {model_family: flux3, +alpha, '
       + '+lora .. +lora8 與它們的強度，+preview_vae 與它的選項}，供 '
       + 'generate-image 的 model_config 輸入埠使用'],
+
+  // ---- MOSS-Image Model Config (model-specific-config) ----
+  'stage.moss-image-model-config.name': ['',
+      'MOSS-Image 模型配置',
+      'MOSS-Image 模型設定'],
+  'stage.moss-image-model-config.doc': ['',
+      '源：MOSS-Image 的专属参数——引导强度、负向分支跳过的块、跳层引导、'
+      + '采样日程的 shift、运行时 LoRA 槽位和实时预览。普通运行一个都不需要：'
+      + 'generate-image 会按参考实现的默认值运行。发一个节拍即结束；若接了 '
+      + 'trigger 输入端口，则每收到一个节拍发一次。',
+      '來源：MOSS-Image 的專屬參數——引導強度、負向分支跳過的區塊、跳層引'
+      + '導、取樣排程的 shift、執行階段 LoRA 槽位和即時預覽。一般執行一個都不需要：'
+      + 'generate-image 會按參考實作的預設值執行。發一個節拍即結束；若接了 '
+      + 'trigger 輸入埠，則每收到一個節拍發一次。'],
+  'cfg.moss-image-model-config.guidance_scale': ['',
+      '无分类器引导：v = v_neg + g (v - v_neg)，相对负向条件（未接负向提示词'
+      + '时即空提示词的编码）。参考实现的默认值为 3；1 表示每步只做一次前向，'
+      + '完全不跑负向分支。留空即默认值',
+      '無分類器引導：v = v_neg + g (v - v_neg)，相對負向條件（未接負向提示詞'
+      + '時即空提示詞的編碼）。參考實作的預設值為 3；1 表示每步只做一次前向，'
+      + '完全不跑負向分支。留空即預設值'],
+  'cfg.moss-image-model-config.uncond_skip_layers': ['',
+      '负向分支跳过的主干块（从 0 开始计数）——参考实现默认 [22]（负向前向'
+      + '跳过 42 个块中的一个，每步仍是两次前向）。[] 关闭跳过。留空即默认值',
+      '負向分支跳過的主幹區塊（從 0 開始計數）——參考實作預設 [22]（負向前向'
+      + '跳過 42 個區塊中的一個，每步仍是兩次前向）。[] 關閉跳過。留空即預設值'],
+  'cfg.moss-image-model-config.slg_layers': ['',
+      '正向分支上的跳层引导：每步多跑第三次前向，用提示词但跳过这些主干块'
+      + '（从 0 开始计数），再令 v += slg_scale (v_cond - v_skipped)。参考实'
+      + '现的说明建议 [24]、强度 3、区间 0.01 到 1。留空或 [] 即关闭',
+      '正向分支上的跳層引導：每步多跑第三次前向，用提示詞但跳過這些主幹區塊'
+      + '（從 0 開始計數），再令 v += slg_scale (v_cond - v_skipped)。參考實'
+      + '作的說明建議 [24]、強度 3、區間 0.01 到 1。留空或 [] 即關閉'],
+  'cfg.moss-image-model-config.slg_scale': ['',
+      '跳层引导的强度；0（默认）即关闭。guidance_scale 为 1 时，预测值就是跳'
+      + '层那次前向，再加上 slg_scale 乘以两者之差',
+      '跳層引導的強度；0（預設）即關閉。guidance_scale 為 1 時，預測值就是跳'
+      + '層那次前向，再加上 slg_scale 乘以兩者之差'],
+  'cfg.moss-image-model-config.slg_start': ['',
+      '在去噪过程中（第几步 / 总步数，从噪声端算起）负向分支的跳块与跳层引'
+      + '导从哪里开始：[slg_start, slg_stop) 之外只跑普通的 CFG。默认 0',
+      '在去噪過程中（第幾步 / 總步數，從雜訊端算起）負向分支的跳塊與跳層引'
+      + '導從哪裡開始：[slg_start, slg_stop) 之外只跑普通的 CFG。預設 0'],
+  'cfg.moss-image-model-config.slg_stop': ['',
+      '它们在哪里结束（不含该点）。默认 1',
+      '它們在哪裡結束（不含該點）。預設 1'],
+  'cfg.moss-image-model-config.shift': ['',
+      '采样日程的 shift：按步数构造 shift-s 网格，再吸附到训练网格最近的节点'
+      + '。留空即检查点自己的值（5，见 scheduler/scheduler_config.json）。数值'
+      + '越大，越多步数花在高噪声段。步数本身由 generate-image 的 `steps`（或 '
+      + 'scheduler-select）决定，参考实现默认 50',
+      '取樣排程的 shift：按步數建構 shift-s 網格，再吸附到訓練網格最近的節點'
+      + '。留空即檢查點自己的值（5，見 scheduler/scheduler_config.json）。數值'
+      + '越大，越多步數花在高雜訊段。步數本身由 generate-image 的 `steps`（或 '
+      + 'scheduler-select）決定，參考實作預設 50'],
+  'cfg.moss-image-model-config.lora': ['',
+      '在运行时生效的 LoRA——每个被适配的投影计算 W x + scale * B (A x)。可'
+      + '以是一个已注册的模型、一个含单个 .safetensors 的目录，或指向该文件'
+      + '的路径。模块名采用检查点自身的写法（layers.N.proj.q / k / v / o / '
+      + 'ffn_up_gate / ffn_down），可以带 `diffusion_model.` 或 `transformer.`'
+      + ' 前缀；为其他模型准备的适配器一个都绑不上，并会明确报告。加载时生效'
+      + '：在 DiT 构建之前读取，之后再改的节拍只会被报告并忽略（强度仍可实时'
+      + '调整）',
+      '在執行階段生效的 LoRA——每個被套用的投影計算 W x + scale * B (A x)。'
+      + '可以是一個已註冊的模型、一個含單個 .safetensors 的目錄，或指向該檔'
+      + '案的路徑。模組名採用檢查點自身的寫法（layers.N.proj.q / k / v / o / '
+      + 'ffn_up_gate / ffn_down），可以帶 `diffusion_model.` 或 `transformer.`'
+      + ' 前綴；為其他模型準備的轉接器一個都綁不上，並會明確報告。載入時生效'
+      + '：在 DiT 建構之前讀取，之後再改的節拍只會被報告並忽略（強度仍可即時'
+      + '調整）'],
+  'cfg.moss-image-model-config.lora_scale': ['',
+      '适配器强度，按每次前向生效：可实时调整，无需重新加载即可扫参。1.0 '
+      + '= 与训练时一致；0 会跳过两个适配器 GEMM，所以关掉就是真的关掉',
+      '轉接器強度，按每次前向生效：可即時調整，無需重新載入即可掃參。1.0 '
+      + '= 與訓練時一致；0 會跳過兩個轉接器 GEMM，所以關掉就是真的關掉'],
+  'cfg.moss-image-model-config.preview_vae': ['',
+      '可选：用于实时预览的小型自编码器（TAE）。MOSS-Image 用的是 FLUX.2 '
+      + '的 VAE（小解码器读的是同一个潜空间），所以 FLUX.2 的 TAE（'
+      + 'madebyollin 的 taef2）可原样预览它。每走完一个去噪步，模型对成片的'
+      + '干净估计会由它解码，写到去噪阶段的 `preview` 输出端口。留空（默认）'
+      + '即关闭预览——那时什么都不加载、不解码',
+      '可選：用於即時預覽的小型自編碼器（TAE）。MOSS-Image 用的是 FLUX.2 '
+      + '的 VAE（小解碼器讀的是同一個潛空間），所以 FLUX.2 的 TAE（'
+      + 'madebyollin 的 taef2）可原樣預覽它。每走完一個去噪步，模型對成片的'
+      + '乾淨估計會由它解碼，寫到去噪階段的 `preview` 輸出埠。留空（預設）'
+      + '即關閉預覽——那時什麼都不載入、不解碼'],
+  'cfg.moss-image-model-config.preview_every': ['',
+      '每 N 个去噪步渲染一次预览；最后一步总会渲染。解码在单独的线程上进'
+      + '行，绝不让生成等待。它与去噪共用 GPU，所以 N 越大，还给去噪的 GPU '
+      + '时间越多。填 0 即关闭预览',
+      '每 N 個去噪步渲染一次預覽；最後一步總會渲染。解碼在單獨的執行緒上進'
+      + '行，絕不讓生成等待。它與去噪共用 GPU，所以 N 越大，還給去噪的 GPU '
+      + '時間越多。填 0 即關閉預覽'],
+  'cfg.moss-image-model-config.preview_max_edge': ['',
+      '预览画面的最长边（像素）；解码出的画面会按整数倍做盒式缩小，直到放'
+      + '得下。填 0 即按解码原样发送',
+      '預覽畫面的最長邊（像素）；解碼出的畫面會按整數倍做盒式縮小，直到放'
+      + '得下。填 0 即按解碼原樣傳送'],
+  'port.moss-image-model-config.trigger': ['',
+      '可选的节拍，用于控制何时重新发出配置（chrono 滴答、提示词源、反馈回'
+      + '路等）。负载内容不限——收到本身就是信号。未接时，本阶段每次运行只发'
+      + '一次',
+      '可選的節拍，用於控制何時重新發出設定（chrono 滴答、提示詞來源、回饋'
+      + '迴路等）。負載內容不限——收到本身就是訊號。未接時，本階段每次執行只'
+      + '發一次'],
+  'port.moss-image-model-config.model_config': ['',
+      'MOSS-Image 参数，作为一个 FlexData 对象 {model_family: moss-image, '
+      + '+guidance_scale, +uncond_skip_layers, +slg_*, +shift, +lora .. '
+      + '+lora8 与它们'
+      + '的强度，+preview_vae 与它的选项}，供 generate-image 的 model_config '
+      + '输入端口使用',
+      'MOSS-Image 參數，作為一個 FlexData 物件 {model_family: moss-image, '
+      + '+guidance_scale, +uncond_skip_layers, +slg_*, +shift, +lora .. '
+      + '+lora8 與它們'
+      + '的強度，+preview_vae 與它的選項}，供 generate-image 的 model_config '
+      + '輸入埠使用'],
 
   // ---- Krea-2 Model Config (model-specific-config) ----
   'stage.krea2-model-config.name': ['',

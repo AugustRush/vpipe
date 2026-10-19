@@ -332,7 +332,7 @@ TEST(metal_lm_smoke, qmv_ksplit_matches_batch) {
             (std::size_t)MM * NO, 0);
         bool have_first = false;
         double worst = 0.0, worst_b = 0.0;
-        for (const int tr : {2, 3, 4, 6}) {
+        for (const int tr : {1, 2, 3, 4, 6}) {
           const std::string name = "affine_qmv_ks" + std::to_string(tr) +
                                    (sw ? "_swiglu_w4g64" : "_w4g64");
           auto fn = lib.function(name);
@@ -371,6 +371,154 @@ TEST(metal_lm_smoke, qmv_ksplit_matches_batch) {
                     "(batch %.2e)\n", bf ? "bf16" : "f16", K,
                     sw ? "swiglu" : "plain", worst, worst_b);
       }
+    }
+  }
+}
+
+// The split-K tiles at 8 bits (a mixed model's 8-bit tensors in a
+// verify) and the residual-folding twins at both widths: each row within
+// the batch tile's error of an fp32 reference, BYTE-IDENTICAL whichever
+// tile (2..8 rows) computes it -- a verify's rows do not depend on its
+// length -- and y = r + x @ W^T the same written into a separate buffer
+// or into r itself, as a verify writes the residual stream in place.
+TEST(metal_lm_smoke, qmv_ksplit_w8_and_add_match) {
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  std::mt19937 rng(29);
+  std::uniform_int_distribution<std::uint32_t> du(0, 0xffffffffu);
+  std::uniform_real_distribution<float> df(-1.0f, 1.0f);
+  auto lib = mc->load_library("affine_qmv");
+  const int MM = 8, N = 128;
+  auto half_at = [](const metal_compute::SharedBuffer& b, std::size_t i) {
+    __fp16 h;
+    std::memcpy(&h, static_cast<const std::uint16_t*>(b.contents()) + i, 2);
+    return (float)h;
+  };
+  auto fill = [&](metal_compute::SharedBuffer& b, std::size_t n,
+                  float scale) {
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      const __fp16 h = (__fp16)(df(rng) * scale);
+      std::memcpy(&p[i], &h, 2);
+    }
+  };
+  for (const int bits : {4, 8}) {
+    for (const int K : {768, 5120}) {
+      const int groups = K / 64;
+      const std::size_t wwords = (std::size_t)N * K * bits / 32;
+      auto wb = mc->make_shared_buffer(wwords * 4);
+      auto sb = mc->make_shared_buffer((std::size_t)N * groups * 2);
+      auto bb = mc->make_shared_buffer((std::size_t)N * groups * 2);
+      auto xb = mc->make_shared_buffer((std::size_t)MM * K * 2);
+      auto rb = mc->make_shared_buffer((std::size_t)MM * N * 2);
+      auto y0 = mc->make_shared_buffer((std::size_t)MM * N * 2);
+      auto y1 = mc->make_shared_buffer((std::size_t)MM * N * 2);
+      auto* wp = static_cast<std::uint32_t*>(wb.contents());
+      for (std::size_t i = 0; i < wwords; ++i) { wp[i] = du(rng); }
+      fill(sb, (std::size_t)N * groups, bits == 8 ? 0.002f : 0.02f);
+      fill(bb, (std::size_t)N * groups, 0.1f);
+      fill(xb, (std::size_t)MM * K, 1.0f);
+      fill(rb, (std::size_t)MM * N, 4.0f);
+      // fp32 reference over the stored inputs.
+      const int vpw = 32 / bits;
+      const std::uint32_t mask = (1u << bits) - 1u;
+      std::vector<double> ref((std::size_t)MM * N, 0.0);
+      for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; ++k) {
+          const std::uint32_t word =
+              wp[(std::size_t)n * (K / vpw) + k / vpw];
+          const int q = (int)((word >> (bits * (k % vpw))) & mask);
+          const std::size_t g = (std::size_t)n * groups + k / 64;
+          const double wv = (double)q * half_at(sb, g) + half_at(bb, g);
+          for (int r = 0; r < MM; ++r) {
+            ref[(std::size_t)r * N + n] +=
+                wv * half_at(xb, (std::size_t)r * K + k);
+          }
+        }
+      }
+      auto run = [&](const metal_compute::ComputeFunction& fn,
+                     metal_compute::SharedBuffer& y, int m, unsigned tx,
+                     unsigned tiles, unsigned tgx, unsigned tgy,
+                     const metal_compute::SharedBuffer* r) {
+        metal_compute::CommandStream st = mc->make_command_stream();
+        {
+          metal_compute::ComputeEncoder e = st.begin_compute();
+          e.set_function(fn);
+          e.set_buffer(0, wb); e.set_buffer(1, sb); e.set_buffer(2, bb);
+          e.set_buffer(3, xb); e.set_buffer(4, y);
+          e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, m);
+          if (r != nullptr) { e.set_buffer(8, *r); }
+          e.dispatch({tx, (unsigned)(N / 4), tiles}, {tgx, tgy, 1u});
+        }
+        st.commit().wait();
+      };
+      auto rel = [&](const metal_compute::SharedBuffer& y, int m,
+                     bool add) {
+        double num = 0.0, den = 0.0;
+        for (int i = 0; i < m * N; ++i) {
+          const double want =
+              ref[(std::size_t)i] + (add ? half_at(rb, (std::size_t)i) : 0.0);
+          const double d = (double)half_at(y, (std::size_t)i) - want;
+          num += d * d;
+          den += want * want;
+        }
+        return std::sqrt(num / std::max(den, 1e-30));
+      };
+      const std::string w = bits == 8 ? "_w8g64" : "_w4g64";
+      auto batch = lib.function("affine_qmv_batch" + w);
+      ASSERT_TRUE(batch.valid());
+      std::vector<std::uint16_t> first((std::size_t)MM * N, 0);
+      bool have_first = false;
+      double worst = 0.0, worst_b = 0.0, worst_add = 0.0;
+      for (const int tr : {1, 2, 3, 4, 6, 8}) {
+        const std::string t = std::to_string(tr);
+        auto fn = lib.function("affine_qmv_ks" + t + w);
+        auto fn_add = lib.function("affine_qmv_ks" + t + "_add" + w);
+        ASSERT_TRUE(fn.valid() && fn_add.valid());
+        if (!fn.valid() || !fn_add.valid()) { continue; }
+        for (int m = 2; m <= MM; ++m) {
+          const unsigned tiles = (unsigned)((m + tr - 1) / tr);
+          run(batch, y0, m, 32u, (unsigned)((m + 1) / 2), 32u, 2u, nullptr);
+          std::memset(y1.contents(), 0, y1.byte_size());
+          run(fn, y1, m, 64u, tiles, 64u, 1u, nullptr);
+          const double rb_ = rel(y0, m, false), rk = rel(y1, m, false);
+          const auto* y1p = static_cast<const std::uint16_t*>(y1.contents());
+          bool same = true;
+          if (!have_first) {
+            std::memcpy(first.data(), y1p, (std::size_t)m * N * 2);
+            if (m == MM) { have_first = true; }
+          } else {
+            same = std::memcmp(first.data(), y1p, (std::size_t)m * N * 2)
+                   == 0;
+          }
+          // The residual-folding twin, into its own buffer and in place.
+          run(fn_add, y1, m, 64u, tiles, 64u, 1u, &rb);
+          const double ra = rel(y1, m, true);
+          std::vector<std::uint16_t> sep((std::size_t)m * N);
+          std::memcpy(sep.data(), y1.contents(), sep.size() * 2);
+          std::memcpy(y0.contents(), rb.contents(), (std::size_t)m * N * 2);
+          run(fn_add, y0, m, 64u, tiles, 64u, 1u, &y0);
+          const bool inplace =
+              std::memcmp(sep.data(), y0.contents(), sep.size() * 2) == 0;
+          const bool ok = rk <= 1.25 * rb_ + 1e-6 && ra <= 1e-3;
+          if (!ok || !same || !inplace) {
+            std::printf("[qmv-ksplit] w%d ks%d K=%d m=%d rel %.2e (batch "
+                        "%.2e) add %.2e%s%s\n", bits, tr, K, m, rk, rb_, ra,
+                        same ? "" : " NOT byte-identical across tiles",
+                        inplace ? "" : " in place differs");
+          }
+          worst = std::max(worst, rk);
+          worst_b = std::max(worst_b, rb_);
+          worst_add = std::max(worst_add, ra);
+          EXPECT_TRUE(ok);
+          EXPECT_TRUE(same);
+          EXPECT_TRUE(inplace);
+        }
+      }
+      std::printf("[qmv-ksplit] w%d K=%d: rel to fp32 <= %.2e (batch %.2e), "
+                  "with the residual %.2e\n", bits, K, worst, worst_b,
+                  worst_add);
     }
   }
 }

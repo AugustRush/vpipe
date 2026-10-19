@@ -56,6 +56,7 @@ set(LOCAL_TEST_SOURCES
   model-source.cc
   model-source-live.cc
   block-residency.cc
+  block-slots.cc
   memory-plan.cc
   model-memory.cc
   model-register-stage.cc
@@ -198,6 +199,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         flashvsr-plus.cc
         perf-flops.cc
         torch-zip.cc
+        drawthings-store.cc
         wan-vae.cc
         tae-decoder.cc
         latent-preview.cc
@@ -246,10 +248,13 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         qwen-image-edit-sched.cc
         qwen-image-edit-vae.cc
         qwen-image-21-vae.cc
+        vae-i8-conv.cc
         qwen-image-21-layout.cc
         qwen-image-21-cond.cc
         qwen-image-21-dit.cc
         z-image-dit.cc
+        moss-image-dit.cc
+        moss-image-pipeline.cc
         yue2.cc
         bs-roformer.cc
         qwen-image-edit-text.cc

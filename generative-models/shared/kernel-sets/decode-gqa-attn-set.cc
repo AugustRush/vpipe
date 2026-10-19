@@ -74,16 +74,23 @@ DecodeGqaAttnSet::kernel_name(int pos) const {
 
 void
 DecodeGqaAttnSet::encode_member(metal_compute::ComputeEncoder& enc,
-                                const Attn& a, bool vec2, int split) const {
+                                const Attn& a, bool vec2, int split, int rows,
+                                const metal_compute::SharedBuffer* o,
+                                const metal_compute::SharedBuffer* mb,
+                                const metal_compute::SharedBuffer* lb) const {
   const int D = _dims.D, Hq = _dims.Hq, Hkv = _dims.Hkv, G = Hq / Hkv;
+  const metal_compute::SharedBuffer& oacc = o != nullptr ? *o : _oacc;
+  const metal_compute::SharedBuffer& mm = mb != nullptr ? *mb : _m;
+  const metal_compute::SharedBuffer& ll = lb != nullptr ? *lb : _l;
+  const int heads = Hq * rows;   // the merges' heads: row r's at r * Hq
   // Pass 1: per-(kvhead, split) partials into the set's scratch.
   enc.set_function(vec2 ? _vec2 : _kbl);
   enc.set_buffer(0, *a.q, a.q_off);
   enc.set_buffer(1, *a.kpool);
   enc.set_buffer(2, *a.vpool);
-  enc.set_buffer(3, _oacc);
-  enc.set_buffer(4, _m);
-  enc.set_buffer(5, _l);
+  enc.set_buffer(3, oacc);
+  enc.set_buffer(4, mm);
+  enc.set_buffer(5, ll);
   enc.set_constant(6, a.scale);
   enc.set_constant(7, D);
   enc.set_constant(8, Hq);
@@ -93,29 +100,48 @@ DecodeGqaAttnSet::encode_member(metal_compute::ComputeEncoder& enc,
   enc.set_constant(12, a.n_pages);
   enc.set_buffer(13, *a.page_table, a.pgt_off);
   enc.set_constant(14, split);
-  enc.dispatch({32, (unsigned)Hq, (unsigned)split}, {32, (unsigned)G, 1});
+  enc.dispatch({32, (unsigned)Hq, (unsigned)(split * rows)},
+               {32, (unsigned)G, 1});
   // Pass 2: merge the splits -> out. vec2 uses the coalesced merge2 (sums=l
   // before maxs=m, 1 TG/qhead); kbl uses the one-thread-per-d merge.
   if (vec2) {
     enc.set_function(_merge2);
-    enc.set_buffer(0, _oacc);
-    enc.set_buffer(1, _l);
-    enc.set_buffer(2, _m);
+    enc.set_buffer(0, oacc);
+    enc.set_buffer(1, ll);
+    enc.set_buffer(2, mm);
     enc.set_buffer(3, *a.out, a.out_off);
     enc.set_constant(4, D);
     enc.set_constant(5, split);
-    enc.dispatch({1024, (unsigned)Hq, 1}, {1024, 1, 1});
+    enc.dispatch({1024, (unsigned)heads, 1}, {1024, 1, 1});
   } else {
     enc.set_function(_merge);
-    enc.set_buffer(0, _oacc);
-    enc.set_buffer(1, _m);
-    enc.set_buffer(2, _l);
+    enc.set_buffer(0, oacc);
+    enc.set_buffer(1, mm);
+    enc.set_buffer(2, ll);
     enc.set_buffer(3, *a.out, a.out_off);
     enc.set_constant(4, D);
     enc.set_constant(5, split);
-    enc.set_constant(6, Hq);
-    enc.dispatch({(unsigned)(Hq * D), 1, 1}, {256, 1, 1});
+    enc.set_constant(6, heads);
+    enc.dispatch({(unsigned)(heads * D), 1, 1}, {256, 1, 1});
   }
+}
+
+void
+DecodeGqaAttnSet::dispatch_rows(metal_compute::ComputeEncoder& enc,
+                                const Attn& a, int rows,
+                                const metal_compute::SharedBuffer& o,
+                                const metal_compute::SharedBuffer& m,
+                                const metal_compute::SharedBuffer& l) const {
+  if (!_ready || rows <= 0) { return; }
+  static const int kEnv = []() {
+    const char* e = std::getenv("VPIPE_QWEN_GQA_VEC2");
+    return e ? (std::atoi(e) != 0 ? 1 : 0) : -1;
+  }();
+  const int r = regime_of(a.pos);
+  const bool vec2 = (kEnv >= 0) ? (kEnv != 0) : (_kernel[r] != 0);
+  const int split = (kEnv >= 0) ? (vec2 ? vec2_split(a.pos) : kbl_split(a.pos))
+                                : _split[r];
+  encode_member(enc, a, vec2, split, rows, &o, &m, &l);
 }
 
 void

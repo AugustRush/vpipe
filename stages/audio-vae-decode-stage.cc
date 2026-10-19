@@ -44,6 +44,13 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "minimax-h3-fl2va,yue2-vae",
    .model_channel = "diffusion-model"},
+  {.key = "vae_dir", .type = ConfigType::String, .required = false,
+   .doc = "the audio VAE's WEIGHTS, when they are not hf_dir's own: a "
+          "directory, a registry key, or a single file -- a Draw Things "
+          ".ckpt (MiniMax-H3's, which carries the video VAE beside it), "
+          "read under the release's names. The config (latent statistics) "
+          "still comes from hf_dir's audio VAE",
+   .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the VAE weights after each beat and reload on the next one. "
           "\"auto\" (default) decides from physical RAM vs the pipeline's "
@@ -149,6 +156,7 @@ AudioVaeDecodeStage::AudioVaeDecodeStage(const SessionContextIntf* s,
   // edited before hf_dir exists. The "no model at all" case is reported
   // at initialize()/process(), when iport connectivity is known.
   _hf_dir = attr_str("hf_dir");
+  _vae_weights = attr_str("vae_dir");
   // THE ACCELERATION BAG, built once and handed to a registered family
   // whole. Written whether the tier is on or off, and with the SETTLED
   // value, so no family repeats this stage's reading or reaches a
@@ -239,8 +247,9 @@ AudioVaeDecodeStage::declare_resources() const
   // The arena and the PCM are declared by generate-video, not here:
   // the soundtrack's length comes from that stage's frames/fps, and
   // this one has no way to know it at plan time. Same reason the video
-  // decode arena is declared there.
-  return model_memory::weight_claims({vae_dir});
+  // decode arena is declared there. Weights named apart (`vae_dir`) are
+  // what loads, so they are what is claimed.
+  return model_memory::weight_claims({vae_dir_for_release_()});
 }
 
 // Pass TWO: WHEN those weights are resident.
@@ -293,6 +302,12 @@ std::string
 AudioVaeDecodeStage::vae_dir_for_release_() const
 {
   if (_hf_dir.empty()) { return {}; }
+  // Weights named apart from the model (`vae_dir`) are what loads, so
+  // they are what is claimed and released.
+  if (!_vae_weights.empty()) {
+    const std::string w = resolve_model_dir(session(), _vae_weights);
+    if (!w.empty()) { return w; }
+  }
   const std::string root = resolve_model_dir(session(), _hf_dir);
   const std::string h3 = genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
   if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
@@ -482,8 +497,17 @@ AudioVaeDecodeStage::ensure_loaded_()
   // that path gets a checkpoint nothing can account for, share, park or
   // pool: MEASURED, this stage unloaded its VAE and pool_weights() found
   // no such set to pool, silently, because the key was never registered.
+  // The weights from `vae_dir` when it names them (a Draw Things .ckpt),
+  // the config above from the model's own audio VAE either way.
+  std::string ws_dir = vae_dir;
+  if (!_vae_weights.empty()) {
+    ws_dir = resolve_model_dir(session(), _vae_weights);
+    session()->info(fmt(
+        "AudioVaeDecodeStage('{}'): the audio VAE's weights from '{}', its "
+        "config from '{}'", this->id(), ws_dir, vae_dir));
+  }
   _h3_vae = genai::MetalMiniMaxH3AudioVae::load(
-      genai::open_weight_set(vae_dir, session()), mc, cfg);
+      genai::open_weight_set(ws_dir, session()), mc, cfg);
   if (!_h3_vae) {
     // Naming the likely cause, because the config parsed a moment ago and
     // "could not load" alone points at the path -- which by here is known

@@ -775,6 +775,25 @@ attention and GEMM tiers** under the same key spellings, so a family
 that reads the bag reads it identically whichever one it plugs into.
 `generate-video` also carries `motion_cache`, a sampling-loop tier
 described [below](#motion_cache--whether-a-forward-runs-at-all).
+`generate-image` also carries `i8_gemm_tier` (`accel::kI8GemmTier`):
+`"accurate"` (the default, and what an absent key means), `"fast"`,
+which `I8GemmContext::Tier::kFast` implements -- the block weights held
+as rotated int8 at a coarse group (`gemm_fast`, `encode_to_fast`) -- or
+`"token"` / `"token_plain"` (`kI8TierToken` / `kI8TierTokenPlain`),
+`Tier::kToken` with and without `set_token_rotation`: int8 per weight
+row and per token over all of K, at `fast_group() == kTokenGroup`
+through the same calls (the GEMM kernel under them is the context's
+own choice). `encode_to_fast` converts a g64 pack at either width
+(`bits`): a w8 one may convert in place, a w4 one goes into int8 codes
+twice its size, and `fast_converts(bits, gc)` says whether the host
+has that converter -- one without it keeps a w4 weight on the accurate
+tier. A family that keeps a w4 weight as its pack converts it per GEMM
+with `encode_to_fast_scratch` and reads `fast_scratch_codes()` /
+`fast_scratch_scales()` -- one scratch the context keeps, the GEMM
+encoded right after the conversion. `generate-video` carries the same
+key under the same name
+in its bag. A family without these tiers runs the accurate one and need
+say nothing.
 
 These are the cross-family settings the graph asked for, as an **open
 bag**. The
@@ -1066,7 +1085,7 @@ ctx->register_image_family(std::make_unique<AcmeImage>());
 ```
 
 The seam is the **generation**, not the step, for the reason the video
-one gives: `generate-image` holds eight built-in denoisers side by side
+one gives: `generate-image` holds nine built-in denoisers side by side
 because their per-step forwards do not agree — Krea-2 takes a packed
 `[img_seq, z*4]` latent with one timestep, Qwen-Image-Edit runs a dual
 stream, FLUX.2 appends multi-reference tokens with their own RoPE band,
@@ -1074,7 +1093,9 @@ Qwen-Image-2.1 is block-causal over one joint sequence with a cross-step
 KV cache, Boogu and Z-Image are NextDiTs whose timestep conventions
 run in opposite directions, and FLUX.3 is a flow map that runs three
 token modes through blocks of their own and takes each step's target
-time. An interface wide enough for all eight describes none of them. One level up they all answer the same question: given
+time, and MOSS-Image's one modulation drives every block while its
+negative branch runs with a block skipped. An interface wide enough for
+all nine describes none of them. One level up they all answer the same question: given
 conditioning, geometry, a step count and a seed, produce a latent.
 
 **It returns a latent, not pixels**, and that is what makes an image
@@ -1105,7 +1126,7 @@ source names. That is the same path Krea-2's built-in previews take.
 
 The registry is consulted **before** the built-in `flux2` / `flux3` /
 `krea2` / `qwen-image-edit` / `qwen-image-21` / `boogu-image` /
-`z-image` dispatch. The built-ins
+`z-image` / `moss-image` dispatch. The built-ins
 are unchanged and unregistered: this adds a path, it does not reroute the
 existing ones.
 
@@ -1499,7 +1520,11 @@ Within the stable surface, a type is one of two kinds:
 - **Opaque** (`VPIPE_ABI_OPAQUE`). A host-owned object you only reach
   through a pointer or reference (`RuntimeContext`, `WeightSet`,
   `MetalCompute`, the registries). Its members are the host's; its virtuals
-  and methods are still contract.
+  and methods are still contract -- and so is the OFFSET of any member its
+  header's inline methods read (`weights()` returning `_weights`), since
+  that offset is compiled into every plugin that calls the method. The
+  snapshot records those members (`(opaque: read inline)`); within a
+  version, a new member goes after them.
 
 Four rules keep frozen types frozen without a version change:
 
@@ -1583,7 +1608,11 @@ be here.
     that prefix alone;
   - the SDK example plugin builds against it;
   - the ABI matches the snapshot. Anything removed or changed fails;
-    additions are reported.
+    additions are reported;
+  - every kernel the toolkit resolves by a literal name is in the kernel
+    contract -- the toolkit is compiled into plugins, so its kernels are
+    the host's promise too. (A name it builds at run time is beyond this
+    check; keep those listed by hand.)
 
   Run it after any change to an installed header.
 - A failure means one of two things. Either the change was a mistake, or

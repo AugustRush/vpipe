@@ -177,6 +177,30 @@ to_bf16_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
   return out;
 }
 
+// A Draw Things i8x weight's row scales (`<stem>.i8x_scales`, the
+// store's element type) widened to the f32 the token GEMM reads.
+SharedBuffer
+i8x_scales_f32_(const MetalLlamaWeights& wts, MetalCompute* mc,
+                const std::string& nm)
+{
+  const auto* info = wts.info(nm);
+  if (info == nullptr || info->shape.size() != 1) { return {}; }
+  const std::size_t n = (std::size_t)info->shape[0];
+  SharedBuffer raw = wts.load(nm, mc);
+  SharedBuffer out = mc->make_shared_buffer(n * 4);
+  if (raw.empty() || out.empty()) { return {}; }
+  auto* d = static_cast<float*>(out.contents());
+  if (info->dtype == "F32") {
+    std::memcpy(d, raw.contents(), n * 4);
+  } else if (info->dtype == "F16") {
+    const auto* sp = static_cast<const _Float16*>(raw.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = (float)sp[i]; }
+  } else {
+    return {};
+  }
+  return out;
+}
+
 // A checkpoint tensor read straight to a host f32 vector. The timestep
 // MLP runs on the host in f32 (see time_embed_), so its four tensors are
 // CONSUMED by this conversion -- hence read(), not tensor(): caching
@@ -538,15 +562,23 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
     if (im != "minimax_h3") {
       return fail("not a minimax_h3 checkpoint (image_model=" + im + ")");
     }
-  } else if (fs::is_regular_file(p) && lower_(p.extension().string()) ==
-                                           ".safetensors") {
-    // ---- a single diffusers-layout file with no config --------------
-    // lightx2v's FP8 turbo DiT: the H3 architecture's dimensions are read
-    // off the tensors, and everything the tensors cannot say (patch, rope,
-    // eps) keeps the architecture's defaults.
+  } else if (fs::is_regular_file(p) &&
+             (lower_(p.extension().string()) == ".safetensors" ||
+              lower_(p.extension().string()) == ".ckpt")) {
+    // ---- a single file with no config --------------------------------
+    // lightx2v's FP8 turbo DiT (the diffusers layout), or a Draw Things
+    // checkpoint (`.ckpt`, presented under the release's own names with
+    // qkv_proj fused per head -- shared/drawthings-store.h): the H3
+    // architecture's dimensions are read off the tensors, and everything
+    // the tensors cannot say (patch, rope, eps) keeps the architecture's
+    // defaults.
     auto w = MetalLlamaWeights::open_model(p.string());
     if (!w.has_value()) { return fail("cannot open " + p.string()); }
-    if (!w->has("blocks.0.attn.qkv_proj.q.weight")) {
+    const bool split = w->has("blocks.0.attn.qkv_proj.q.weight");
+    const bool fused =
+        !split && lower_(p.extension().string()) == ".ckpt" &&
+        w->has("blocks.0.attn.qkv_proj.weight");
+    if (!split && !fused) {
       return fail(p.string() + " is neither a Comfy-Org H3 component nor an "
                                "H3 DiT in the diffusers naming");
     }
@@ -573,14 +605,18 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
         "\"audio_latents_dim\": {}, \"text_dim\": {}, "
         "\"timestep_input_dim\": {}, \"time_embed_hidden_size\": {}, "
         "\"time_embed_dim\": {}}}",
-        hidden, dim("blocks.0.attn.qkv_proj.q.weight", 0) / 128,
+        hidden,
+        split ? dim("blocks.0.attn.qkv_proj.q.weight", 0) / 128
+              : dim("blocks.0.attn.qkv_proj.weight", 0) / (3 * 128),
         count("blocks."), count("token_refiner.blocks."),
         dim("blocks.0.mlp.fc2.weight", 1), vin / 4,
         dim("audio_patch_proj.weight", 1), dim("condition_proj.weight", 1),
         dim("time_embedder.proj_in.weight", 1),
         dim("time_embedder.proj_in.weight", 0),
         dim("time_embedder.proj_out.weight", 0))());
-    diffusers = true;
+    // The diffusers layout's assembled qkv is FLAT; the Draw Things one is
+    // gathered per head, as released.
+    diffusers = split;
   } else {
     if (fs::is_directory(p)) { p = p / "config.json"; }
     std::ifstream f(p);
@@ -893,6 +929,313 @@ MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
   return l;
 }
 
+MetalMiniMaxH3Transformer::Linear
+MetalMiniMaxH3Transformer::i8_linear_(WeightSet& ws, const std::string& nm,
+                                      Retain r)
+{
+  if (!_i8_layout || !_i8) { return Linear{}; }
+  const MetalLlamaWeights& src = ws.src();
+  // A DRAW THINGS i8x weight on the unrotated token tier: its codes and
+  // row scales are that layout as stored, so nothing is quantized again
+  // and a streamed block refills them by name. (Rotated, it is quantized
+  // from its dequantized `.weight` below, like a dense checkpoint.)
+  const auto* xi = src.info(nm + ".i8x");
+  if (xi != nullptr && xi->shape.size() == 2 &&
+      src.info(nm + ".i8x_scales") != nullptr &&
+      _i8->fast_group((int)xi->shape[1]) == I8GemmContext::kTokenGroup &&
+      !_i8->token_rotated()) {
+    const int N = (int)xi->shape[0], K = (int)xi->shape[1];
+    const std::string cn = nm + ".i8x", sn = nm + ".i8x_scales";
+    Linear l;
+    l.gc = I8GemmContext::kTokenGroup;
+    l.n = N;
+    l.k = K;
+    l.i8x = true;
+    if (r == Retain::Streamed) {
+      l.codes = ws.stream_tensor(cn, _mc, WeightSet::Residency::Copied);
+      l.cscales = ws.stream_derived(
+          [&]() { return i8x_scales_f32_(src, _mc, sn); });
+    } else {
+      const std::size_t cb = (std::size_t)N * K, sb = (std::size_t)N * 4;
+      SharedBuffer both = ws.derived(
+          std::string("h3-i8/i8x|") + cn, [&]() -> SharedBuffer {
+            SharedBuffer sc = i8x_scales_f32_(src, _mc, sn);
+            SharedBuffer out = _mc->make_shared_buffer(cb + sb);
+            if (sc.empty() || out.empty() ||
+                !src.read_into(cn, out.contents(), cb)) {
+              return {};
+            }
+            std::memcpy(static_cast<std::uint8_t*>(out.contents()) + cb,
+                        sc.contents(), sb);
+            return out;
+          });
+      if (!both.empty()) {
+        l.codes = both.subview(0, cb);
+        l.cscales = both.subview(cb, sb);
+      }
+    }
+    if (l.codes.empty() || l.cscales.empty()) { return Linear{}; }
+    return l;
+  }
+  // Anything else is CONVERTED: once, into the entry a kept block holds,
+  // straight from the source (a read, so no bf16 copy stays beside it);
+  // or, a STREAMED block, after every refill out of what the slot holds
+  // (Linear::ds / ps), so a streamed block runs the tier a preloaded one
+  // runs. The conversion is a weight pass at the quantizers' rate (~0.1
+  // ms a [12288, 4096] weight on an M5 Ultra) against a block's GEMMs at
+  // video geometry, so it is paid per refill without regret.
+  const auto* ci = src.info(nm + ".weight");
+  if (ci == nullptr || ci->shape.size() != 2 ||
+      _f8.find(nm + ".weight") != nullptr) {
+    return Linear{};
+  }
+  const auto* si = src.info(nm + ".scales");
+  const bool pack = _quant_bits > 0 && si != nullptr && si->shape.size() == 2;
+  const int N = (int)ci->shape[0];
+  const int K = pack ? (int)(si->shape[1] * _quant_group) : (int)ci->shape[1];
+  // g64 packs, w8 or w4.
+  const int bits =
+      pack && K > 0 ? (int)(ci->shape[1] * 32 / (long)K) : 0;
+  if (pack && (_quant_group != 64 || (bits != 8 && bits != 4) ||
+               ci->shape[1] * 32 != (long)K * bits)) {
+    return Linear{};
+  }
+  const int gc = _i8->fast_group(K);
+  if (gc <= 0 || N < 16 ||
+      (gc == I8GemmContext::kTokenGroup && (N % 4) != 0) ||
+      (pack && !_i8->fast_converts(bits, gc))) {
+    return Linear{};
+  }
+  // A W4 PACK KEPT AS STORED unless the engine says the box has room
+  // for its layout (Config::i8_hold_w4): the layout is twice its size,
+  // so gemm_ converts it into the context's scratch before each
+  // projection (I8GemmContext::encode_to_fast_scratch). (A streamed one
+  // is handled below: it is never cached.)
+  if (pack && bits == 4 && !_cfg.i8_hold_w4 && r == Retain::Cached) {
+    Linear l;
+    l.gc = gc;
+    l.n = N;
+    l.k = K;
+    l.bits = 4;
+    l.pc = true;
+    l.codes = ws.tensor(nm + ".weight", _mc,
+                        kept_residency_(_stream_blocks, _wire.on()));
+    l.scales = weight_(ws, nm + ".scales", r);
+    l.qbias = weight_(ws, nm + ".biases", r);
+    if (l.codes.empty() || l.scales.empty() || l.qbias.empty()) {
+      return Linear{};
+    }
+    return l;
+  }
+  const std::size_t cb = (std::size_t)N * K;
+  const std::size_t sb = I8GemmContext::fast_scale_bytes(N, K, gc);
+  if (r == Retain::Streamed) {
+    Linear l;
+    l.gc = gc;
+    l.n = N;
+    l.k = K;
+    if (pack && bits == 4) {
+      // A slot holds a w4 pack as stored, converted per projection; a
+      // promotion holds its layout where the engine says (keep_block_).
+      l.bits = 4;
+      l.pc = true;
+    } else if (pack) {
+      l.bits = 8;
+      l.ps = true;
+    } else {
+      l.ds = true;
+      l.w = weight_(ws, nm + ".weight", r);
+      l.codes = _mc->make_shared_buffer(cb);
+    }
+    if (pack) {
+      l.codes = ws.stream_tensor(nm + ".weight", _mc,
+                                 WeightSet::Residency::Copied);
+      l.scales = weight_(ws, nm + ".scales", r);
+      l.qbias = weight_(ws, nm + ".biases", r);
+      if (l.scales.empty() || l.qbias.empty()) { return Linear{}; }
+    }
+    if (!l.pc) { l.cscales = _mc->make_shared_buffer(sb); }
+    if (l.codes.empty() || (!l.pc && l.cscales.empty()) ||
+        (l.ds && l.w.empty())) {
+      return Linear{};
+    }
+    if (!l.pc) {
+      CommandStream st = _mc->make_command_stream();
+      bool ok = false;
+      {
+        ComputeEncoder e = st.begin_compute();
+        ok = encode_fast_(e, l);
+      }
+      if (!ok || !st.commit().wait_ok(nullptr)) { return Linear{}; }
+    }
+    return l;
+  }
+  const std::string key = std::string("h3-i8/") + _i8->layout_tag(gc) +
+                          (pack ? (bits == 8 ? "w8|" : "w4|") : "bf|") +
+                          nm;
+  SharedBuffer both = ws.derived(key, [&]() -> SharedBuffer {
+    SharedBuffer out = _mc->make_shared_buffer(cb + sb);
+    if (out.empty()) { return {}; }
+    SharedBuffer c, sc, b, w;
+    if (pack) {
+      c = ws.read(nm + ".weight", _mc, WeightSet::Residency::Copied);
+      sc = to_bf16_(src, _mc, nm + ".scales");
+      b = to_bf16_(src, _mc, nm + ".biases");
+      if (c.empty() || sc.empty() || b.empty()) { return {}; }
+    } else {
+      w = to_bf16_(src, _mc, nm + ".weight");
+      if (w.empty()) { return {}; }
+    }
+    CommandStream st = _mc->make_command_stream();
+    bool ok = false;
+    {
+      ComputeEncoder e = st.begin_compute();
+      ok = pack ? _i8->encode_to_fast(e, c, sc, b, out.subview(0, cb),
+                                      out.subview(cb, sb), gc, N, K, bits)
+                : _i8->encode_quant_fast(e, w, out.subview(0, cb),
+                                         out.subview(cb, sb), gc, N, K);
+    }
+    return ok && st.commit().wait_ok(nullptr) ? std::move(out)
+                                              : SharedBuffer{};
+  });
+  if (both.empty()) { return Linear{}; }
+  Linear l;
+  l.gc = gc;
+  l.n = N;
+  l.k = K;
+  l.codes = both.subview(0, cb);
+  l.cscales = both.subview(cb, sb);
+  if (l.codes.empty() || l.cscales.empty()) { return Linear{}; }
+  return l;
+}
+
+bool
+MetalMiniMaxH3Transformer::encode_fast_(ComputeEncoder& e, Linear& l) const
+{
+  if (!l.ds && !l.ps) { return true; }
+  if (_i8 == nullptr || l.codes.empty() || l.cscales.empty()) {
+    return false;
+  }
+  // The same calls, at the same group, the preloaded entry is built with.
+  if (l.ds) {
+    return !l.w.empty() &&
+           _i8->encode_quant_fast(e, l.w, l.codes, l.cscales, l.gc, l.n,
+                                  l.k);
+  }
+  return !l.scales.empty() && !l.qbias.empty() &&
+         _i8->encode_to_fast(e, l.codes, l.scales, l.qbias, l.codes,
+                             l.cscales, l.gc, l.n, l.k);
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::streamed_holding_bytes() const
+{
+  if (!_stream_blocks) { return 0; }
+  std::size_t n = _resid.bytes() + slot_bytes() + _final_adaln_tab.byte_size();
+  for (const SharedBuffer& t : _adaln_tab) { n += t.byte_size(); }
+  return n;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::release_idle_slots()
+{
+  if (!_stream_blocks || !_slots_ready ||
+      _blocks.size() != (std::size_t)_cfg.n_layers) {
+    return 0;
+  }
+  for (const Block& b : _blocks) {
+    if (b.qkv.empty()) { return 0; }
+  }
+  const std::size_t freed = slot_bytes();
+  _slot[0] = Block{};
+  _slot[1] = Block{};
+  _slots_ready = false;
+  _slot_pair = false;
+  if (freed > 0 && _mc != nullptr && _mc->session() != nullptr) {
+    _mc->session()->log_debug(fmt(
+        "MetalMiniMaxH3Transformer: all {} blocks resident -- the slot "
+        "pair ({} MB) is released", _cfg.n_layers, freed >> 20));
+  }
+  return freed;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::kept_block_bytes_(const Block& b) const
+{
+  const bool hold = _cfg.i8_hold_w4 && _i8 != nullptr;
+  auto kl = [&](const Linear& l) -> std::size_t {
+    if (l.pc && hold) {
+      return (std::size_t)l.n * l.k +
+             I8GemmContext::fast_scale_bytes(l.n, l.k, l.gc);
+    }
+    if (l.ds || l.ps) {
+      return l.codes.byte_size() + l.cscales.byte_size() + l.b.byte_size();
+    }
+    return l.w.byte_size() + l.b.byte_size() + l.codes.byte_size() +
+           l.scales.byte_size() + l.qbias.byte_size() +
+           l.f8_scale.byte_size() + l.cscales.byte_size();
+  };
+  return b.n1.byte_size() + b.n2.byte_size() + b.qn.byte_size() +
+         b.kn.byte_size() + kl(b.qkv) + kl(b.out) + kl(b.fc1) + kl(b.fc2) +
+         kl(b.adaln);
+}
+
+bool
+MetalMiniMaxH3Transformer::keep_block_(Block& b) const
+{
+  // Conversions land in fresh buffers, swapped in after the wait: the
+  // encoder reads the pack until then.
+  struct Swap {
+    Linear* l;
+    SharedBuffer codes, cscales;
+  };
+  std::vector<Swap> swaps;
+  CommandStream cs;
+  ComputeEncoder ce;
+  bool ok = true;
+  const bool hold = _cfg.i8_hold_w4 && _i8 != nullptr;
+  for (Linear* l : {&b.qkv, &b.out, &b.fc1, &b.fc2}) {
+    if (l->ds) {
+      l->w = SharedBuffer{};
+      l->ds = false;
+    }
+    if (l->ps) {
+      l->scales = SharedBuffer{};
+      l->qbias = SharedBuffer{};
+      l->ps = false;
+    }
+    if (l->pc && hold) {
+      Swap sw{l, _mc->make_shared_buffer((std::size_t)l->n * l->k),
+              _mc->make_shared_buffer(
+                  I8GemmContext::fast_scale_bytes(l->n, l->k, l->gc))};
+      if (!cs.valid()) {
+        cs = _mc->make_command_stream();
+        ce = cs.begin_compute();
+      }
+      if (!sw.codes.empty() && !sw.cscales.empty() && ce.valid() &&
+          _i8->encode_to_fast(ce, l->codes, l->scales, l->qbias, sw.codes,
+                              sw.cscales, l->gc, l->n, l->k, l->bits)) {
+        swaps.push_back(std::move(sw));
+      } else {
+        ok = false;
+      }
+    }
+  }
+  if (cs.valid()) {
+    ce.end();
+    ok = cs.commit().wait_ok(nullptr) && ok;
+    for (Swap& sw : swaps) {
+      if (!ok) { break; }
+      sw.l->codes = std::move(sw.codes);
+      sw.l->cscales = std::move(sw.cscales);
+      sw.l->pc = false;
+      sw.l->scales = SharedBuffer{};
+      sw.l->qbias = SharedBuffer{};
+    }
+  }
+  return ok;
+}
+
 namespace {
 
 // The per-row f32 scale of a weight assembled from `parts`, in output-row
@@ -1146,6 +1489,29 @@ MetalMiniMaxH3Transformer::fp8_dense_(ComputeEncoder& enc, const Linear& l,
   return &view;
 }
 
+// The int8 layout widened into the same dequant scratch, for a shape the
+// int8 GEMM declines (under its row floor): the rotation undone, so any
+// dense route reads the weight it would have.
+const MetalMiniMaxH3Transformer::Linear*
+MetalMiniMaxH3Transformer::i8_dense_(ComputeEncoder& enc, const Linear& l,
+                                     const SharedBuffer& codes,
+                                     const SharedBuffer& cscales,
+                                     Linear& view, int N, int K)
+{
+  const std::size_t need = (std::size_t)N * (std::size_t)K * 2;
+  if (_w_deq.empty() || _w_deq.byte_size() < need) {
+    _w_deq = _mc->make_shared_buffer(need);
+    if (_w_deq.empty()) { return nullptr; }
+  }
+  if (_i8 == nullptr ||
+      !_i8->encode_dequant_fast(enc, codes, cscales, l.gc, _w_deq, N, K)) {
+    return nullptr;
+  }
+  view = Linear{};
+  view.w = _w_deq.subview(0, need);
+  return view.w.empty() ? nullptr : &view;
+}
+
 // fc1 in the interleaved gate/up layout, for a block the model KEEPS.
 //
 // Through derived() with read() sources, and that combination is the
@@ -1304,11 +1670,25 @@ MetalMiniMaxH3Transformer::clone_block_(const Block& src, Block& dst,
     d.gu_inter   = s.gu_inter;
     d.f8         = s.f8;
     d.f8_per_row = s.f8_per_row;
-    one(s.w, d.w);
+    d.gc         = s.gc;
+    d.n          = s.n;
+    d.k          = s.k;
+    d.i8x        = s.i8x;
+    d.pc         = s.pc;
+    // A streamed layout's refill sources are the slot's alone: a second
+    // slot (shapes only) needs them, a promotion (bytes) keeps the layout
+    // without them -- the rest of what it keeps is keep_block_'s.
+    d.ds         = s.ds && !copy_bytes;
+    d.ps         = s.ps && !copy_bytes;
+    static const SharedBuffer kNone;
+    const bool src_dead = copy_bytes && s.ds;
+    const bool pack_dead = copy_bytes && s.ps;
+    one(s.cscales, d.cscales);
+    one(src_dead ? kNone : s.w, d.w);
     one(s.b, d.b);
     one(s.codes, d.codes);
-    one(s.scales, d.scales);
-    one(s.qbias, d.qbias);
+    one(pack_dead ? kNone : s.scales, d.scales);
+    one(pack_dead ? kNone : s.qbias, d.qbias);
     one(s.f8_scale, d.f8_scale);
   };
   one(src.n1, dst.n1);
@@ -1369,8 +1749,44 @@ MetalMiniMaxH3Transformer::refill_block_(WeightSet& ws,
     dst = std::move(rebuilt);
     ++repaired;
   };
+  // The streamed layouts whose products are rebuilt from what was just
+  // refilled, all in one command buffer once the reads are in.
+  std::vector<Linear*> convert;
   auto lin = [&](const std::string& nm, Linear& l) {
     if (!ok) { return; }
+    // THE INT8 LAYOUT. A dense weight refills its bf16 source (`ds`), a
+    // w8 pack its codes, scales and biases (`ps`) -- both converted after
+    // the reads -- and a w4 pack converted per projection its pack as
+    // stored (`pc`). Draw Things' own codes refill raw by name and the
+    // f32 row scales are rebuilt: small, and a slot that kept them would
+    // keep the FIRST block's.
+    if (l.gc > 0 && (l.ds || l.ps || l.pc)) {
+      if (l.ds) {
+        one(nm + ".weight", l.w, /*raw=*/false);
+      } else {
+        one(nm + ".weight", l.codes, /*raw=*/true);
+        one(nm + ".scales", l.scales, /*raw=*/false);
+        one(nm + ".biases", l.qbias, /*raw=*/false);
+      }
+      if (!l.pc) { convert.push_back(&l); }
+      return;
+    }
+    if (l.gc > 0) {
+      if (!l.i8x) { ok = false; return; }
+      if (refill_streamed_tensor(ws, nm + ".i8x", l.codes,
+                                 RefillDst::kRaw) != Refill::kFilled) {
+        SharedBuffer rb = ws.stream_tensor(nm + ".i8x", _mc,
+                                           WeightSet::Residency::Copied);
+        if (rb.empty()) { ok = false; return; }
+        l.codes = std::move(rb);
+        ++repaired;
+      }
+      l.cscales = ws.stream_derived([&]() {
+        return i8x_scales_f32_(ws.src(), _mc, nm + ".i8x_scales");
+      });
+      if (l.cscales.empty()) { ok = false; }
+      return;
+    }
     // The one thing the per-tensor path cannot repair, because it is not
     // a tensor: a Linear whose quantized-ness or bit width has changed
     // under the slot. Rebuild the whole Linear so its buffers and its
@@ -1407,6 +1823,15 @@ MetalMiniMaxH3Transformer::refill_block_(WeightSet& ws,
   lin(prefix + "mlp.fc1", b.fc1);
   lin(prefix + "mlp.fc2", b.fc2);
   if (with_adaln) { lin(prefix + "adaln_proj.linear", b.adaln); }
+  if (ok && !convert.empty()) {
+    if (!_cvt_stream.valid()) { _cvt_stream = _mc->make_command_stream(); }
+    bool enc_ok = true;
+    {
+      ComputeEncoder e = _cvt_stream.begin_compute();
+      for (Linear* l : convert) { enc_ok = encode_fast_(e, *l) && enc_ok; }
+    }
+    ok = _cvt_stream.commit().wait_ok(nullptr) && enc_ok;
+  }
   // Said once, and at debug: a checkpoint that repairs every block is
   // paying for it on every forward, and that is worth being able to see
   // without it turning into a mechanism that silently switched itself
@@ -1424,12 +1849,20 @@ MetalMiniMaxH3Transformer::refill_block_(WeightSet& ws,
 bool
 MetalMiniMaxH3Transformer::load_block_(WeightSet& ws,
                                        const std::string& prefix, Block& b,
-                                       bool with_adaln, Retain r)
+                                       bool main, bool with_adaln, Retain r)
 {
   b.n1  = weight_(ws, prefix + "norm1.weight", r);
   b.n2  = weight_(ws, prefix + "norm2.weight", r);
-  b.qkv = linear_(ws, prefix + "attn.qkv_proj", false, r);
-  b.out = linear_(ws, prefix + "attn.out_proj", false, r);
+  // A MAIN block's projections in the int8 layout where the tier asks
+  // and the weight allows -- baked or not; the refiner (text rows, under
+  // the int8 row floor) keeps its own.
+  auto proj = [&](const std::string& nm) {
+    Linear l = main ? i8_linear_(ws, nm, r) : Linear{};
+    if (l.empty()) { return linear_(ws, nm, false, r); }
+    return l;
+  };
+  b.qkv = proj(prefix + "attn.qkv_proj");
+  b.out = proj(prefix + "attn.out_proj");
   b.qn  = weight_(ws, prefix + "attn.q_norm.weight", r);
   b.kn  = weight_(ws, prefix + "attn.k_norm.weight", r);
   // A block that is KEPT is built straight into the interleaved layout.
@@ -1437,10 +1870,14 @@ MetalMiniMaxH3Transformer::load_block_(WeightSet& ws,
   // permutation would be paid 50 times a step and cost more than the
   // fusion saves. A streamed block later promoted to resident is
   // interleaved at the promotion, where it is paid once.
-  b.fc1 = (_fuse_ff && r == Retain::Cached)
-              ? fc1_gu_(ws, prefix + "mlp.fc1")
-              : linear_(ws, prefix + "mlp.fc1", false, r);
-  b.fc2 = linear_(ws, prefix + "mlp.fc2", false, r);
+  {
+    Linear l = main ? i8_linear_(ws, prefix + "mlp.fc1", r) : Linear{};
+    b.fc1 = !l.empty() ? std::move(l)
+            : (_fuse_ff && r == Retain::Cached)
+                ? fc1_gu_(ws, prefix + "mlp.fc1")
+                : linear_(ws, prefix + "mlp.fc1", false, r);
+  }
+  b.fc2 = proj(prefix + "mlp.fc2");
   if (with_adaln) {
     b.adaln = linear_(ws, prefix + "adaln_proj.linear", true, r);
     if (b.adaln.empty() || b.adaln.b.empty()) { return false; }
@@ -2823,7 +3260,31 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     // gemm_mma_ once the dense weight exists. bf16 kernels: this DiT's
     // activations, dequant scratch and output are all bf16.
     auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm, /*bf16=*/true);
+    i8->set_tier(cfg.i8_tier >= 2   ? I8GemmContext::Tier::kToken
+                 : cfg.i8_tier == 1 ? I8GemmContext::Tier::kFast
+                                    : I8GemmContext::Tier::kAccurate);
+    i8->set_token_rotation(cfg.i8_tier == 2);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
+    // The int8 LAYOUT for the main blocks (see Config::i8_tier), decided
+    // here because load_block_ reads it. Not under the ANE tier, whose
+    // stagers read the checkpoint's weights as they are.
+    m->_i8_layout = m->_i8 != nullptr &&
+                    m->_i8->tier() != I8GemmContext::Tier::kAccurate &&
+                    !cfg.ane_ffn && m->_i8->fast_group(cfg.hidden) > 0;
+    if (m->_i8_layout && mc->session() != nullptr) {
+      const int fg = m->_i8->fast_group(cfg.hidden);
+      mc->session()->info(fmt(
+          "MetalMiniMaxH3Transformer: the main blocks' projections take the "
+          "{} int8 tier ({})",
+          fg == I8GemmContext::kTokenGroup ? "TOKEN" : "FAST",
+          fg != I8GemmContext::kTokenGroup
+              ? fmt("rotated, group {}", fg)()
+          : m->_i8->token_rotated()
+              ? "per channel x per token, Hadamard-256 rotated; " +
+                    m->_i8->token_kernel() + " GEMM"
+          : "per channel x per token; a Draw Things i8x checkpoint's "
+            "codes as stored; " + m->_i8->token_kernel() + " GEMM"));
+    }
     // Deep-K split for the FF down projection. bf16 libraries: the fold
     // writes this DiT's element type.
     m->_splitk.load(mc, m->_lib_dense_mma, m->_lib_elt);
@@ -2925,13 +3386,18 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   // (`rope_theta`, config_from_json), so there it is computed -- in f32,
   // as 1 / theta^(2i / (2 * rope_freq_dim)), which reproduces the native
   // table BIT FOR BIT (checked against the Comfy-Org file; a double
-  // evaluation rounds 4 of the 16 entries differently).
+  // evaluation rounds 4 of the 16 entries differently). A Draw Things
+  // `.ckpt` carries no table either and runs on the architecture's base,
+  // the diffusers config's 10000.
+  const bool dt_ckpt =
+      lower_(std::filesystem::path(ws.dir()).extension().string()) ==
+      ".ckpt";
   if (ws.src().has("rope.inv_freq")) {
     if (!to_host_f32_(ws, mc, "rope.inv_freq", m->_inv_freq) ||
         (int)m->_inv_freq.size() != cfg.rope_freq_dim) {
       return nullptr;
     }
-  } else if (ws.src().has("blocks.0.attn.qkv_proj.q.weight") &&
+  } else if ((ws.src().has("blocks.0.attn.qkv_proj.q.weight") || dt_ckpt) &&
              cfg.rope_theta > 0.0f && cfg.rope_freq_dim > 0) {
     m->_inv_freq.resize((std::size_t)cfg.rope_freq_dim);
     const float dim = (float)(2 * cfg.rope_freq_dim);
@@ -2946,7 +3412,8 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_refiner.resize((std::size_t)cfg.n_refiner);
   for (int i = 0; i < cfg.n_refiner; ++i) {
     if (!m->load_block_(ws, blk_("token_refiner.blocks.", i, ""),
-                        m->_refiner[(std::size_t)i], false, r)) {
+                        m->_refiner[(std::size_t)i], /*main=*/false,
+                        /*with_adaln=*/false, r)) {
       return nullptr;
     }
   }
@@ -2973,7 +3440,8 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     m->_blocks.resize((std::size_t)cfg.n_layers);
     for (int i = 0; i < cfg.n_layers; ++i) {
       if (!m->load_block_(ws, blk_("blocks.", i, ""),
-                          m->_blocks[(std::size_t)i], true, r)) {
+                          m->_blocks[(std::size_t)i], /*main=*/true,
+                          /*with_adaln=*/true, r)) {
         return nullptr;
       }
     }
@@ -3590,9 +4058,25 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
   // into the dequant scratch -- `wl` is then an ordinary dense weight to
   // every route, i8 and LoRA fold below. The bias stays `l`'s.
   Linear fv;
-  const Linear* wl = fp8_dense_(enc, l, fv, N, K);
+  const Linear* wl = l.gc > 0 ? &l : fp8_dense_(enc, l, fv, N, K);
   if (wl == nullptr) { return; }
+  // The int8 layout's operands: its own, or -- a w4 pack held as stored
+  // -- the context's scratch, converted ONCE for all of the bands (and
+  // for the dense stand-in below, which widens the same values).
+  const SharedBuffer* fc = &wl->codes;
+  const SharedBuffer* fcs = &wl->cscales;
+  if (wl->gc > 0 && wl->pc) {
+    if (!_i8 || !_i8->encode_to_fast_scratch(enc, wl->codes, wl->scales,
+                                             wl->qbias, wl->gc, N, K)) {
+      return;
+    }
+    fc = &_i8->fast_scratch_codes();
+    fcs = &_i8->fast_scratch_scales();
+  }
   _flops.gemm(M, N, K);
+  // The int8 layout's dense stand-in, widened only if a band needs it.
+  Linear iv;
+  const Linear* idense = nullptr;
   // Whether an adapter can run at all was settled in lora_stack_, so an
   // empty stack here simply means none is attached.
   const int nl = lora != nullptr ? lora->n : 0;
@@ -3629,9 +4113,26 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
       if (scaled[i]) { fold = i; }
     }
     bool folded = false;
-    gemm_route_dispatch_(enc, x, xo, *wl, y, yo, rows, N, K, route,
-                         fold >= 0 ? lora->s[fold].f : nullptr,
-                         &folded, fold >= 0 ? lo[fold] : 0);
+    // THE INT8 LAYOUT (Linear::gc): I8GemmContext, its scratch, nothing
+    // to fold. A band it declines -- the int8 route's row floor -- runs
+    // dense from the layout widened into the dequant scratch.
+    if (wl->gc > 0 && _i8 &&
+        _i8->gemm_fast(enc, x, xo, *fc, *fcs, wl->gc, SharedBuffer{}, y, yo,
+                       rows, N, K)) {
+      // done
+    } else {
+      const Linear* dl = wl;
+      if (wl->gc > 0) {
+        if (idense == nullptr) {
+          idense = i8_dense_(enc, *wl, *fc, *fcs, iv, N, K);
+        }
+        if (idense == nullptr) { return; }
+        dl = idense;
+      }
+      gemm_route_dispatch_(enc, x, xo, *dl, y, yo, rows, N, K, route,
+                           fold >= 0 ? lora->s[fold].f : nullptr,
+                           &folded, fold >= 0 ? lo[fold] : 0);
+    }
     for (int i = 0; i < nl; ++i) {
       if (folded && i == fold) { continue; }
       const LoraStack::Use& u = lora->s[i];
@@ -3959,6 +4460,8 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
   const auto t0 = std::chrono::steady_clock::now();
   for (const Shape& sh : shapes) {
     if (skip_fc1 && sh.N == 2 * F) { continue; }
+    // A projection in the int8 layout has no route to choose.
+    if (sh.l->gc > 0) { continue; }
     // Candidates are filtered per SHAPE, not once: route_ok_ takes
     // (M, N, K), and the tn2 tile in particular is legal for some of this
     // model's widths and not others.
@@ -4939,7 +5442,8 @@ MetalMiniMaxH3Transformer::block_bytes_(const Block& b)
       &b.adaln.w, &b.adaln.b, &b.adaln.codes, &b.adaln.scales,
       &b.adaln.qbias,
       &b.qkv.f8_scale, &b.out.f8_scale, &b.fc1.f8_scale, &b.fc2.f8_scale,
-      &b.adaln.f8_scale};
+      &b.adaln.f8_scale, &b.qkv.cscales, &b.out.cscales, &b.fc1.cscales,
+      &b.fc2.cscales, &b.adaln.cscales};
   std::size_t n = 0;
   for (const metal_compute::SharedBuffer* p : all) { n += p->byte_size(); }
   return n;
@@ -5050,6 +5554,10 @@ MetalMiniMaxH3Transformer::resident_block_bytes_() const
   for (const std::string& n : _ws->src().tensor_names()) {
     if (n.rfind(pfx, 0) != 0) { continue; }
     if (n.find("adaln") != std::string::npos) { continue; }
+    // The i8x code / scale views of a Draw Things weight are the same
+    // weight again (stream_sizing_alias): counted, a block read 3 bytes
+    // an element where it holds 2 (dense) or 1 (token_plain).
+    if (stream_sizing_alias(n)) { continue; }
     const auto* ti = _ws->src().info(n);
     if (ti != nullptr) { total += (std::size_t)ti->nbytes; }
   }
@@ -5068,7 +5576,8 @@ MetalMiniMaxH3Transformer::wire_block_(Block& b, bool on)
       &b.adaln.w, &b.adaln.b, &b.adaln.codes, &b.adaln.scales,
       &b.adaln.qbias,
       &b.qkv.f8_scale, &b.out.f8_scale, &b.fc1.f8_scale, &b.fc2.f8_scale,
-      &b.adaln.f8_scale};
+      &b.adaln.f8_scale, &b.qkv.cscales, &b.out.cscales, &b.fc1.cscales,
+      &b.fc2.cscales, &b.adaln.cscales};
   std::size_t changed = 0;
   for (metal_compute::SharedBuffer* p : all) {
     const std::size_t n = _wire.wire_one(_mc, *p, on);
@@ -5445,6 +5954,17 @@ MetalMiniMaxH3Transformer::sage_scratch_bytes(int seq) const
       _cfg.n_heads, _cfg.n_heads, seq, seq, _cfg.head_dim,
       MetalSageAttention::nax_query_block(),
       MetalSageAttention::nax_key_block(), sage_lend_bytes_(seq), 0);
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::i8_scratch_bytes(int seq) const
+{
+  if (!_i8 || seq <= 0) { return 0; }
+  // fc2's K is the widest activation, fc1 [2 ffn, hidden] the widest
+  // weight; the row bands gemm_ cuts are at most the sequence.
+  return I8GemmContext::forward_bytes_bound(
+      seq, _cfg.ffn, 2 * _cfg.ffn, _cfg.hidden,
+      _i8->tier() == I8GemmContext::Tier::kAccurate);
 }
 
 namespace {
@@ -6134,6 +6654,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     }
     wire_fixed_(true);
   }
+  // A stack residency has kept whole needs its slots no more.
+  (void)release_idle_slots();
   _resid.note_reserve_allocated(
       scratch_bytes(c, seq, n_text, n_t, uses_dequant_scratch()));
   const auto mbudget = _mc->memory_budget();
@@ -6746,7 +7268,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       stream.commit().wait();
       acc += std::chrono::duration<double, std::milli>(
                  std::chrono::steady_clock::now() - mark).count();
-      stream = _mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       mark = std::chrono::steady_clock::now();
     };
@@ -6782,7 +7306,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             L.video_start, L.num_video_rows,
             band(L.video_start, L.num_video_rows)));
       }
-      stream = _mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       mark = std::chrono::steady_clock::now();
     };
@@ -6818,7 +7344,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           "video {:12.5f}", where, width, band(0, n_text),
           band(L.audio_start, n_audio),
           band(L.video_start, L.num_video_rows)));
-      stream = _mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       mark = std::chrono::steady_clock::now();
     };
@@ -7224,7 +7752,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         enc.end();
         _flops.flush(stream);
         stream.commit().wait();
-        stream = _mc->make_command_stream();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
       }
@@ -7243,7 +7773,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         enc.end();
         _flops.flush(stream);
         stream.commit().wait();
-        stream = _mc->make_command_stream();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
       }
@@ -7281,7 +7813,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
               "minimax-h3: staging block {}'s qkv for the ANE failed; it "
               "keeps the GPU", lora_layer));
         }
-        stream = _mc->make_command_stream();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
       }
@@ -7302,7 +7836,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         } else {
           _ane_qkv->note_probe(q_drain_ms, qg_ms);
         }
-        stream = _mc->make_command_stream();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
         // THE GPU FALLBACK: `s.nm` is only the tier's input, so the rows it
@@ -7526,7 +8062,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
               "minimax-h3: staging block {}'s weights for the ANE failed; "
               "it keeps the GPU feed-forward", lora_layer));
         }
-        stream = _mc->make_command_stream();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
       }
@@ -7600,7 +8138,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                 : 0.0;
         const bool ane_ok =
             _ane->finish(lora_layer, rows, t_gpu, ane_drain_ms);
-        stream = _mc->make_command_stream();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
         // THE GPU FALLBACK, in place over the rows the ANE lost.
@@ -7614,7 +8154,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         _ane->note_probe(ane_drain_ms,
                          std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - t_g0).count());
-        stream = _mc->make_command_stream();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
       }
@@ -7801,8 +8343,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           _slot[0] = Block{};
           _slot[1] = Block{};
           _slot_pair = false;
-          if (!load_block_(*_ws, blk_("blocks.", Lx, ""), _slot[0], !baked,
-                           Retain::Streamed)) {
+          if (!load_block_(*_ws, blk_("blocks.", Lx, ""), _slot[0],
+                           /*main=*/true, !baked, Retain::Streamed)) {
             return {};
           }
           // The second slot is a durable allocation, so it is asked for
@@ -7917,7 +8459,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             ++pf_hit;
           }
           if (!have && !load_block_(*_ws, blk_("blocks.", Lx, ""), streamed,
-                                    !baked, Retain::Streamed)) {
+                                    /*main=*/true, !baked,
+                                    Retain::Streamed)) {
             return {};
           }
           bp = &streamed;
@@ -8013,7 +8556,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
               std::sqrt(sh / H), shx, std::sqrt(sc / H), scx,
               std::sqrt(ga / H), gax));
         }
-        stream = _mc->make_command_stream();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
       }
@@ -8078,7 +8623,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                              ? refill_block_(*_ws, blk_("blocks.", nxt, ""),
                                              _slot[dst], !baked)
                              : load_block_(*_ws, blk_("blocks.", nxt, ""),
-                                           pf.blk, !baked, Retain::Streamed);
+                                           pf.blk, /*main=*/true, !baked,
+                                           Retain::Streamed);
                 });
           }
         }
@@ -8146,7 +8692,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             std::chrono::steady_clock::now() - gp0).count();
         if (sprof && streaming) { sp_gpu_ms += blk_ms; }
         if (streaming) { note_attn_tile_(blk_ms); }
-        stream = _mc->make_command_stream();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
       }
@@ -8167,7 +8715,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // and the alternative is dropping them and re-reading the same
         // block from disk on the next of 30-odd steps.
         if (Lx < (int)_blocks.size()) {
-          const std::size_t nb = block_bytes_(*bp);
+          // KEPT bytes, not the slot's: a promotion drops a streamed
+          // layout's refill sources and converts a held w4 layout.
+          const std::size_t nb = kept_block_bytes_(*bp);
           // Past the wire budget there is nothing to gain: the block
           // would be kept unprotected, the compressor would take it (it
           // is the coldest memory in the process), and the next walk
@@ -8190,6 +8740,11 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
               kept = clone_block_(*bp, _blocks[(std::size_t)Lx], true);
               if (!kept) { _blocks[(std::size_t)Lx] = Block{}; }
             }
+            // What a preloaded block holds, cloned or MOVED: the move
+            // brings the fallback's refill sources and per-call pack. A
+            // held layout that cannot be built leaves the pack converting
+            // per projection, which is still the same values.
+            if (kept) { (void)keep_block_(_blocks[(std::size_t)Lx]); }
             // A failed copy is simply not a promotion: the slot still
             // holds the block, the forward has already run it, and the
             // next step streams it again. Nothing is booked.

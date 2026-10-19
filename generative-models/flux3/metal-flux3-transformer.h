@@ -185,6 +185,23 @@ class MetalFlux3Transformer {
   void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
+  // Drop what a forward keeps for the next one -- the dense stand-in,
+  // split-K planes and the int8 context's buffers; each regrows on
+  // demand. The stage calls it after a
+  // generation on a bounded box, before the decode wants the room.
+  void release_forward_scratch();
+  // A STREAMED stack residency has kept whole gives its slot pair
+  // back (BlockSlots::release_if_saturated) -- between generations; a
+  // forward does the same at its top. Returns the bytes freed.
+  std::size_t release_idle_slots()
+  {
+    return _slots.release_if_saturated(_blocks);
+  }
+  // Streamed blocks BUILT into their slot because the slot was laid
+  // out for another (a mixed pack's other width; BlockSlots::Ops::
+  // same_layout), over the model's life. For a test to show the slots
+  // crossed widths -- and did not give up and stream without them.
+  int slot_relayouts() const { return _slots.relaid(); }
   // Whether the block projections run in the signed int8 layout (see
   // _sgn) -- what a test asserts before it compares anything.
   bool signed_layout() const { return _sgn; }
@@ -288,6 +305,9 @@ class MetalFlux3Transformer {
   // Convert a quantized weight the model OWNS (a refilled slot) to the
   // signed layout in place, and say so on it. False touches nothing.
   bool sign_(QWeight& w) const;
+  // Is block L stored at the widths `b` was built for? (A mixed pack;
+  // see BlockSlots::Ops::same_layout.)
+  bool same_layout_(int L, const Block& b) const;
   // A signed weight as a DENSE one, dequantized into _w_deq -- for the
   // routes that do not read the layout. `w` itself when it is not
   // signed; null when the scratch cannot be had.

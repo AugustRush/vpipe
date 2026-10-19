@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -115,6 +118,7 @@ I8GemmContext::I8GemmContext(MetalCompute* mc, bool want, bool bf16)
   }
   if (g64) {
     _fn_quant_s8 = _lib_q.function("quant_f16_i8s_row_g64");
+    _fn_quant_swiglu_s8 = _lib_q.function("swiglu_quant_f16_i8s_row_g64");
     _fn_to_s8 = _lib_q.function("affine_to_signed_w8g64");
     _fn_to_s4 = _lib_q.function("affine_to_signed_w4g64");
     _fn_dq_s8 = _lib_q.function("affine_dequant_w8g64s");
@@ -123,6 +127,88 @@ I8GemmContext::I8GemmContext(MetalCompute* mc, bool want, bool bf16)
     _fn_s8_w4 = _lib_g.function("gemm_i8s_w4g64");
     _fn_s8_w8_sk = _lib_g.function("gemm_i8s_w8g64_sk");
     _fn_s8_w4_sk = _lib_g.function("gemm_i8s_w4g64_sk");
+  }
+  // THE FAST TIER's kernels, per group: the rotated quantizers and the
+  // coarse GEMM at its tile -- 128x64 over 8 simdgroups, which beat
+  // 64x128 in both forward A/Bs on the M5 Ultra (1.085x against 1.067x
+  // of the accurate tier); VPIPE_I8_FAST_TILE=64x128 for the A/B.
+  {
+    const bool t128 = [] {
+      const char* e = std::getenv("VPIPE_I8_FAST_TILE");
+      return e == nullptr || std::strcmp(e, "64x128") != 0;
+    }();
+    _fast_bm = t128 ? 128 : 64;
+    _fast_bn = t128 ? 64 : 128;
+    const int gcs[3] = {256, 512, 1024};
+    for (int i = 0; i < 3; ++i) {
+      const std::string g = std::to_string(gcs[i]);
+      _fast[i].quant = _lib_q.function(("quant_i8_row_gc" + g + "_r").c_str());
+      _fast[i].swiglu =
+          _lib_q.function(("swiglu_quant_i8_row_gc" + g + "_r").c_str());
+      _fast[i].to_fast =
+          _lib_q.function(("affine_to_i8c_w8_gc" + g + "_r").c_str());
+      _fast[i].to_fast4 =
+          _lib_q.function(("affine_to_i8c_w4_gc" + g + "_r").c_str());
+      _fast[i].dequant =
+          _lib_q.function(("i8c_dequant_gc" + g + "_r").c_str());
+      _fast[i].gemm = _lib_g.function(
+          ("gemm_i8c_g" + g + (t128 ? "_t128x64" : "_t64x128")).c_str());
+    }
+  }
+  // THE TOKEN TIER's: the per-row quantizers and the register-fragment
+  // GEMM (set_token_kernel: MLX's blocked loop at 128x64 as 4x2
+  // simdgroups of 32x32 unless the caller asks otherwise).
+  // VPIPE_I8_TOKEN_TILE=64x128 / VPIPE_I8_TOKEN_KERNEL=<entry suffix>
+  // (m128x64, d64x128, ...) override the caller.
+  {
+    _fast[3].quant = _lib_q.function("quant_i8_tok");
+    _fast[3].swiglu = _lib_q.function("swiglu_quant_i8_tok");
+    _fast[3].to_fast = _lib_q.function("affine_to_i8pt_w8");
+    _fast[3].to_fast4 = _lib_q.function("affine_to_i8pt_w4");
+    _fast[3].dequant = _lib_q.function("i8pt_dequant");
+    _fast[4].quant = _lib_q.function("quant_i8_tok_r");
+    _fast[4].swiglu = _lib_q.function("swiglu_quant_i8_tok_r");
+    _fast[4].to_fast = _lib_q.function("affine_to_i8pt_w8_r");
+    _fast[4].to_fast4 = _lib_q.function("affine_to_i8pt_w4_r");
+    _fast[4].dequant = _lib_q.function("i8pt_dequant_r");
+    set_token_kernel(false, false);
+    bool db = false, wide = false, env = false;
+    if (const char* e = std::getenv("VPIPE_I8_TOKEN_TILE")) {
+      wide = std::strcmp(e, "64x128") == 0;
+      env = true;
+    }
+    if (const char* e = std::getenv("VPIPE_I8_TOKEN_KERNEL")) {
+      int bm = 0, bn = 0;
+      if ((e[0] == 'm' || e[0] == 'd') &&
+          std::sscanf(e + 1, "%dx%d", &bm, &bn) == 2 &&
+          ((bm == 128 && bn == 64) || (bm == 64 && bn == 128))) {
+        db = e[0] == 'd';
+        wide = bm == 64;
+        env = true;
+      }
+    }
+    if (env) {
+      set_token_kernel(db, wide);
+      _tok_kernel_env = true;
+    }
+    if (const char* e = std::getenv("VPIPE_I8_TOKEN_ROT")) {
+      _tok_rot_env = std::atoi(e) != 0 ? 1 : 0;
+      _tok_rot = _tok_rot_env != 0;
+    }
+  }
+  if (const char* e = std::getenv("VPIPE_I8_TIER")) {
+    if (std::strcmp(e, "token") == 0 || std::strcmp(e, "2") == 0) {
+      _tier_env = (int)Tier::kToken;
+    } else if (std::strcmp(e, "fast") == 0 || std::strcmp(e, "1") == 0) {
+      _tier_env = (int)Tier::kFast;
+    } else if (std::strcmp(e, "accurate") == 0 || std::strcmp(e, "0") == 0) {
+      _tier_env = (int)Tier::kAccurate;
+    }
+    if (_tier_env >= 0) { _tier = (Tier)_tier_env; }
+  }
+  if (const char* e = std::getenv("VPIPE_I8_FAST_GROUP")) {
+    const int v = std::atoi(e);
+    if (v == 256 || v == 512 || v == 1024) { _fast_group = v; }
   }
   if (const char* e = std::getenv("VPIPE_I8_NATIVE_CMODE")) {
     _cmode = std::atoi(e) == 0 ? 0 : 1;
@@ -160,6 +246,27 @@ I8GemmContext::I8GemmContext(MetalCompute* mc, bool want, bool bf16)
   // What this session's contexts have measured before -- a model loaded
   // again, or another with the same shapes (tuned-answers.h).
   if (_on) { _answers = tuning_cache(mc); }
+}
+
+void
+I8GemmContext::set_token_kernel(bool double_buffered, bool wide_n)
+{
+  if (_tok_kernel_env || !_lib_g.valid()) { return; }
+  const char* name = double_buffered
+      ? (wide_n ? "gemm_i8pt_d64x128" : "gemm_i8pt_d128x64")
+      : (wide_n ? "gemm_i8pt_m64x128" : "gemm_i8pt_m128x64");
+  _fast[3].gemm = _lib_g.function(name);
+  _fast[4].gemm = _lib_g.function(name);
+  _tok_db = double_buffered;
+  _tok_wm = wide_n ? 2 : 4;
+  _tok_wn = wide_n ? 4 : 2;
+}
+
+std::string
+I8GemmContext::token_kernel() const
+{
+  return std::string(_tok_db ? "double-buffered " : "blocked ") +
+         (_tok_wm == 4 ? "128x64" : "64x128");
 }
 
 std::vector<int>
@@ -225,6 +332,7 @@ I8GemmContext::gemm(ComputeEncoder& enc, const SharedBuffer& x,
   if (bias && !_fn_fold_bias.valid() && plan_(M, N, K) > 0) {
     return false;
   }
+  _fq_m = _fq_k = _fq_gc = 0;   // the scratch is about to be rewritten
   // Everything below the quantizers works in the PADDED contraction: the
   // scratches, the group count and the GEMM's K. Only the two quantize
   // dispatches see the real K, and only to know where to stop reading.
@@ -288,7 +396,7 @@ I8GemmContext::gemm(ComputeEncoder& enc, const SharedBuffer& x,
   // copies of the block's output, so a deep split costs more DISPATCHES
   // rather than more memory -- the same trade MmaSplitK makes, and the
   // reason the budget constrains the search instead of vetoing after it.
-  const int rows = rows_per_block_(S, N);
+  const int rows = rows_per_block_(S, N, M);
   const std::size_t plane_bytes =
       (std::size_t)S * (std::size_t)rows * (std::size_t)N * 4u;
   if (rows < 64 || !need(_planes, plane_bytes)) {
@@ -397,7 +505,7 @@ I8GemmContext::encode_native_gemm_(ComputeEncoder& enc,
          : (bits == 8 ? _fn_u8q_w8_sk : _fn_u8q_w4_sk);
   const int G = K / 64;
   const unsigned nx = (unsigned)(((N + 63) / 64) * 128);
-  const int rows = S > 0 ? rows_per_block_(S, N) : 0;
+  const int rows = S > 0 ? rows_per_block_(S, N, M) : 0;
   const std::size_t plane_bytes =
       (std::size_t)S * (std::size_t)rows * (std::size_t)N * 4u;
   if (S <= 0 || !fsk.valid() || rows < 64 || _planes.empty() ||
@@ -468,7 +576,7 @@ I8GemmContext::encode_signed_gemm_(ComputeEncoder& enc,
   const ComputeFunction& fsk = bits == 8 ? _fn_s8_w8_sk : _fn_s8_w4_sk;
   const int G = K / 64;
   const unsigned nx = (unsigned)(((N + 63) / 64) * 128);
-  const int rows = S > 0 ? rows_per_block_(S, N) : 0;
+  const int rows = S > 0 ? rows_per_block_(S, N, M) : 0;
   const std::size_t plane_bytes =
       (std::size_t)S * (std::size_t)rows * (std::size_t)N * 4u;
   if (S <= 0 || !fsk.valid() || rows < 64 || _planes.empty() ||
@@ -527,6 +635,7 @@ I8GemmContext::gemm_affine(ComputeEncoder& enc, const SharedBuffer& x,
 {
   if (!native_available(bits)) { return false; }
   if (K < 1024 || N < 16 || (K % 64) != 0) { return false; }
+  _fq_m = _fq_k = _fq_gc = 0;   // the scratch is about to be rewritten
   const bool bias = !b.empty();
   const int G = K / 64;
   auto need = [&](SharedBuffer& sb, std::size_t bytes) {
@@ -571,8 +680,8 @@ I8GemmContext::gemm_affine(ComputeEncoder& enc, const SharedBuffer& x,
   // The split's planes, or the single op when they cannot be had.
   if (S > 0) {
     const std::size_t pb = (std::size_t)S *
-        (std::size_t)rows_per_block_(S, N) * (std::size_t)N * 4u;
-    if (rows_per_block_(S, N) < 64 || !need(_planes, pb)) { S = 0; }
+        (std::size_t)rows_per_block_(S, N, M) * (std::size_t)N * 4u;
+    if (rows_per_block_(S, N, M) < 64 || !need(_planes, pb)) { S = 0; }
   }
   // Activation rows -> u8 codes + per-(row, group) scale, code sum and
   // the scaled sum the zero-point matmul reads.
@@ -613,6 +722,7 @@ I8GemmContext::gemm_signed(ComputeEncoder& enc, const SharedBuffer& x,
                            std::size_t ye, int M, int N, int K)
 {
   if (!signed_accepts(M, N, K, bits)) { return false; }
+  _fq_m = _fq_k = _fq_gc = 0;   // the scratch is about to be rewritten
   const bool bias = !b.empty();
   settle_(Route::kSigned, bits, N, K, M);
   int S = plan_(M, N, K);
@@ -634,8 +744,8 @@ I8GemmContext::gemm_signed(ComputeEncoder& enc, const SharedBuffer& x,
   }
   if (S > 0) {
     const std::size_t pb = (std::size_t)S *
-        (std::size_t)rows_per_block_(S, N) * (std::size_t)N * 4u;
-    if (rows_per_block_(S, N) < 64 || !need(_planes, pb)) { S = 0; }
+        (std::size_t)rows_per_block_(S, N, M) * (std::size_t)N * 4u;
+    if (rows_per_block_(S, N, M) < 64 || !need(_planes, pb)) { S = 0; }
   }
   // Activation rows -> signed codes, per-(row, group) scales, and u =
   // scale * sum(codes) for the zero-point matmul.
@@ -649,6 +759,378 @@ I8GemmContext::gemm_signed(ComputeEncoder& enc, const SharedBuffer& x,
   record_(Pending{N, K, M, Route::kSigned, bits, alias_(codes),
                   alias_(scales), alias_(zb)});
   encode_signed_gemm_(enc, codes, scales, zb, bits, b, y, ye, M, N, K, S);
+  return true;
+}
+
+const I8GemmContext::FastFns*
+I8GemmContext::fast_fns_(int gc) const
+{
+  const int i = gc == 256 ? 0 : gc == 512 ? 1 : gc == 1024 ? 2
+                : gc == kTokenGroup ? (_tok_rot ? 4 : 3) : -1;
+  if (i < 0) { return nullptr; }
+  const FastFns& f = _fast[i];
+  return f.quant.valid() && f.swiglu.valid() && f.to_fast.valid() &&
+                 f.dequant.valid() && f.gemm.valid()
+             ? &f : nullptr;
+}
+
+int
+I8GemmContext::fast_group(int K) const
+{
+  if (!_on || _tier == Tier::kAccurate || K <= 0) { return 0; }
+  if (_tier == Tier::kToken) {
+    return (K % (_tok_rot ? 256 : 64)) == 0 && K <= 16384 &&
+                   fast_fns_(kTokenGroup) != nullptr
+               ? kTokenGroup : 0;
+  }
+  for (int gc : {1024, 512, 256}) {
+    if (gc <= _fast_group && (K % gc) == 0 && fast_fns_(gc) != nullptr) {
+      return gc;
+    }
+  }
+  return 0;
+}
+
+namespace {
+
+// Whether K splits into whole groups of gc: any K the token tier's
+// kernels take (a multiple of their 64-deep step, of 256 rotated) at
+// kTokenGroup.
+bool
+group_fits_(int K, int gc, bool rot)
+{
+  return gc == I8GemmContext::kTokenGroup
+             ? (K % (rot ? 256 : 64)) == 0 && K <= 16384
+             : gc > 0 && (K % gc) == 0;
+}
+
+// The coarse tier's row passes (quant_i8_row_gc* and friends): one
+// simdgroup per (row, group), four groups a threadgroup. The token
+// tier's: a threadgroup of K/16 threads a row (i8pt_dequant: 256);
+// rotated, a simdgroup per TWO 256-blocks (the kernels take one or
+// two) -- 1.05-1.18x one each (gemm_i8.fast_conversion_rate, M5 Ultra
+// and base M5).
+void
+encode_rows_gc_(ComputeEncoder& enc, int rows, int K, int gc,
+                bool dequant = false, bool rot = false)
+{
+  if (gc == I8GemmContext::kTokenGroup) {
+    const unsigned T =
+        rot       ? 32u * (unsigned)std::max(1, (K / 256 + 1) / 2)
+        : dequant ? 256u
+                  : (unsigned)std::max(32, (K / 16 + 31) / 32 * 32);
+    enc.dispatch({T, (unsigned)rows, 1}, {T, 1, 1});
+    return;
+  }
+  const unsigned tgs = (unsigned)((K / gc + 3) / 4);
+  enc.dispatch({tgs * 128u, (unsigned)rows, 1}, {128, 1, 1});
+}
+
+// The coarse GEMM's dispatch (gemm_i8c_* in dense_gemm_mma); wm > 0 is
+// the token tier's register kernel, wm x wn simdgroups of 32x32.
+void
+encode_fast_gemm_(ComputeEncoder& enc, const ComputeFunction& f,
+                  const SharedBuffer& xq, const SharedBuffer& codes,
+                  const SharedBuffer& as, const SharedBuffer& ws,
+                  const SharedBuffer& b, const SharedBuffer& y,
+                  std::size_t ye, int M, int N, int K, int bm, int bn,
+                  int wm = 0, int wn = 0)
+{
+  enc.set_function(f);
+  enc.set_buffer(0, xq);
+  enc.set_buffer(1, codes);
+  enc.set_buffer(2, as);
+  enc.set_buffer(3, ws);
+  enc.set_buffer(4, y, ye * 2);
+  enc.set_constant(5, K);
+  enc.set_constant(6, N);
+  enc.set_constant(7, M);
+  enc.set_buffer(8, b.empty() ? ws : b);
+  enc.set_constant(9, b.empty() ? 0 : 1);
+  if (wm > 0) {
+    const unsigned BM = 32u * wm, BN = 32u * wn;
+    enc.dispatch({(unsigned)((N + BN - 1) / BN) * 32u,
+                  (unsigned)((M + BM - 1) / BM) * wn, (unsigned)wm},
+                 {32u, (unsigned)wn, (unsigned)wm});
+    return;
+  }
+  enc.dispatch({(unsigned)((N + bn - 1) / bn) * 256u,
+                (unsigned)((M + bm - 1) / bm), 1}, {256, 1, 1});
+}
+
+}  // namespace
+
+bool
+I8GemmContext::gemm_fast(ComputeEncoder& enc, const SharedBuffer& x,
+                         std::size_t xe, const SharedBuffer& codes,
+                         const SharedBuffer& scales, int gc,
+                         const SharedBuffer& b, const SharedBuffer& y,
+                         std::size_t ye, int M, int N, int K)
+{
+  const FastFns* f = fast_fns_(gc);
+  if (f == nullptr || !fast_accepts(M, N, K) || !group_fits_(K, gc, _tok_rot)) {
+    return false;
+  }
+  auto need = [&](SharedBuffer& sb, std::size_t bytes) {
+    if (sb.empty() || sb.byte_size() < bytes) {
+      sb = _mc->make_shared_buffer(bytes);
+    }
+    return !sb.empty();
+  };
+  if (!need(_xq, (std::size_t)M * K) ||
+      !need(_as, fast_scale_bytes(M, K, gc))) {
+    return false;
+  }
+  enc.set_function(f->quant);
+  enc.set_buffer(0, x, xe * 2);
+  enc.set_buffer(1, _xq);
+  enc.set_buffer(2, _as);
+  enc.set_constant(3, K);
+  encode_rows_gc_(enc, M, K, gc, false, _tok_rot);
+  _fq_m = _fq_k = _fq_gc = 0;
+  encode_fast_gemm_(enc, f->gemm, _xq, codes, _as, scales, b, y, ye, M, N,
+                    K, _fast_bm, _fast_bn, tok_wm_(gc), _tok_wn);
+  return true;
+}
+
+bool
+I8GemmContext::quantize_fast(ComputeEncoder& enc, const SharedBuffer& x,
+                             std::size_t xe, int M, int K, int gc)
+{
+  _fq_m = _fq_k = _fq_gc = 0;
+  const FastFns* f = fast_fns_(gc);
+  if (f == nullptr || M <= 0 || K <= 0 || !group_fits_(K, gc, _tok_rot)) {
+    return false;
+  }
+  auto need = [&](SharedBuffer& sb, std::size_t bytes) {
+    if (sb.empty() || sb.byte_size() < bytes) {
+      sb = _mc->make_shared_buffer(bytes);
+    }
+    return !sb.empty();
+  };
+  if (!need(_xq, (std::size_t)M * K) ||
+      !need(_as, fast_scale_bytes(M, K, gc))) {
+    return false;
+  }
+  enc.set_function(f->quant);
+  enc.set_buffer(0, x, xe * 2);
+  enc.set_buffer(1, _xq);
+  enc.set_buffer(2, _as);
+  enc.set_constant(3, K);
+  encode_rows_gc_(enc, M, K, gc, false, _tok_rot);
+  _fq_m = M;
+  _fq_k = K;
+  _fq_gc = gc;
+  return true;
+}
+
+bool
+I8GemmContext::gemm_fast_quantized(ComputeEncoder& enc,
+                                   const SharedBuffer& codes,
+                                   const SharedBuffer& scales, int gc,
+                                   const SharedBuffer& b,
+                                   const SharedBuffer& y, std::size_t ye,
+                                   int M, int N, int K)
+{
+  const FastFns* f = fast_fns_(gc);
+  if (f == nullptr || M != _fq_m || K != _fq_k || gc != _fq_gc ||
+      !fast_accepts(M, N, K)) {
+    return false;
+  }
+  encode_fast_gemm_(enc, f->gemm, _xq, codes, _as, scales, b, y, ye, M, N,
+                    K, _fast_bm, _fast_bn, tok_wm_(gc), _tok_wn);
+  return true;
+}
+
+bool
+I8GemmContext::gemm_fast_swiglu(ComputeEncoder& enc, const SharedBuffer& gate,
+                                std::size_t ge, const SharedBuffer& up,
+                                std::size_t ue, const SharedBuffer& codes,
+                                const SharedBuffer& scales, int gc,
+                                const SharedBuffer& y, std::size_t ye, int M,
+                                int N, int K)
+{
+  const FastFns* f = fast_fns_(gc);
+  if (f == nullptr || !fast_accepts(M, N, K) || !group_fits_(K, gc, _tok_rot)) {
+    return false;
+  }
+  auto need = [&](SharedBuffer& sb, std::size_t bytes) {
+    if (sb.empty() || sb.byte_size() < bytes) {
+      sb = _mc->make_shared_buffer(bytes);
+    }
+    return !sb.empty();
+  };
+  if (!need(_xq, (std::size_t)M * K) ||
+      !need(_as, fast_scale_bytes(M, K, gc))) {
+    return false;
+  }
+  _fq_m = _fq_k = _fq_gc = 0;   // the scratch is about to be rewritten
+  enc.set_function(f->swiglu);
+  enc.set_buffer(0, gate, ge * 2);
+  enc.set_buffer(1, up, ue * 2);
+  enc.set_buffer(2, _xq);
+  enc.set_buffer(3, _as);
+  enc.set_constant(4, K);
+  encode_rows_gc_(enc, M, K, gc, false, _tok_rot);
+  encode_fast_gemm_(enc, f->gemm, _xq, codes, _as, scales, SharedBuffer{}, y,
+                    ye, M, N, K, _fast_bm, _fast_bn, tok_wm_(gc), _tok_wn);
+  return true;
+}
+
+bool
+I8GemmContext::fast_converts(int bits, int gc) const
+{
+  const FastFns* f = fast_fns_(gc);
+  return f != nullptr && (bits == 8 || (bits == 4 && f->to_fast4.valid()));
+}
+
+bool
+I8GemmContext::encode_to_fast(ComputeEncoder& enc, const SharedBuffer& codes_in,
+                              const SharedBuffer& scales,
+                              const SharedBuffer& biases,
+                              const SharedBuffer& codes_out,
+                              const SharedBuffer& out_scales, int gc, int N,
+                              int K, int bits) const
+{
+  const FastFns* f = fast_fns_(gc);
+  if (f == nullptr || N <= 0 || K <= 0 || !group_fits_(K, gc, _tok_rot) ||
+      !fast_converts(bits, gc) ||
+      codes_in.byte_size() < (std::size_t)N * K * bits / 8 ||
+      codes_out.byte_size() < (std::size_t)N * K ||
+      scales.byte_size() < (std::size_t)N * (K / 64) * 2 ||
+      biases.byte_size() < (std::size_t)N * (K / 64) * 2 ||
+      out_scales.byte_size() < fast_scale_bytes(N, K, gc)) {
+    return false;
+  }
+  if (bits == 4) {
+    // Each output row is twice its input row: in place, one row's
+    // writes would land on rows other threadgroups are still reading.
+    const auto* ci = static_cast<const char*>(codes_in.contents());
+    const auto* co = static_cast<const char*>(codes_out.contents());
+    if (ci == nullptr || co == nullptr ||
+        (co < ci + (std::size_t)N * K / 2 && ci < co + (std::size_t)N * K)) {
+      return false;
+    }
+  }
+  enc.set_function(bits == 4 ? f->to_fast4 : f->to_fast);
+  enc.set_buffer(0, codes_in);
+  enc.set_buffer(1, scales);
+  enc.set_buffer(2, biases);
+  enc.set_buffer(3, codes_out);
+  enc.set_buffer(4, out_scales);
+  enc.set_constant(5, K);
+  encode_rows_gc_(enc, N, K, gc, false, _tok_rot);
+  return true;
+}
+
+bool
+I8GemmContext::encode_to_fast_scratch(ComputeEncoder& enc,
+                                      const SharedBuffer& codes,
+                                      const SharedBuffer& scales,
+                                      const SharedBuffer& biases, int gc,
+                                      int N, int K)
+{
+  if (!fast_converts(4, gc) || N <= 0 || K <= 0) { return false; }
+  auto need = [&](SharedBuffer& sb, std::size_t bytes) {
+    if (sb.empty() || sb.byte_size() < bytes) {
+      sb = _mc->make_shared_buffer(bytes);
+    }
+    return !sb.empty();
+  };
+  if (!need(_wq, (std::size_t)N * K) ||
+      !need(_ws, fast_scale_bytes(N, K, gc))) {
+    return false;
+  }
+  return encode_to_fast(enc, codes, scales, biases, _wq, _ws, gc, N, K, 4);
+}
+
+bool
+I8GemmContext::encode_quant_fast(ComputeEncoder& enc, const SharedBuffer& w,
+                                 const SharedBuffer& codes_out,
+                                 const SharedBuffer& out_scales, int gc,
+                                 int N, int K) const
+{
+  const FastFns* f = fast_fns_(gc);
+  if (f == nullptr || N <= 0 || K <= 0 || !group_fits_(K, gc, _tok_rot) ||
+      w.byte_size() < (std::size_t)N * K * 2 ||
+      codes_out.byte_size() < (std::size_t)N * K ||
+      out_scales.byte_size() < fast_scale_bytes(N, K, gc)) {
+    return false;
+  }
+  enc.set_function(f->quant);
+  enc.set_buffer(0, w);
+  enc.set_buffer(1, codes_out);
+  enc.set_buffer(2, out_scales);
+  enc.set_constant(3, K);
+  encode_rows_gc_(enc, N, K, gc, false, _tok_rot);
+  return true;
+}
+
+bool
+I8GemmContext::encode_dequant_fast(ComputeEncoder& enc,
+                                   const SharedBuffer& codes,
+                                   const SharedBuffer& scales, int gc,
+                                   const SharedBuffer& out, int N,
+                                   int K) const
+{
+  const FastFns* f = fast_fns_(gc);
+  if (f == nullptr || N <= 0 || K <= 0 || !group_fits_(K, gc, _tok_rot) ||
+      out.byte_size() < (std::size_t)N * K * 2) {
+    return false;
+  }
+  enc.set_function(f->dequant);
+  enc.set_buffer(0, codes);
+  enc.set_buffer(1, scales);
+  enc.set_buffer(2, out);
+  enc.set_constant(3, K);
+  encode_rows_gc_(enc, N, K, gc, /*dequant=*/true, _tok_rot);
+  return true;
+}
+
+bool
+I8GemmContext::gemm_signed_swiglu(ComputeEncoder& enc,
+                                  const SharedBuffer& gate, std::size_t ge,
+                                  const SharedBuffer& up, std::size_t ue,
+                                  const SharedBuffer& codes,
+                                  const SharedBuffer& scales,
+                                  const SharedBuffer& zb, int bits,
+                                  const SharedBuffer& y, std::size_t ye,
+                                  int M, int N, int K)
+{
+  if (!_fn_quant_swiglu_s8.valid() || !signed_accepts(M, N, K, bits)) {
+    return false;
+  }
+  _fq_m = _fq_k = _fq_gc = 0;   // the scratch is about to be rewritten
+  int S = plan_(M, N, K);
+  const int G = K / 64;
+  auto need = [&](SharedBuffer& sb, std::size_t bytes) {
+    if (sb.empty() || sb.byte_size() < bytes) {
+      sb = _mc->make_shared_buffer(bytes);
+    }
+    return !sb.empty();
+  };
+  if (!need(_xq, (std::size_t)M * K) ||
+      !need(_as, (std::size_t)M * G * 2) ||
+      !need(_uf, (std::size_t)M * G * 2)) {
+    return false;
+  }
+  if (S > 0) {
+    const std::size_t pb = (std::size_t)S *
+        (std::size_t)rows_per_block_(S, N, M) * (std::size_t)N * 4u;
+    if (rows_per_block_(S, N, M) < 64 || !need(_planes, pb)) { S = 0; }
+  }
+  enc.set_function(_fn_quant_swiglu_s8);
+  enc.set_buffer(0, gate, ge * 2);
+  enc.set_buffer(1, up, ue * 2);
+  enc.set_buffer(2, _xq);
+  enc.set_buffer(3, _as);
+  enc.set_buffer(4, _uf);
+  enc.set_constant(5, K);
+  enc.dispatch({256u, (unsigned)M, 1}, {256, 1, 1});
+  record_(Pending{N, K, M, Route::kSigned, bits, alias_(codes),
+                  alias_(scales), alias_(zb)});
+  encode_signed_gemm_(enc, codes, scales, zb, bits, SharedBuffer{}, y, ye, M,
+                      N, K, S);
   return true;
 }
 
@@ -736,7 +1218,7 @@ I8GemmContext::encode_tuned_(ComputeEncoder& enc, const Pending& p, int M,
     enc.dispatch({nx, (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
     return;
   }
-  const int rows = rows_per_block_(S, N);
+  const int rows = rows_per_block_(S, N, M);
   if (rows < 64) { return; }
   const int gpp = (G + S - 1) / S;
   for (int m0 = 0; m0 < M; m0 += rows) {
@@ -812,7 +1294,7 @@ I8GemmContext::tune_pending(MetalCompute* mc)
     int smax = 0;
     for (int S : cands) { smax = S > smax ? S : smax; }
     const std::size_t pbytes = (std::size_t)smax *
-        (std::size_t)rows_per_block_(smax, p.N) * (std::size_t)p.N * 4u;
+        (std::size_t)rows_per_block_(smax, p.N, M) * (std::size_t)p.N * 4u;
     if (_planes.empty() || _planes.byte_size() < pbytes) {
       _planes = mc->make_shared_buffer(pbytes);
     }

@@ -32,6 +32,7 @@ the snapshot (`write`) and decide the number -- see docs/PLUGINS.md,
 """
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -90,6 +91,13 @@ def walk_ast(text, stable):
         docs.append(obj)
 
     records, functions, opaque, keys = {}, set(), set(), {}
+    # opaque record -> the fields its IN-CLASS inline methods read through
+    # `this`. An opaque class's layout is the host's own -- except where
+    # its own header compiles a member's offset into every plugin that
+    # calls the accessor: `WeightRegistry& weights() { return _weights; }`
+    # on GenerativeModelManager. Those offsets are ABI, and a member
+    # inserted ahead of one breaks every plugin built before it.
+    reads = {}
 
     # WHICH FILE EACH NODE IS IN. Clang's JSON writes a location's "file"
     # only when it differs from the LAST file it wrote, across every
@@ -177,6 +185,8 @@ def walk_ast(text, stable):
                             for c in inner)
             if is_opaque:
                 opaque.add(q)
+            fields = {c.get("name") for c in inner
+                      if c.get("kind") == "FieldDecl" and c.get("name")}
             access = ("private" if node.get("tagUsed") == "class"
                       else "public")
             virt = []
@@ -188,6 +198,10 @@ def walk_ast(text, stable):
                 if ck in ("CXXMethodDecl", "CXXDestructorDecl"):
                     if ok and not c.get("isImplicit"):
                         functions.add(q + "::" + c.get("name", ""))
+                    if ok and is_opaque and fields:
+                        got = this_member_reads(c, fields)
+                        if got:
+                            reads.setdefault(q, set()).update(got)
                     if c.get("virtual"):
                         sig = c.get("type", {}).get("qualType", "")
                         pure = " = 0" if c.get("pure") else ""
@@ -220,7 +234,86 @@ def walk_ast(text, stable):
         attribute(d)
     for d in docs:
         visit(d, [], False)
-    return records, functions, opaque, keys
+    return records, functions, opaque, keys, reads
+
+
+def this_member_reads(method, fields):
+    """The fields of the method's own class its BODY names through `this`
+    (implicitly or not). Nothing for a declaration without a body."""
+    out = set()
+
+    def is_this(n):
+        k = n.get("kind", "")
+        if k == "CXXThisExpr":
+            return True
+        if k in ("ImplicitCastExpr", "ParenExpr"):
+            return any(is_this(c) for c in n.get("inner", []))
+        return False
+
+    def rec(n):
+        if n.get("kind") == "MemberExpr" and n.get("name") in fields:
+            inner = n.get("inner", [])
+            if inner and is_this(inner[0]):
+                out.add(n["name"])
+        for c in n.get("inner", []):
+            rec(c)
+
+    for c in method.get("inner", []):
+        if c.get("kind") == "CompoundStmt":
+            rec(c)
+    return out
+
+
+# A kernel the TOOLKIT resolves by name -- compiled into every plugin --
+# must be one the host promises to keep: the contract
+# (kernel-contract.h). The contract test checks the other direction, that
+# every contracted kernel resolves in the host; nothing checked this one,
+# and Sol's f16 steel entries were resolved by every f16 plugin forward
+# without being listed. Names are the string literals inside a
+# `.function(` call (a ternary included); a name built at run time is out
+# of reach of this check.
+def contract_entries(prefix):
+    path = os.path.join(prefix, "include", "apple-silicon", "metal-compute",
+                        "kernel-contract.h")
+    with open(path) as f:
+        text = f.read()
+    return set(re.findall(r'\{"[A-Za-z0-9_]+",\s*"([A-Za-z0-9_]+)"', text))
+
+
+def toolkit_kernels(prefix, sources_file):
+    files = []
+    if sources_file and os.path.exists(sources_file):
+        with open(sources_file) as f:
+            files += [x for x in f.read().strip().split(";") if x]
+    files += glob.glob(os.path.join(prefix, "include", "generative-models",
+                                    "shared", "*.h"))
+    names = {}
+    for path in files:
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            continue
+        for m in re.finditer(r"\.function\(", text):
+            depth, i = 1, m.end()
+            while i < len(text) and depth > 0:
+                if text[i] == "(":
+                    depth += 1
+                elif text[i] == ")":
+                    depth -= 1
+                i += 1
+            arg = text[m.end():i - 1]
+            for lm in re.finditer(r'"([A-Za-z0-9_]+)"', arg):
+                # A literal JOINED to another by `+` is a fragment of a
+                # name built at run time (i8-gemm's group-numbered
+                # kernels), not a name.
+                before = arg[:lm.start()].rstrip()
+                after = arg[lm.end():].lstrip().lstrip(") ")
+                if (before.endswith("+") or after.startswith("+") or
+                        lm.group(1).startswith("_")):
+                    continue
+                names.setdefault(lm.group(1), os.path.basename(path))
+    return names
 
 
 def string_literal(node):
@@ -294,12 +387,19 @@ def snapshot(args):
     ast = probe(args.prefix, stable, args.cxx,
                 ["-Xclang", "-ast-dump=json", "-Xclang",
                  "-ast-dump-filter=vpipe"])
-    records, functions, opaque, keys = walk_ast(ast, stable)
+    records, functions, opaque, keys, reads = walk_ast(ast, stable)
     lay = probe(args.prefix, stable, args.cxx,
                 ["-Xclang", "-fdump-record-layouts-complete"])
     # A host-owned type (VPIPE_ABI_OPAQUE) keeps its virtuals and its
-    # symbols in the contract; only its layout is the host's own.
+    # symbols in the contract; only its layout is the host's own -- apart
+    # from the members its inline methods read, whose offsets are.
     layout = layouts(lay, set(records) - opaque)
+    olay = layouts(lay, set(reads))
+    for q, fields in reads.items():
+        body = [l for l in olay.get(q, [])
+                if l.split("|", 1)[-1].strip().split(" ")[-1] in fields]
+        if body:
+            layout[q + " (opaque: read inline)"] = body
     syms = exported(args.lib, functions, set(records))
     return stable, records, layout, syms, keys
 
@@ -357,12 +457,21 @@ def main():
     ap.add_argument("--cxx", required=True)
     ap.add_argument("--out")
     ap.add_argument("--snapshot")
+    ap.add_argument("--toolkit-sources")
     args = ap.parse_args()
     text = render(*snapshot(args))
+    contract = contract_entries(args.prefix)
+    uncontracted = sorted(
+        "%s (%s)" % (k, f) for k, f in
+        toolkit_kernels(args.prefix, args.toolkit_sources).items()
+        if k not in contract)
     if args.mode == "write":
         with open(args.out, "w") as f:
             f.write(text)
         print("abi-snapshot: wrote %s" % args.out)
+        for k in uncontracted:
+            print("abi-snapshot: WARNING the toolkit resolves %s, which the "
+                  "kernel contract does not list" % k)
         return 0
     with open(args.snapshot) as f:
         old = parse(f.read())
@@ -387,6 +496,9 @@ def main():
               sorted(new["keys"].items()) if k not in old["keys"]]
     added += ["symbols: " + s for s in sorted(new["symbols"] -
                                                old["symbols"])]
+    for k in uncontracted:
+        problems.append("kernels: the toolkit resolves %s, which the kernel "
+                        "contract (kernel-contract.h) does not list" % k)
     for a in added:
         print("abi-snapshot: added   " + a)
     for p in problems:

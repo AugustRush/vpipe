@@ -710,6 +710,13 @@ Session::~Session()
   // would do the same thing -- explicit reset just makes the
   // dependency on the include obvious.
   _ffmpeg.reset();
+  // The model manager before MetalCompute, which is declared after it and
+  // so would go first: what the manager still holds as the session ends
+  // -- a DiT or a VAE kept warm (keep_model_warm) -- gives its wired
+  // buffers back through MetalCompute as it goes. With MetalCompute gone
+  // first, that read freed memory: a segfault at the end of every process
+  // that ended with a DiT kept warm.
+  _llm_mgr.reset();
   // _config destroyed by member dtor as usual.
 }
 

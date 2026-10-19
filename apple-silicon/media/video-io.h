@@ -57,7 +57,8 @@ private:
 };
 
 // Codecs VideoWriter knows, by the name a graph uses:
-//   prores4444, prores4444xq  ProRes 4444 (XQ); keeps alpha
+//   prores4444, prores4444xq  ProRes 4444 (XQ); keeps alpha when asked
+//                             (VideoWriteOptions::alpha), else has none
 //   prores422hq, prores422, prores422lt, prores422proxy
 //   hevc   HEVC Main10 (10-bit; HDR when the frames are PQ or HLG)
 //   hevc8  HEVC Main (8-bit)
@@ -70,7 +71,9 @@ struct VideoWriteOptions {
   int         height = 0;
   int         fps_num = 24;
   int         fps_den = 1;
-  bool        alpha = false;    // keep a 4-channel picture's alpha
+  // Keep a 4-channel picture's alpha (ProRes 4444). Not kept, the file
+  // has no alpha plane, as a 3-channel picture's has none.
+  bool        alpha = false;
   ColorTags   color;            // what the frames' samples mean
   double      quality = 0;      // HEVC / H.264: 0..1; 0 = the encoder's
   std::int64_t bitrate = 0;     // HEVC / H.264 bits per second; 0 = auto

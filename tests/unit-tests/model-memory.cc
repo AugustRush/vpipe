@@ -1445,10 +1445,22 @@ TEST(model_memory, a_decode_arena_is_estimated_from_the_vae_config)
   // FLUX.2: ~7 full-res base-channel buffers at 2 B/elt -> h*w*base*14.
   // base is max(block_out[0], block_out[1]) -- block_out[0] alone
   // under-modelled the peak 2x, which is what the 2K overflow fix found.
+  // ...plus the im2col band MetalFlux2Vae allocates on every decode,
+  // capped at 128 MB.
   write_vae("AutoencoderKLFlux2", "[128, 256, 512, 512]");
   const std::size_t flux = model_memory::vae_decode_scratch_bytes(
       root.string(), 1024, 1024);
-  EXPECT_TRUE(flux == (std::size_t)1024 * 1024 * 256 * 14);
+  EXPECT_TRUE(flux == (std::size_t)1024 * 1024 * 256 * 14 + (128u << 20));
+  // FLUX.3's VAE states its decoder's widths as `null` -- diffusers' "as
+  // the encoder's" -- which threw, refusing every FLUX.3 graph at launch.
+  {
+    std::ofstream f(root / "vae" / "config.json");
+    f << "{\"_class_name\": \"AutoencoderKLFlux2\", "
+         "\"block_out_channels\": [128, 256, 512, 512], "
+         "\"decoder_block_out_channels\": null}";
+  }
+  EXPECT_TRUE(model_memory::vae_decode_scratch_bytes(root.string(), 1024, 1024)
+              == flux);
 
   // Qwen-Image / Krea-2 spell their width `base_dim` and ship NO
   // block_out_channels -- every quantized Krea-2 and Qwen-Image-Edit
@@ -2607,6 +2619,46 @@ TEST(model_memory, a_declared_phase_survives_the_planner)
   fs::remove_all(root, ec);
 }
 
+// ONE STORE, TWO COMPONENTS, TWO PHASES. A Draw Things .ckpt can hold
+// both MiniMax-H3 VAEs: vae-decode claims it for `decode`, audio-vae-
+// decode claims it unphased and -- under `destroy` -- refines it to
+// `decode-audio`. The refinement used to REPLACE the decode claim, so the
+// video VAE was absent from the phase that runs it; now it widens to
+// cover both, and only the denoise (and condition) go without it.
+TEST(model_memory, a_refinement_widens_to_another_stage_s_phase)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-twophase";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root / "vaes", ec);
+  {
+    std::ofstream f(root / "vaes" / "both.safetensors", std::ios::binary);
+    std::string blob(3000, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  }
+  const std::string vae = (root / "vaes").string();
+  pl->begin_plan(&s);
+  pl->claim(&s, vae, std::string(model_memory::kPhaseDecode), "", 0);
+  pl->claim(&s, vae, "", "", 0);
+  pl->decide(&s, vae, std::string(model_memory::kPhaseDecodeAudio));
+  pl->end_plan(&s);
+  EXPECT_TRUE(mgr->phase_footprint(
+                  std::string(model_memory::kPhaseDecode)) == 3000u);
+  EXPECT_TRUE(mgr->phase_footprint(
+                  std::string(model_memory::kPhaseDecodeAudio)) == 3000u);
+  EXPECT_TRUE(mgr->phase_footprint(
+                  std::string(model_memory::kPhaseDenoise)) == 0u);
+  fs::remove_all(root, ec);
+}
+
 namespace {
 
 // RAII for VPIPE_RAM_LIMIT_MB, which every memory decision reads to
@@ -2781,6 +2833,79 @@ TEST(model_memory, every_phase_in_the_order_can_be_decided)
 //
 // Loads nothing. Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (an H3 root or pack),
 // optionally VPIPE_KREA2_TEST_MODEL_PATH (a model whose VAE is not H3's).
+// generate-video BOOKS MiniMax-H3's ACTIVATIONS in the denoise phase --
+// ~200 KB a row, which only the runtime preflight had known -- in both
+// ledgers, sized at the graph's geometry; and on matrix cores with an
+// int8 tier a dense checkpoint's floor carries the layout each streamed
+// slot keeps beside its bf16 (h3_int8_slot_bytes_).
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH. Loads no weights.
+TEST(model_memory, generate_video_books_h3_s_activations)
+{
+  const char* h3 = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (h3 == nullptr || *h3 == '\0') { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  const bool mx = mc != nullptr && mc->supports_matrix_cores();
+  struct Plan {
+    std::size_t scratch = 0, reported = 0, floor = 0;
+  };
+  auto plan = [&](bool geometry, const char* tier) {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("hf_dir", FlexData::make_string(h3));
+    if (geometry) {
+      cfg.as_object().insert("width", FlexData::make_int(960));
+      cfg.as_object().insert("height", FlexData::make_int(544));
+      cfg.as_object().insert("frames", FlexData::make_int(61));
+      cfg.as_object().insert("fps", FlexData::make_real(24.0));
+    }
+    if (tier != nullptr) {
+      cfg.as_object().insert("i8_gemm", FlexData::make_bool(true));
+      cfg.as_object().insert("i8_gemm_tier", FlexData::make_string(tier));
+    }
+    GenerateVideoStage st(&sess, "gen", std::vector<InEdge>{},
+                          std::move(cfg));
+    Plan p;
+    for (const ResourceClaim& c : st.declare_resources()) {
+      if (c.kind == model_memory::kScratchKind &&
+          c.phase == model_memory::kPhaseDenoise &&
+          c.key.find("-h3-dit|") != std::string::npos) {
+        p.scratch = std::strtoull(
+            c.key.substr(c.key.rfind('|') + 1).c_str(), nullptr, 10);
+      }
+      if (c.kind == model_memory::kWeightsKind && c.floor_bytes > 0) {
+        p.floor = std::max(p.floor, c.floor_bytes);
+      }
+    }
+    p.reported = st.declare_memory().scratch;
+    return p;
+  };
+  const Plan none = plan(false, nullptr);
+  const Plan base = plan(true, nullptr);
+  const Plan acc = plan(true, "accurate");
+  const Plan tok = plan(true, "token");
+  std::printf("[model_memory] generate-video H3 denoise scratch: %zu MB "
+              "(default geometry %zu MB), reported %zu MB; i8 accurate %zu MB, "
+              "token %zu MB; DiT floor %zu MB, token %zu MB%s\n",
+              base.scratch >> 20, none.scratch >> 20, base.reported >> 20,
+              acc.scratch >> 20, tok.scratch >> 20, acc.floor >> 20,
+              tok.floor >> 20, mx ? "" : " (no matrix cores)");
+  // 960x544 x 61 frames is ~10k rows: over a gigabyte at ~200 KB a row.
+  EXPECT_TRUE(base.scratch > (1ull << 30) && base.reported == base.scratch);
+  // Without one in the graph, the checkpoint's default geometry is
+  // planned (planned_geometry_), so a real bound still lands.
+  EXPECT_TRUE(none.scratch > (1ull << 30));
+  if (mx) {
+    EXPECT_TRUE(acc.scratch > base.scratch);
+    // The slot layout is sized from block 0's shapes, so a root whose
+    // DiT weights live elsewhere (a config-only transformer/ beside a
+    // Draw Things file) has nothing to size it from.
+    if (acc.floor > (1ull << 30)) { EXPECT_TRUE(tok.floor > acc.floor); }
+  } else {
+    EXPECT_TRUE(acc.scratch == base.scratch && tok.floor == acc.floor);
+  }
+}
+
 TEST(model_memory, ane_modules_are_claimed_by_the_stages_that_build_them)
 {
   const char* h3 = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");

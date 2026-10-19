@@ -21,8 +21,13 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "stages/model-memory.h"
 #include "stages/text-chat-stage.h"
 #include "generative-models/generative-model-manager.h"
+#ifdef VPIPE_BUILD_APPLE_SILICON
+#include "generative-models/model-loader.h"
+#include "generative-models/qwen3/metal-qwen-model.h"
+#endif
 
 #include "common/media-line.h"
 
@@ -438,6 +443,44 @@ TEST(text_chat_stage, mtp_flag_parsed) {
   }
 }
 
+// A drafter's verify keeps its scratch for the model's life, so the plan
+// books it -- the figure MetalQwenModel::verify_scratch_bytes gives for
+// MTP's three rows -- and books nothing when no drafter will run.
+// Reads the checkpoint's config only. VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH (a
+// model carrying its MTP head).
+TEST(text_chat_stage, a_drafter_s_verify_scratch_is_planned) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (path == nullptr || *path == 0) { return; }
+  Session sess;
+  CerrSilencer hush;
+  auto booked = [&](bool mtp) -> std::size_t {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("hf_dir", FlexData::make_string(path));
+    cfg.as_object().insert("mtp", FlexData::make_bool(mtp));
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+    std::size_t bytes = 0;
+    for (const ResourceClaim& c : s.declare_resources()) {
+      if (c.kind != model_memory::kScratchKind
+          || c.key.rfind("spec-verify:", 0) != 0) {
+        continue;
+      }
+      bytes = (std::size_t)std::stoull(c.key.substr(c.key.rfind('|') + 1));
+    }
+    return bytes;
+  };
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  genai::ModelLoader loader(&sess);
+  const auto mc = loader.load_config(path);
+  ASSERT_TRUE(mc.has_value());
+  const std::size_t want = genai::MetalQwenModel::verify_scratch_bytes(
+      genai::MetalQwenModel::config_from(*mc), 3, /*mtp_head=*/true);
+  std::printf("[text_chat] MTP verify scratch planned %zu, want %zu\n",
+              booked(true), want);
+  EXPECT_TRUE(want > 0 && booked(true) == want);
+#endif
+  EXPECT_TRUE(booked(false) == 0);
+}
+
 TEST(text_chat_stage, metal_chat_smoke) {
   const char* path = std::getenv("VPIPE_METAL_LM_SMOKE_MODEL");
   if (!path || !*path) {
@@ -496,6 +539,22 @@ TEST(text_chat_stage, metal_chat_smoke) {
                 static_cast<long long>(ctx_pos), text.c_str());
     if (!text.empty()) { found = true; }
     EXPECT_TRUE(ctx_pos > 0);
+    // A plain prompt's prefill is counted, as a conversation's is.
+    const std::int64_t prefilled = root.contains("prefilled")
+        ? root.at("prefilled").as_int(0) : 0;
+    EXPECT_TRUE(prefilled > 0 && prefilled < ctx_pos);
+    // Where a drafter decoded, its drafts are counted and some kept.
+    if (root.contains("rounds") && root.at("rounds").as_int(0) > 1) {
+      const std::int64_t drafted = root.at("drafted").as_int(0);
+      std::printf("[text_chat_stage.metal_smoke] %s: %lld rounds, "
+                  "%lld/%lld drafts kept\n",
+                  std::string(root.at("drafter").as_string("")).c_str(),
+                  static_cast<long long>(root.at("rounds").as_int(0)),
+                  static_cast<long long>(root.at("accepted").as_int(0)),
+                  static_cast<long long>(drafted));
+      EXPECT_TRUE(drafted > 0);
+      EXPECT_TRUE(root.at("accepted").as_int(0) <= drafted);
+    }
   }
   EXPECT_TRUE(found);
 }

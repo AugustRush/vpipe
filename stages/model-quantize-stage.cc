@@ -154,6 +154,7 @@ dit_class_family_(const std::string& class_name)
     return "qwen-image-21";
   }
   if (class_name == "ZImageTransformer2DModel") { return "z-image"; }
+  if (class_name == "MOSSImageTransformer") { return "moss-image"; }
   if (class_name == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
   if (class_name == "BooguImageTransformer2DModel") { return "boogu-image"; }
   // Wan video. Its two A14B experts are separate checkpoints, so each is
@@ -577,6 +578,17 @@ dit_quant_linears_(const std::string& family)
     // and the final layer, through whose 64 rows every velocity value
     // leaves.
     return {"to_q", "to_k", "to_v", "0", "w1", "w2", "w3"};
+  }
+  if (family == "moss-image") {
+    // Six biasless Linears a main block, all under `proj.`: q / k / v / o
+    // and the feed-forward's fused ffn_up_gate ([hidden | gate]) and
+    // ffn_down. "ffn_down" ALSO names the text blocks' down projection
+    // (text_embedder.blocks.N.ffn_down), which the exclude list keeps
+    // dense along with everything else model-level: the two text
+    // blocks (every prompt passes through them, at prompt rows), the
+    // latent and text embedders, the timestep MLP, the ONE shared
+    // modulation every block reads, and the head.
+    return {"q", "k", "v", "o", "ffn_up_gate", "ffn_down"};
   }
   if (family == "wan") {
     // Wan's single-stream block: self-attention, cross-attention into the
@@ -1475,6 +1487,14 @@ ModelQuantizeStage::quantize_dit_component_(
         "separate them -- the modulation is quantized either way and this "
         "key changes nothing", this->id()));
   }
+  if (_quant_modulation && family == "moss-image") {
+    // ONE shared Linear (113 MB) feeds every block's modulation; there is
+    // no per-block table to quantize, and this one stays bf16.
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): moss-image's modulation is one shared "
+        "113 MB Linear, kept bf16 -- quant_modulation changes nothing",
+        this->id()));
+  }
   if (_quant_modulation && (is_qie || is_boogu || is_wan || is_qi21)) {
     // The adaLN modulation projections are the largest weights in these DiTs
     // and are kept bf16 by default because they are what the residual scale
@@ -1529,6 +1549,11 @@ ModelQuantizeStage::quantize_dit_component_(
                          "timestep_embedder.", "target_timestep_embedder.",
                          "proj_out"};
   }
+  if (family == "moss-image") {
+    opt.quant_exclude = {"text_embedder.", "video_embedder",
+                         "time_embedding.", "shared_block_modulation",
+                         "video_head_modulation", "final_linear_video"};
+  }
   if (family == "z-image") {
     // The model-level weights, kept bf16 on the usual grounds: all of
     // them are small and every value in the model passes through one of
@@ -1575,6 +1600,13 @@ ModelQuantizeStage::quantize_dit_component_(
       if (genai::MetalFlux3Transformer::Config::read_dims(dit_dir, &fc)) {
         opt.n_layers = fc.n_single;
       }
+    } else if (family == "moss-image") {
+      // Rank the 42 main blocks (`layers.N`; num_layers counts only
+      // them). The two text blocks (`text_embedder.blocks.N`) keep the
+      // base width. The default arm's `transformer_blocks.` matches no
+      // MOSS-Image tensor, so mixed ranked NOTHING and wrote a uniform
+      // pack while saying it was mixed.
+      opt.layer_prefix = "layers.";
     } else if (is_boogu) {
       // Rank Boogu's single-stream tail: 32 of its 46 blocks and the bulk of
       // the weights. (The 8 dual-stream blocks and the 6 refiners keep the
@@ -1607,28 +1639,31 @@ ModelQuantizeStage::quantize_dit_component_(
           "calib_dir, or drop awq", this->id(), dit_dir));
       return false;
     }
-    if (is_zimage && _calib_dir.empty()) {
+    if (family == "moss-image") {
+      // Not even from a calib_dir: the generic DiT fold below is
+      // Krea-2's -- its tensor names, and a down <- up smoothing fold
+      // that is exact only where the up half enters LINEARLY (SwiGLU).
+      // MOSS-Image's SITU takes 25 tanh(h / 25) of it, so the fold
+      // would change the function, not just the rounding.
       session()->warn(fmt(
-          "ModelQuantizeStage('{}'): z-image has no on-device AWQ "
-          "collector, and the fall-through would calibrate a Krea-2 model "
-          "over these weights -- refusing. Use plain or mixed "
-          "quantization, or supply calib_dir", this->id()));
+          "ModelQuantizeStage('{}'): moss-image has no AWQ fold -- its "
+          "SITU feed-forward is not linear in the up half the DiT fold "
+          "scales -- refusing. Use plain or mixed quantization",
+          this->id()));
       return false;
     }
-    if (is_flux3 && _calib_dir.empty()) {
+    // A NAMED PREDICATE, not a list of refusals: the families with an
+    // on-device collector of their own. Everything else reaches the
+    // fall-through below, which is KREA-2's collector, and would be
+    // calibrated by building a Krea-2 DiT config over its weights.
+    const bool own_collector =
+        family == "krea2" || is_flux2 || is_boogu || is_qie;
+    if (!own_collector && qprof == nullptr && _calib_dir.empty()) {
       session()->warn(fmt(
-          "ModelQuantizeStage('{}'): flux3 has no on-device AWQ collector, "
+          "ModelQuantizeStage('{}'): {} has no on-device AWQ collector, "
           "and the fall-through would calibrate a Krea-2 model over these "
           "weights -- refusing. Use plain or mixed quantization, or supply "
-          "calib_dir", this->id()));
-      return false;
-    }
-    if (is_qi21 && _calib_dir.empty()) {
-      session()->warn(fmt(
-          "ModelQuantizeStage('{}'): qwen-image-21 has no on-device AWQ "
-          "collector, and the fall-through would calibrate a Krea-2 model "
-          "over these weights -- refusing. Use plain or mixed "
-          "quantization, or supply calib_dir", this->id()));
+          "calib_dir", this->id(), family));
       return false;
     }
     if (qprof != nullptr && _calib_dir.empty()) {

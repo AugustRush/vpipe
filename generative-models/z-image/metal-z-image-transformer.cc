@@ -175,7 +175,7 @@ MetalZImageTransformer::wire_block_(Block& b, bool on)
     changed += n;
   };
   auto qw = [&](QWeight& w) {
-    one(w.w); one(w.codes); one(w.scales); one(w.qbias);
+    one(w.w); one(w.codes); one(w.scales); one(w.qbias); one(w.cscales);
   };
   QWeight* q[] = {&b.qw, &b.kw, &b.vw, &b.ow, &b.w1, &b.w3, &b.w2, &b.ada};
   for (QWeight* w : q) { qw(*w); }
@@ -357,7 +357,7 @@ MetalZImageTransformer::to_elt_(WeightSet& ws, const std::string& name,
 
 MetalZImageTransformer::QWeight
 MetalZImageTransformer::load_qw_(WeightSet& ws, const std::string& name,
-                                 Retain r, bool sign)
+                                 Retain r, bool sign, bool fast)
 {
   QWeight qw;
   const MetalLlamaWeights& wts = ws.src();
@@ -370,6 +370,76 @@ MetalZImageTransformer::load_qw_(WeightSet& ws, const std::string& name,
     const long K = scols * (long)_quant_group;
     const int bits = K > 0 ? (int)(gcols * 32 / K) : 0;
     qw.bits = (bits == 8) ? 8 : 4;
+    // THE FAST TIER: the codes dequantized, group-rotated and requantized
+    // at the coarse group (or per row on the token tier). A w8 pack's
+    // once -- in the builder of the entry a retained block keeps (one
+    // buffer, codes then scales), in place in a streamed read with the
+    // scales in a buffer the model owns. A w4 pack's per GEMM, into the
+    // context's scratch (its layout would be twice its size), so it is
+    // held as stored.
+    const int fgc0 =
+        (fast && _fast && _quant_group == 64) ? _i8->fast_group((int)K) : 0;
+    const int fgc =
+        fgc0 > 0 && _i8->fast_converts(qw.bits, fgc0) ? fgc0 : 0;
+    if (fgc > 0) {
+      const std::string cn = name + ".weight", sn = name + ".scales",
+                        bn = name + ".biases";
+      const int N = (int)ci->shape[0], KK = (int)K, qb = qw.bits;
+      const std::size_t cb = (std::size_t)N * KK;
+      const std::size_t sb = I8GemmContext::fast_scale_bytes(N, KK, fgc);
+      QWeight f;
+      f.bits = qb; f.gc = fgc; f.n = N; f.k = KK;
+      if (qb == 4 && (r == Retain::Streamed || !_cfg.i8_hold_w4)) {
+        // A W4 PACK IS HELD AS STORED: its layout is twice its size,
+        // so each GEMM converts it into the context's scratch right
+        // before reading it (fast_operand_).
+        f.codes = r == Retain::Streamed
+                      ? ws.stream_tensor(cn, _mc, WeightSet::Residency::Copied)
+                      : ws.tensor(cn, _mc, WeightSet::Residency::Copied);
+        f.scales = to_elt_(ws, sn, r);
+        f.qbias = to_elt_(ws, bn, r);
+        f.quantized = !f.codes.empty() && !f.scales.empty() &&
+                      !f.qbias.empty();
+        f.pc = true;
+      } else if (r == Retain::Streamed) {
+        f.codes = ws.stream_tensor(cn, _mc, WeightSet::Residency::Copied);
+        f.scales = to_elt_(ws, sn, r);
+        f.qbias = to_elt_(ws, bn, r);
+        f.cscales = _mc->make_shared_buffer(sb);
+        f.quantized = !f.codes.empty() && !f.scales.empty() &&
+                      !f.qbias.empty() && !f.cscales.empty() && fast_(f);
+      } else {
+        SharedBuffer both = ws.derived(
+            std::string(kKey) + _i8->layout_tag(fgc) + "|" + cn,
+            [&]() -> SharedBuffer {
+              SharedBuffer c = ws.read(cn, _mc,
+                                       WeightSet::Residency::Copied);
+              SharedBuffer s = to_bf16_(ws.src(), _mc, sn);
+              SharedBuffer b = to_bf16_(ws.src(), _mc, bn);
+              SharedBuffer out = _mc->make_shared_buffer(cb + sb);
+              if (c.empty() || s.empty() || b.empty() || out.empty()) {
+                return {};
+              }
+              CommandStream st = _mc->make_command_stream();
+              bool ok = false;
+              {
+                ComputeEncoder e = st.begin_compute();
+                ok = _i8->encode_to_fast(e, c, s, b, out.subview(0, cb),
+                                         out.subview(cb, sb), fgc, N, KK,
+                                         qb);
+              }
+              return ok && st.commit().wait_ok(nullptr) ? std::move(out)
+                                                        : SharedBuffer{};
+            });
+        if (!both.empty()) {
+          f.codes = both.subview(0, cb);
+          f.cscales = both.subview(cb, sb);
+          f.quantized = !f.codes.empty() && !f.cscales.empty();
+        }
+      }
+      if (f.quantized) { return f; }
+      // Not convertible: the layouts below, as if never asked.
+    }
     // THE SIGNED LAYOUT, converted where the bytes are first the model's
     // own: in the builder of the entries the set keeps for a retained
     // block (so nothing unsigned stays cached beside them), in place in
@@ -423,6 +493,57 @@ MetalZImageTransformer::load_qw_(WeightSet& ws, const std::string& name,
     }
     qw.codes = {}; qw.scales = {}; qw.qbias = {};
   }
+  // THE FAST TIER, a dense checkpoint (bf16, or F32 narrowed on the way
+  // in): quantized once into the entry a retained block keeps, which
+  // then holds no bf16 copy at all. A STREAMED one keeps the bf16 as its
+  // refill target and quantizes it after every refill (QWeight::ds), so
+  // the slot runs the tier a preloaded block runs and a promotion keeps
+  // what the entry keeps. A quantized pack's dense tensor stays dense:
+  // the pack left it out on purpose.
+  if (fast && _fast && _quant_bits == 0 && ci != nullptr &&
+      ci->shape.size() == 2) {
+    const int N = (int)ci->shape[0], KK = (int)ci->shape[1];
+    const int fgc = _i8->fast_group(KK);
+    if (fgc > 0 && r == Retain::Streamed) {
+      const std::size_t cb = (std::size_t)N * KK;
+      const std::size_t sb = I8GemmContext::fast_scale_bytes(N, KK, fgc);
+      QWeight f;
+      f.bits = 8; f.gc = fgc; f.n = N; f.k = KK; f.ds = true;
+      f.w = to_elt_(ws, name + ".weight", r);
+      f.codes = _mc->make_shared_buffer(cb);
+      f.cscales = _mc->make_shared_buffer(sb);
+      f.quantized = !f.w.empty() && !f.codes.empty() && !f.cscales.empty();
+      if (f.quantized && fast_(f)) { return f; }
+    } else if (fgc > 0) {
+      const std::size_t cb = (std::size_t)N * KK;
+      const std::size_t sb = I8GemmContext::fast_scale_bytes(N, KK, fgc);
+      const std::string wn = name + ".weight";
+      SharedBuffer both = ws.derived(
+          std::string(kKey) + _i8->layout_tag(fgc) + "bf|" + wn,
+          [&]() -> SharedBuffer {
+            SharedBuffer w = to_bf16_(ws.src(), _mc, wn);
+            SharedBuffer out = _mc->make_shared_buffer(cb + sb);
+            if (w.empty() || out.empty()) { return {}; }
+            CommandStream st = _mc->make_command_stream();
+            bool ok = false;
+            {
+              ComputeEncoder e = st.begin_compute();
+              ok = _i8->encode_quant_fast(e, w, out.subview(0, cb),
+                                          out.subview(cb, sb), fgc, N, KK);
+            }
+            return ok && st.commit().wait_ok(nullptr) ? std::move(out)
+                                                      : SharedBuffer{};
+          });
+      if (!both.empty()) {
+        QWeight f;
+        f.bits = 8; f.gc = fgc; f.n = N; f.k = KK;
+        f.codes = both.subview(0, cb);
+        f.cscales = both.subview(cb, sb);
+        f.quantized = !f.codes.empty() && !f.cscales.empty();
+        if (f.quantized) { return f; }
+      }
+    }
+  }
   qw.w = to_elt_(ws, name + ".weight", r);
   return qw;
 }
@@ -431,19 +552,21 @@ bool
 MetalZImageTransformer::load_block_(WeightSet& ws, const std::string& p,
                                     bool with_ada, Block& b, Retain r)
 {
-  b.qw = load_qw_(ws, p + "attention.to_q", r, true);
-  b.kw = load_qw_(ws, p + "attention.to_k", r, true);
-  b.vw = load_qw_(ws, p + "attention.to_v", r, true);
+  // The modulated blocks (with_ada) are the ones at the image's rows; the
+  // context refiner's run at the caption's.
+  b.qw = load_qw_(ws, p + "attention.to_q", r, true, with_ada);
+  b.kw = load_qw_(ws, p + "attention.to_k", r, true, with_ada);
+  b.vw = load_qw_(ws, p + "attention.to_v", r, true, with_ada);
   // to_out is a ModuleList, so the projection is ".0" -- not a typo.
-  b.ow = load_qw_(ws, p + "attention.to_out.0", r, true);
+  b.ow = load_qw_(ws, p + "attention.to_out.0", r, true, with_ada);
   b.nq = to_elt_(ws, p + "attention.norm_q.weight", r);
   b.nk = to_elt_(ws, p + "attention.norm_k.weight", r);
   // SwiGLU as Llama names it: w1 gates, w3 is the up projection and w2
   // the down one. Reading w1 and w3 the other way round is a model that
   // still denoises.
-  b.w1 = load_qw_(ws, p + "feed_forward.w1", r, true);
-  b.w3 = load_qw_(ws, p + "feed_forward.w3", r, true);
-  b.w2 = load_qw_(ws, p + "feed_forward.w2", r, true);
+  b.w1 = load_qw_(ws, p + "feed_forward.w1", r, true, with_ada);
+  b.w3 = load_qw_(ws, p + "feed_forward.w3", r, true, with_ada);
+  b.w2 = load_qw_(ws, p + "feed_forward.w2", r, true, with_ada);
   b.an1 = to_elt_(ws, p + "attention_norm1.weight", r);
   b.an2 = to_elt_(ws, p + "attention_norm2.weight", r);
   b.fn1 = to_elt_(ws, p + "ffn_norm1.weight", r);
@@ -497,7 +620,8 @@ std::size_t
 MetalZImageTransformer::qw_bytes_(const QWeight& w)
 {
   if (w.quantized) {
-    return w.codes.byte_size() + w.scales.byte_size() + w.qbias.byte_size();
+    return w.codes.byte_size() + w.scales.byte_size() + w.qbias.byte_size() +
+           w.cscales.byte_size() + (w.ds ? w.w.byte_size() : 0);
   }
   return w.w.byte_size();
 }
@@ -518,7 +642,10 @@ MetalZImageTransformer::each_block_tensor_(
 {
   const std::string p = mod_prefix_(L);
   auto qw = [&](QWeight& w, const char* nm) {
-    if (w.quantized) {
+    if (w.ds) {
+      // The dense source only: the layout is its product (post_refill).
+      fn(p + nm + ".weight", w.w, Placement::kBf16);
+    } else if (w.quantized) {
       fn(p + nm + ".weight", w.codes, Placement::kRaw);
       fn(p + nm + ".scales", w.scales, Placement::kBf16);
       fn(p + nm + ".biases", w.qbias, Placement::kBf16);
@@ -562,14 +689,49 @@ MetalZImageTransformer::clone_block_(const Block& src, Block& dst,
                                      bool copy) const
 {
   bool ok = true;
+  // A PROMOTION keeps what a preloaded block keeps (see
+  // kept_block_bytes_): a w4 pack whose layout is held (Config::
+  // i8_hold_w4) is converted into it here, all of a block's in one
+  // command buffer, by the call the preloaded entry's builder makes.
+  CommandStream cs;
+  ComputeEncoder ce;
   auto cq = [&](const QWeight& s, QWeight& d) {
+    const bool hold = copy && s.pc && _cfg.i8_hold_w4 && _i8 != nullptr;
     d.quantized = s.quantized;
     d.bits = s.bits;
     d.sgn = s.sgn;
-    ok = clone_buf_(_mc, s.w, d.w, copy) && ok;
+    d.gc = s.gc;
+    d.pc = s.pc && !hold;
+    d.n = s.n;
+    d.k = s.k;
+    // A dense source is the slot's refill target, and only a second
+    // slot (copy false) keeps one.
+    d.ds = s.ds && !copy;
+    static const SharedBuffer kNone;
+    if (hold) {
+      d.codes = _mc->make_shared_buffer((std::size_t)s.n * s.k);
+      d.cscales = _mc->make_shared_buffer(
+          I8GemmContext::fast_scale_bytes(s.n, s.k, s.gc));
+      if (!cs.valid()) {
+        cs = _mc->make_command_stream();
+        ce = cs.begin_compute();
+      }
+      ok = !d.codes.empty() && !d.cscales.empty() && ce.valid() &&
+           _i8->encode_to_fast(ce, s.codes, s.scales, s.qbias, d.codes,
+                               d.cscales, s.gc, s.n, s.k, s.bits) &&
+           ok;
+      return;
+    }
+    ok = clone_buf_(_mc, s.cscales, d.cscales, copy) && ok;
+    ok = clone_buf_(_mc, s.ds && copy ? kNone : s.w, d.w, copy) && ok;
     ok = clone_buf_(_mc, s.codes, d.codes, copy) && ok;
-    ok = clone_buf_(_mc, s.scales, d.scales, copy) && ok;
-    ok = clone_buf_(_mc, s.qbias, d.qbias, copy) && ok;
+    // A weight already in its int8 layout (gc > 0, not converted per
+    // call) never reads the pack's scales and biases again, so a
+    // PROMOTED copy leaves them behind -- ~6% of a w8 block, wired. A
+    // second slot (copy false) keeps them: its next refill converts.
+    const bool dead = copy && s.gc > 0 && !s.pc;
+    ok = clone_buf_(_mc, dead ? kNone : s.scales, d.scales, copy) && ok;
+    ok = clone_buf_(_mc, dead ? kNone : s.qbias, d.qbias, copy) && ok;
   };
   cq(src.qw, dst.qw); cq(src.kw, dst.kw); cq(src.vw, dst.vw);
   cq(src.ow, dst.ow);
@@ -582,7 +744,78 @@ MetalZImageTransformer::clone_block_(const Block& src, Block& dst,
   ok = clone_buf_(_mc, src.fn2, dst.fn2, copy) && ok;
   cq(src.ada, dst.ada);
   ok = clone_buf_(_mc, src.ada_b, dst.ada_b, copy) && ok;
+  if (cs.valid()) {
+    ce.end();
+    ok = cs.commit().wait_ok(nullptr) && ok;
+  }
   return ok;
+}
+
+bool
+MetalZImageTransformer::keep_block_(Block& b) const
+{
+  const bool hold = _cfg.i8_hold_w4 && _i8 != nullptr;
+  CommandStream cs;
+  bool ok = true;
+  std::vector<std::pair<QWeight*, QWeight>> held;
+  {
+    ComputeEncoder e;
+    for (QWeight* w : {&b.qw, &b.kw, &b.vw, &b.ow, &b.w1, &b.w3, &b.w2}) {
+      if (w->ds) {
+        w->w = SharedBuffer{};
+        w->ds = false;
+      }
+      if (w->quantized && w->gc > 0 && !w->pc) {
+        w->scales = SharedBuffer{};
+        w->qbias = SharedBuffer{};
+      }
+      if (!(w->quantized && w->pc && hold)) { continue; }
+      // The w4 pack into the layout the preload holds: the call and the
+      // operands its derived entry is built from, so the same bytes.
+      QWeight f;
+      f.quantized = true; f.bits = w->bits; f.gc = w->gc;
+      f.n = w->n; f.k = w->k;
+      f.codes = _mc->make_shared_buffer((std::size_t)w->n * w->k);
+      f.cscales = _mc->make_shared_buffer(
+          I8GemmContext::fast_scale_bytes(w->n, w->k, w->gc));
+      if (f.codes.empty() || f.cscales.empty()) { ok = false; continue; }
+      if (!cs.valid()) {
+        cs = _mc->make_command_stream();
+        e = cs.begin_compute();
+      }
+      if (!e.valid() ||
+          !_i8->encode_to_fast(e, w->codes, w->scales, w->qbias, f.codes,
+                               f.cscales, w->gc, w->n, w->k, w->bits)) {
+        ok = false;
+        continue;
+      }
+      held.emplace_back(w, std::move(f));
+    }
+  }
+  // Swapped in only once the GPU has written them: until then the pack
+  // is what the block runs.
+  if (cs.valid() && !cs.commit().wait_ok(nullptr)) { return false; }
+  for (auto& [w, f] : held) { *w = std::move(f); }
+  return ok;
+}
+
+std::size_t
+MetalZImageTransformer::kept_block_bytes_(const Block& b) const
+{
+  auto kq = [&](const QWeight& w) -> std::size_t {
+    if (w.pc && _cfg.i8_hold_w4 && _i8 != nullptr) {
+      return (std::size_t)w.n * w.k +
+             I8GemmContext::fast_scale_bytes(w.n, w.k, w.gc);
+    }
+    if (w.quantized && w.gc > 0 && !w.pc) {
+      return w.codes.byte_size() + w.cscales.byte_size();
+    }
+    return qw_bytes_(w);
+  };
+  return kq(b.qw) + kq(b.kw) + kq(b.vw) + kq(b.ow) + b.nq.byte_size() +
+         b.nk.byte_size() + kq(b.w1) + kq(b.w3) + kq(b.w2) +
+         b.an1.byte_size() + b.an2.byte_size() + b.fn1.byte_size() +
+         b.fn2.byte_size() + kq(b.ada) + b.ada_b.byte_size();
 }
 
 SharedBuffer
@@ -627,7 +860,8 @@ MetalZImageTransformer::sign_(QWeight& w) const
   // A weight this model keeps unsigned (dense, the layout off) has
   // nothing to do. A signed one in a slot was just REFILLED raw, whatever
   // its flag says from the build, so it converts unconditionally.
-  if (!w.quantized || !_sgn || !_i8 || !_i8->signed_available(w.bits)) {
+  if (!w.quantized || w.gc > 0 || !_sgn || !_i8 ||
+      !_i8->signed_available(w.bits)) {
     return true;
   }
   if (!genai::to_signed_affine(w.codes, w.scales, w.qbias, w.bits,
@@ -638,20 +872,120 @@ MetalZImageTransformer::sign_(QWeight& w) const
   return true;
 }
 
+// A slot built for a block of the OTHER width -- a mixed pack holds whole
+// blocks at w8 and the rest at w4, adaLN included -- is rebuilt rather
+// than refilled (BlockSlots::Ops::same_layout): the refill would place
+// the codes and keep the slot's width, fast-tier scales and signed flag.
+bool
+MetalZImageTransformer::same_layout_(int L, const Block& b) const
+{
+  if (_quant_bits == 0 || _ws == nullptr) { return true; }
+  const std::string p = mod_prefix_(L);
+  const std::pair<const QWeight*, const char*> all[] = {
+      {&b.qw, "attention.to_q"}, {&b.kw, "attention.to_k"},
+      {&b.vw, "attention.to_v"}, {&b.ow, "attention.to_out.0"},
+      {&b.w1, "feed_forward.w1"}, {&b.w3, "feed_forward.w3"},
+      {&b.w2, "feed_forward.w2"}, {&b.ada, "adaLN_modulation.0"}};
+  for (const auto& [w, nm] : all) {
+    if (stored_affine_bits(*_ws, p + nm, _quant_group) !=
+        (w->quantized ? w->bits : 0)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int
+MetalZImageTransformer::fast_weights(int bits) const
+{
+  int n = 0;
+  for (const Block& b : _blocks) {
+    for (const QWeight* w : {&b.qw, &b.kw, &b.vw, &b.ow, &b.w1, &b.w3,
+                             &b.w2, &b.ada}) {
+      n += w->quantized && w->gc > 0 && w->bits == bits;
+    }
+  }
+  return n;
+}
+
+bool
+MetalZImageTransformer::encode_fast_(ComputeEncoder& e, QWeight& w) const
+{
+  // A w4 pack kept as stored converts per GEMM (fast_operand_), not here.
+  if (w.gc <= 0 || w.pc) { return true; }
+  if (!_i8 || w.codes.empty() || w.cscales.empty()) { return false; }
+  // A dense source: quantized out of the bf16 the refill landed, by the
+  // call the preloaded entry's builder makes.
+  if (w.ds) {
+    return !w.w.empty() &&
+           _i8->encode_quant_fast(e, w.w, w.codes, w.cscales, w.gc, w.n,
+                                  w.k);
+  }
+  if (w.scales.empty() || w.qbias.empty()) { return false; }
+  // The slot's codes are the model's own: converted in place, before
+  // anything reads the block.
+  return _i8->encode_to_fast(e, w.codes, w.scales, w.qbias, w.codes,
+                             w.cscales, w.gc, w.n, w.k);
+}
+
+bool
+MetalZImageTransformer::fast_(QWeight& w) const
+{
+  if (w.gc <= 0 || w.pc) { return true; }
+  CommandStream st = _mc->make_command_stream();
+  bool ok = false;
+  {
+    ComputeEncoder e = st.begin_compute();
+    ok = encode_fast_(e, w);
+  }
+  return ok && st.commit().wait_ok(nullptr);
+}
+
+bool
+MetalZImageTransformer::fast_operand_(ComputeEncoder& enc, const QWeight& w,
+                                      const SharedBuffer** codes,
+                                      const SharedBuffer** scales) const
+{
+  if (!w.pc) {
+    *codes = &w.codes;
+    *scales = &w.cscales;
+    return true;
+  }
+  if (!_i8 || !_i8->encode_to_fast_scratch(enc, w.codes, w.scales, w.qbias,
+                                           w.gc, w.n, w.k)) {
+    return false;
+  }
+  *codes = &_i8->fast_scratch_codes();
+  *scales = &_i8->fast_scratch_scales();
+  return true;
+}
+
+bool
+MetalZImageTransformer::fast_dense_(ComputeEncoder& enc, const QWeight& w,
+                                    const SharedBuffer& out, int N, int K) const
+{
+  const SharedBuffer* c = nullptr;
+  const SharedBuffer* cs = nullptr;
+  return fast_operand_(enc, w, &c, &cs) &&
+         _i8->encode_dequant_fast(enc, *c, *cs, w.gc, out, N, K);
+}
+
 const MetalZImageTransformer::QWeight*
 MetalZImageTransformer::signed_dense_(ComputeEncoder& enc, const QWeight& w,
                                       QWeight& view, int N, int K) const
 {
-  if (!w.quantized || !w.sgn) { return &w; }
+  if (!w.quantized || (!w.sgn && w.gc <= 0)) { return &w; }
   const std::size_t need = (std::size_t)N * (std::size_t)K * 2;
   if (_w_deq.empty() || _w_deq.byte_size() < need) {
     _w_deq = _mc->make_shared_buffer(need);
     if (_w_deq.empty()) { return nullptr; }
   }
-  if (!_i8 || !_i8->encode_dequant_signed(enc, w.codes, w.scales, w.qbias,
-                                          w.bits, _w_deq, N, K)) {
-    return nullptr;
-  }
+  const bool ok =
+      _i8 != nullptr &&
+      (w.gc > 0 ? fast_dense_(enc, w, _w_deq, N, K)
+                : _i8->encode_dequant_signed(enc, w.codes, w.scales,
+                                             w.qbias, w.bits, _w_deq, N, K));
+  if (!ok) { return nullptr; }
   view = QWeight{};
   view.w = _w_deq.subview(0, need);
   if (view.w.empty()) { return nullptr; }
@@ -680,14 +1014,33 @@ MetalZImageTransformer::configure_slots_()
   };
   ops.bytes = [](const Block& b) { return block_bytes_(b); };
   ops.empty = [](const Block& b) { return b.qw.empty(); };
-  // Every quantized projection just landed RAW, and converts to the
-  // signed layout here, on the reader thread, under the GPU's work. The
-  // adaLN, which load_block_ keeps unsigned, is left as read.
+  // Every quantized projection just landed RAW, and converts to its
+  // layout here, on the reader thread, under the GPU's work: the fast
+  // layouts (a pack's codes, a dense source) in ONE command buffer for
+  // the block on the reader's own stream, the signed layout on the CPU.
+  // The adaLN, which load_block_ keeps as stored, is left as read.
   ops.post_refill = [this](int, Block& b) {
-    for (QWeight* w : {&b.qw, &b.kw, &b.vw, &b.ow, &b.w1, &b.w3, &b.w2}) {
+    QWeight* all[] = {&b.qw, &b.kw, &b.vw, &b.ow, &b.w1, &b.w3, &b.w2};
+    bool any = false;
+    for (QWeight* w : all) {
+      if (w->gc > 0 && !w->pc) { any = true; }
+    }
+    if (any) {
+      if (!_cvt_stream.valid()) { _cvt_stream = _mc->make_command_stream(); }
+      bool ok = true;
+      {
+        ComputeEncoder e = _cvt_stream.begin_compute();
+        for (QWeight* w : all) { ok = encode_fast_(e, *w) && ok; }
+      }
+      if (!_cvt_stream.commit().wait_ok(nullptr) || !ok) { return false; }
+    }
+    for (QWeight* w : all) {
       if (!sign_(*w)) { return false; }
     }
     return true;
+  };
+  ops.same_layout = [this](int L, const Block& b) {
+    return same_layout_(L, b);
   };
   _slots.set_weight_set(_ws.get());
   _slots.configure(_mc, std::move(ops), "MetalZImageTransformer",
@@ -832,6 +1185,10 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   {
     auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm,
                                               /*bf16=*/true);
+    i8->set_tier(cfg.i8_tier >= 2   ? I8GemmContext::Tier::kToken
+                 : cfg.i8_tier == 1 ? I8GemmContext::Tier::kFast
+                                    : I8GemmContext::Tier::kAccurate);
+    i8->set_token_rotation(cfg.i8_tier == 2);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
   if (const char* e = std::getenv("VPIPE_Z_IMAGE_SOL")) {
@@ -904,6 +1261,32 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
             m->_quant_group == 64 &&
             !m->_cfg.ane_ffn && !m->_cfg.ane_qkv &&
             (m->_i8->signed_available(8) || m->_i8->signed_available(4));
+  // THE FAST OR TOKEN TIER for the modulated blocks (see _fast): g64
+  // packs (w8, w4, or both in a mixed one) and dense checkpoints, on the
+  // matrix-core route, away from the ANE tiers. Its weights never meet
+  // the signed layout (sign_ leaves them), so the two decide
+  // independently.
+  m->_fast = m->_i8 && m->_use_mma2 &&
+             m->_i8->tier() != I8GemmContext::Tier::kAccurate &&
+             (m->_quant_bits == 0 || m->_quant_group == 64) &&
+             !m->_cfg.ane_ffn && !m->_cfg.ane_qkv &&
+             m->_i8->fast_group(m->_cfg.hidden) > 0;
+  if (m->_fast && mc->session() != nullptr) {
+    const int fg = m->_i8->fast_group(m->_cfg.hidden);
+    mc->session()->info(fmt(
+        "MetalZImageTransformer: the modulated blocks' projections take "
+        "the {}{}",
+        fg == I8GemmContext::kTokenGroup
+            ? std::string(m->_i8->token_rotated()
+                              ? "TOKEN int8 tier (per channel x per token, "
+                                "Hadamard-256 rotated"
+                              : "TOKEN int8 tier (per channel x per token") +
+                  "; " + m->_i8->token_kernel() + " GEMM)"
+            : fmt("FAST int8 tier (rotated, group {})", fg)(),
+        m->_stream_blocks && m->_quant_bits == 0
+            ? "; a streamed dense block is quantized after each refill"
+            : ""));
+  }
   if (m->_sgn && mc->session() != nullptr) {
     mc->session()->info(fmt(
         "MetalZImageTransformer: the quantized block projections take the "
@@ -1072,6 +1455,7 @@ MetalZImageTransformer::build_rope_(const zimage::Layout& lay,
 SharedBuffer
 MetalZImageTransformer::forward(const Request& req, std::string* err)
 {
+  _fast_failed = false;   // per forward: a latch, not a verdict on the model
   auto fail = [&](const std::string& m) {
     if (err != nullptr) { *err = m; }
     return SharedBuffer{};
@@ -1209,7 +1593,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
                 (std::streamsize)(v.size() * sizeof(float)));
       }
     }
-    stream = mc->make_command_stream();
+    // The same stream: a fresh one is a new queue, and its first
+    // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+    // stream_per_commit_costs).
     enc = stream.begin_compute();
   };
 
@@ -1262,7 +1648,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       }
     }
     if (!found) { pbuckets.push_back(Bucket{bucket, ms, 1}); }
-    stream = mc->make_command_stream();
+    // The same stream: a fresh one is a new queue, and its first
+    // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+    // stream_per_commit_costs).
     enc = stream.begin_compute();
     pclock = std::chrono::steady_clock::now();
   };
@@ -1606,12 +1994,18 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
             "z-image: staging block {}'s q/k/v for the ANE failed; it "
             "keeps the GPU projections", L));
       }
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
     }
     const int qg_rows = rows - q_rows;
     const auto t_q0 = std::chrono::steady_clock::now();
-    if (qg_rows > 0) {
+    if (qg_rows > 0 &&
+        !fast_shared_(enc, nrm, 0, qg_rows, H,
+                      {{&b.qw, &qb, 0, H, !LA(&BlockLora::q).empty()},
+                       {&b.kw, &kb, 0, H, !LA(&BlockLora::k).empty()},
+                       {&b.vw, &vb, 0, H, !LA(&BlockLora::v).empty()}})) {
       lin(nrm, 0, b.qw, qb, 0, qg_rows, H, H, LA(&BlockLora::q));
       lin(nrm, 0, b.kw, kb, 0, qg_rows, H, H, LA(&BlockLora::k));
       lin(nrm, 0, b.vw, vb, 0, qg_rows, H, H, LA(&BlockLora::v));
@@ -1636,7 +2030,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
         q_lost = _ane_qkv->lost_row0();
         if (q_lost < 0 || q_lost >= rows) { return false; }
       }
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       if (q_lost >= 0) {
         const std::size_t e0 = (std::size_t)q_lost * H;
@@ -1703,7 +2099,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
             "z-image: staging block {}'s weights for the ANE failed; it "
             "keeps the GPU feed-forward", L));
       }
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
     }
     // The GPU's feed-forward over rows [r0, r0 + n), `nrm` into `ob`: its
@@ -1712,8 +2110,33 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     auto gpu_ff = [&](int r0, int n) {
       if (n <= 0) { return; }
       const std::size_t e0 = (std::size_t)r0 * H;
-      lin(nrm, e0, b.w1, ffg, 0, n, FFI, H, LA(&BlockLora::w1));
-      lin(nrm, e0, b.w3, ffu, 0, n, FFI, H, LA(&BlockLora::w3));
+      if (!fast_shared_(enc, nrm, e0, n, H,
+                        {{&b.w1, &ffg, 0, FFI, !LA(&BlockLora::w1).empty()},
+                         {&b.w3, &ffu, 0, FFI,
+                          !LA(&BlockLora::w3).empty()}})) {
+        lin(nrm, e0, b.w1, ffg, 0, n, FFI, H, LA(&BlockLora::w1));
+        lin(nrm, e0, b.w3, ffu, 0, n, FFI, H, LA(&BlockLora::w3));
+      }
+      // FUSED: the down projection's int8 input quantized straight from
+      // gate and up, so the product is never stored -- the same codes
+      // swiglu + gemm_fast make. Not with an adapter on the down
+      // projection (it reads the bf16 product).
+      // VPIPE_Z_IMAGE_NO_SWIGLU_FUSE=1 for the A/B.
+      {
+        const QWeight& dw = b.w2;
+        const SharedBuffer* dc = nullptr;
+        const SharedBuffer* dcs = nullptr;
+        if (_i8 && dw.quantized && dw.gc > 0 && LA(&BlockLora::w2).empty() &&
+            n <= mma_row_band(H, FFI) &&
+            std::getenv("VPIPE_Z_IMAGE_NO_SWIGLU_FUSE") == nullptr &&
+            _i8->fast_accepts(n, H, FFI) &&
+            fast_operand_(enc, dw, &dc, &dcs) &&
+            _i8->gemm_fast_swiglu(enc, ffg, 0, ffu, 0, *dc, *dcs, dw.gc, ob,
+                                  e0, n, H, FFI)) {
+          _flops.gemm(n, H, FFI);
+          return;
+        }
+      }
       // In place on the gate: same index in, same index out. The
       // largest elementwise dispatch in the model, so it is the one
       // that pays most for being four-wide.
@@ -1747,7 +2170,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
         ff_lost = _ane->lost_row0();
         if (ff_lost < 0 || ff_lost >= rows) { return false; }
       }
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       if (ff_lost >= 0) { gpu_ff(ff_lost, rows - ff_lost); }
     }
@@ -1807,7 +2232,10 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     bool on;
     ~SlotJoin() { if (on) { s->join(); } }
   } slot_join{&_slots, _stream_blocks};
-  if (_stream_blocks) { _slots.begin_forward(); }
+  if (_stream_blocks) {
+    (void)_slots.release_if_saturated(_blocks);
+    _slots.begin_forward();
+  }
 
   // ---- how much of the stack this box can KEEP ------------------------
   if (_stream_blocks) {
@@ -1980,7 +2408,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       if (!stream.commit().wait_ok(&ge2)) {
         return fail("z-image forward: " + ge2);
       }
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
     }
     // ONE ANE worker serves both tiers and takes one job at a time -- a
@@ -2047,9 +2477,16 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       // AFTER the wait, so nothing encoded still points at the slot,
       // and promotion CLONES out of it so the slot stays usable for the
       // read already in flight.
-      const std::size_t nb = _slots.last_bytes();
+      // KEPT bytes, not the slot's: a promotion drops a dense source
+      // and dead pack scales, and converts a held w4 layout
+      // (clone_block_).
+      const std::size_t nb =
+          _slots.last_bytes() > 0 ? kept_block_bytes_(*b) : 0;
       if (nb > 0 && _wire.wirable(nb) && _resid.admit(_mc, nb) &&
           _slots.promote_into(_blocks[(std::size_t)L])) {
+        // What a preloaded block holds, whichever way it was promoted --
+        // see keep_block_.
+        (void)keep_block_(_blocks[(std::size_t)L]);
         // Wired LAST, after every write this block will ever get: mlock
         // pins the pages that exist NOW.
         _wire.note_wired(_mc, wire_block_(_blocks[(std::size_t)L], true),
@@ -2057,7 +2494,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
         _resid.note_admitted(nb);
       }
       sp_add(sp_gpu_ms, gp0);
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       if (!enc.valid()) { return fail("z-image forward: no encoder"); }
       // ITS OWN BUCKET. The commit, the wait and the promotion happen
@@ -2084,7 +2523,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       if (!stream.commit().wait_ok(&ge)) {
         return fail("z-image forward: " + ge);
       }
-      stream = mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       if (!enc.valid()) { return fail("z-image forward: no encoder"); }
     }
@@ -2118,6 +2559,11 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
   }
   // Every routed layer has run, so Sol's count is this forward's whole.
   if (_sol) { _sol_flops.finish(_sol->exact_blocks()); }
+  if (_fast_failed) {
+    _fast_failed = false;
+    return fail("z-image forward: a fast-tier GEMM was declined after its "
+                "input was quantized");
+  }
   if (prof && mc->session() != nullptr) {
     double tot = 0.0;
     for (const auto& b : pbuckets) { tot += b.ms; }
@@ -2163,6 +2609,39 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
   return vel;
 }
 
+bool
+MetalZImageTransformer::fast_shared_(ComputeEncoder& enc, const SharedBuffer& x,
+                                     std::size_t xe, int M, int K,
+                                     std::initializer_list<FastOut> outs)
+{
+  if (!_i8 || outs.size() < 2 ||
+      std::getenv("VPIPE_Z_IMAGE_NO_FAST_SHARE") != nullptr) {
+    return false;
+  }
+  const int gc = outs.begin()->w->gc;
+  for (const FastOut& o : outs) {
+    const QWeight& w = *o.w;
+    if (!w.quantized || w.gc <= 0 || w.gc != gc || o.adapted ||
+        M > mma_row_band(o.n, K) || !_i8->fast_accepts(M, o.n, K)) {
+      return false;
+    }
+  }
+  if (!_i8->quantize_fast(enc, x, xe, M, K, gc)) { return false; }
+  for (const FastOut& o : outs) {
+    const SharedBuffer* c = nullptr;
+    const SharedBuffer* cs = nullptr;
+    if (!fast_operand_(enc, *o.w, &c, &cs) ||
+        !_i8->gemm_fast_quantized(enc, *c, *cs, gc, SharedBuffer{}, *o.y, o.ye,
+                                  M, o.n, K)) {
+      // Unreachable after the checks above; a hole would be silent, so
+      // the forward reports it.
+      _fast_failed = true;
+    }
+    _flops.gemm(M, o.n, K);
+  }
+  return true;
+}
+
 // ---- the matrix-core GEMM -------------------------------------------
 //
 // Returns false with NOTHING encoded when this box or this shape is not
@@ -2187,6 +2666,18 @@ MetalZImageTransformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& xin,
   // its floor is the int8 route's own (I8GemmContext::signed_accepts --
   // 1024 rows, or lower by VPIPE_I8_SIGNED_MIN_M, which it then beats
   // the dequant + matmul2d below at).
+  // THE FAST TIER's GEMM (a weight held in its layout), at the same
+  // floor; below it the weight dequantizes like a signed one.
+  if (_i8 && w.quantized && w.gc > 0 &&
+      _i8->fast_accepts(M, N, K)) {
+    const SharedBuffer* c = nullptr;
+    const SharedBuffer* cs = nullptr;
+    if (fast_operand_(enc, w, &c, &cs) &&
+        _i8->gemm_fast(enc, xin, xe, *c, *cs, w.gc, SharedBuffer{}, y, ye,
+                       M, N, K)) {
+      return true;
+    }
+  }
   if (_i8 && w.quantized && w.sgn &&
       _i8->gemm_signed(enc, xin, xe, w.codes, w.scales, w.qbias, w.bits, y,
                        ye, M, N, K)) {
@@ -2195,7 +2686,7 @@ MetalZImageTransformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& xin,
   if (M < _mma_min_m) { return false; }
 
   const SharedBuffer* wdense = nullptr;
-  if (w.quantized && w.sgn) {
+  if (w.quantized && (w.sgn || w.gc > 0)) {
     QWeight view;
     if (signed_dense_(enc, w, view, N, K) == nullptr) { return false; }
     wdense = &_w_deq;
@@ -2334,7 +2825,8 @@ MetalZImageTransformer::ane_eligible_(int L, const Block& b) const
   auto ok = [](const QWeight& q) {
     if (q.empty()) { return false; }
     if (!q.quantized) { return true; }
-    return (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
+    // The fast layout is not affine: the stager cannot read it.
+    return q.gc == 0 && (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
            !q.qbias.empty();
   };
   return ok(b.w1) && ok(b.w3) && ok(b.w2);
@@ -2431,7 +2923,8 @@ MetalZImageTransformer::ane_qkv_eligible_(int L, const Block& b) const
   auto ok = [](const QWeight& q) {
     if (q.empty()) { return false; }
     if (!q.quantized) { return true; }
-    return (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
+    // The fast layout is not affine: the stager cannot read it.
+    return q.gc == 0 && (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
            !q.qbias.empty();
   };
   return ok(b.qw) && ok(b.kw) && ok(b.vw);
@@ -2690,6 +3183,71 @@ MetalZImageTransformer::resident_bytes() const
   // the whole stack and `_resid` is empty; streaming, it holds exactly
   // what residency promoted.
   for (const Block& b : _blocks) { n += block_bytes_(b); }
+  // And the slot pair while it exists: it stays allocated beside every
+  // promoted block, and a holding taken without it dropped two blocks
+  // from both ledgers once the promoted set passed the floor.
+  n += _slots.held_bytes();
+  return n;
+}
+
+void
+MetalZImageTransformer::release_forward_scratch()
+{
+  _w_deq = {};
+  if (_i8) { _i8->release_scratch(); }
+}
+
+std::size_t
+MetalZImageTransformer::forward_scratch_bytes(const Config& c, int img_rows,
+                                              int txt_rows, bool packed,
+                                              bool matrix_cores)
+{
+  // Mirrors forward() at build_layout()'s geometry (each half padded to
+  // kSeqMultiple, image first): ten [JT, H] planes (joint, nrm, ob, q /
+  // k / v, their head-major copies, ao), the [JT, F] gate and up, the
+  // caption's normed input, the f32 rotary pair and the velocity -- all
+  // live for the whole forward, the refiners using prefixes of them.
+  // Held between forwards: a pack's dense stand-in, the int8 context,
+  // and Sol's / Sage's scratch, which rebuild per geometry inside a
+  // forward and on a held stack overlap the set the open command buffer
+  // still retains -- so each geometry is booked.
+  if (img_rows <= 0) { return 0; }
+  auto pad = [](std::size_t n) {
+    const std::size_t m = (std::size_t)zimage::kSeqMultiple;
+    return (n + m - 1) / m * m;
+  };
+  const std::size_t txt = txt_rows > 0 ? (std::size_t)txt_rows : 0;
+  const std::size_t IT = pad((std::size_t)img_rows), CT = pad(txt);
+  const std::size_t JT = IT + CT;
+  const std::size_t H = (std::size_t)c.hidden;
+  const std::size_t F = (std::size_t)c.ffn_inner;
+  const std::size_t Hd = (std::size_t)c.head_dim;
+  std::size_t n = 10 * JT * H * 2 + 2 * JT * F * 2 +
+                  txt * (std::size_t)c.cap_dim * 2 + 2 * JT * Hd * 4 +
+                  (std::size_t)img_rows * (std::size_t)c.patch_dim() * 2;
+  if (packed) { n += F * H * 2; }
+  if (!matrix_cores) { return n; }
+  if (c.i8_gemm) {
+    n += I8GemmContext::forward_bytes_bound((int)JT, (int)F, (int)F, (int)H,
+                                            c.i8_tier == 0);
+  }
+  const int NH = c.n_heads;
+  if (c.sol.enabled) {
+    for (std::size_t r : {JT, IT}) {
+      if (r >= (std::size_t)kSolMinSegment) {
+        n += MetalSolAttention::scratch_bytes(NH, (int)r, (int)Hd,
+                                              c.sol.key_block, true);
+      }
+    }
+  }
+  if (c.sage.enabled) {
+    for (std::size_t r : {JT, IT, CT}) {
+      if (r >= (std::size_t)kSageMinSegment) {
+        n += MetalSageAttention::scratch_bytes(NH, NH, (int)r, (int)r,
+                                               (int)Hd, 64, 32);
+      }
+    }
+  }
   return n;
 }
 

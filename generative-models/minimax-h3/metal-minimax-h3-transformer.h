@@ -165,6 +165,23 @@ class MetalMiniMaxH3Transformer {
     // hand) at a cost of 4.8% extra int8 MACs, inside its 10% cap.
     // Set from generate-video's `i8_gemm`; VPIPE_I8_GEMM overrides.
     bool i8_gemm = false;
+    // ...and which int8 GEMM (I8GemmContext::Tier, generate-video's
+    // `i8_gemm_tier`): 0 accurate (the per-call route above), 1 fast,
+    // 2 token, 3 token unrotated. The last three HOLD the 50 main
+    // blocks' four projections in I8GemmContext's int8 layout (rotated
+    // coarse groups, or one scale a row and a token), converted once
+    // into the entry a kept block holds; a Draw Things i8x checkpoint's
+    // codes ARE the unrotated token layout and are read as stored,
+    // kept or streamed. Off under the ANE tier, whose stagers read the
+    // checkpoint's own weights. VPIPE_I8_TIER / VPIPE_I8_TOKEN_ROT
+    // override it.
+    int i8_tier = 0;
+    // A w4 pack's block projections on the fast / token tiers: HOLD
+    // their int8 layout (true; twice their bytes, the fastest) or keep
+    // the pack and convert it before each GEMM into one scratch (false,
+    // the default; a streamed block always does). The engine's call --
+    // generate-image sets it where the box has room.
+    bool i8_hold_w4 = false;
 
     // Sol-Attn (LOSSY), from generate-video's `sol_attn*` keys. Off by
     // default. Attention here is dense self-attention over the packed
@@ -531,6 +548,21 @@ class MetalMiniMaxH3Transformer {
   // in one commit. Remove once nothing asks.
   int pinned_blocks() const { return 0; }
   bool streaming() const { return _stream_blocks; }
+  // Whether the main blocks' projections run in the int8 layout
+  // (Config::i8_tier), and -- for a preloaded stack -- whether the first
+  // one holds a Draw Things checkpoint's own codes. What a test asserts
+  // before it compares anything.
+  bool i8_layout() const { return _i8_layout; }
+  bool i8x_native() const
+  {
+    return !_blocks.empty() && _blocks[0].qkv.i8x && _blocks[0].fc2.i8x;
+  }
+  // The token tiers' GEMM kernel it took ("blocked 128x64", ...; empty
+  // without int8).
+  std::string i8_token_kernel() const
+  {
+    return _i8 ? _i8->token_kernel() : std::string();
+  }
 
   // Bytes the ANE feed-forward tier holds for a `seq`-row forward of this
   // shape; see AneFeedForward::runtime_bytes. Static because the PLAN asks
@@ -833,6 +865,21 @@ class MetalMiniMaxH3Transformer {
   // Reported so a run can say how much of the box it actually used.
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
+  // The streaming slot pair, while it exists.
+  std::size_t slot_bytes() const
+  {
+    return block_bytes_(_slot[0]) + block_bytes_(_slot[1]);
+  }
+  // What a STREAMING model holds beyond its weight set's cached entries
+  // (the trunk): the promoted blocks, the slot pair and the AdaLN tables
+  // the bake built. The figure a per-clip holding correction adds to the
+  // set's -- promoted blocks are this model's own buffers, which the set
+  // never sees. 0 for a preloaded model, whose blocks are the set's.
+  std::size_t streamed_holding_bytes() const;
+  // EVERY BLOCK KEPT: give the slot pair back -- two blocks a preload
+  // never held. Call with no forward running; the next streamed block
+  // (after an eviction) builds it again. Returns the bytes freed.
+  std::size_t release_idle_slots();
 
   // Give back at least `bytes` of promoted blocks, for a peer that needs
   // the room (the VAE decode is the case this exists for). Returns what
@@ -954,6 +1001,14 @@ class MetalMiniMaxH3Transformer {
   // BYTES each, which at video geometry is a gigabyte and a half that
   // nothing sizing the box had heard of.
   std::size_t sage_scratch_bytes(int seq) const;
+
+  // ...and the INT8 CONTEXT's, the same shape of question again: the
+  // activation codes and scales of the widest GEMM at this sequence, the
+  // per-call weight scratch (the accurate tier requantizes every weight
+  // per call; a w4 pack on fast / token converts into it) and split-K's
+  // planes -- grown inside the first forward and kept. A bound
+  // (I8GemmContext::forward_bytes_bound), 0 when the context is off.
+  std::size_t i8_scratch_bytes(int seq) const;
 
   // How many times the activation scratch has been ALLOCATED.
   //
@@ -1156,9 +1211,30 @@ class MetalMiniMaxH3Transformer {
     fp8::Format f8 = fp8::Format::kNone;
     metal_compute::SharedBuffer f8_scale;
     bool f8_per_row = false;
+    // I8GemmContext's int8 LAYOUT (Config::i8_tier) when gc > 0: `codes`
+    // int8 [n, k] and `cscales` its scales at group gc (kTokenGroup: f32
+    // [n]) -- or, `pc`, a w4 pack's codes / scales / qbias as stored,
+    // converted per projection (gemm_). Deliberately NOT `quantized`,
+    // which means the affine pack every other route reads.
+    // `i8x`: Draw Things' own codes, refilled raw by name in a slot.
+    int gc = 0;
+    int n = 0, k = 0;
+    metal_compute::SharedBuffer cscales;
+    bool i8x = false;
+    // The w4 pack kept as stored and converted per projection (gemm_);
+    // false for a layout held (Config::i8_hold_w4), w4 or w8.
+    bool pc = false;
+    // A STREAMED block's layout, rebuilt after every refill out of what
+    // the slot refills (refill_block_): `ds`, a dense weight -- `w` keeps
+    // its bf16, quantized into codes / cscales; `ps`, a w8 pack -- its
+    // codes / scales / qbias are refilled and the codes converted IN
+    // PLACE. A promotion keeps the layout alone (keep_block_), as the
+    // entry a preloaded block holds.
+    bool ds = false;
+    bool ps = false;
     bool is_fp8() const { return f8 != fp8::Format::kNone; }
     bool empty() const {
-      return (quantized || is_fp8()) ? codes.empty() : w.empty();
+      return (quantized || is_fp8() || gc > 0) ? codes.empty() : w.empty();
     }
   };
 
@@ -1286,6 +1362,20 @@ class MetalMiniMaxH3Transformer {
   metal_compute::SharedBuffer weight_(WeightSet& ws, const std::string& nm,
                                       Retain r);
   Linear linear_(WeightSet& ws, const std::string& nm, bool bias, Retain r);
+  // A main block's projection in I8GemmContext's int8 layout (see
+  // Config::i8_tier), or an EMPTY Linear where it cannot be -- the caller
+  // then takes linear_(). Native for a Draw Things i8x weight; converted
+  // once into a derived entry otherwise, and then for a kept block only.
+  Linear i8_linear_(WeightSet& ws, const std::string& nm, Retain r);
+  // A layout weight widened into the dequant scratch for a shape the int8
+  // GEMM declines, from its layout operands (`l`'s own, or the scratch a
+  // w4 pack was converted into); `view` aliases the scratch, as
+  // fp8_dense_'s does.
+  const Linear* i8_dense_(metal_compute::ComputeEncoder& enc,
+                          const Linear& l,
+                          const metal_compute::SharedBuffer& codes,
+                          const metal_compute::SharedBuffer& cscales,
+                          Linear& view, int N, int K);
   // A linear the checkpoint stores in PIECES (the diffusers layout's
   // split qkv and swapped fc1 -- minimax-h3-diffusers-layout.h), built
   // whole: FP8 codes when every piece is FP8 of one format, else bf16.
@@ -1303,8 +1393,27 @@ class MetalMiniMaxH3Transformer {
   // when an FP8 weight cannot be expanded.
   const Linear* fp8_dense_(metal_compute::ComputeEncoder& enc,
                            const Linear& l, Linear& view, int N, int K);
+  // `main`: one of the 50 main blocks (the int8 layout may apply; the
+  // refiner's text rows sit under its row floor). `with_adaln`: read the
+  // AdaLN projection -- false for a refiner block and for a main block
+  // once the bake has replaced it. Two questions: a baked main block is
+  // still a main block.
   bool load_block_(WeightSet& ws, const std::string& prefix, Block& b,
-                   bool with_adaln, Retain r);
+                   bool main, bool with_adaln, Retain r);
+  // A streamed layout weight's conversion (Linear::ds / ps), encoded on
+  // `e`; true with nothing encoded for any other weight.
+  bool encode_fast_(metal_compute::ComputeEncoder& e, Linear& l) const;
+  // What a PROMOTION of `b` keeps: no dense source, no dead pack scales,
+  // a w4 pack whose layout is held (Config::i8_hold_w4) at the layout's
+  // size. Residency and the wired pool are asked for this.
+  std::size_t kept_block_bytes_(const Block& b) const;
+  // ...and makes the promoted block hold exactly that, whether it was
+  // cloned out of a slot or moved in from the per-block fallback.
+  // Idempotent.
+  bool keep_block_(Block& b) const;
+  // The refill's conversions, on a stream of the reader's (a fresh queue's
+  // first commit costs 1-2 ms; four projections a block added up).
+  mutable metal_compute::CommandStream _cvt_stream;
 
   // Offsets are in ELEMENTS, not bytes, and exist because every
   // modality writes into its own contiguous slice of the one packed
@@ -1596,6 +1705,9 @@ class MetalMiniMaxH3Transformer {
   metal_compute::ComputeFunction _fn_qmm_swiglu4, _fn_qmm_swiglu8;
   metal_compute::ComputeFunction _fn_qmm_swiglu4_bm64, _fn_qmm_swiglu8_bm64;
   bool _fuse_ff = false;
+  // The main blocks' projections take I8GemmContext's int8 layout
+  // (Config::i8_tier); decided before any block loads.
+  bool _i8_layout = false;
 
   // ---- the ANE tier ------------------------------------------------
   // Built LAZILY at the first forward, because the chunked module needs

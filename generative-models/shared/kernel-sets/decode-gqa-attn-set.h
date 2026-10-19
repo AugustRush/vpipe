@@ -70,6 +70,16 @@ class DecodeGqaAttnSet {
   // THE UNIFIED ENTRANCE. Encodes the winning member kernel (+ its tuned split)
   // for a.pos's regime into a.out. No-op if !ready().
   void dispatch(metal_compute::ComputeEncoder& enc, const Attn& a) const;
+  // The same for `rows` query rows at once -- row r at a.pos + r, its q
+  // at a.q_off + r * Hq * D elements in, its [Hq,D] result as far into
+  // a.out -- a speculative verify's rows in one pass and one merge
+  // instead of two dispatches a row (each latency-bound), every row's
+  // arithmetic the one-row dispatch's at a.pos's split. The caller owns
+  // the partials: o >= rows*Hq*256*D floats, m and l >= rows*Hq*256.
+  void dispatch_rows(metal_compute::ComputeEncoder& enc, const Attn& a,
+                     int rows, const metal_compute::SharedBuffer& o,
+                     const metal_compute::SharedBuffer& m,
+                     const metal_compute::SharedBuffer& l) const;
 
   // Resolved choice for `pos` (for the model's load-time debug log).
   const char* kernel_name(int pos) const;
@@ -93,7 +103,10 @@ class DecodeGqaAttnSet {
 
   int regime_of(int pos) const;
   void encode_member(metal_compute::ComputeEncoder& enc, const Attn& a,
-                     bool vec2, int split) const;
+                     bool vec2, int split, int rows = 1,
+                     const metal_compute::SharedBuffer* o = nullptr,
+                     const metal_compute::SharedBuffer* m = nullptr,
+                     const metal_compute::SharedBuffer* l = nullptr) const;
 };
 
 }  // namespace vpipe::genai

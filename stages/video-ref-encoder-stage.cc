@@ -100,6 +100,18 @@ const ConfigKey kAttrs[] = {
    // mode from the composer entirely -- the picker would filter out the
    // only checkpoint it runs on.
    .suggest_db_type = "minimax-h3-ref2va,minimax-h3-fl2va"},
+  {.key = "encoder_dir", .type = ConfigType::String, .required = false,
+   .doc = "the text encoder's WEIGHTS, when they are not hf_dir's own: a "
+          "directory, a registry key, or a single file -- a Draw Things "
+          ".ckpt (MiniMax-H3's Qwen3-VL-32B, vision tower included), read "
+          "under the release's names. The config and tokenizer still come "
+          "from hf_dir",
+   .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
+  {.key = "vae_dir", .type = ConfigType::String, .required = false,
+   .doc = "the video and audio VAEs' WEIGHTS, when they are not hf_dir's "
+          "own: a Draw Things .ckpt carrying both (MiniMax-H3's), read "
+          "under the release's names. The configs still come from hf_dir",
+   .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
   {.key = "frames", .type = ConfigType::Int, .required = false,
    .doc = "the GENERATED frame count at 24 fps, snapped up to the next "
           "17n+5. MUST MATCH the generate-video stage's `frames`: it is the "
@@ -346,6 +358,8 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
   // "no model at all" is reported at initialize()/process() time, when
   // iport connectivity is known, rather than at construction.
   _hf_dir           = attr_str("hf_dir");
+  _enc_weights      = attr_str("encoder_dir");
+  _vae_weights      = attr_str("vae_dir");
   // One path or a list of them. The composer's file browser appends
   // into a JSON array, and a single pick left as a bare string is what
   // a hand-written pipeline looks like -- both are the same request, so
@@ -538,16 +552,17 @@ VideoRefEncoderStage::declare_memory() const
   if (enc.empty()) { enc = (fs::path(root) / "text_encoder").string(); }
   std::string vvae = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
   if (vvae.empty()) { vvae = (fs::path(root) / "video_vae").string(); }
-  // ONLY what this stage HOLDS.
-  //
-  // declare_resources also names the DiT, because a claim is what every
-  // peer sizes itself against and a 66 GB component nobody declared is
-  // the silent under-count the planning phase exists to prevent. This
-  // is a different question: StageMemory describes one stage's own
-  // holdings, and the DiT belongs to generate-video, which declares it.
-  // Counting it here as well would charge the graph for it twice --
-  // this plan dedups by nothing, since it deliberately knows bytes and
-  // not checkpoints.
+  // Weights named apart are what loads, so they are what is held.
+  if (const std::string w = weights_path_(_enc_weights); !w.empty()) {
+    enc = w;
+  }
+  if (const std::string w = weights_path_(_vae_weights); !w.empty()) {
+    vvae = w;
+  }
+  // ONLY what this stage HOLDS. The DiT belongs to generate-video, which
+  // declares it -- here as in declare_resources -- and counting it here
+  // as well would charge the graph for it twice: this plan dedups by
+  // nothing, since it deliberately knows bytes and not checkpoints.
   const bool destroys = _unload_cfg == model_memory::UnloadPolicy::kDestroy;
   const bool reclaims  = _unload_cfg == model_memory::UnloadPolicy::kAuto;
   // The encoder streams its layers here (ecfg.lm.stream_layers), so it
@@ -569,19 +584,12 @@ VideoRefEncoderStage::declare_resources() const
   if (enc.empty()) { enc = (fs::path(root) / "text_encoder").string(); }
   std::string vvae = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
   if (vvae.empty()) { vvae = (fs::path(root) / "video_vae").string(); }
-  // The DiT is declared here as well, exactly as the conditioner
-  // declares the DiT it is paired with: this claim is what every peer
-  // sizes itself against, and a 66 GB component nobody declared is the
-  // silent under-count the resource-planning phase exists to prevent.
-  // Which partition the reference names, from the models DB: a repo
-  // holding both resolves to fl2va by filename, and this claim is what
-  // every peer sizes itself against.
-  const std::string part =
-      genai::MetalMiniMaxH3Transformer::partition_of_model_type(
-          resolve_model(session(), _hf_dir).model_type);
-  std::string dit =
-      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
-  if (dit.empty()) { dit = (fs::path(root) / "transformer").string(); }
+  if (const std::string w = weights_path_(_enc_weights); !w.empty()) {
+    enc = w;
+  }
+  if (const std::string w = weights_path_(_vae_weights); !w.empty()) {
+    vvae = w;
+  }
 
   // THE ENCODER IS CLAIMED WITH ITS FLOOR, and that is not the same
   // thing as declare_memory() already knowing the floor.
@@ -606,11 +614,10 @@ VideoRefEncoderStage::declare_resources() const
   // the second is an UNDER-count that misses the use this stage makes
   // of it.
   //
-  // The DiT is declared here as well, exactly as the conditioner
-  // declares the DiT it is paired with: this claim is what every peer
-  // sizes itself against, and a 66 GB component nobody declared is the
-  // silent under-count the resource-planning phase exists to prevent.
-  for (auto& c : model_memory::weight_claims({vvae, dit})) {
+  // NOT THE DiT: generate-video declares the one it loads (its
+  // partition, or its `dit_dir`), and naming the release's copy here put
+  // a DiT nothing loads in the plan whenever the two differ.
+  for (auto& c : model_memory::weight_claims({vvae})) {
     out.push_back(std::move(c));
   }
   return out;
@@ -644,18 +651,17 @@ VideoRefEncoderStage::decide_resources() const
   const std::string root = resolve_model_dir(session(), _hf_dir);
   std::string enc = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
   if (enc.empty()) { enc = (fs::path(root) / "text_encoder").string(); }
-  const std::string part =
-      genai::MetalMiniMaxH3Transformer::partition_of_model_type(
-          resolve_model(session(), _hf_dir).model_type);
-  std::string dit =
-      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
-  if (dit.empty()) { dit = (fs::path(root) / "transformer").string(); }
+  // The encoder this stage LOADS -- `encoder_dir` when set, as
+  // declare_resources claims it. Phasing the release's copy left the
+  // claimed one (a 32B Draw Things .ckpt) persistent through the denoise.
+  if (const std::string w = weights_path_(_enc_weights); !w.empty()) {
+    enc = w;
+  }
 
   const bool releases =
       _unload_cfg == model_memory::UnloadPolicy::kDestroy ||
       (_unload_cfg == model_memory::UnloadPolicy::kAuto &&
-       model_memory::bounded(session(), {enc, dit},
-                             model_memory::kHeadroom));
+       model_memory::bounded(session(), {enc}, model_memory::kHeadroom));
   if (!releases) { return {}; }
   return model_memory::weight_claims_in_phase(
       {enc}, model_memory::kPhaseCondition);
@@ -745,6 +751,13 @@ VideoRefEncoderStage::ensure_loaded_()
   }
 }
 
+std::string
+VideoRefEncoderStage::weights_path_(const std::string& ref) const
+{
+  if (ref.empty()) { return {}; }
+  return resolve_model_dir(session(), ref);
+}
+
 bool
 VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
 {
@@ -764,6 +777,15 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
   // globally, because the pool is KV for 50 layers of a 32B model and a
   // text-only conditioner should not pay for it.
   if (_max_prompt_tokens > 0) { ecfg.lm.max_seq = _max_prompt_tokens; }
+  // The weights from `encoder_dir` when it names them; the config above
+  // and the tokenizer from the model's own encoder either way.
+  const std::string enc_w = weights_path_(_enc_weights);
+  if (!enc_w.empty()) {
+    ecfg.weights = enc_w;
+    session()->info(fmt(
+        "VideoRefEncoderStage('{}'): the text encoder's weights from '{}', "
+        "its config and tokenizer from '{}'", this->id(), enc_w, _enc_dir));
+  }
   {
     // The 50 tapped layers are ~48 GB bf16 (~26 GB at w8), and this
     // stage holds two VAEs beside them. Same streaming rule the DiTs
@@ -775,8 +797,8 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
     // phase, and asking about `denoise` -- where it no longer exists --
     // drops its own bytes from its own verdict. See plan_streaming.
     const auto plan = model_memory::plan_streaming(
-        session(), _enc_dir, std::string(), model_memory::kStreamHeadroom,
-        0, model_memory::kPhaseCondition);
+        session(), enc_w.empty() ? _enc_dir : enc_w, std::string(),
+        model_memory::kStreamHeadroom, 0, model_memory::kPhaseCondition);
     // ALWAYS STREAM -- see StreamPlan::stream. One prefill per prompt,
     // then dropped; the plan is consulted only for the pinned prefix.
     ecfg.lm.stream_layers = true;
@@ -825,8 +847,13 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
                          vcerr));
     return false;
   }
-  _video_vae = genai::MetalMiniMaxH3VideoVae::load(
-      vdir.empty() ? _root : vdir, mc, vcfg);
+  const std::string vae_w = weights_path_(_vae_weights);
+  _video_vae =
+      vae_w.empty()
+          ? genai::MetalMiniMaxH3VideoVae::load(vdir.empty() ? _root : vdir,
+                                                mc, vcfg)
+          : genai::MetalMiniMaxH3VideoVae::load(
+                genai::open_weight_set(vae_w, session()), mc, vcfg);
   if (!_video_vae) {
     session()->error(fmt(
         "VideoRefEncoderStage('{}'): video VAE load failed: {}", this->id(),
@@ -840,8 +867,12 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
   std::string acerr;
   if (genai::MetalMiniMaxH3AudioVae::config_from_json(
           adir.empty() ? _root : adir, acfg, &acerr)) {
-    _audio_vae = genai::MetalMiniMaxH3AudioVae::load(
-        adir.empty() ? _root : adir, mc, acfg);
+    _audio_vae =
+        vae_w.empty()
+            ? genai::MetalMiniMaxH3AudioVae::load(adir.empty() ? _root : adir,
+                                                  mc, acfg)
+            : genai::MetalMiniMaxH3AudioVae::load(
+                  genai::open_weight_set(vae_w, session()), mc, acfg);
   }
   if (!_audio_vae) {
     // NOT fatal: a request of images and silent clips never touches it.
@@ -852,17 +883,17 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
         "carry a soundtrack will be refused", this->id(),
         acerr.empty() ? "load failed" : acerr));
   }
-  // What the idle-unload heuristic weighs: this stage's own components
-  // plus the DiT it is paired with. Same dirs declare_resources() named,
-  // so the declaration and the estimate cannot disagree.
+  // What the idle-unload heuristic weighs: this stage's own components.
+  // Same dirs declare_resources() named, so the declaration and the
+  // estimate cannot disagree; the DiT is counted from generate-video's
+  // declaration, which the manager holds.
   _peer_dirs.clear();
-  _peer_dirs.push_back(_enc_dir);
-  if (!vdir.empty()) { _peer_dirs.push_back(vdir); }
-  if (!adir.empty()) { _peer_dirs.push_back(adir); }
-  {
-    const std::string d =
-        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(_root, _partition);
-    if (!d.empty()) { _peer_dirs.push_back(d); }
+  _peer_dirs.push_back(enc_w.empty() ? _enc_dir : enc_w);
+  if (!vae_w.empty()) {
+    _peer_dirs.push_back(vae_w);
+  } else {
+    if (!vdir.empty()) { _peer_dirs.push_back(vdir); }
+    if (!adir.empty()) { _peer_dirs.push_back(adir); }
   }
   session()->info(fmt(
       "VideoRefEncoderStage('{}'): MiniMax-H3 ref2va encoders ready "

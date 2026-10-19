@@ -13,10 +13,15 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/weight-registry.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace std;
@@ -316,6 +321,115 @@ TEST(weight_registry, shared_model_dies_with_its_last_holder) {
   // All holders gone -> the entry expires and the next request rebuilds.
   auto d = mgr->shared_model<Payload>("ut-kind", dir, "", make);
   EXPECT_TRUE(builds == 2);
+}
+
+// A model a stage built, kept warm (keep_model_warm): handed back to the
+// next stage asking for its kind, directory AND key; another key over
+// the same model drops the stale build; it goes at its time, and when
+// a launch that declares weights but not its directory asks for room.
+TEST(weight_registry, a_built_model_is_kept_warm_by_key) {
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  const std::string dir = "/tmp/vpipe-warm-model-test";
+  std::weak_ptr<Payload> seen;
+  {
+    auto m = std::make_shared<Payload>(1);
+    seen = m;
+    mgr->keep_model_warm("ut-dit", dir, "i8 3", std::move(m), 4096, 60.0);
+  }
+  EXPECT_TRUE(!seen.expired());              // the hold keeps it
+  EXPECT_TRUE(mgr->warm_model_bytes(dir) == 4096);
+  // Another kind or key is not it.
+  EXPECT_TRUE(mgr->take_warm<Payload>("ut-vae", dir, "i8 3") == nullptr);
+  EXPECT_TRUE(!seen.expired());
+  auto got = mgr->take_warm<Payload>("ut-dit", dir, "i8 3");
+  ASSERT_TRUE(got != nullptr);
+  EXPECT_TRUE(got->value == 1);
+  EXPECT_TRUE(mgr->warm_model_bytes(dir) == 0);   // taken: no longer held
+  EXPECT_TRUE(mgr->take_warm<Payload>("ut-dit", dir, "i8 3") == nullptr);
+
+  // Kept again, then asked under another key: the old build goes.
+  mgr->keep_model_warm("ut-dit", dir, "i8 3", std::move(got), 4096, 60.0);
+  EXPECT_TRUE(!seen.expired());
+  EXPECT_TRUE(mgr->take_warm<Payload>("ut-dit", dir, "i8 0") == nullptr);
+  EXPECT_TRUE(seen.expired());
+
+  // Its time out: the reaper lets it go.
+  {
+    auto m = std::make_shared<Payload>(2);
+    seen = m;
+    mgr->keep_model_warm("ut-dit", dir, "k", std::move(m), 1, 0.05);
+  }
+  for (int i = 0; i < 200 && !seen.expired(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(seen.expired());
+
+  // A launch that declares other weights: released as a warm LM is.
+  {
+    auto m = std::make_shared<Payload>(3);
+    seen = m;
+    mgr->keep_model_warm("ut-dit", dir, "k", std::move(m), 1, 60.0);
+  }
+  mgr->clear_declarations();
+  mgr->declare_weights("/tmp/vpipe-warm-model-other", 1u << 20);
+  auto dirs = mgr->warm_dirs();
+  EXPECT_TRUE(std::find(dirs.begin(), dirs.end(), dir) != dirs.end());
+  EXPECT_TRUE(mgr->release_warm_unclaimed() == 1);
+  EXPECT_TRUE(seen.expired());
+  mgr->clear_declarations();
+
+  // 0 seconds: let go at once.
+  {
+    auto m = std::make_shared<Payload>(4);
+    seen = m;
+    mgr->keep_model_warm("ut-dit", dir, "k", std::move(m), 1, 0.0);
+  }
+  EXPECT_TRUE(seen.expired());
+}
+
+// A model still kept warm as the SESSION ends goes with the manager --
+// and a DiT going gives its wired buffers back through the session's
+// MetalCompute (WiredPool::wire_one, from its destructor). The session
+// destroyed its MetalCompute first: every process that ended with a DiT
+// kept warm read freed memory there, and segfaulted.
+TEST(weight_registry, a_model_kept_warm_goes_before_the_metal_it_uses) {
+  struct Held {
+    const Session*                 s = nullptr;
+    vpipe::genai::WiredPool        pool;
+    SharedBuffer                   buf;
+    std::shared_ptr<int>           alive;   // MetalCompute there at the end
+    std::shared_ptr<std::size_t>   unwired;
+    ~Held()
+    {
+      MetalCompute* mc = s->metal_compute();
+      *alive = mc != nullptr;
+      if (mc != nullptr) { *unwired = pool.wire_one(mc, buf, false); }
+    }
+  };
+  auto alive = std::make_shared<int>(-1);
+  auto unwired = std::make_shared<std::size_t>(1);
+  {
+    Session s;
+    MetalCompute* mc = mc_(s);
+    auto* mgr = s.generative_model_manager();
+    if (mc == nullptr || mgr == nullptr) { return; }
+    auto m = std::make_shared<Held>();
+    m->s = &s;
+    m->alive = alive;
+    m->unwired = unwired;
+    m->pool.open(mc);
+    m->buf = mc->make_shared_buffer(16u << 20);
+    m->pool.wire_one(mc, m->buf, true);   // as a DiT's resident block
+    mgr->keep_model_warm("ut-dit", "/tmp/vpipe-warm-model-test", "k",
+                         std::move(m), 16u << 20, 600.0);
+  }
+  EXPECT_TRUE(*alive == 1);
+  // The pool's count is the manager's, and goes with it: wire_one finds
+  // no manager now and leaves the buffer to be freed (which unwires it
+  // in the kernel).
+  EXPECT_TRUE(*unwired == 0);
 }
 
 // Every reactivation is bracketed, whether or not a reload was needed:

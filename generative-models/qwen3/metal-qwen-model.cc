@@ -960,17 +960,50 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     }
     // Split-K tiles (see _ks_verify): VPIPE_QMV_KSPLIT=0 off, 1 the
     // speculative verify only, 2 verify + batched decode (default).
-    bool ok = true;
-    for (int r : {2, 3, 4, 6}) {
+    bool ok = true, ok8 = true, okadd = true;
+    for (int r : {2, 3, 4, 6, 8}) {
       const std::string n = std::to_string(r);
       m->_fn_qmv_ks[r] =
           m->_lib_qmv.function("affine_qmv_ks" + n + "_w4g64");
       m->_fn_qmv_ks_swiglu[r] =
           m->_lib_qmv.function("affine_qmv_ks" + n + "_swiglu_w4g64");
+      m->_fn_qmv8_ks[r] =
+          m->_lib_qmv.function("affine_qmv_ks" + n + "_w8g64");
+      m->_fn_qmv_ks_add[r] =
+          m->_lib_qmv.function("affine_qmv_ks" + n + "_add_w4g64");
+      m->_fn_qmv8_ks_add[r] =
+          m->_lib_qmv.function("affine_qmv_ks" + n + "_add_w8g64");
       ok = ok && m->_fn_qmv_ks[r].valid()
            && m->_fn_qmv_ks_swiglu[r].valid();
+      ok8 = ok8 && m->_fn_qmv8_ks[r].valid();
+      okadd = okadd && m->_fn_qmv_ks_add[r].valid()
+              && m->_fn_qmv8_ks_add[r].valid();
+    }
+    m->_fn_ks1[0][0] = m->_lib_qmv.function("affine_qmv_ks1_w4g64");
+    m->_fn_ks1[0][1] = m->_lib_qmv.function("affine_qmv_ks1_w8g64");
+    m->_fn_ks1[1][0] = m->_lib_qmv.function("affine_qmv_ks1_add_w4g64");
+    m->_fn_ks1[1][1] = m->_lib_qmv.function("affine_qmv_ks1_add_w8g64");
+    m->_fn_ks1_swiglu = m->_lib_qmv.function("affine_qmv_ks1_swiglu_w4g64");
+    m->_ks1_ok = true;
+    for (const auto* f : {&m->_fn_ks1[0][0], &m->_fn_ks1[0][1],
+                          &m->_fn_ks1[1][0], &m->_fn_ks1[1][1],
+                          &m->_fn_ks1_swiglu}) {
+      if (!f->valid()) { m->_ks1_ok = false; }
+    }
+    if (const char* e = std::getenv("VPIPE_QWEN_DECODE_KS");
+        e != nullptr && std::atoi(e) == 0) {
+      m->_ks1_ok = false;
     }
     m->_ks_loaded = ok;
+    m->_ks8_loaded = ok && ok8;
+    m->_ks_add_loaded = ok && ok8 && okadd;
+    if (const char* e = std::getenv("VPIPE_QMV_KS_ADD");
+        e != nullptr && std::atoi(e) == 0) {
+      m->_ks_add_loaded = false;
+    }
+    if (const char* e = std::getenv("VPIPE_QMV_KS_TALL")) {
+      m->_ks_tall = std::atoi(e) != 0;
+    }
     int ks_mode = 2;
     if (const char* e = std::getenv("VPIPE_QMV_KSPLIT")) {
       ks_mode = std::atoi(e);
@@ -981,6 +1014,10 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   // strides by a fixed 512 -> silently wrong at 256; rms_norm_fast_f16 is the
   // threadgroup-size-agnostic simd_sum (== pre-f1ab287, no RMS_PAD cap).
   m->_fn_rms = m->_lib_rms.function("rms_norm_fast_f16");
+  if (const char* e = std::getenv("VPIPE_QWEN_RMS_VEC");
+      e == nullptr || std::atoi(e) != 0) {
+    m->_fn_rms_vec = m->_lib_rms.function("rms_norm_vec_f16");
+  }
   m->_fn_swiglu = m->_lib_elt.function("swiglu_f16");
   // Generic f16 copy (used by the k-quant dequant fold AND the Leviathan-Chen
   // MTP logit stash). Load unconditionally so the mixed-affine (OptiQ) path has
@@ -1213,6 +1250,7 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_smp_thresh        = m->_lib_elt.function("sample_thresh_f16");
   m->_fn_smp_pick_partial  = m->_lib_elt.function("sample_pick_partial_f16");
   m->_fn_smp_pick_combine  = m->_lib_elt.function("sample_pick_combine_f16");
+  m->_fn_seen_rows = m->_lib_elt.function("seen_rows_from_ids");
   m->_fn_lc_sample = m->_lib_elt.function("lc_sample_f16");
   m->_fn_lc_accept = m->_lib_elt.function("lc_accept_f16");
   m->_fn_lc_sample_batch = m->_lib_elt.function("lc_sample_batch_f16");
@@ -1601,15 +1639,8 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   m->_layers.resize(cfg.n_layers);
   // Pinned prefix (streaming only): as many leading layers as fit resident
   // beside the in-flight one, so a roomy box re-reads only the tail.
-  if (m->_stream_layers && !m->_raw && cfg.pin_frac > 0.0) {
-    std::vector<std::string> pfx;
-    pfx.reserve((std::size_t)cfg.n_layers);
-    for (int i = 0; i < cfg.n_layers; ++i) {
-      pfx.push_back(cfg.weight_prefix + cfg.model_seg + "layers." +
-                    std::to_string(i) + ".");
-    }
-    m->_pinned_layers = stream_pin_count(*wts, pfx, cfg.pin_frac);
-    if (m->_pinned_layers > cfg.n_layers) { m->_pinned_layers = cfg.n_layers; }
+  if (m->_stream_layers && !m->_raw) {
+    m->_pinned_layers = pinned_layer_count(*wts, cfg);
   }
   for (int L = 0; L < cfg.n_layers; ++L) {
     Layer& ly = m->_layers[(std::size_t)L];
@@ -2716,6 +2747,9 @@ MetalQwenModel::decode_step_fast(ContextId cid, std::int32_t token_id,
     encode_argmax_(enc, _d_logits, 0, _d_argmax_id, 0, c.vocab);
   }
   stream.commit().wait();
+  if (_row_hash_on) {
+    note_row_hash_(cid, pos, _d_logits.contents(), (std::size_t)c.vocab * 2);
+  }
   return *static_cast<const std::int32_t*>(_d_argmax_id.contents());
 }
 
@@ -3421,7 +3455,7 @@ MetalQwenModel::encode_decode_step_(
   auto rms = [&](const SharedBuffer& xin, std::size_t xoff,
                  const SharedBuffer& w, const SharedBuffer& y,
                  std::size_t yoff, int R, int Hd) {
-    enc.set_function(_fn_rms);
+    enc.set_function(rms_fn_(Hd, xoff, yoff));
     enc.set_buffer(0, xin, xoff);
     enc.set_buffer(1, w);
     enc.set_buffer(2, y, yoff);
@@ -3429,11 +3463,39 @@ MetalQwenModel::encode_decode_step_(
     enc.set_constant(4, eps);
     enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
   };
+  // y[yoff_e:] (+)= W @ x on the one-row split-K tile (_decode_ks): an
+  // affine tensor of 4 or 8 bits; `res` the residual folded in (y may be
+  // it); `swiglu` the interleaved gate|up writing silu(g) * u. False when
+  // the tile does not take it (the caller's kernel then runs).
+  auto ks1_can = [&](const SharedBuffer& s, int bits, int Kk, int N,
+                     bool swiglu) {
+    return _decode_ks && !s.empty() && (bits == 4 || bits == 8)
+        && (N % 4) == 0 && (Kk % 64) == 0 && (!swiglu || bits == 4);
+  };
+  auto ks1 = [&](const SharedBuffer& w, const SharedBuffer& s,
+                 const SharedBuffer& b, int bits, const SharedBuffer& xin,
+                 std::size_t xoff, const SharedBuffer& y, std::size_t yoff_e,
+                 int Kk, int N, const SharedBuffer* res, bool swiglu) {
+    if (!ks1_can(s, bits, Kk, N, swiglu)) { return false; }
+    enc.set_function(swiglu ? _fn_ks1_swiglu
+                            : _fn_ks1[res != nullptr][bits == 8 ? 1 : 0]);
+    enc.set_buffer(0, w); enc.set_buffer(1, s); enc.set_buffer(2, b);
+    enc.set_buffer(3, xin, xoff); enc.set_buffer(4, y, yoff_e * 2);
+    enc.set_constant(5, Kk); enc.set_constant(6, N);
+    const int one = 1;
+    enc.set_constant(7, one);
+    if (res != nullptr) { enc.set_buffer(8, *res); }
+    enc.dispatch({64u, (unsigned)(N / 4), 1u}, {64u, 1u, 1u});
+    return true;
+  };
   auto qmv = [&](const SharedBuffer& w, const SharedBuffer& s,
                  const SharedBuffer& b, const SharedBuffer& xin,
                  std::size_t xoff, const SharedBuffer& y, int Kk, int N) {
     if (s.empty()) {   // dense f16: plain GEMV, no scales/biases
       dense_gemv_(enc, w, xin, xoff, y, 0, Kk, N);
+      return;
+    }
+    if (ks1(w, s, b, c.quant_bits, xin, xoff, y, 0, Kk, N, nullptr, false)) {
       return;
     }
     enc.set_function(_fn_qmv);
@@ -3460,6 +3522,9 @@ MetalQwenModel::encode_decode_step_(
       enc.dispatch({(unsigned)N, 1, 1}, {256, 1, 1});
       return;
     }
+    if (ks1(w, s, b, c.quant_bits, xin, 0, y, 0, Kk, N, &res, false)) {
+      return;
+    }
     enc.set_function(_fn_qmv_add);
     enc.set_buffer(0, w);
     enc.set_buffer(1, s);
@@ -3479,6 +3544,9 @@ MetalQwenModel::encode_decode_step_(
   auto amv = [&](const SharedBuffer& w, const SharedBuffer& s,
                  const SharedBuffer& b, int bits, const SharedBuffer& xin,
                  const SharedBuffer& y, std::size_t yoff_e, int Kk, int N) {
+    if (ks1(w, s, b, bits, xin, 0, y, yoff_e, Kk, N, nullptr, false)) {
+      return;
+    }
     enc.set_function(bits == 8 ? _fn_qmv8 : _fn_qmv);
     enc.set_buffer(0, w);
     enc.set_buffer(1, s);
@@ -3507,6 +3575,7 @@ MetalQwenModel::encode_decode_step_(
                      const SharedBuffer& b, int bits, const SharedBuffer& xin,
                      const SharedBuffer& y, const SharedBuffer& res, int Kk,
                      int N) {
+    if (ks1(w, s, b, bits, xin, 0, y, 0, Kk, N, &res, false)) { return; }
     enc.set_function(bits == 8 ? _fn_qmv8_add : _fn_qmv_add);
     enc.set_buffer(0, w);
     enc.set_buffer(1, s);
@@ -4041,6 +4110,12 @@ MetalQwenModel::encode_decode_step_(
       if (ly.mlp_fused) {
         // gate|up fused (both w4) -> ONE swiglu qmv (weights read once, no
         // _d_up round-trip, no standalone swiglu bubble). down keeps its bits.
+        if (ks1_can(ly.gus, 4, H, 2 * c.ffn_inner, true)) {
+          DUP(DC_FFN, [&] {
+            ks1(ly.guw, ly.gus, ly.gub, 4, _d_hn, 0, _d_sg, 0, H,
+                2 * c.ffn_inner, nullptr, true);
+          });
+        } else {
         enc.set_function(_fn_qmv_swiglu);
         enc.set_buffer(0, ly.guw);
         enc.set_buffer(1, ly.gus);
@@ -4052,6 +4127,7 @@ MetalQwenModel::encode_decode_step_(
         DUP(DC_FFN, [&] {
           enc.dispatch({32, (unsigned)(c.ffn_inner / 2), 1}, {32, 2, 1});
         });
+        }
       } else {
         // De-fused: gate + up as two affine qmv (own bits) into _d_sg / _d_up,
         // then a standalone SwiGLU (the 4 genuinely mixed-bit layers).
@@ -4096,6 +4172,12 @@ MetalQwenModel::encode_decode_step_(
         radd(H);
       });
     } else {
+      if (ks1_can(ly.gus, c.quant_bits, H, 2 * c.ffn_inner, true)) {
+        DUP(DC_FFN, [&] {
+          ks1(ly.guw, ly.gus, ly.gub, c.quant_bits, _d_hn, 0, _d_sg, 0, H,
+              2 * c.ffn_inner, nullptr, true);
+        });
+      } else {
       enc.set_function(_fn_qmv_swiglu);
       enc.set_buffer(0, ly.guw);
       enc.set_buffer(1, ly.gus);
@@ -4107,6 +4189,7 @@ MetalQwenModel::encode_decode_step_(
       DUP(DC_FFN, [&] {
         enc.dispatch({32, (unsigned)(c.ffn_inner / 2), 1}, {32, 2, 1});
       });
+      }
       DUP(DC_FFN, [&] {
         qmv_add(ly.dw, ly.ds, ly.db, _d_sg, _d_x, _d_x, c.ffn_inner, H);
       });
@@ -4131,6 +4214,15 @@ MetalQwenModel::encode_decode_step_(
   } else {
     // Mixed: lm_head is the (tied) 8-bit embed in OptiQ -> pick the w8 qmv.
     const int lb = _tied ? _embed_bits : _lm_bits;
+    const int hb = _mixed ? lb : c.quant_bits;
+    if (ks1_can(_tied ? _embed_s : _lm_s, hb, H, c.vocab, false)) {
+      DUP(DC_LMHEAD, [&] {
+        ks1(_tied ? _embed_w : _lm_w, _tied ? _embed_s : _lm_s,
+            _tied ? _embed_b : _lm_b, hb, _d_hn, 0, _d_logits, 0, H, c.vocab,
+            nullptr, false);
+      });
+      return;
+    }
     enc.set_function((_mixed && lb == 8) ? _fn_qmv8 : _fn_qmv);
     enc.set_buffer(0, _tied ? _embed_w : _lm_w);
     enc.set_buffer(1, _tied ? _embed_s : _lm_s);
@@ -4410,26 +4502,88 @@ MetalQwenModel::autotune_qmv_ladder_()
   }
 }
 
+// Profiling only, VPIPE_VERIFY_SKIP=w4,w8,head,gdn,attn,sample,draft,
+// ingest,replay: a speculative round with that kind of work left out, so
+// what it costs is the round's time with it less the round's without. The
+// tokens are garbage then (the ids are clamped so they stay in the vocab).
+enum : unsigned {
+  kVsW4 = 1, kVsW8 = 2, kVsHead = 4, kVsGdn = 8, kVsAttn = 16,
+  kVsSample = 32, kVsDraft = 64, kVsIngest = 128, kVsReplay = 256
+};
+static unsigned
+verify_skip_mask_()
+{
+  static const unsigned mask = [] {
+    const char* e = std::getenv("VPIPE_VERIFY_SKIP");
+    if (e == nullptr) { return 0u; }
+    const std::string v = std::string(",") + e + ",";
+    unsigned m = 0;
+    const std::pair<const char*, unsigned> names[] = {
+        {",w4,", kVsW4}, {",w8,", kVsW8}, {",head,", kVsHead},
+        {",gdn,", kVsGdn}, {",attn,", kVsAttn}, {",sample,", kVsSample},
+        {",draft,", kVsDraft}, {",ingest,", kVsIngest},
+        {",replay,", kVsReplay}};
+    for (const auto& [n, bit] : names) {
+      if (v.find(n) != std::string::npos) { m |= bit; }
+    }
+    return m;
+  }();
+  return mask;
+}
+static bool vskip_(unsigned k) { return (verify_skip_mask_() & k) != 0; }
+// The multi-row GDN norms fused as decode runs them (qk_norm, gated RMS);
+// VPIPE_VERIFY_GDN_FUSE=0 the separate RMS norms and SwiGLU, for an A/B.
+static bool
+gdn_fuse_()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("VPIPE_VERIFY_GDN_FUSE");
+    return e == nullptr || std::atoi(e) != 0;
+  }();
+  return on;
+}
+
 bool
 MetalQwenModel::ks_dispatch_(
     ComputeEncoder& enc, int m, const SharedBuffer& w, const SharedBuffer& s,
     const SharedBuffer& b, const SharedBuffer& xin, const SharedBuffer& y,
-    int Kk, int Nout, bool swiglu) const
+    int Kk, int Nout, bool swiglu, int bits,
+    const SharedBuffer* radd) const
 {
   // One tile up to 6 rows, then 4-row tiles: a single 8-row tile holds
   // 32 accumulators a thread and loses the occupancy it was meant to buy.
   const bool on = (_ks_scope == KsScope::kVerify && _ks_verify)
                   || (_ks_scope == KsScope::kBatched && _ks_batched);
-  if (!on || m < 2 || (Nout % 4) != 0 || (Kk % 64) != 0) {
+  if (!on || m < 1 || (Nout % 4) != 0 || (Kk % 64) != 0) {
     return false;
   }
-  const int tr = m <= 4 ? m : (m <= 6 ? 6 : 4);
-  const auto& fn = swiglu ? _fn_qmv_ks_swiglu[tr] : _fn_qmv_ks[tr];
-  enc.set_function(fn);
+  if (bits != 4 && bits != 8) { return false; }
+  if (bits == 8 && swiglu) { return false; }
+  // One row (a round of the anchor alone: MTP's first): decode's own
+  // one-row tile, the residual folded as decode folds it, so the row is
+  // decode's byte for byte. Its GDN state carries into every later round.
+  // Not here when decode runs qmv_fast (VPIPE_QWEN_DECODE_KS=0).
+  if (m == 1) {
+    if (!_decode_ks) { return false; }
+    enc.set_function(swiglu ? _fn_ks1_swiglu
+                            : _fn_ks1[radd != nullptr][bits == 8 ? 1 : 0]);
+  } else {
+    if (bits == 8 && !_ks8_loaded) { return false; }
+    if (radd != nullptr && (swiglu || !_ks_add_loaded)) { return false; }
+  }
+  const int tr = m <= 4 ? m : (m <= 6 ? 6 : (_ks_tall ? 8 : 4));
+  if (m > 1) {
+    enc.set_function(
+        radd != nullptr ? (bits == 8 ? _fn_qmv8_ks_add[tr]
+                                     : _fn_qmv_ks_add[tr])
+        : bits == 8 ? _fn_qmv8_ks[tr]
+        : (swiglu ? _fn_qmv_ks_swiglu[tr] : _fn_qmv_ks[tr]));
+  }
   enc.set_buffer(0, w); enc.set_buffer(1, s); enc.set_buffer(2, b);
   enc.set_buffer(3, xin); enc.set_buffer(4, y);
   enc.set_constant(5, Kk); enc.set_constant(6, Nout);
   enc.set_constant(7, m);
+  if (radd != nullptr) { enc.set_buffer(8, *radd); }
   enc.dispatch({64u, (unsigned)(Nout / 4), (unsigned)((m + tr - 1) / tr)},
                {64u, 1u, 1u});
   ++_ks_dispatches;
@@ -4442,6 +4596,10 @@ MetalQwenModel::qmm_auto_(
     const SharedBuffer& b, const SharedBuffer& xin, const SharedBuffer& y,
     int Kk, int Nout)
 {
+  if (_ks_scope == KsScope::kVerify && verify_skip_mask_() != 0
+      && vskip_(_vs_head ? kVsHead : kVsW4)) {
+    return;
+  }
   // 2..kQmvBatchMaxRows: batched GEMV (weights read once per tile row set;
   // MAXM=2 -> grid.z tiles ceil(m/2)). Decode is DRAM-bound on the weight
   // read, so this beats the steel GEMM (compute-tiled for prefill) until m
@@ -4451,10 +4609,10 @@ MetalQwenModel::qmm_auto_(
   // load-time probe (autotune_qmv_ladder_). Every tile kernel is
   // bit-identical per row, so the plan is a pure perf choice
   // (token-exact regardless). The split-K tiles are the exception and
-  // go first where the caller allows them (ks_dispatch_, _ks_verify).
+  // go first where the caller allows them (ks_dispatch_, _ks_verify) --
+  // a single row too, on decode's one-row tile.
   const int cap = qmv_batch_cap_(kQmvBatchMaxRows);
-  if (m > 1 && m <= cap
-      && ks_dispatch_(enc, m, w, s, b, xin, y, Kk, Nout, false)) {
+  if (m <= cap && ks_dispatch_(enc, m, w, s, b, xin, y, Kk, Nout, false)) {
     return;
   }
   if (m > 1 && m <= cap && _fn_qmv_batch.valid()) {
@@ -4518,10 +4676,13 @@ MetalQwenModel::qmm_auto_swiglu_(
     const SharedBuffer& b, const SharedBuffer& xin, const SharedBuffer& y,
     int Kk, int Nout)
 {
+  if (_ks_scope == KsScope::kVerify && verify_skip_mask_() != 0
+      && vskip_(kVsW4)) {
+    return;
+  }
   const unsigned gy = (unsigned)(Nout / 4);   // == ffn/2 (fused width 2*ffn)
   const int cap = qmv_batch_cap_(kQmvBatchMaxRows);
-  if (m > 1 && m <= cap
-      && ks_dispatch_(enc, m, w, s, b, xin, y, Kk, Nout, true)) {
+  if (m <= cap && ks_dispatch_(enc, m, w, s, b, xin, y, Kk, Nout, true)) {
     return;
   }
   if (m > 1 && m <= cap && _fn_qmv_batch_swiglu.valid()) {
@@ -4903,7 +5064,7 @@ MetalQwenModel::encode_batched_step_(
   auto rms = [&](const SharedBuffer& xin, std::size_t xoff,
                  const SharedBuffer& w, const SharedBuffer& y,
                  std::size_t yoff, int R, int Hd) {
-    enc.set_function(_fn_rms);
+    enc.set_function(rms_fn_(Hd, xoff, yoff));
     enc.set_buffer(0, xin, xoff); enc.set_buffer(1, w);
     enc.set_buffer(2, y, yoff);
     enc.set_constant(3, Hd); enc.set_constant(4, eps);
@@ -6363,7 +6524,7 @@ MetalQwenModel::calib_run_layer(int L, std::vector<SharedBuffer>& resid,
       auto rms = [&](const SharedBuffer& xin, std::size_t xoff,
                      const SharedBuffer& w, const SharedBuffer& y,
                      std::size_t yoff, int R, int Hd) {
-        enc.set_function(_fn_rms);
+        enc.set_function(rms_fn_(Hd, xoff, yoff));
         enc.set_buffer(0, xin, xoff); enc.set_buffer(1, w);
         enc.set_buffer(2, y, yoff);
         enc.set_constant(3, Hd); enc.set_constant(4, eps);
@@ -6866,7 +7027,7 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
     auto rms = [&](const SharedBuffer& xin, std::size_t xoff,
                    const SharedBuffer& w, const SharedBuffer& y,
                    std::size_t yoff, int R, int Hd) {
-      enc.set_function(_fn_rms);
+      enc.set_function(rms_fn_(Hd, xoff, yoff));
       enc.set_buffer(0, xin, xoff);
       enc.set_buffer(1, w);
       enc.set_buffer(2, y, yoff);
@@ -7883,6 +8044,16 @@ MetalQwenModel::vqmm_(ComputeEncoder& enc, int m, const SharedBuffer& w,
     qmm_auto_(enc, m, w, s, b, xin, y, K, N);   // 4-bit: qmv_batch/qmv/steel
     return;
   }
+  if (_ks_scope == KsScope::kVerify && verify_skip_mask_() != 0
+      && vskip_(_vs_head ? kVsHead : kVsW8)) {
+    return;
+  }
+  // 8-bit, the verify's (and batched decode's) rows: split-K first, as
+  // qmm_auto_ does the 4-bit ones.
+  if (m <= qmv_batch_cap_(kQmvBatchMaxRows)
+      && ks_dispatch_(enc, m, w, s, b, xin, y, K, N, false, 8)) {
+    return;
+  }
   // 8-bit, 2..kQmvBatchMaxRows: batched-GEMV (weight read once per tile
   // row set) -- qmv bandwidth, so a small-M verify costs ~1 decode step
   // instead of steel's ~3x. Follows the same probed per-m plan as the
@@ -7944,12 +8115,11 @@ MetalQwenModel::vqmm_(ComputeEncoder& enc, int m, const SharedBuffer& w,
                (unsigned)(((m + 31) / 32) * 2), 2}, {32, 2, 2});
 }
 
-// Verify sub-profile accumulators (VPIPE_MTP_VPROFILE): the verify command
-// buffer is split into main-forward / verifier-head (lm_head+decision) / MTP-
-// head segments, each commit()+wait() timed. Reset per mtp_decode, printed in
-// its profile block. Off by default -> one command buffer, no perturbation.
-static double g_vp_main = 0.0, g_vp_vhead = 0.0, g_vp_mtp = 0.0;
-static long g_vp_n = 0;
+// The verify's sub-profile (VPIPE_MTP_VPROFILE: its command buffer split
+// into main-forward / verifier-head (lm_head+decision) / MTP-head segments,
+// each commit()+wait() timed; reset per mtp_decode, printed in its profile
+// block; off by default -> one command buffer, no perturbation) and its host
+// clocks (read always, printed by dflash_decode) live in _vstats.
 
 // Decode-attn kernel selection now lives in the DecodeGqaAttnSet; these forward
 // to it (for the few non-dispatch callers + the legacy fallback paths).
@@ -8049,7 +8219,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
   const int H = c.hidden, D = c.head_dim, Hq = c.n_heads, Hkv = c.n_kv_heads;
   const int qd = c.qd(), kd = c.kd();
   const int Cd = c.gdn_conv_dim, keyd = c.key_dim(), vald = c.value_dim();
-  const int Hv = c.gdn_v_heads, Dv = c.gdn_v_dim, Dk = c.gdn_k_dim;
+  const int Hv = c.gdn_v_heads, Dv = c.gdn_v_dim;
   const int Hk = c.gdn_k_heads, Kc = c.gdn_conv_kernel, ffn = c.ffn_inner;
   const float eps = c.rms_eps, scale = 1.0f / std::sqrt((float)D);
   const int gate = c.attn_output_gate ? 1 : 0;
@@ -8081,9 +8251,18 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
   const int n_pages =
       _ctx->fill_page_table(cid, static_cast<std::int32_t*>(_pgtab.contents()));
 
-  auto buf = [&](std::size_t e) { return _mc->make_shared_buffer(e * 2); };
-  SharedBuffer hn = buf((std::size_t)n * H);
-  SharedBuffer qraw = buf((std::size_t)n * qdo);
+  using vclk = std::chrono::steady_clock;
+  const auto t_v0 = vclk::now();
+  // Scratch from the pool (verify_scratch_): slot, elements a row, bytes
+  // an element -- sized for kQmvBatchMaxRows rows at least, so a round's
+  // block length changing does not make it new.
+  const std::size_t rows_cap = (std::size_t)std::max(n, kQmvBatchMaxRows);
+  auto pbuf = [&](int slot, std::size_t per_row,
+                  std::size_t esz = 2) -> const SharedBuffer& {
+    return verify_scratch_((std::size_t)slot, rows_cap * per_row * esz);
+  };
+  const SharedBuffer& hn = pbuf(0, (std::size_t)H);
+  const SharedBuffer& qraw = pbuf(1, (std::size_t)qdo);
   // Fused q|k|v scratch [n, qdo+2kd]: the k-quant dequant GEMM's output,
   // the dense GEMM's -- and the affine qkv_fused branch's (a layer whose
   // q/k/v share the base width: EVERY full layer of a uniform affine model,
@@ -8092,44 +8271,56 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
   // hang a round later. A few KB: always made. The a|b in_proj split
   // [n, 2*Hv] stays k-quant only (the affine path GEMVs each part straight
   // into qkv/zbuf/abuf/bbuf).
-  SharedBuffer qfull = buf((std::size_t)n * (qdo + 2 * kd));
-  SharedBuffer abtmp =
-      _kquant ? buf((std::size_t)n * 2 * Hv) : SharedBuffer{};
+  const SharedBuffer& qfull = pbuf(2, (std::size_t)(qdo + 2 * kd));
+  const SharedBuffer& abtmp =
+      _kquant ? pbuf(3, (std::size_t)(2 * Hv)) : _vnone;
   // Dense fused GDN in_proj scratch [n, Nf] (qkv|z|a|b), hsliced into the
   // de-fused qkv/zbuf/abuf/bbuf the recurrent path consumes.
   const int Nf_gdn = Cd + vald + 2 * Hv;
-  SharedBuffer mixf =
-      (_dense || uni) ? buf((std::size_t)n * Nf_gdn) : SharedBuffer{};
-  SharedBuffer q3 = buf((std::size_t)n * qd), gate3 = buf((std::size_t)n * qd);
-  SharedBuffer kbuf = buf((std::size_t)n * kd), vbuf = buf((std::size_t)n * kd);
-  SharedBuffer qt = buf((std::size_t)n * qd), kt = buf((std::size_t)n * kd),
-               vt = buf((std::size_t)n * kd);
-  SharedBuffer at = buf((std::size_t)n * qd), att = buf((std::size_t)n * qd),
-               ao = buf((std::size_t)n * H);
-  SharedBuffer qkv = buf((std::size_t)n * Cd);
-  SharedBuffer zbuf = buf((std::size_t)n * vald);
-  SharedBuffer abuf = buf((std::size_t)n * Hv), bbuf = buf((std::size_t)n * Hv);
-  SharedBuffer convout = buf((std::size_t)n * Cd);
-  SharedBuffer gbuf = _mc->make_shared_buffer((std::size_t)n * Hv * 4);
-  SharedBuffer betabuf = _mc->make_shared_buffer((std::size_t)n * Hv * 4);
-  SharedBuffer ygdn = buf((std::size_t)n * vald);
-  SharedBuffer normout = buf((std::size_t)n * vald);
-  SharedBuffer sg = buf((std::size_t)n * ffn), upb = buf((std::size_t)n * ffn);
-  SharedBuffer vlogits = buf((std::size_t)n * c.vocab);
-  SharedBuffer vamax =
-      _mc->make_shared_buffer((std::size_t)n * sizeof(std::int32_t));
+  const SharedBuffer& mixf =
+      (_dense || uni) ? pbuf(4, (std::size_t)Nf_gdn) : _vnone;
+  const SharedBuffer& q3 = pbuf(5, (std::size_t)qd);
+  const SharedBuffer& gate3 = pbuf(6, (std::size_t)qd);
+  const SharedBuffer& kbuf = pbuf(7, (std::size_t)kd);
+  const SharedBuffer& vbuf = pbuf(8, (std::size_t)kd);
+  const SharedBuffer& qt = pbuf(9, (std::size_t)qd);
+  const SharedBuffer& kt = pbuf(10, (std::size_t)kd);
+  const SharedBuffer& vt = pbuf(11, (std::size_t)kd);
+  const SharedBuffer& at = pbuf(12, (std::size_t)qd);
+  const SharedBuffer& att = pbuf(13, (std::size_t)qd);
+  const SharedBuffer& ao = pbuf(14, (std::size_t)H);
+  const SharedBuffer& qkv = pbuf(15, (std::size_t)Cd);
+  const SharedBuffer& zbuf = pbuf(16, (std::size_t)vald);
+  const SharedBuffer& abuf = pbuf(17, (std::size_t)Hv);
+  const SharedBuffer& bbuf = pbuf(18, (std::size_t)Hv);
+  const SharedBuffer& convout = pbuf(19, (std::size_t)Cd);
+  const SharedBuffer& gbuf = pbuf(20, (std::size_t)Hv, 4);
+  const SharedBuffer& betabuf = pbuf(21, (std::size_t)Hv, 4);
+  const SharedBuffer& ygdn = pbuf(22, (std::size_t)vald);
+  const SharedBuffer& normout = pbuf(23, (std::size_t)vald);
+  const SharedBuffer& sg = pbuf(24, (std::size_t)ffn);
+  const SharedBuffer& upb = pbuf(25, (std::size_t)ffn);
+  const SharedBuffer& vlogits = pbuf(26, (std::size_t)c.vocab);
+  const SharedBuffer& vamax = pbuf(27, 1, sizeof(std::int32_t));
   // Speculative-sampling scratch (only when the verify samples): per-position
   // softmax-weight workspace [n,vocab] (the sample kernel can't alias one ws
   // across the n in-flight dispatches) + the seen-set the kernel binds: a
   // row per position when penalties apply (mtp_decode's _mtp_seen_rows:
   // what pdecode's seen-set holds at that step), else one zeroed row.
-  SharedBuffer vsample_ws, vseen;
+  const bool vsamp = !sp.greedy && _fn_sample.valid();
+  const SharedBuffer& vsample_ws =
+      vsamp ? pbuf(28, (std::size_t)c.vocab) : _vnone;
+  const SharedBuffer* vseen_p = &_vnone;
   std::size_t vseen_stride = 0;
-  if (!sp.greedy && _fn_sample.valid()) {
-    vsample_ws = buf((std::size_t)n * c.vocab);
+  if (vsamp && vo != nullptr && vo->seen_rows != nullptr) {
+    // The prologue writes the rows on the GPU (DFlash, penalised).
+    vseen_p = vo->seen_rows;
+    vseen_stride = (std::size_t)c.vocab;
+  } else if (vsamp) {
     const bool rows =
         _mtp_seen_rows.size() == (std::size_t)n * (std::size_t)c.vocab;
-    vseen = _mc->make_shared_buffer((std::size_t)c.vocab * (rows ? n : 1));
+    const SharedBuffer& vseen = pbuf(29, (std::size_t)c.vocab, 1);
+    vseen_p = &vseen;
     if (!vsample_ws.empty() && !vseen.empty()) {
       if (rows) {
         std::memcpy(vseen.contents(), _mtp_seen_rows.data(),
@@ -8149,8 +8340,23 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
   // the output exact regardless).
   const bool run_mtp = (mtp_preds != nullptr) && _mtp.ok;
   const bool run_mtp2 = run_mtp && (mtp_preds2 != nullptr);
-  SharedBuffer emb_P, mnorm_e, mnorm_h, mcomb, mcomb2, mctmp, mqfull, mvamax,
-      mvamax2, mhs;
+  const auto mbuf = [&](int slot, std::size_t per_row,
+                        std::size_t esz = 2) -> const SharedBuffer& {
+    return run_mtp ? pbuf(slot, per_row, esz) : _vnone;
+  };
+  const SharedBuffer& emb_P = mbuf(30, (std::size_t)H);
+  const SharedBuffer& mnorm_e = mbuf(31, (std::size_t)H);
+  const SharedBuffer& mnorm_h = mbuf(32, (std::size_t)H);
+  const SharedBuffer& mcomb = mbuf(33, (std::size_t)H);
+  const SharedBuffer& mctmp = mbuf(34, (std::size_t)H);
+  // base post-final-norm hidden for the MTP
+  const SharedBuffer& mhs = mbuf(35, (std::size_t)H);
+  const SharedBuffer& mqfull = mbuf(36, (std::size_t)(qdo + 2 * kd));
+  const SharedBuffer& mvamax = mbuf(37, 1, sizeof(std::int32_t));
+  const SharedBuffer& mcomb2 =
+      run_mtp2 ? pbuf(38, (std::size_t)H) : _vnone;
+  const SharedBuffer& mvamax2 =
+      run_mtp2 ? pbuf(39, 1, sizeof(std::int32_t)) : _vnone;
   ContextManager::AppendSlot mslot;
   std::size_t m_page_off = 0;
   int m_npages = 0;
@@ -8172,18 +8378,6 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
     m_page_off = (std::size_t)mslot.page_id.v * _mtp.ctx->page_stride_bytes();
     m_npages = _mtp.ctx->fill_page_table(
         _mtp.cid, static_cast<std::int32_t*>(_mtp.pgt.contents()));
-    emb_P = buf((std::size_t)n * H);
-    mnorm_e = buf((std::size_t)n * H);
-    mnorm_h = buf((std::size_t)n * H);
-    mcomb = buf((std::size_t)n * H);
-    mctmp = buf((std::size_t)n * H);
-    mhs = buf((std::size_t)n * H);   // base post-final-norm hidden for the MTP
-    mqfull = buf((std::size_t)n * (qdo + 2 * kd));
-    mvamax = _mc->make_shared_buffer((std::size_t)n * sizeof(std::int32_t));
-    if (run_mtp2) {
-      mcomb2 = buf((std::size_t)n * H);
-      mvamax2 = _mc->make_shared_buffer((std::size_t)n * sizeof(std::int32_t));
-    }
   }
 
   // MAXM=4 batched GEMV (read each weight once per 4 rows) is now selected
@@ -8193,7 +8387,8 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
   static const bool vprof =
       (std::getenv("VPIPE_MTP_VPROFILE") != nullptr);
   std::chrono::steady_clock::time_point t_phase;
-  metal_compute::CommandStream stream = _mc->make_command_stream();
+  const auto t_v1 = vclk::now();
+  metal_compute::CommandStream& stream = spec_stream_();
   {
     ComputeEncoder enc = stream.begin_compute();
     if (vo != nullptr && vo->prologue) { vo->prologue(enc); }
@@ -8213,7 +8408,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
     auto rms = [&](const SharedBuffer& xin, std::size_t xoff,
                    const SharedBuffer& w, const SharedBuffer& y,
                    std::size_t yoff, int R, int Hd) {
-      enc.set_function(_fn_rms);
+      enc.set_function(rms_fn_(Hd, xoff, yoff));
       enc.set_buffer(0, xin, xoff); enc.set_buffer(1, w);
       enc.set_buffer(2, y, yoff);
       enc.set_constant(3, Hd); enc.set_constant(4, eps);
@@ -8262,6 +8457,18 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
       enc.set_buffer(0, a); enc.set_buffer(1, bb); enc.set_buffer(2, out);
       enc.set_constant(3, nn);
       enc.dispatch({(unsigned)nn, 1, 1}, {256, 1, 1});
+    };
+    // x += xin @ W^T, the residual folded into a split-K GEMV where one
+    // runs (affine, 4 or 8 bits): true when encoded, else the caller
+    // GEMVs into ao and adds.
+    auto lin_add = [&](const SharedBuffer& w, const SharedBuffer& ws,
+                       const SharedBuffer& wb, int bits,
+                       const SharedBuffer& xin, int K, int N) {
+      if (_kquant || _dense || ws.empty()) { return false; }
+      if (verify_skip_mask_() != 0 && vskip_(bits == 8 ? kVsW8 : kVsW4)) {
+        return true;
+      }
+      return ks_dispatch_(enc, n, w, ws, wb, xin, x, K, N, false, bits, &x);
     };
     auto kv_write = [&](const SharedBuffer& src, const SharedBuffer& pool) {
       for (const Chunk& ch : chunks) {
@@ -8362,18 +8569,23 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
         // it dominates the verify (and erodes MTP) at long context. Past the
         // mb threshold switch to the same flash-decode-GQA the single-token
         // decode uses (each KV head read ONCE for all G query heads, KV split
-        // across simdgroups + merge), run once PER query token (n is tiny).
-        // Query i attends causally to KV 0..q_offset+i (pos = q_offset+i), so
-        // the result equals the scalar multi-query kernel -- and the serial
-        // decode it's verified against ALSO uses this kernel, so token-exact.
-        const bool long_ctx = (q_offset + n) >= _sdpa_mb_min;
-        const bool use_gqa = _gqa_attn && long_ctx && (D <= 256)
-            && (D % 32 == 0) && !_d_gqa_oacc.empty();
-        if (use_gqa) {
-          const int sp = gqa_split_for(q_offset + n), G = Hq / Hkv;
-          // Prefer the MLX 2-pass decode (vec2): each draft query is a single-
-          // token decode at pos q_offset+i, so it drops straight in.
-          const bool use_vec2 = gqa_vec2_on(D, q_offset + n);
+        // across simdgroups + merge). Query i attends causally to KV
+        // 0..q_offset+i (pos = q_offset+i), and EACH ROW AS DECODE WOULD AT
+        // ITS POSITION: the scalar kernel below decode's line (a round can
+        // straddle it), past it the decode set's member and split for the
+        // row's regime (a round can straddle one) -- off the set, the split
+        // for the row's position. Another kernel or split sums the keys in
+        // another order, and a bf16 near-tie can then turn.
+        const bool gqa_ok = _gqa_attn && (D <= 256) && (D % 32 == 0)
+                            && !_d_gqa_oacc.empty();
+        // Rows [0, lo) are those decode runs on the scalar kernel.
+        const int lo = !gqa_ok
+            ? n : std::clamp(_sdpa_mb_min - 1 - q_offset, 0, n);
+        if (vskip_(kVsAttn)) {
+          // (profiling: attention left out)
+        } else if (lo < n) {
+          const int G = Hq / Hkv;
+          const bool use_set = D == 256 && _decode_set.ready();
           // vec is latency-optimal even at G=6 -- see decode_step_fast.
           const bool use_vec =
               _gqa_vec && (D % 128 == 0) && _fn_sdpa_gqa_vec.valid();
@@ -8381,17 +8593,87 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
           const metal_compute::ComputeFunction& vec_fn =
               !use_kbl ? _fn_sdpa_gqa_vec
                        : (D == 256 ? _fn_sdpa_gqa_kbl : _fn_sdpa_gqa_kbl128);
+          auto split_at = [&](int pos) {
+            return use_set ? _decode_set.split_for(pos) : gqa_split_for(pos);
+          };
           // Per-query roped q must be contiguous [Hq, D]: transpose qt
-          // [Hq,n,D] -> at [n,Hq,D] so query i = at + i*qd. The merges write
-          // att [n,Hq,D] directly (no post-attention transpose needed).
+          // [Hq,n,D] -> at [n,Hq,D] so query i = at + i*qd. Every row
+          // writes att [n,Hq,D] directly (no post-attention transpose).
           transpose(qt, at, Hq, n);
-          for (int i = 0; i < n; ++i) {
-            if (use_vec2) {
+          for (int i = 0; i < lo; ++i) {   // decode's scalar rows
+            const int one = 1, pi = q_offset + i;
+            enc.set_function(_fn_sdpa_paged);
+            enc.set_buffer(0, at, (std::size_t)i * qd * 2);
+            enc.set_buffer(1, kp); enc.set_buffer(2, vp);
+            enc.set_buffer(3, att, (std::size_t)i * qd * 2);
+            enc.set_constant(4, scale); enc.set_constant(5, D);
+            enc.set_constant(6, Hq); enc.set_constant(7, Hkv);
+            enc.set_constant(8, one); enc.set_constant(9, pi);
+            enc.set_constant(10, page_tokens); enc.set_constant(11, n_pages);
+            enc.set_buffer(12, _pgtab);
+            enc.dispatch({32, (unsigned)Hq, 1}, {32, 1, 1});
+          }
+          // The rest at once when they share decode's member and split: one
+          // pass and one merge, not two dispatches a row, each latency-
+          // bound (14 of a 59 ms 8-row round at 15k tokens on an M5 Ultra)
+          // -- every row's arithmetic the one-row dispatch's.
+          // VPIPE_VERIFY_ATTN_ROWS=0 keeps the loop.
+          static const bool rows_on = [] {
+            const char* e = std::getenv("VPIPE_VERIFY_ATTN_ROWS");
+            return e == nullptr || std::atoi(e) != 0;
+          }();
+          const int m = n - lo, p0 = q_offset + lo, p1 = q_offset + n - 1;
+          const std::size_t r0 = (std::size_t)lo * qd * 2;
+          const int sp = split_at(p0);
+          const bool same = sp == split_at(p1)
+              && (!use_set
+                  || _decode_set.uses_vec2(p0) == _decode_set.uses_vec2(p1));
+          const std::size_t rsp = kVerifyRowsAttnSplits;
+          const bool rows_go = rows_on && m > 1 && same
+              && (use_set || use_vec) && sp <= (int)rsp;
+          if (rows_go) {
+            const SharedBuffer& ro = pbuf(42, (std::size_t)Hq * rsp * D, 4);
+            const SharedBuffer& rm = pbuf(43, (std::size_t)Hq * rsp, 4);
+            const SharedBuffer& rl = pbuf(44, (std::size_t)Hq * rsp, 4);
+            if (use_set) {
+              DecodeGqaAttnSet::Attn a;
+              a.q = &at; a.q_off = r0;
+              a.kpool = &kp; a.vpool = &vp;
+              a.out = &att; a.out_off = r0;
+              a.page_table = &_pgtab; a.pgt_off = 0;
+              a.pos = p0; a.page_tokens = page_tokens;
+              a.n_pages = n_pages; a.scale = scale;
+              _decode_set.dispatch_rows(enc, a, m, ro, rm, rl);
+            } else {
+              enc.set_function(vec_fn);
+              enc.set_buffer(0, at, r0); enc.set_buffer(1, kp);
+              enc.set_buffer(2, vp); enc.set_buffer(3, ro);
+              enc.set_buffer(4, rm); enc.set_buffer(5, rl);
+              enc.set_constant(6, scale); enc.set_constant(7, D);
+              enc.set_constant(8, Hq); enc.set_constant(9, Hkv);
+              enc.set_constant(10, p0);
+              enc.set_constant(11, page_tokens); enc.set_constant(12, n_pages);
+              enc.set_buffer(13, _pgtab); enc.set_constant(14, sp);
+              enc.dispatch({32, (unsigned)Hq, (unsigned)(sp * m)},
+                           {32, (unsigned)G, 1});
+              const int heads = m * Hq;
+              enc.set_function(_fn_sdpa_gqa_merge);
+              enc.set_buffer(0, ro); enc.set_buffer(1, rm);
+              enc.set_buffer(2, rl); enc.set_buffer(3, att, r0);
+              enc.set_constant(4, D); enc.set_constant(5, sp);
+              enc.set_constant(6, heads);
+              enc.dispatch({(unsigned)(heads * D), 1, 1}, {256, 1, 1});
+            }
+          }
+          for (int i = lo; i < n && !rows_go; ++i) {
+            const int pi = q_offset + i;
+            if (use_set) {
               encode_gqa_vec2_(enc, at, (std::size_t)i * qd * 2, kp, vp,
-                  att, (std::size_t)i * qd * 2, q_offset + i, scale, D, Hq,
+                  att, (std::size_t)i * qd * 2, pi, scale, D, Hq,
                   Hkv, page_tokens, n_pages, _pgtab, 0);
               continue;
             }
+            const int spi = split_at(pi);
             enc.set_function(use_vec ? vec_fn : _fn_sdpa_gqa);
             enc.set_buffer(0, at, (std::size_t)i * qd * 2);
             enc.set_buffer(1, kp); enc.set_buffer(2, vp);
@@ -8399,26 +8681,26 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
             enc.set_buffer(5, _d_gqa_l);
             enc.set_constant(6, scale); enc.set_constant(7, D);
             enc.set_constant(8, Hq); enc.set_constant(9, Hkv);
-            enc.set_constant(10, q_offset + i);
+            enc.set_constant(10, pi);
             enc.set_constant(11, page_tokens); enc.set_constant(12, n_pages);
-            enc.set_buffer(13, _pgtab); enc.set_constant(14, sp);
+            enc.set_buffer(13, _pgtab); enc.set_constant(14, spi);
             if (use_vec) {
-              enc.dispatch({32, (unsigned)Hq, (unsigned)sp},
+              enc.dispatch({32, (unsigned)Hq, (unsigned)spi},
                            {32, (unsigned)G, 1});
             } else {
-              enc.dispatch({32, (unsigned)Hkv, (unsigned)sp}, {32, 1, 1});
+              enc.dispatch({32, (unsigned)Hkv, (unsigned)spi}, {32, 1, 1});
             }
             enc.set_function(_fn_sdpa_gqa_merge);
             enc.set_buffer(0, _d_gqa_oacc); enc.set_buffer(1, _d_gqa_m);
             enc.set_buffer(2, _d_gqa_l);
             enc.set_buffer(3, att, (std::size_t)i * qd * 2);
-            enc.set_constant(4, D); enc.set_constant(5, sp);
+            enc.set_constant(4, D); enc.set_constant(5, spi);
             enc.set_constant(6, Hq);
             enc.dispatch({(unsigned)(Hq * D), 1, 1}, {256, 1, 1});
           }
         } else {
-          // n is tiny (<= draft window): the scalar paged kernel is cheapest
-          // at short KV.
+          // Every row short of decode's line: the scalar multi-query
+          // kernel, each query as decode's one-row call computes it.
           enc.set_function(_fn_sdpa_paged);
           enc.set_buffer(0, qt); enc.set_buffer(1, kp); enc.set_buffer(2, vp);
           enc.set_buffer(3, at);
@@ -8436,19 +8718,24 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
           enc.set_buffer(2, att); enc.set_constant(3, n * qd);
           enc.dispatch({(unsigned)(n * qd), 1, 1}, {256, 1, 1});
         }
-        if (_kquant) {
-          if (ly.o_q4k_aff) {
-            amv_g32_batch_(enc, ly.o_aw, ly.o_as, ly.o_ab, att, ao, qd, H, n,
-                           H, 0);
-          } else {
-            kqmv_batch_(enc, ly.kqo_t, ly.kqo, att, ao, qd, H, n, H, 0);
-          }
-        } else if (uni) {
-          qmm_auto_(enc, n, ly.ow, ly.os, ly.ob, att, ao, qd, H);
+        if (lin_add(ly.ow, ly.os, ly.ob, uni ? c.quant_bits : ly.o_bits, att,
+                    qd, H)) {
+          // o_proj with the residual folded in
         } else {
-          vqmm_(enc, n, ly.ow, ly.os, ly.ob, ly.o_bits, att, ao, qd, H);
+          if (_kquant) {
+            if (ly.o_q4k_aff) {
+              amv_g32_batch_(enc, ly.o_aw, ly.o_as, ly.o_ab, att, ao, qd, H,
+                             n, H, 0);
+            } else {
+              kqmv_batch_(enc, ly.kqo_t, ly.kqo, att, ao, qd, H, n, H, 0);
+            }
+          } else if (uni) {
+            qmm_auto_(enc, n, ly.ow, ly.os, ly.ob, att, ao, qd, H);
+          } else {
+            vqmm_(enc, n, ly.ow, ly.os, ly.ob, ly.o_bits, att, ao, qd, H);
+          }
+          residual(x, ao, x, n * H);
         }
-        residual(x, ao, x, n * H);
       } else {
         // GDN recurrent-step inputs (conv input qkv, gdn_step g/beta) land in
         // this layer's verify cache when capturing (non-ring path, for
@@ -8532,8 +8819,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
             enc.set_constant(6, Kc); enc.set_constant(7, Cd);
             enc.set_constant(8, keyd); enc.set_buffer(9, *cw);
             enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
-            rms(convout, 0, _gdn_qscale, convout, 0, Hk, Dk);
-            rms(convout, kb1, _gdn_kscale, convout, kb1, Hk, Dk);
+            encode_gdn_qk_norm_(enc, convout, 0, kb1, Hk);
             enc.set_function(gdn4 ? _fn_gdn_step_ndv4 : _fn_gdn_step);
             enc.set_buffer(0, convout, 0); enc.set_buffer(1, convout, kb1);
             enc.set_buffer(2, convout, vb1);
@@ -8547,6 +8833,8 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
             enc.set_constant(10, Hv);
             enc.dispatch({32, gdn_dvy, (unsigned)Hv}, {32, 4, 1});
           }
+        } else if (ring2 && vskip_(kVsGdn)) {
+          // (profiling: the recurrence left out)
         } else if (ring2) {
           // DOUBLE-BUFFERED batched path (DFlash): all n rows in one
           // conv1d + one gdn_step, reading ring slot 0 and writing slot 1,
@@ -8565,8 +8853,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
           enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
           const std::size_t kb_off = (std::size_t)n * keyd * 2;
           const std::size_t vb_off = 2 * kb_off;
-          rms(convout, 0, _gdn_qscale, convout, 0, n * Hk, Dk);
-          rms(convout, kb_off, _gdn_kscale, convout, kb_off, n * Hk, Dk);
+          encode_gdn_qk_norm_(enc, convout, 0, kb_off, n * Hk);
           enc.set_function(gdn4 ? _fn_gdn_step_ndv4 : _fn_gdn_step);
           enc.set_buffer(0, convout, 0); enc.set_buffer(1, convout, kb_off);
           enc.set_buffer(2, convout, vb_off); enc.set_buffer(3, gbuf_c);
@@ -8589,8 +8876,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
           enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
           const std::size_t kb_off = (std::size_t)n * keyd * 2;
           const std::size_t vb_off = 2 * kb_off;
-          rms(convout, 0, _gdn_qscale, convout, 0, n * Hk, Dk);
-          rms(convout, kb_off, _gdn_kscale, convout, kb_off, n * Hk, Dk);
+          encode_gdn_qk_norm_(enc, convout, 0, kb_off, n * Hk);
           enc.set_function(gdn4 ? _fn_gdn_step_ndv4 : _fn_gdn_step);
           enc.set_buffer(0, convout, 0); enc.set_buffer(1, convout, kb_off);
           enc.set_buffer(2, convout, vb_off); enc.set_buffer(3, gbuf_c);
@@ -8602,20 +8888,35 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
           enc.set_constant(10, Hv);
           enc.dispatch({32, gdn_dvy, (unsigned)Hv}, {32, 4, 1});
         }
-        rms(ygdn, 0, ly.gdn_norm, normout, 0, n * Hv, Dv);
-        enc.set_function(_fn_swiglu);
-        enc.set_buffer(0, zbuf); enc.set_buffer(1, normout);
-        enc.set_buffer(2, normout); enc.set_constant(3, n * vald);
-        enc.dispatch({(unsigned)(n * vald), 1, 1}, {256, 1, 1});
-        if (_kquant) {
-          kqmv_batch_(enc, ly.kqout_t, ly.kqout, normout, ao, vald, H, n, H, 0);
-        } else if (uni) {
-          qmm_auto_(enc, n, ly.gow, ly.gos, ly.gob, normout, ao, vald, H);
+        if (_fn_gdn_gated_rms.valid() && gdn_fuse_()) {
+          // rms_norm(y, w) * silu(z) in one pass, as decode runs it.
+          enc.set_function(_fn_gdn_gated_rms);
+          enc.set_buffer(0, ygdn); enc.set_buffer(1, ly.gdn_norm);
+          enc.set_buffer(2, zbuf); enc.set_buffer(3, normout);
+          enc.set_constant(4, Dv); enc.set_constant(5, eps);
+          enc.dispatch({128, (unsigned)(n * Hv), 1}, {128, 1, 1});
         } else {
-          vqmm_(enc, n, ly.gow, ly.gos, ly.gob, ly.gout_bits, normout, ao,
-                vald, H);
+          rms(ygdn, 0, ly.gdn_norm, normout, 0, n * Hv, Dv);
+          enc.set_function(_fn_swiglu);
+          enc.set_buffer(0, zbuf); enc.set_buffer(1, normout);
+          enc.set_buffer(2, normout); enc.set_constant(3, n * vald);
+          enc.dispatch({(unsigned)(n * vald), 1, 1}, {256, 1, 1});
         }
-        residual(x, ao, x, n * H);
+        if (lin_add(ly.gow, ly.gos, ly.gob, uni ? c.quant_bits : ly.gout_bits,
+                    normout, vald, H)) {
+          // out_proj with the residual folded in
+        } else {
+          if (_kquant) {
+            kqmv_batch_(enc, ly.kqout_t, ly.kqout, normout, ao, vald, H, n, H,
+                        0);
+          } else if (uni) {
+            qmm_auto_(enc, n, ly.gow, ly.gos, ly.gob, normout, ao, vald, H);
+          } else {
+            vqmm_(enc, n, ly.gow, ly.gos, ly.gob, ly.gout_bits, normout, ao,
+                  vald, H);
+          }
+          residual(x, ao, x, n * H);
+        }
       }
       // MLP: gate/up GEMM + SwiGLU + down (all rows). k-quant batched-GEMV
       // (weight read once) into sg/upb; affine direct batched-GEMV (vqmm_).
@@ -8645,14 +8946,19 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
         enc.set_constant(3, n * ffn);
         enc.dispatch({(unsigned)(n * ffn), 1, 1}, {256, 1, 1});
       }
-      if (_kquant) {
-        kqmv_batch_(enc, ly.kqdown_t, ly.kqdown, sg, ao, ffn, H, n, H, 0);
-      } else if (uni) {
-        qmm_auto_(enc, n, ly.dw, ly.ds, ly.db, sg, ao, ffn, H);
+      if (lin_add(ly.dw, ly.ds, ly.db, uni ? c.quant_bits : ly.down_bits, sg,
+                  ffn, H)) {
+        // down_proj with the residual folded in
       } else {
-        vqmm_(enc, n, ly.dw, ly.ds, ly.db, ly.down_bits, sg, ao, ffn, H);
+        if (_kquant) {
+          kqmv_batch_(enc, ly.kqdown_t, ly.kqdown, sg, ao, ffn, H, n, H, 0);
+        } else if (uni) {
+          qmm_auto_(enc, n, ly.dw, ly.ds, ly.db, sg, ao, ffn, H);
+        } else {
+          vqmm_(enc, n, ly.dw, ly.ds, ly.db, ly.down_bits, sg, ao, ffn, H);
+        }
+        residual(x, ao, x, n * H);
       }
-      residual(x, ao, x, n * H);
       // DFlash taps: the residual after this layer, every row.
       if (vo != nullptr && vo->tap_layers != nullptr && vo->taps != nullptr) {
         for (std::size_t j = 0; j < vo->tap_layers->size(); ++j) {
@@ -8666,7 +8972,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
         }
       }
     }
-    vp_split(g_vp_main);   // main 36-layer forward over the n drafts
+    vp_split(_vstats.vp_main);   // main 36-layer forward over the n drafts
     // Final norm + per-position lm_head (direct quantized, M=n) + the verifier's
     // per-position DECISION -> vamax[k] (the token after drafts[0..k]). Greedy:
     // argmax. Speculative sampling: a token sampled from P at slot q_offset+k+1,
@@ -8675,6 +8981,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
     // token is then the verifier's sample from the right conditional P, i.e.
     // exact autoregressive sampling; the drafts only gate how many land/round.
     rms(x, 0, _final_ln, hn, 0, n, H);
+    _vs_head = true;
     if (_kquant) {
       // Tied q6_K lm_head (the embed table doubles as the head): ONE batched
       // q6_K GEMV reads the [vocab, H] table once for all n positions (vs n
@@ -8691,9 +8998,21 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
       vqmm_(enc, n, _tied ? _embed_w : _lm_w, _tied ? _embed_s : _lm_s,
             _tied ? _embed_b : _lm_b, lb, hn, vlogits, H, c.vocab);
     }
+    _vs_head = false;
+    if (_row_hash_on) {   // set_row_hashes: before the MTP head reuses it
+      const int cnt = n * c.vocab, zero = 0;
+      if (_row_hash_buf.byte_size() < (std::size_t)cnt * 2) {
+        _row_hash_buf = _mc->make_shared_buffer((std::size_t)cnt * 2);
+      }
+      enc.set_function(_fn_copy);
+      enc.set_buffer(0, vlogits); enc.set_buffer(1, _row_hash_buf);
+      enc.set_constant(2, zero); enc.set_constant(3, cnt);
+      enc.dispatch({(unsigned)cnt, 1, 1}, {256, 1, 1});
+    }
     // lc_mode keeps vamax = ARGMAX (the MTP drafting context); the committed
     // token is chosen by mtp_decode's Leviathan-Chen step from _lc_vlogits.
-    const bool vsample = !sp.greedy && !vsample_ws.empty() && !lc_mode;
+    const bool vsample = !sp.greedy && !vsample_ws.empty()
+                         && !vseen_p->empty() && !lc_mode;
     if (lc_mode) {   // stash the verifier logits before the MTP head reuses them
       enc.set_function(_fn_copy);
       enc.set_buffer(0, vlogits); enc.set_buffer(1, _lc_vlogits);
@@ -8701,7 +9020,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
       enc.set_constant(2, zero); enc.set_constant(3, cnt);
       enc.dispatch({(unsigned)cnt, 1, 1}, {256, 1, 1});
     }
-    for (int k = 0; k < n; ++k) {
+    for (int k = 0; k < n && !vskip_(kVsSample); ++k) {
       const std::size_t vamax_off = (std::size_t)k * sizeof(std::int32_t);
       const std::size_t vlog_off = (std::size_t)k * c.vocab * 2;
       if (!vsample) {
@@ -8712,12 +9031,13 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
                           (std::uint64_t)(q_offset + k + 1 - seed_slot0));
         encode_sample_core_(enc, vlogits, vlog_off, vamax, vamax_off,
                             vsample_ws, (std::size_t)k * c.vocab * 2,
-                            vseen, (std::size_t)k * vseen_stride, sp,
+                            *vseen_p, (std::size_t)k * vseen_stride, sp,
                             step_seed, c.vocab);
       }
     }
 
-    vp_split(g_vp_vhead);   // final norm + verifier lm_head + per-pos decision
+    // final norm + verifier lm_head + per-pos decision
+    vp_split(_vstats.vp_vhead);
     // ---- Fused MTP head (the "verify is a decode step that drafts") ----
     // At each position i: combined = fc_e@norm_e(embed(P_i)) + fc_h@norm_h(H_i),
     // one full-attn MTP layer (its own KV), then argmax(lm_head(mtp.norm(.))) =
@@ -8943,15 +9263,51 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
       if (pre_commit) { pre_commit(enc); }
     }
   }
+  const auto t_v2 = vclk::now();
   stream.commit().wait();
+  if (_row_hash_on && !_row_hash_buf.empty()) {
+    const auto* r = static_cast<const unsigned char*>(_row_hash_buf.contents());
+    const std::size_t rb = (std::size_t)c.vocab * 2;
+    for (int k = 0; k < n; ++k) {
+      note_row_hash_(cid, q_offset + k, r + (std::size_t)k * rb, rb);
+    }
+  }
+  {
+    const auto t_v3 = vclk::now();
+    auto ms = [](vclk::duration d) {
+      return std::chrono::duration<double, std::milli>(d).count();
+    };
+    _vstats.alloc += ms(t_v1 - t_v0);
+    _vstats.enc += ms(t_v2 - t_v1);
+    _vstats.wait += ms(t_v3 - t_v2);
+    ++_vstats.n;
+    static const bool marks = [] {
+      const char* e = std::getenv("VPIPE_MC_GPU_TIME");
+      return e != nullptr && std::atoi(e) >= 2;
+    }();
+    if (marks) {
+      const double now = metal_compute::CommandStream::host_seconds();
+      auto& mk = _vstats.marks;
+      if (mk.size() >= VerifyStats::kMaxMarks) {   // the newest half kept
+        mk.erase(mk.begin(), mk.begin() + (std::ptrdiff_t)(mk.size() / 2));
+      }
+      mk.emplace_back(
+          now - std::chrono::duration<double>(t_v3 - t_v0).count(), now);
+    }
+  }
   if (vprof) {   // last segment: the fused MTP head (1x depth-1, 2x depth-2)
-    g_vp_mtp += std::chrono::duration<double, std::milli>(
+    _vstats.vp_mtp += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_phase).count();
-    ++g_vp_n;
+    ++_vstats.vp_n;
   }
   preds->resize((std::size_t)n);
   const auto* a = static_cast<const std::int32_t*>(vamax.contents());
   for (int k = 0; k < n; ++k) { (*preds)[(std::size_t)k] = a[k]; }
+  if (verify_skip_mask_() != 0) {
+    for (auto& t : *preds) {
+      if (t < 0 || t >= c.vocab) { t = 0; }
+    }
+  }
   if (run_mtp) {
     mtp_preds->resize((std::size_t)n);
     const auto* mp = static_cast<const std::int32_t*>(mvamax.contents());
@@ -8976,9 +9332,8 @@ MetalQwenModel::gdn_replay_(ContextId cid, int keep, const GdnVerifyCache& gc)
   if (keep <= 0 || gc.layers.empty()) { return; }
   const Config& c = _cfg;
   const int Cd = c.gdn_conv_dim, keyd = c.key_dim(), vald = c.value_dim();
-  const int Hv = c.gdn_v_heads, Dv = c.gdn_v_dim, Dk = c.gdn_k_dim;
+  const int Hv = c.gdn_v_heads, Dv = c.gdn_v_dim;
   const int Hk = c.gdn_k_heads, Kc = c.gdn_conv_kernel;
-  const float eps = c.rms_eps;
   auto buf = [&](std::size_t e) { return _mc->make_shared_buffer(e * 2); };
   SharedBuffer convout = buf((std::size_t)keep * Cd);
   SharedBuffer ygdn = buf((std::size_t)keep * vald);
@@ -8986,18 +9341,9 @@ MetalQwenModel::gdn_replay_(ContextId cid, int keep, const GdnVerifyCache& gc)
   const std::size_t vb_off = 2 * kb_off;
   const bool gdn4 =
       _fn_gdn_step_ndv4.valid() && (Dv % 4 == 0) && !_gdn_force_v1;
-  metal_compute::CommandStream stream = _mc->make_command_stream();
+  metal_compute::CommandStream& stream = spec_stream_();
   {
     ComputeEncoder enc = stream.begin_compute();
-    auto rms = [&](const SharedBuffer& xin, std::size_t xoff,
-                   const SharedBuffer& w, const SharedBuffer& y,
-                   std::size_t yoff, int R, int Hd) {
-      enc.set_function(_fn_rms);
-      enc.set_buffer(0, xin, xoff); enc.set_buffer(1, w);
-      enc.set_buffer(2, y, yoff);
-      enc.set_constant(3, Hd); enc.set_constant(4, eps);
-      enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
-    };
     for (std::size_t gi = 0; gi < gc.layers.size(); ++gi) {
       const int L = gc.layers[gi];
       const Layer& ly = _layers[(std::size_t)L];
@@ -9011,8 +9357,7 @@ MetalQwenModel::gdn_replay_(ContextId cid, int keep, const GdnVerifyCache& gc)
       enc.set_constant(6, Kc); enc.set_constant(7, Cd);   // x_stride = Cd
       enc.set_constant(8, keyd); enc.set_buffer(9, *csb);
       enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
-      rms(convout, 0, _gdn_qscale, convout, 0, keep * Hk, Dk);
-      rms(convout, kb_off, _gdn_kscale, convout, kb_off, keep * Hk, Dk);
+      encode_gdn_qk_norm_(enc, convout, 0, kb_off, keep * Hk);
       enc.set_function(gdn4 ? _fn_gdn_step_ndv4 : _fn_gdn_step);
       enc.set_buffer(0, convout, 0); enc.set_buffer(1, convout, kb_off);
       enc.set_buffer(2, convout, vb_off); enc.set_buffer(3, gc.gbuf[gi]);
@@ -9599,7 +9944,7 @@ MetalQwenModel::mtp_seed_prefix_(std::int32_t first_token)
     auto rms = [&](const SharedBuffer& xin, std::size_t xoff,
                    const SharedBuffer& w, const SharedBuffer& y,
                    std::size_t yoff, int R, int Hd) {
-      enc.set_function(_fn_rms);
+      enc.set_function(rms_fn_(Hd, xoff, yoff));
       enc.set_buffer(0, xin, xoff); enc.set_buffer(1, w);
       enc.set_buffer(2, y, yoff);
       enc.set_constant(3, Hd); enc.set_constant(4, eps);
@@ -9697,6 +10042,7 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
 {
   out_ids.clear();
   if (ctl.hit_stop) { *ctl.hit_stop = false; }
+  if (ctl.drafted) { *ctl.drafted = 0; }
   // The MTP head is fused into mtp_verify_chunk_, supported on the de-fused
   // affine (mixed) path, the native k-quant (GGUF NextN) path, and the dense
   // (raw-HF bf16/f16) path.
@@ -9732,7 +10078,10 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
   // Verify sub-profile (VPIPE_MTP_VPROFILE): reset the per-segment accumulators
   // mtp_verify_chunk_ fills so this decode's breakdown stands alone.
   static const bool vprof_d = (std::getenv("VPIPE_MTP_VPROFILE") != nullptr);
-  if (vprof_d) { g_vp_main = g_vp_vhead = g_vp_mtp = 0.0; g_vp_n = 0; }
+  if (vprof_d) {
+    _vstats.vp_main = _vstats.vp_vhead = _vstats.vp_mtp = 0.0;
+    _vstats.vp_n = 0;
+  }
   using mtp_clock = std::chrono::steady_clock;
   double prof_verify_ms = 0.0, prof_rerun_ms = 0.0, prof_snap_ms = 0.0;
   // L-C step wall-time (host post()/sample() grind vs the GPU lc_* kernels).
@@ -9934,6 +10283,7 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
     if (have_d1) { drafts.push_back(d1); }
     if (d2 && have_d2) { drafts.push_back(d2v); }
     const int K = (int)drafts.size();
+    if (ctl.drafted) { *ctl.drafted += K - 1; }
 
     // ONE fused forward: the main model verifies the K drafts AND the MTP head
     // (run 1x for depth-1, 2x chained for depth-2, in the SAME command buffer
@@ -10053,7 +10403,7 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
     // token ids are now in _lc_out; read them into preds/mpreds(/mpreds2).
     if (lc_mode && gpu_lc) {
       if (lc_nofold) {
-        metal_compute::CommandStream stream = _mc->make_command_stream();
+        metal_compute::CommandStream& stream = spec_stream_();
         { ComputeEncoder enc = stream.begin_compute(); encode_lc(enc); }
         stream.commit().wait();
       }
@@ -10362,17 +10712,18 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
         gpu_lc ? "GPU" : "host", (int)out_ids.size(), rounds, prof_lc_ms,
         rounds > 0 ? prof_lc_ms / (double)rounds : 0.0);
   }
-  if (vprof_d && g_vp_n > 0) {
-    const double v = (double)g_vp_n;
-    const double sum = g_vp_main + g_vp_vhead + g_vp_mtp;
+  if (vprof_d && _vstats.vp_n > 0) {
+    const VerifyStats& vs = _vstats;
+    const double v = (double)vs.vp_n;
+    const double sum = vs.vp_main + vs.vp_vhead + vs.vp_mtp;
     std::printf(
         "[mtp_vprof] depth=%d verifies=%ld | main=%.2f/v vhead=%.2f/v "
         "mtp=%.2f/v (%.0fx head) | sum/v=%.2fms (main %.0f%% vhead %.0f%% "
         "mtp %.0f%%)\n",
-        (draft_len >= 2 ? 2 : 1), g_vp_n, g_vp_main / v, g_vp_vhead / v,
-        g_vp_mtp / v, g_vp_vhead > 0 ? g_vp_mtp / g_vp_vhead : 0.0, sum / v,
-        100.0 * g_vp_main / sum, 100.0 * g_vp_vhead / sum,
-        100.0 * g_vp_mtp / sum);
+        (draft_len >= 2 ? 2 : 1), vs.vp_n, vs.vp_main / v, vs.vp_vhead / v,
+        vs.vp_mtp / v, vs.vp_vhead > 0 ? vs.vp_mtp / vs.vp_vhead : 0.0,
+        sum / v, 100.0 * vs.vp_main / sum, 100.0 * vs.vp_vhead / sum,
+        100.0 * vs.vp_mtp / sum);
   }
   return true;
 }
@@ -10688,6 +11039,174 @@ MetalQwenModel::dflash_bind_ctx_(ContextId cid)
   }
 }
 
+const metal_compute::ComputeFunction&
+MetalQwenModel::rms_fn_(int Hd, std::size_t xoff, std::size_t yoff) const
+{
+  // Hidden-size rows only (the residual stream's norms, decode's and the
+  // verify's alike): a per-head q / k norm stays scalar, as decode's fused
+  // rms_rope reduces -- the verify's per-head norms must match it.
+  const bool vec = _fn_rms_vec.valid() && Hd >= 1024 && Hd % 4 == 0
+                   && Hd <= 256 * 4 * 8 && xoff % 8 == 0 && yoff % 8 == 0;
+  return vec ? _fn_rms_vec : _fn_rms;
+}
+
+metal_compute::CommandStream&
+MetalQwenModel::spec_stream_()
+{
+  static const bool fresh = [] {   // VPIPE_SPEC_STREAM=0: a stream a call
+    const char* e = std::getenv("VPIPE_SPEC_STREAM");
+    return e != nullptr && std::atoi(e) == 0;
+  }();
+  if (fresh || !_spec_stream.valid()) {
+    _spec_stream = _mc->make_command_stream();
+  }
+  return _spec_stream;
+}
+
+const SharedBuffer&
+MetalQwenModel::verify_scratch_(std::size_t slot, std::size_t bytes)
+{
+  while (_vscratch.size() <= slot) { _vscratch.emplace_back(); }
+  SharedBuffer& b = _vscratch[slot];
+  if (b.empty() || b.byte_size() < bytes) {
+    b = _mc->make_shared_buffer(std::max<std::size_t>(bytes, 16));
+  }
+  return b;
+}
+
+int
+MetalQwenModel::pinned_layer_count(const MetalLlamaWeights& wts,
+                                   const Config& c)
+{
+  if (!c.stream_layers || c.pin_frac <= 0.0) { return 0; }
+  std::vector<std::string> pfx;
+  pfx.reserve((std::size_t)c.n_layers);
+  for (int i = 0; i < c.n_layers; ++i) {
+    pfx.push_back(c.weight_prefix + c.model_seg + "layers." +
+                  std::to_string(i) + ".");
+  }
+  return std::min(stream_pin_count(wts, pfx, c.pin_frac), c.n_layers);
+}
+
+std::size_t
+MetalQwenModel::verify_scratch_bytes(const Config& c, int rows,
+                                     bool mtp_head, std::size_t* conditional)
+{
+  // verify_scratch_'s slots as mtp_verify_chunk_ and gdn_replay_ take
+  // them, each at its widest layout: elements a row, bytes an element,
+  // whether only some rounds take it (38..39 depth 2; 40..41 a replay,
+  // which a verify on the GDN ring never runs). Keep in step with those
+  // (the speculative tests hold a model's pool to it).
+  struct Slot { std::size_t per_row, esz; bool cond = false; };
+  const std::size_t H = c.hidden, qd = c.qd(), kd = c.kd();
+  const std::size_t qdo = c.attn_output_gate ? 2 * qd : qd;
+  const std::size_t Cd = c.gdn_conv_dim, vald = c.value_dim();
+  const std::size_t Hv = c.gdn_v_heads, ffn = c.ffn_inner;
+  const std::size_t V = c.vocab;
+  const std::size_t sp = (std::size_t)c.n_heads * kVerifyRowsAttnSplits;
+  const Slot main[] = {
+      {H, 2}, {qdo, 2}, {qdo + 2 * kd, 2}, {2 * Hv, 2, true},    // 0..3
+      {Cd + vald + 2 * Hv, 2, true}, {qd, 2}, {qd, 2}, {kd, 2},  // 4..7
+      {kd, 2}, {qd, 2}, {kd, 2}, {kd, 2}, {qd, 2}, {qd, 2},      // 8..13
+      {H, 2}, {Cd, 2}, {vald, 2}, {Hv, 2}, {Hv, 2}, {Cd, 2},     // 14..19
+      {Hv, 4}, {Hv, 4}, {vald, 2}, {vald, 2}, {ffn, 2},          // 20..24
+      {ffn, 2}, {V, 2}, {1, 4}, {V, 2, true}, {V, 1, true},      // 25..29
+      {Cd, 2, true}, {vald, 2, true},                            // 40..41
+      {sp * (std::size_t)c.head_dim, 4, true}, {sp, 4, true},    // 42..43
+      {sp, 4, true},                                             // 44
+  };
+  const Slot mtp[] = {
+      {H, 2}, {H, 2}, {H, 2}, {H, 2}, {H, 2}, {H, 2},            // 30..35
+      {qdo + 2 * kd, 2}, {1, 4}, {H, 2, true}, {1, 4, true},     // 36..39
+  };
+  const std::size_t R = (std::size_t)std::max(rows, kQmvBatchMaxRows);
+  std::size_t total = 0, cond = 0;
+  auto add = [&](const Slot& s) {
+    const std::size_t b = std::max<std::size_t>(R * s.per_row * s.esz, 16);
+    total += b;
+    if (s.cond) { cond += b; }
+  };
+  for (const Slot& s : main) { add(s); }
+  if (mtp_head) {
+    for (const Slot& s : mtp) { add(s); }
+  }
+  if (conditional != nullptr) { *conditional = cond; }
+  return total;
+}
+
+
+void
+MetalQwenModel::set_row_hashes(bool on)
+{
+  _row_hash_on = on;
+  _row_hashes.clear();
+}
+
+std::uint64_t
+MetalQwenModel::row_hash(ContextId cid, int pos) const
+{
+  const auto it =
+      _row_hashes.find(((std::uint64_t)cid.v << 32) | (std::uint32_t)pos);
+  return it == _row_hashes.end() ? 0 : it->second;
+}
+
+void
+MetalQwenModel::note_row_hash_(ContextId cid, int pos, const void* row,
+                               std::size_t bytes)
+{
+  // FNV-1a over 8-byte words (a row is read once, so the timed loops it
+  // rides barely notice), then the tail bytes.
+  std::uint64_t h = 1469598103934665603ull;
+  const auto* p = static_cast<const unsigned char*>(row);
+  std::size_t i = 0;
+  for (; i + 8 <= bytes; i += 8) {
+    std::uint64_t w;
+    std::memcpy(&w, p + i, 8);
+    h = (h ^ w) * 1099511628211ull;
+  }
+  for (; i < bytes; ++i) { h = (h ^ p[i]) * 1099511628211ull; }
+  _row_hashes[((std::uint64_t)cid.v << 32) | (std::uint32_t)pos] = h | 1;
+}
+
+std::size_t
+MetalQwenModel::verify_scratch_held() const
+{
+  std::size_t total = 0;
+  for (const SharedBuffer& b : _vscratch) { total += b.byte_size(); }
+  return total;
+}
+
+void
+MetalQwenModel::encode_gdn_qk_norm_(ComputeEncoder& enc,
+                                    const SharedBuffer& buf,
+                                    std::size_t qoff, std::size_t koff,
+                                    int heads) const
+{
+  const Config& c = _cfg;
+  const int Dk = c.gdn_k_dim;
+  const float eps = c.rms_eps;
+  if (_fn_gdn_qk_norm.valid() && gdn_fuse_()
+      && koff == qoff + (std::size_t)heads * Dk * 2) {
+    const float inv = 1.0f / std::sqrt((float)Dk);
+    const float s_q = inv * inv, s_k = inv;
+    enc.set_function(_fn_gdn_qk_norm);
+    enc.set_buffer(0, buf, qoff);
+    enc.set_constant(1, heads); enc.set_constant(2, Dk);
+    enc.set_constant(3, s_q); enc.set_constant(4, s_k);
+    enc.set_constant(5, eps);
+    enc.dispatch({128, (unsigned)(2 * heads), 1}, {128, 1, 1});
+    return;
+  }
+  for (const auto& [off, w] : {std::pair{qoff, &_gdn_qscale},
+                               std::pair{koff, &_gdn_kscale}}) {
+    enc.set_function(rms_fn_(Dk, off, off));
+    enc.set_buffer(0, buf, off); enc.set_buffer(1, *w);
+    enc.set_buffer(2, buf, off);
+    enc.set_constant(3, Dk); enc.set_constant(4, eps);
+    enc.dispatch({256, (unsigned)heads, 1}, {256, 1, 1});
+  }
+}
+
 void
 MetalQwenModel::encode_gdn_replay2_(ComputeEncoder& enc, ContextId cid,
                                     int keep, const GdnVerifyCache& gc)
@@ -10695,23 +11214,18 @@ MetalQwenModel::encode_gdn_replay2_(ComputeEncoder& enc, ContextId cid,
   if (keep <= 0 || gc.layers.empty()) { return; }
   const Config& c = _cfg;
   const int Cd = c.gdn_conv_dim, keyd = c.key_dim(), vald = c.value_dim();
-  const int Hv = c.gdn_v_heads, Dv = c.gdn_v_dim, Dk = c.gdn_k_dim;
+  const int Hv = c.gdn_v_heads, Dv = c.gdn_v_dim;
   const int Hk = c.gdn_k_heads, Kc = c.gdn_conv_kernel;
-  const float eps = c.rms_eps;
-  SharedBuffer convout = _mc->make_shared_buffer((std::size_t)keep * Cd * 2);
-  SharedBuffer ygdn = _mc->make_shared_buffer((std::size_t)keep * vald * 2);
+  // Pooled past the verify's slots: it is encoded into the verify's
+  // command buffer (its prologue).
+  const std::size_t rcap = (std::size_t)std::max(keep, kQmvBatchMaxRows);
+  const SharedBuffer& convout = verify_scratch_(40, rcap * Cd * 2);
+  const SharedBuffer& ygdn = verify_scratch_(41, rcap * vald * 2);
   const std::size_t kb_off = (std::size_t)keep * keyd * 2;
   const std::size_t vb_off = 2 * kb_off;
   const bool gdn4 =
       _fn_gdn_step_ndv4.valid() && (Dv % 4 == 0) && !_gdn_force_v1;
   const unsigned gdn_dvy = gdn4 ? (unsigned)(Dv / 4) : (unsigned)Dv;
-  auto rms = [&](std::size_t off, const SharedBuffer& w, int R) {
-    enc.set_function(_fn_rms);
-    enc.set_buffer(0, convout, off); enc.set_buffer(1, w);
-    enc.set_buffer(2, convout, off);
-    enc.set_constant(3, Dk); enc.set_constant(4, eps);
-    enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
-  };
   for (std::size_t gi = 0; gi < gc.layers.size(); ++gi) {
     const int L = gc.layers[gi];
     const Layer& ly = _layers[(std::size_t)L];
@@ -10727,8 +11241,7 @@ MetalQwenModel::encode_gdn_replay2_(ComputeEncoder& enc, ContextId cid,
     enc.set_constant(6, Kc); enc.set_constant(7, Cd);   // x_stride = Cd
     enc.set_constant(8, keyd); enc.set_buffer(9, *cw);
     enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
-    rms(0, _gdn_qscale, keep * Hk);
-    rms(kb_off, _gdn_kscale, keep * Hk);
+    encode_gdn_qk_norm_(enc, convout, 0, kb_off, keep * Hk);
     enc.set_function(gdn4 ? _fn_gdn_step_ndv4 : _fn_gdn_step);
     enc.set_buffer(0, convout, 0); enc.set_buffer(1, convout, kb_off);
     enc.set_buffer(2, convout, vb_off); enc.set_buffer(3, gc.gbuf[gi]);
@@ -10805,9 +11318,33 @@ MetalQwenModel::dflash_decode(ContextId cid, std::int32_t first_token,
 
   // Penalised sampling: the seen-set pdecode holds -- `prime` and every
   // token kept so far; each verify row adds the block's tokens up to it.
-  std::vector<std::uint8_t> seen_base;
+  // Kept in a GPU buffer and spread into the rows by seen_rows_from_ids
+  // inside the round's command buffer, so the draft need not be read
+  // back first: the host build cost a round its own command buffer and a
+  // wait (14 of a 46 ms round on an M5 Ultra). VPIPE_DFLASH_SEEN_GPU=0
+  // builds them on the host as before.
+  static const bool seen_gpu_on = [] {
+    const char* e = std::getenv("VPIPE_DFLASH_SEEN_GPU");
+    return e == nullptr || std::atoi(e) != 0;
+  }();
+  const bool gpu_seen = penal && seen_gpu_on && _fn_seen_rows.valid();
+  std::vector<std::uint8_t> seen_host;
+  SharedBuffer seen_buf, seen_rows;
+  std::uint8_t* seen_base = nullptr;
+  if (gpu_seen) {
+    seen_buf = _mc->make_shared_buffer((std::size_t)c.vocab);
+    seen_rows = _mc->make_shared_buffer((std::size_t)Lb * c.vocab);
+    if (seen_buf.empty() || seen_rows.empty()) {
+      _ctx->gdn_ring_end(cid);
+      return false;
+    }
+    seen_base = static_cast<std::uint8_t*>(seen_buf.contents());
+  } else if (penal) {
+    seen_host.resize((std::size_t)c.vocab);
+    seen_base = seen_host.data();
+  }
   if (penal) {
-    seen_base.assign((std::size_t)c.vocab, 0);
+    std::memset(seen_base, 0, (std::size_t)c.vocab);
     for (const std::int32_t t : ctl.prime) {
       if (t >= 0 && t < c.vocab) { seen_base[(std::size_t)t] = 1; }
     }
@@ -10818,13 +11355,19 @@ MetalQwenModel::dflash_decode(ContextId cid, std::int32_t first_token,
   int pend_keep = 0;
   int pend_rows = 0, pend_pos = 0, pend_L = 0;
   auto encode_owed = [&](ComputeEncoder& enc) {
-    if (pend_keep > 0) {
+    if (pend_keep > 0 && !vskip_(kVsReplay)) {
       encode_gdn_replay2_(enc, cid, pend_keep, gcache);
       _ctx->gdn_ring_advance(cid);
       pend_keep = 0;
     }
+    if (pend_keep > 0) {   // replay left out (profiling): still advance
+      _ctx->gdn_ring_advance(cid);
+      pend_keep = 0;
+    }
     if (pend_rows > 0) {
-      _dflash->encode_ingest(enc, taps, pend_L, 0, pend_rows, pend_pos);
+      if (!vskip_(kVsIngest)) {
+        _dflash->encode_ingest(enc, taps, pend_L, 0, pend_rows, pend_pos);
+      }
       pend_rows = 0;
     }
   };
@@ -10838,9 +11381,15 @@ MetalQwenModel::dflash_decode(ContextId cid, std::int32_t first_token,
   }();
   double draft_ms = 0.0;
   if (std::getenv("VPIPE_MTP_VPROFILE") != nullptr) {
-    g_vp_main = g_vp_vhead = g_vp_mtp = 0.0;
-    g_vp_n = 0;
+    _vstats.vp_main = _vstats.vp_vhead = _vstats.vp_mtp = 0.0;
+    _vstats.vp_n = 0;
   }
+  _vstats.alloc = _vstats.enc = _vstats.wait = 0.0;
+  _vstats.n = 0;
+  _vstats.marks.clear();
+  (void)metal_compute::CommandStream::take_gpu_spans();
+  double gpu0 = 0.0;
+  metal_compute::CommandStream::gpu_time_stats(&gpu0, nullptr);
   SpecStats st;
   int pos = seed_slot0;            // KV slot of this round's anchor
   std::int32_t anchor = first_token;
@@ -10855,7 +11404,7 @@ MetalQwenModel::dflash_decode(ContextId cid, std::int32_t first_token,
     if (L >= 2) { _dflash->fill_block_ids(blkp, anchor, L); }
     auto draft_enc = [&](ComputeEncoder& enc) {
       encode_owed(enc);
-      if (L >= 2) {
+      if (L >= 2 && !vskip_(kVsDraft)) {
         _dflash->encode_draft(enc, *_dflash_hooks, blk, L, pos, ids, 1);
       }
     };
@@ -10866,10 +11415,19 @@ MetalQwenModel::dflash_decode(ContextId cid, std::int32_t first_token,
     vo.tap_layers = &dc.target_layer_ids;
     vo.taps = &taps;
     vo.gdn_ring2 = true;
+    // Row k's seen-set from the drafted ids, on the GPU (gpu_seen).
+    auto seen_enc = [&](ComputeEncoder& enc) {
+      enc.set_function(_fn_seen_rows);
+      enc.set_buffer(0, seen_buf); enc.set_buffer(1, ids);
+      enc.set_buffer(2, seen_rows);
+      enc.set_constant(3, c.vocab); enc.set_constant(4, L);
+      enc.dispatch({(unsigned)c.vocab, (unsigned)L, 1}, {256, 1, 1});
+    };
+    if (gpu_seen) { vo.seen_rows = &seen_rows; }
     const auto t0 = clk::now();
-    if (penal || prof_split) {
-      // The per-row seen-sets need the drafts on the host first.
-      metal_compute::CommandStream ds = _mc->make_command_stream();
+    if ((penal && !gpu_seen) || prof_split) {
+      // The host's per-row seen-sets need the drafts read back first.
+      metal_compute::CommandStream& ds = spec_stream_();
       {
         ComputeEncoder enc = ds.begin_compute();
         draft_enc(enc);
@@ -10878,12 +11436,12 @@ MetalQwenModel::dflash_decode(ContextId cid, std::int32_t first_token,
       draft_ms += std::chrono::duration<double, std::milli>(
           clk::now() - t0).count();
     }
-    if (penal) {
+    if (penal && !gpu_seen) {
       const std::size_t V = (std::size_t)c.vocab;
       _mtp_seen_rows.resize((std::size_t)L * V);
       for (int k = 0; k < L; ++k) {
         std::uint8_t* row = _mtp_seen_rows.data() + (std::size_t)k * V;
-        std::memcpy(row, seen_base.data(), V);
+        std::memcpy(row, seen_base, V);
         for (int i = 0; i <= k; ++i) {
           const std::int32_t t = idp[i];
           if (t >= 0 && t < c.vocab) { row[(std::size_t)t] = 1; }
@@ -10891,10 +11449,14 @@ MetalQwenModel::dflash_decode(ContextId cid, std::int32_t first_token,
       }
       vo.prologue = embed_enc;
     } else if (prof_split) {
-      vo.prologue = embed_enc;
+      vo.prologue = [&](ComputeEncoder& enc) {
+        if (gpu_seen) { seen_enc(enc); }
+        embed_enc(enc);
+      };
     } else {
       vo.prologue = [&](ComputeEncoder& enc) {
         draft_enc(enc);
+        if (gpu_seen) { seen_enc(enc); }
         embed_enc(enc);
       };
     }
@@ -10970,7 +11532,7 @@ MetalQwenModel::dflash_decode(ContextId cid, std::int32_t first_token,
   // Settle what the last round owes, so the context's state is the kept
   // tokens' and the drafter has seen them.
   if (pend_keep > 0 || pend_rows > 0) {
-    metal_compute::CommandStream fs = _mc->make_command_stream();
+    metal_compute::CommandStream& fs = spec_stream_();
     {
       ComputeEncoder enc = fs.begin_compute();
       encode_owed(enc);
@@ -10991,6 +11553,82 @@ MetalQwenModel::dflash_decode(ContextId cid, std::int32_t first_token,
                   draft_ms / (double)st.rounds,
                   (st.gpu_ms - draft_ms) / (double)st.rounds);
     }
+    if (_vstats.n > 0) {
+      const double vn = (double)_vstats.n;
+      std::printf("[dflash]   verify host: scratch %.2f, encode %.2f, "
+                  "commit+wait %.2f ms/round\n", _vstats.alloc / vn,
+                  _vstats.enc / vn, _vstats.wait / vn);
+    }
+    double gpu1 = 0.0;
+    metal_compute::CommandStream::gpu_time_stats(&gpu1, nullptr);
+    if (gpu1 > gpu0) {
+      std::printf("[dflash]   GPU busy %.1f of %.1f ms/round\n",
+                  (gpu1 - gpu0) / (double)st.rounds,
+                  st.gpu_ms / (double)st.rounds);
+    }
+    auto spans = metal_compute::CommandStream::take_gpu_spans();
+    if (spans.size() > 1 && !_vstats.marks.empty()) {
+      // Round to round: the last buffer's GPU end -> the host's wait
+      // returning (wake) -> the next verify entered (the host's turn) ->
+      // its first buffer committed (encode) -> that buffer's GPU start
+      // (the driver).
+      std::sort(spans.begin(), spans.end(),
+                [](const auto& a, const auto& b) { return a.start < b.start; });
+      double wake = 0, turn = 0, enc = 0, drv = 0, k0 = 0, k1 = 0;
+      long n = 0;
+      for (std::size_t r = 0; r + 1 < _vstats.marks.size(); ++r) {
+        const double ret = _vstats.marks[r].second;
+        const double next = _vstats.marks[r + 1].first;
+        // the last buffer ending before ret, the first starting after it
+        const auto* last = (const decltype(spans)::value_type*)nullptr;
+        const auto* first = last;
+        for (const auto& s : spans) {
+          if (s.end <= ret) { last = &s; }
+          if (s.start >= ret && first == nullptr) { first = &s; }
+        }
+        if (last == nullptr || first == nullptr) { continue; }
+        wake += ret - last->end;
+        turn += next - ret;
+        enc += first->commit - next;
+        drv += first->start - first->commit;
+        k0 += first->kstart - first->commit;
+        k1 += first->kend - first->kstart;
+        ++n;
+      }
+      // The driver's work on each buffer, by its place in the round.
+      {
+        double kw[4] = {0, 0, 0, 0};
+        long kn[4] = {0, 0, 0, 0};
+        std::sort(spans.begin(), spans.end(), [](const auto& a,
+                                                 const auto& b) {
+          return a.commit < b.commit;
+        });
+        for (const auto& mk : _vstats.marks) {
+          int idx = 0;
+          for (const auto& sp : spans) {
+            if (sp.commit < mk.first || sp.commit > mk.second) { continue; }
+            const int slot = std::min(idx, 3);
+            kw[slot] += sp.kend - sp.kstart;
+            ++kn[slot];
+            ++idx;
+          }
+        }
+        std::printf("[dflash]   driver per buffer (ms): 1st %.2f, 2nd %.2f, "
+                    "3rd %.2f, rest %.3f\n",
+                    kn[0] ? kw[0] * 1e3 / kn[0] : 0.0,
+                    kn[1] ? kw[1] * 1e3 / kn[1] : 0.0,
+                    kn[2] ? kw[2] * 1e3 / kn[2] : 0.0,
+                    kn[3] ? kw[3] * 1e3 / kn[3] : 0.0);
+      }
+      if (n > 0) {
+        std::printf("[dflash]   round to round (ms): GPU end -> wait back "
+                    "%.2f, -> next verify %.2f, -> first commit %.2f, -> GPU "
+                    "start %.2f (driver picks it up %.2f, works %.2f)\n",
+                    wake * 1e3 / n, turn * 1e3 / n, enc * 1e3 / n,
+                    drv * 1e3 / n, k0 * 1e3 / n, k1 * 1e3 / n);
+      }
+    }
+    _vstats.marks.clear();
     if (adaptive) {
       std::string tl;
       for (std::size_t ci = 0; ci < _dflash_tuner.cand.size(); ++ci) {
@@ -11002,10 +11640,10 @@ MetalQwenModel::dflash_decode(ContextId cid, std::int32_t first_token,
       }
       std::printf("[dflash]   tuner:%s\n", tl.c_str());
     }
-    if (std::getenv("VPIPE_MTP_VPROFILE") != nullptr && g_vp_n > 0) {
+    if (std::getenv("VPIPE_MTP_VPROFILE") != nullptr && _vstats.vp_n > 0) {
       std::printf("[dflash]   verify split: layers %.1f, head %.1f ms "
-                  "(%ld verifies)\n", g_vp_main / (double)g_vp_n,
-                  g_vp_vhead / (double)g_vp_n, g_vp_n);
+                  "(%ld verifies)\n", _vstats.vp_main / (double)_vstats.vp_n,
+                  _vstats.vp_vhead / (double)_vstats.vp_n, _vstats.vp_n);
     }
   }
   return !(failed && out_ids.empty());

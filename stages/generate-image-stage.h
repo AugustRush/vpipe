@@ -21,6 +21,7 @@
 #include "generative-models/boogu/metal-boogu-transformer.h"
 #include "generative-models/z-image/metal-z-image-transformer.h"
 #include "generative-models/flux3/metal-flux3-transformer.h"
+#include "generative-models/moss-image/metal-moss-image-transformer.h"
 #include "generative-models/vosr/metal-vosr-transformer.h"
 #include "stages/generation-input.h"
 #include "stages/latent-preview.h"
@@ -40,6 +41,7 @@ namespace genai { class WeightSet; }   // generative-models/weight-set.h
 // generative-models/image-model-registry.h -- an out-of-tree family and
 // the one resident checkpoint it builds.
 namespace genai { class ImageModelFamily; class ImageGenerator; }
+namespace model_memory { struct StreamPlan; }   // stages/model-memory.h
 
 // Text-to-image (DiT) stage: the denoiser half of the diffusion split -- it
 // consumes ready-made conditioning from a `diffusion-conditioner` stage (which
@@ -177,12 +179,39 @@ public:
   void apply_constant(unsigned iport, const FlexData& beat) override;
 
 private:
+  // What the int8 layouts (i8_gemm_tier fast / token) add to the DiT's
+  // bytes on disk where this stage's config and box engage them: a w4
+  // pack's projections held at int8 (`held`), or the scratch they are
+  // converted into before each GEMM (`scratch`). Zero where they do not
+  // engage.
+  std::size_t int8_held_bytes_(const std::string& dit) const;
+  std::size_t int8_scratch_bytes_(const std::string& dit) const;
+  // What a streamed DENSE checkpoint's slot pairs add on the int8
+  // layouts (each slot keeps its bf16 source and the layout from it).
+  std::size_t int8_slot_bytes_(const std::string& dit) const;
+  // The DiT this stage will LOAD, named at planning time: `dit_dir`
+  // when the graph names one, else the checkpoint's own.
+  std::string planned_dit_dir_(const std::string& root) const;
+  // Whether the ANE tier declare_resources claimed may run: the plan's
+  // grant for its one unit (`bytes` only sizes the no-plan fallback).
+  // Logs the refusal; the caller turns the tier off.
+  bool ane_granted_(std::size_t bytes, const char* family) const;
+  // The engine's call between the two, from the DiT's streaming plan; it
+  // says which on the log.
+  bool hold_w4_int8_(const model_memory::StreamPlan& plan, bool streamed,
+                     const std::string& dit);
+  // ...as decided at the plan, for the reloads that follow it.
+  bool _i8_hold_w4 = false;
+  // Whether that decision has been made: until it has, declare_memory()
+  // books the layout held (the preload at its largest).
+  bool _i8_hold_decided = false;
   // Tell the manager what a STREAMING DiT actually keeps resident, which
   // is its pinned prefix rather than the whole checkpoint its files
   // suggest. Without this every peer sizes the box against ~20 GB that
   // was never there. No-op when the DiT is not streaming.
   void revise_dit_declaration_(const std::string& dit_dir) const;
   std::size_t dit_resident_bytes_() const;
+  void release_idle_slots_();
   void correct_dit_holding_(const char* when) const;
 
   // The checkpoint whose holding correct_dit_holding_ moves, plus the
@@ -224,6 +253,9 @@ public:
   {
     return _lora[(std::size_t)(slot > 0 ? 1 : 0)].scale;
   }
+  // Whether this stage's DiT was a model kept warm, taken back
+  // (`keep_loaded`) -- a test's proof the take ran rather than a build.
+  bool dit_taken_warm() const noexcept { return _dit_taken_warm; }
 
 private:
   // Copies the settled ANE tier from the accel bag onto a family config
@@ -260,6 +292,40 @@ private:
   double      _guidance_scale{};     // CFG scale; 1 => disabled (single pass)
   bool        _infer_size{};    // no width/height configured: size from iport5
   bool        _i8_gemm{};            // LOSSY dynamic-int8 DiT GEMMs (opt-in)
+  double      _keep_loaded{};        // s a built DiT is kept warm after
+  void        keep_models_warm_();
+  // ---- a DiT kept WARM between graphs (`keep_loaded`) ---------------
+  //
+  // What a family built, under a key naming every setting that changed
+  // it -- the tiers, attention, the ANE's share (and whether its modules
+  // were built), its adapters' files (a strength is live, set again on a
+  // take), `extra` for what only the family has. Fields a family's
+  // Config lacks are left out.
+  template <class Cfg, class Spec>
+  static std::string warm_key_(const Cfg& cfg, bool stream,
+                               const std::vector<Spec>& loras,
+                               const std::string& extra = {});
+  // The DiT kept warm under `key` for `dir`, taken back (and `key` kept
+  // as this stage's); null when there is none, keep_loaded is off or the
+  // box is tight (`_dit_bounded`).
+  template <class Dit>
+  std::shared_ptr<Dit> take_warm_dit_(const char* kind,
+                                      const std::string& dir,
+                                      const std::string& key,
+                                      const char* name);
+  // Handed to the manager as the stage ends (keep_models_warm_).
+  template <class Dit>
+  void keep_warm_dit_(const char* kind, const std::string& dir,
+                      std::shared_ptr<Dit>& dit, const char* name);
+  // Set by the family's init: the box is tight, its DiT freed for the
+  // decode -- never kept warm.
+  bool        _dit_bounded = false;
+  bool        _dit_taken_warm = false;   // see dit_taken_warm()
+  // The settings this stage's DiT was built with; empty before.
+  std::string _dit_warm_key;
+  int         _i8_tier{};            // ...its tier: 0 accurate, 1 fast,
+                                     // 2 token, 3 token_plain
+                                     // (i8_gemm_tier)
   // ---- an out-of-tree family, when one claimed this checkpoint ------
   //
   // Consulted BEFORE the built-in _class_name chain and, when it claims,
@@ -361,8 +427,9 @@ private:
   // shape.
   bool _preview_shape_said = false;
 
-  std::unique_ptr<genai::MetalKrea2Transformer>   _dit;
-  std::unique_ptr<genai::MetalFlux2Transformer>   _flux2_dit;
+  // Shared, so each can outlive the stage kept warm (keep_models_warm_).
+  std::shared_ptr<genai::MetalKrea2Transformer>   _dit;
+  std::shared_ptr<genai::MetalFlux2Transformer>   _flux2_dit;
   std::unique_ptr<genai::MetalQwenImageTransformer> _qie_dit;
   // Boogu-Image's 10B NextDiT (its own class: five block kinds and three
   // refiner stacks share nothing with the MMDiTs above).
@@ -552,7 +619,8 @@ private:
   }
 
   // ---- Qwen-Image-2.1 ------------------------------------------------
-  std::unique_ptr<genai::MetalQwenImage21Transformer> _qi21_dit;
+  // Shared, so it can outlive the stage kept warm (keep_models_warm_).
+  std::shared_ptr<genai::MetalQwenImage21Transformer> _qi21_dit;
   std::string _qi21_dit_dir;
   bool _qi21_stream = false;
   // qwen-image-21-model-config's `use_kv_cache`. Defaults ON, matching
@@ -583,7 +651,7 @@ private:
       const std::function<void(const std::vector<float>&)>& emit_step) const;
 
   // ---- Z-Image -------------------------------------------------------
-  std::unique_ptr<genai::MetalZImageTransformer> _zi_dit;
+  std::shared_ptr<genai::MetalZImageTransformer> _zi_dit;
   std::string _zi_dit_dir;
   bool _zi_stream = false;
   // z-image-model-config's knobs. The DISTILLED Turbo checkpoint wants
@@ -612,7 +680,7 @@ private:
       const std::function<void(const std::vector<float>&)>& emit_step) const;
 
   // ---- FLUX.3 Image Klein ---------------------------------------------
-  std::unique_ptr<genai::MetalFlux3Transformer> _flux3_dit;
+  std::shared_ptr<genai::MetalFlux3Transformer> _flux3_dit;
   std::string _flux3_dit_dir;
   bool _flux3_stream = false;
   // The sampler the CHECKPOINT states (<root>/config.json `sampler`):
@@ -634,6 +702,39 @@ private:
       const metal_compute::SharedBuffer& text, int n_rows, int gen_h,
       int gen_w, const std::vector<RefLatent>& refs,
       const std::vector<float>* init_packed,
+      const std::function<void(const std::vector<float>&)>& emit_step) const;
+
+  // ---- MOSS-Image -------------------------------------------------------
+  std::shared_ptr<genai::MetalMossImageTransformer> _moss_dit;
+  std::string _moss_dit_dir;
+  bool _moss_stream = false;
+  // The sampler the CHECKPOINT states (scheduler/scheduler_config.json:
+  // shift 5, training_shift 1, 1000 training steps), read at load.
+  double _moss_shift = 5.0;
+  double _moss_train_shift = 1.0;
+  int _moss_train_steps = 1000;
+  // moss-image-model-config's keys, each "no opinion" when absent (reset
+  // per launch): guidance (the reference's 3), the negative branch's
+  // skipped blocks (its [22]) and a shift override.
+  double _moss_guidance_cfg = -1.0;
+  bool _moss_skip_set = false;
+  std::vector<int> _moss_skip_cfg;
+  double _moss_shift_cfg = 0.0;
+  // Skip-layer guidance on the positive branch (a third forward) and the
+  // window that gates it AND the negative branch's skip.
+  std::vector<int> _moss_slg_layers;
+  double _moss_slg_scale = 0.0;
+  double _moss_slg_start = 0.0;
+  double _moss_slg_stop = 1.0;
+  bool load_moss_image_dit_();
+  void free_moss_image_dit_for_decode_(int gen_w, int gen_h);
+  // Text (+ the negative) -> [128, H/16, W/16], FLUX.2's VAE's latent:
+  // the reference pipeline's own loop (snapped schedule, f32 Euler, CFG
+  // against the negative run with its blocks skipped).
+  std::vector<float> generate_moss_image_(
+      const metal_compute::SharedBuffer& txt_pos, int n_real,
+      const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
+      int gen_h, int gen_w, const std::vector<float>* init_packed,
       const std::function<void(const std::vector<float>&)>& emit_step) const;
 
   // The conditioning -> unpacked-latent forward: fuse the tapped text

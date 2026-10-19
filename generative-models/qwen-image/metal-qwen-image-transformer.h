@@ -158,7 +158,26 @@ class MetalQwenImageTransformer {
   // once the reserve is taken) and before the first forward.
   void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
+  // The streaming slot pair, while it exists (BlockSlots::held_bytes).
+  std::size_t slot_bytes() const { return _slots.held_bytes(); }
   int resident_block_count() const { return _resid.count(); }
+  // Drop what a forward keeps for the next one -- the dense stand-in,
+  // split-K planes and the int8 context's buffers; each regrows on
+  // demand. The stage calls it after a
+  // generation on a bounded box, before the decode wants the room.
+  void release_forward_scratch();
+  // A STREAMED stack residency has kept whole gives its slot pair
+  // back (BlockSlots::release_if_saturated) -- between generations; a
+  // forward does the same at its top. Returns the bytes freed.
+  std::size_t release_idle_slots()
+  {
+    return _slots.release_if_saturated(_blocks);
+  }
+  // Streamed blocks BUILT into their slot because the slot was laid
+  // out for another (a mixed pack's other width; BlockSlots::Ops::
+  // same_layout), over the model's life. For a test to show the slots
+  // crossed widths -- and did not give up and stream without them.
+  int slot_relayouts() const { return _slots.relaid(); }
   // Give back at least `bytes` of resident blocks, for a peer that needs
   // the room now.
   std::size_t release_resident_blocks(std::size_t bytes);
@@ -286,6 +305,9 @@ class MetalQwenImageTransformer {
       int L, Block& b,
       const BlockSlots<Block>::TensorFn& fn) const;
   bool clone_block_(const Block& src, Block& dst, bool copy) const;
+  // Is block L stored at the widths `b` was built for? (A mixed pack;
+  // see BlockSlots::Ops::same_layout.)
+  bool same_layout_(int L, const Block& b) const;
   metal_compute::SharedBuffer rebuild_one_(
       const std::string& nm, Placement how);
   void configure_slots_();

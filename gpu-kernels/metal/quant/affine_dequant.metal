@@ -1033,6 +1033,769 @@ kernel void quant_f16_i8s_row_g64(
   }
 }
 
+// quant_f16_i8s_row_g64 over silu(gate) * up, never storing the product:
+// the down projection's input is quantized straight from the two halves
+// the up projection wrote. The product is rounded to the element type
+// first, exactly as swiglu_v4_f16 stores it, so the codes, scales and u
+// are the ones that kernel followed by quant_f16_i8s_row_g64 produce.
+//   0:gate[M,K] 1:up[M,K] 2:q[M,K] i8 3:scales[M,K/64] 4:u[M,K/64] 5:K
+//   dispatch (threads): {256, M, 1}, tg {256, 1, 1}
+kernel void swiglu_quant_f16_i8s_row_g64(
+    const device VPIPE_ELT* gate   [[buffer(0)]],
+    const device VPIPE_ELT* up     [[buffer(1)]],
+    device char*            q      [[buffer(2)]],
+    device VPIPE_ELT*       scales [[buffer(3)]],
+    device VPIPE_ELT*       u      [[buffer(4)]],
+    const constant int& K     [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int row = (int)tgid.y;
+  const int G = K / 64;
+  for (int g = (int)sgid; g < G; g += 8) {
+    const int64_t at = (int64_t)row * K + g * 64 + (int)lane * 2;
+    const vec<VPIPE_ELT, 2> gv =
+        *reinterpret_cast<const device vec<VPIPE_ELT, 2>*>(gate + at);
+    const vec<VPIPE_ELT, 2> uv =
+        *reinterpret_cast<const device vec<VPIPE_ELT, 2>*>(up + at);
+    const float2 gf = float2(gv), uf2 = float2(uv);
+    const float2 sg = gf / (1.0f + exp(-gf));
+    const vec<VPIPE_ELT, 2> h = vec<VPIPE_ELT, 2>(sg * uf2);
+    float am = max(fabs((float)h.x), fabs((float)h.y));
+    am = simd_max(am);
+    const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+    const int qx = clamp((int)rint((float)h.x * inv), -127, 127);
+    const int qy = clamp((int)rint((float)h.y * inv), -127, 127);
+    *reinterpret_cast<device char2*>(q + at) = char2((char)qx, (char)qy);
+    const int sum = simd_sum(qx + qy);
+    if (lane == 0) {
+      const VPIPE_ELT sc = (VPIPE_ELT)(am * (1.0f / 127.0f));
+      scales[(int64_t)row * G + g] = sc;
+      u[(int64_t)row * G + g] = (VPIPE_ELT)((float)sc * (float)sum);
+    }
+  }
+}
+
+// THE COARSE TIER's quantizers (gemm_i8c_* in dense_gemm_mma): symmetric
+// int8 per (row, group of GC) with an amax scale in the element type, one
+// simdgroup per group, each lane GC/32 CONTIGUOUS elements. Rows are
+// activation rows or weight channels alike -- a bf16 weight takes the
+// same pass once, at load. K % GC == 0.
+//   quant_i8_row_gc*:        0:x[M,K] 1:q[M,K] i8 2:scales[M,K/GC] 3:K
+//   swiglu_quant_i8_row_gc*: 0:gate 1:up 2:q 3:scales 4:K -- the product
+//     rounded to the element type first, as swiglu_v4_f16 stores it
+//   affine_to_i8c_w8_gc*:    0:codes[N,K] u8 (g64 affine) 1:scales
+//     2:biases [N,K/64] 3:q[N,K] i8 (may be 0) 4:cscales[N,K/GC] 5:K --
+//     each element dequantized, then requantized at GC
+//   affine_to_i8c_w4_gc*:    the same from a w4 g64 pack (codes [N,K/2],
+//     byte b holding k = 2b low and 2b + 1 high); q is twice the codes'
+//     size, so it is a buffer of its own
+//   i8c_dequant_gc*:         0:q[N,K] i8 1:cscales 2:out[N,K] 3:K
+//   all: ONE SIMDGROUP PER (row, group), four groups a threadgroup:
+//   dispatch (threads) {ceil(K/GC / 4) * 128, rows, 1}, tg {128, 1, 1}.
+//   (A simdgroup walking its row's groups in turn left too few in
+//   flight to hide the loads once the rotation's registers cut
+//   occupancy.)
+// THE ROTATION (ROT): an orthonormal Walsh-Hadamard transform of each
+// group, applied to BOTH operands, so the product is unchanged
+// (x W^T = (x H)(W H)^T, H H^T = I) while an outlier channel's energy is
+// spread over its whole group instead of setting the group's scale --
+// QuaRot's trick, block-diagonal at GC. Sylvester order, so H is
+// symmetric and its own inverse: the dequant rotates back with the same
+// transform. A lane holds GC/32 contiguous elements: the strides inside
+// a lane are register butterflies, the five across lanes simd shuffles.
+// The group's values are passed by ARRAY REFERENCE and the helpers are
+// forced inline: through a `thread float*` the array stayed in thread
+// memory, and every butterfly stage was a stack round trip -- the rotated
+// quantizer ran 3x the plain one's time whatever the rotation's size
+// (gemm_i8.coarse_tier: blocks of 16, no shuffles at all, cost the same
+// as 512). And EVERY INDEX IS A TEMPLATE CONSTANT (the recursions
+// below): written as loops -- nested, the inner bounds off the outer
+// variable -- `unroll(full)` or not, v[] still went to thread memory.
+// MEASURED on the M5 Ultra, a w4 [12288, 4096] into the token layout
+// (gemm_i8.fast_conversion_rate): the three in-lane stages 0.16 ms as
+// loops, 0.005 written out, the whole conversion 0.06 without them.
+template <int PL, int H, int J = 0>
+__attribute__((always_inline)) static inline void
+i8c_bfly_(thread float (&v)[PL])
+{
+  if constexpr (J < PL) {
+    if constexpr ((J & H) == 0) {
+      const float a = v[J], b = v[J + H];
+      v[J] = a + b;
+      v[J + H] = a - b;
+    }
+    i8c_bfly_<PL, H, J + 1>(v);
+  }
+}
+
+template <int PL, int HL, int H = 1>
+__attribute__((always_inline)) static inline void
+i8c_bfly_stages_(thread float (&v)[PL])
+{
+  if constexpr (H < HL) {
+    i8c_bfly_<PL, H>(v);
+    i8c_bfly_stages_<PL, HL, 2 * H>(v);
+  }
+}
+
+// A cross-lane butterfly is o + sg v with sg = -1 on the high lane: one
+// fma, exact in the product, so the same bits as `hi ? o - v : v + o`.
+template <int PL, int J = 0>
+__attribute__((always_inline)) static inline void
+i8c_xbfly_(thread float (&v)[PL], float sg, ushort m)
+{
+  if constexpr (J < PL) {
+    v[J] = fma(sg, v[J], simd_shuffle_xor(v[J], m));
+    i8c_xbfly_<PL, J + 1>(v, sg, m);
+  }
+}
+
+template <int PL, int ML, int M = 1>
+__attribute__((always_inline)) static inline void
+i8c_xstages_(thread float (&v)[PL], uint lane)
+{
+  if constexpr (M < ML) {
+    i8c_xbfly_<PL>(v, (lane & (uint)M) != 0 ? -1.0f : 1.0f, (ushort)M);
+    i8c_xstages_<PL, ML, 2 * M>(v, lane);
+  }
+}
+
+template <int PL, int J = 0>
+__attribute__((always_inline)) static inline void
+i8c_scale_(thread float (&v)[PL], float n)
+{
+  if constexpr (J < PL) {
+    v[J] *= n;
+    i8c_scale_<PL, J + 1>(v, n);
+  }
+}
+
+template <int GC, int RB = GC, bool NORM = true>
+__attribute__((always_inline)) static inline void
+i8c_fwht(thread float (&v)[GC / 32], uint lane)
+{
+  constexpr int PL = GC / 32;
+  // RB < GC rotates in independent blocks of RB (block-diagonal): the
+  // strides at and past RB are skipped -- in-lane ones past PL, the
+  // cross-lane ones past RB / PL lanes.
+  constexpr int HL = RB < PL ? RB : PL;
+  constexpr int ML = RB > PL ? RB / PL : 1;
+  i8c_bfly_stages_<PL, HL>(v);
+  i8c_xstages_<PL, ML>(v, lane);
+  if constexpr (NORM) { i8c_scale_<PL>(v, rsqrt((float)RB)); }
+}
+
+template <int GC, bool ROT = false, int RB = GC>
+__attribute__((always_inline)) static inline void
+i8c_quant_group(thread float (&v)[GC / 32], device char* qp,
+                device VPIPE_ELT* sp, uint lane)
+{
+  constexpr int PL = GC / 32;
+  if constexpr (ROT) { i8c_fwht<GC, RB>(v, lane); }
+  float am = 0.0f;
+#pragma clang loop unroll(full)
+  for (int i = 0; i < PL; ++i) { am = max(am, fabs(v[i])); }
+  am = simd_max(am);
+  const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+#pragma clang loop unroll(full)
+  for (int i = 0; i < PL; i += 4) {
+    const int4 r = clamp(int4(rint(float4(v[i], v[i + 1], v[i + 2],
+                                          v[i + 3]) * inv)),
+                         int4(-127), int4(127));
+    *reinterpret_cast<device char4*>(qp + i) = char4(r);
+  }
+  if (lane == 0) { *sp = (VPIPE_ELT)(am * (1.0f / 127.0f)); }
+}
+
+template <int GC, bool ROT = false, int RB = GC>
+static inline void quant_i8_row_gc_impl(
+    const device VPIPE_ELT* x, device char* q, device VPIPE_ELT* scales,
+    int K, uint row, uint gx, uint sgid,
+    uint lane)
+{
+  constexpr int PL = GC / 32;
+  const int G = K / GC;
+  {
+    const int g = (int)gx * 4 + (int)sgid;
+    if (g >= G) { return; }
+    const int64_t at = (int64_t)row * K + g * GC + (int)lane * PL;
+    float v[PL];
+#pragma clang loop unroll(full)
+    for (int i = 0; i < PL; i += 4) {
+      const vec<VPIPE_ELT, 4> h =
+          *reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(x + at + i);
+      v[i] = (float)h.x; v[i + 1] = (float)h.y;
+      v[i + 2] = (float)h.z; v[i + 3] = (float)h.w;
+    }
+    i8c_quant_group<GC, ROT, RB>(v, q + at, scales + (int64_t)row * G + g,
+                                  lane);
+  }
+}
+
+template <int GC, bool ROT = false>
+static inline void swiglu_quant_i8_row_gc_impl(
+    const device VPIPE_ELT* gate, const device VPIPE_ELT* up, device char* q,
+    device VPIPE_ELT* scales, int K, uint row, uint gx, uint sgid,
+    uint lane)
+{
+  constexpr int PL = GC / 32;
+  const int G = K / GC;
+  {
+    const int g = (int)gx * 4 + (int)sgid;
+    if (g >= G) { return; }
+    const int64_t at = (int64_t)row * K + g * GC + (int)lane * PL;
+    float v[PL];
+#pragma clang loop unroll(full)
+    for (int i = 0; i < PL; i += 4) {
+      const float4 gv = float4(
+          *reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(gate + at + i));
+      const float4 uv = float4(
+          *reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(up + at + i));
+      const vec<VPIPE_ELT, 4> h =
+          vec<VPIPE_ELT, 4>(gv / (1.0f + exp(-gv)) * uv);
+      v[i] = (float)h.x; v[i + 1] = (float)h.y;
+      v[i + 2] = (float)h.z; v[i + 3] = (float)h.w;
+    }
+    i8c_quant_group<GC, ROT>(v, q + at, scales + (int64_t)row * G + g,
+                              lane);
+  }
+}
+
+// An affine pack's code for element `at` of its [N, K] matrix: a byte at
+// w8, a nibble at w4 (byte at / 2, low nibble for an even at).
+template <int BITS>
+__attribute__((always_inline)) static inline uint
+affine_code(const device uchar* codes, int64_t at)
+{
+  if constexpr (BITS == 8) {
+    return codes[at];
+  } else {
+    const uint c = codes[at >> 1];
+    return (at & 1) != 0 ? (c >> 4) : (c & 0xfu);
+  }
+}
+
+// Four consecutive codes of an affine pack from element `at` (a multiple
+// of 4): a uchar4 at w8, two bytes of nibbles at w4.
+template <int BITS>
+__attribute__((always_inline)) static inline float4
+affine_codes4(const device uchar* codes, int64_t at)
+{
+  if constexpr (BITS == 8) {
+    return float4(*reinterpret_cast<const device uchar4*>(codes + at));
+  } else {
+    const uint p =
+        *reinterpret_cast<const device ushort*>(codes + (at >> 1));
+    return float4(p & 0xfu, (p >> 4) & 0xfu, (p >> 8) & 0xfu, p >> 12);
+  }
+}
+
+template <int GC, bool ROT = false, int BITS = 8>
+static inline void affine_to_i8c_impl(
+    const device uchar* codes, const device VPIPE_ELT* scales,
+    const device VPIPE_ELT* biases, device char* q,
+    device VPIPE_ELT* cscales, int K, uint row, uint gx, uint sgid,
+    uint lane)
+{
+  constexpr int PL = GC / 32;
+  const int G = K / GC, G64 = K / 64;
+  {
+    const int g = (int)gx * 4 + (int)sgid;
+    if (g >= G) { return; }
+    const int k0 = g * GC + (int)lane * PL;
+    const int64_t at = (int64_t)row * K + k0;
+    // A lane's PL elements are contiguous and inside ONE g64 group (PL
+    // divides 64): one scale, one bias, and the codes as whole words --
+    // what a per-call conversion (encode_to_fast_scratch) runs at.
+    const int64_t sg = (int64_t)row * G64 + k0 / 64;
+    const float s = (float)scales[sg], b = (float)biases[sg];
+    // Four at a time (affine_codes4): a per-element shift and mask over
+    // whole words ran at half the rate (gemm_i8.fast_conversion_rate).
+    float v[PL];
+#pragma clang loop unroll(full)
+    for (int i = 0; i < PL; i += 4) {
+      const float4 a = affine_codes4<BITS>(codes, at + i) * s + b;
+      v[i] = a.x; v[i + 1] = a.y; v[i + 2] = a.z; v[i + 3] = a.w;
+    }
+    // Every lane has read its elements before any writes them, and no
+    // lane touches another's: at w8, in place (q == codes) is safe.
+    simdgroup_barrier(mem_flags::mem_none);
+    i8c_quant_group<GC, ROT>(v, q + at, cscales + (int64_t)row * G + g,
+                             lane);
+  }
+}
+
+template <int GC, bool ROT = false>
+static inline void i8c_dequant_impl(
+    const device char* q, const device VPIPE_ELT* cscales,
+    device VPIPE_ELT* out, int K, uint row, uint gx, uint sgid,
+    uint lane)
+{
+  constexpr int PL = GC / 32;
+  const int G = K / GC;
+  {
+    const int g = (int)gx * 4 + (int)sgid;
+    if (g >= G) { return; }
+    const int64_t at = (int64_t)row * K + g * GC + (int)lane * PL;
+    const float s = (float)cscales[(int64_t)row * G + g];
+    float v[PL];
+#pragma clang loop unroll(full)
+    for (int i = 0; i < PL; ++i) { v[i] = (float)q[at + i] * s; }
+    if constexpr (ROT) { i8c_fwht<GC>(v, lane); }
+#pragma clang loop unroll(full)
+    for (int i = 0; i < PL; ++i) { out[at + i] = (VPIPE_ELT)v[i]; }
+  }
+}
+
+#define I8C_QUANT_ENTRIES(GC, ROT, SFX)                                        \
+  kernel void quant_i8_row_gc##GC##SFX(                                        \
+      const device VPIPE_ELT* x [[buffer(0)]],                                 \
+      device char* q [[buffer(1)]],                                            \
+      device VPIPE_ELT* scales [[buffer(2)]],                                  \
+      const constant int& K [[buffer(3)]],                                     \
+      uint2 tgid [[threadgroup_position_in_grid]],                             \
+      uint sgid [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]]) {                               \
+    quant_i8_row_gc_impl<GC, ROT>(x, q, scales, K, tgid.y, tgid.x, sgid,     \
+                                  lane);                                       \
+  }                                                                            \
+  kernel void swiglu_quant_i8_row_gc##GC##SFX(                                 \
+      const device VPIPE_ELT* gate [[buffer(0)]],                              \
+      const device VPIPE_ELT* up [[buffer(1)]],                                \
+      device char* q [[buffer(2)]],                                            \
+      device VPIPE_ELT* scales [[buffer(3)]],                                  \
+      const constant int& K [[buffer(4)]],                                     \
+      uint2 tgid [[threadgroup_position_in_grid]],                             \
+      uint sgid [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]]) {                               \
+    swiglu_quant_i8_row_gc_impl<GC, ROT>(gate, up, q, scales, K, tgid.y,       \
+                                    tgid.x, sgid, lane);                       \
+  }                                                                            \
+  kernel void affine_to_i8c_w8_gc##GC##SFX(                                    \
+      const device uchar* codes [[buffer(0)]],                                 \
+      const device VPIPE_ELT* scales [[buffer(1)]],                            \
+      const device VPIPE_ELT* biases [[buffer(2)]],                            \
+      device char* q [[buffer(3)]],                                            \
+      device VPIPE_ELT* cscales [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                                     \
+      uint2 tgid [[threadgroup_position_in_grid]],                             \
+      uint sgid [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]]) {                               \
+    affine_to_i8c_impl<GC, ROT, 8>(codes, scales, biases, q, cscales, K,       \
+                                   tgid.y, tgid.x, sgid, lane);                \
+  }                                                                            \
+  kernel void affine_to_i8c_w4_gc##GC##SFX(                                    \
+      const device uchar* codes [[buffer(0)]],                                 \
+      const device VPIPE_ELT* scales [[buffer(1)]],                            \
+      const device VPIPE_ELT* biases [[buffer(2)]],                            \
+      device char* q [[buffer(3)]],                                            \
+      device VPIPE_ELT* cscales [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                                     \
+      uint2 tgid [[threadgroup_position_in_grid]],                             \
+      uint sgid [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]]) {                               \
+    affine_to_i8c_impl<GC, ROT, 4>(codes, scales, biases, q, cscales, K,       \
+                                   tgid.y, tgid.x, sgid, lane);                \
+  }                                                                            \
+  kernel void i8c_dequant_gc##GC##SFX(                                         \
+      const device char* q [[buffer(0)]],                                      \
+      const device VPIPE_ELT* cscales [[buffer(1)]],                           \
+      device VPIPE_ELT* out [[buffer(2)]],                                     \
+      const constant int& K [[buffer(3)]],                                     \
+      uint2 tgid [[threadgroup_position_in_grid]],                             \
+      uint sgid [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]]) {                               \
+    i8c_dequant_impl<GC, ROT>(q, cscales, out, K, tgid.y, tgid.x, sgid, lane); \
+  }
+I8C_QUANT_ENTRIES(256, false, )
+I8C_QUANT_ENTRIES(512, false, )
+I8C_QUANT_ENTRIES(1024, false, )
+// ...and ROTATED (suffix _r): the group Walsh-Hadamard before the
+// quantizer, and after the dequant.
+I8C_QUANT_ENTRIES(256, true, _r)
+I8C_QUANT_ENTRIES(512, true, _r)
+I8C_QUANT_ENTRIES(1024, true, _r)
+// THE ROTATION BLOCK, for its A/B (gemm_i8.coarse_tier): the g512
+// activation quantizer rotating in blocks of RB < 512.
+#define I8C_QUANT_RB(RB)                                                       \
+  kernel void quant_i8_row_gc512_rb##RB(                                       \
+      const device VPIPE_ELT* x [[buffer(0)]],                                 \
+      device char* q [[buffer(1)]],                                            \
+      device VPIPE_ELT* scales [[buffer(2)]],                                  \
+      const constant int& K [[buffer(3)]],                                     \
+      uint2 tgid [[threadgroup_position_in_grid]],                             \
+      uint sgid [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]]) {                               \
+    quant_i8_row_gc_impl<512, true, RB>(x, q, scales, K, tgid.y, tgid.x,       \
+                                        sgid, lane);                           \
+  }
+I8C_QUANT_RB(16)
+I8C_QUANT_RB(64)
+I8C_QUANT_RB(128)
+I8C_QUANT_RB(256)
+
+// THE PER-TOKEN TIER's quantizers (gemm_i8pt_* in dense_gemm_mma): one
+// symmetric int8 scale per ROW over all of K, stored f32 -- the i8x
+// layout. One threadgroup a row of T = K/16 threads (rounded up to a
+// simdgroup), each holding 16 of the row's values in registers: read
+// once, amax, quantize from registers. K % 4 == 0, K <= 16384. Sizing
+// the threadgroup to the row rather than the registers to the largest
+// row is what keeps the occupancy up: a fixed 256-thread group holding
+// 64 values a thread ran 1.6x the rotated g512 quantizer's time.
+// Rows are activation tokens or weight channels alike.
+//   quant_i8_tok:        0:x[M,K] 1:q[M,K] i8 2:scales[M] f32 3:K
+//   swiglu_quant_i8_tok: 0:gate[M,K] 1:up[M,K] 2:q 3:scales 4:K -- the
+//     product rounded to the element type first, as swiglu_v4_f16
+//     stores it
+//   affine_to_i8pt_w8:   0:codes[N,K] u8 (g64 affine) 1:scales 2:biases
+//     [N,K/64] 3:q[N,K] i8 4:cscales[N] f32 5:K -- dequantized, then
+//     requantized per channel; q may alias codes
+//   affine_to_i8pt_w4:   the same from a w4 g64 pack (codes [N,K/2]); q
+//     is a buffer of its own
+//   i8pt_dequant:        0:q[N,K] i8 1:cscales[N] f32 2:w[N,K] 3:K
+//   dispatch (threads): {T, rows, 1}, tg {T, 1, 1} (i8pt_dequant: 256)
+constant constexpr int kI8ptNV = 4;  // float4s a thread
+
+static inline float i8pt_row_amax(float am, uint sgid, uint lane,
+                                  uint nsg, threadgroup float* sm)
+{
+  am = simd_max(am);
+  if (lane == 0) { sm[sgid] = am; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  am = lane < nsg ? sm[lane] : 0.0f;
+  return simd_max(am);
+}
+
+static inline void i8pt_row_store(thread const float4 (&v)[kI8ptNV],
+                                  float am, device char* q, int64_t base,
+                                  int K, uint lid, uint T,
+                                  device float* scale)
+{
+  const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+#pragma clang loop unroll(full)
+  for (int j = 0; j < kI8ptNV; ++j) {
+    const int k = (j * (int)T + (int)lid) * 4;
+    if (k < K) {
+      const int4 r = clamp(int4(rint(v[j] * inv)), int4(-127), int4(127));
+      *reinterpret_cast<device char4*>(q + base + k) = char4(r);
+    }
+  }
+  if (lid == 0) { *scale = am * (1.0f / 127.0f); }
+}
+
+#define I8PT_ARGS                                                              \
+  uint2 tgid [[threadgroup_position_in_grid]],                                 \
+      uint lid [[thread_index_in_threadgroup]],                                \
+      uint2 T2 [[threads_per_threadgroup]],                                    \
+      uint sgid [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]]
+
+kernel void quant_i8_tok(
+    const device VPIPE_ELT* x [[buffer(0)]],
+    device char* q [[buffer(1)]],
+    device float* scales [[buffer(2)]],
+    const constant int& K [[buffer(3)]],
+    I8PT_ARGS)
+{
+  const uint T = T2.x;
+  threadgroup float sm[32];
+  const int64_t base = (int64_t)tgid.y * K;
+  float4 v[kI8ptNV];
+  float am = 0.0f;
+#pragma clang loop unroll(full)
+  for (int j = 0; j < kI8ptNV; ++j) {
+    const int k = (j * (int)T + (int)lid) * 4;
+    v[j] = float4(0.0f);
+    if (k < K) {
+      v[j] = float4(
+          *reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(x + base + k));
+      const float4 a = fabs(v[j]);
+      am = max(am, max(max(a.x, a.y), max(a.z, a.w)));
+    }
+  }
+  am = i8pt_row_amax(am, sgid, lane, (T + 31) / 32, sm);
+  i8pt_row_store(v, am, q, base, K, lid, T, scales + tgid.y);
+}
+
+kernel void swiglu_quant_i8_tok(
+    const device VPIPE_ELT* gate [[buffer(0)]],
+    const device VPIPE_ELT* up [[buffer(1)]],
+    device char* q [[buffer(2)]],
+    device float* scales [[buffer(3)]],
+    const constant int& K [[buffer(4)]],
+    I8PT_ARGS)
+{
+  const uint T = T2.x;
+  threadgroup float sm[32];
+  const int64_t base = (int64_t)tgid.y * K;
+  float4 v[kI8ptNV];
+  float am = 0.0f;
+#pragma clang loop unroll(full)
+  for (int j = 0; j < kI8ptNV; ++j) {
+    const int k = (j * (int)T + (int)lid) * 4;
+    v[j] = float4(0.0f);
+    if (k < K) {
+      const float4 g = float4(
+          *reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(gate + base + k));
+      const float4 u = float4(
+          *reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(up + base + k));
+      v[j] = float4(vec<VPIPE_ELT, 4>(g / (1.0f + exp(-g)) * u));
+      const float4 a = fabs(v[j]);
+      am = max(am, max(max(a.x, a.y), max(a.z, a.w)));
+    }
+  }
+  am = i8pt_row_amax(am, sgid, lane, (T + 31) / 32, sm);
+  i8pt_row_store(v, am, q, base, K, lid, T, scales + tgid.y);
+}
+
+
+template <int BITS>
+static inline void affine_to_i8pt_impl(
+    const device uchar* codes, const device VPIPE_ELT* scales,
+    const device VPIPE_ELT* biases, device char* q, device float* cscales,
+    int K, uint row, uint lid, uint T, uint sgid, uint lane,
+    threadgroup float* sm)
+{
+  const int64_t base = (int64_t)row * K;
+  const int64_t gbase = (int64_t)row * (K / 64);
+  float4 v[kI8ptNV];
+  float am = 0.0f;
+#pragma clang loop unroll(full)
+  for (int j = 0; j < kI8ptNV; ++j) {
+    const int k = (j * (int)T + (int)lid) * 4;
+    v[j] = float4(0.0f);
+    if (k < K) {
+      const float4 c = affine_codes4<BITS>(codes, base + k);
+      const float s = (float)scales[gbase + k / 64];
+      const float b = (float)biases[gbase + k / 64];
+      // The pack's own element-type dequant, as affine_dequant_w8g64.
+      v[j] = float4(vec<VPIPE_ELT, 4>(c * s + b));
+      const float4 a = fabs(v[j]);
+      am = max(am, max(max(a.x, a.y), max(a.z, a.w)));
+    }
+  }
+  am = i8pt_row_amax(am, sgid, lane, (T + 31) / 32, sm);
+  // In place (w8) is safe: every read of the row is done by the barrier
+  // the reduction took.
+  i8pt_row_store(v, am, q, base, K, lid, T, cscales + row);
+}
+
+kernel void affine_to_i8pt_w8(
+    const device uchar* codes [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    device char* q [[buffer(3)]],
+    device float* cscales [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    I8PT_ARGS)
+{
+  threadgroup float sm[32];
+  affine_to_i8pt_impl<8>(codes, scales, biases, q, cscales, K, tgid.y, lid,
+                         T2.x, sgid, lane, sm);
+}
+
+kernel void affine_to_i8pt_w4(
+    const device uchar* codes [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    device char* q [[buffer(3)]],
+    device float* cscales [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    I8PT_ARGS)
+{
+  threadgroup float sm[32];
+  affine_to_i8pt_impl<4>(codes, scales, biases, q, cscales, K, tgid.y, lid,
+                         T2.x, sgid, lane, sm);
+}
+
+
+// THE ROTATED TOKEN QUANTIZERS (_r): the same per-row scale, taken
+// after an orthonormal Walsh-Hadamard transform of every 256-wide block
+// of K (i8c_fwht<256>), on the activation and on the weight alike, so
+// the product is unchanged and an outlier channel is spread over its
+// block instead of setting the whole row's scale. The GEMM does not
+// change. A lane eight contiguous values of a 256-block, a simdgroup
+// one block or two: S simdgroups a row, ceil(K/512) <= S <= 32 (the
+// context dispatches ceil(K/512) -- two blocks each ran 1.05-1.18x one,
+// gemm_i8.fast_conversion_rate). K % 256 == 0, K <= 16384.
+//   quant_i8_tok_r / swiglu_quant_i8_tok_r / affine_to_i8pt_w{8,4}_r:
+//     the buffers of their unrotated twins; dispatch {32 S, rows}, tg
+//     {32 S}
+//   i8pt_dequant_r: 0:q 1:cscales 2:w 3:K -- the transform is its own
+//     inverse; the same dispatch
+// MODE 0 plain, 1 swiglu, 2 an affine g64 pack at BITS.
+template <int MODE, int BITS = 8>
+static inline void quant_i8_tok_r_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* up,
+    const device uchar* codes, const device VPIPE_ELT* ascales,
+    const device VPIPE_ELT* abiases, device char* q, device float* scale,
+    int K, uint row, uint T, uint sgid, uint lane, threadgroup float* sm)
+{
+  const int G = K / 256, S = (int)T / 32;
+  const int64_t base = (int64_t)row * K;
+  float v[2][8];
+  float am = 0.0f;
+#pragma clang loop unroll(full)
+  for (int nb = 0; nb < 2; ++nb) {
+    const int b = (int)sgid + nb * S;
+    const int64_t at = base + b * 256 + (int)lane * 8;
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) { v[nb][i] = 0.0f; }
+    if (b < G) {
+#pragma clang loop unroll(full)
+      for (int i = 0; i < 8; i += 4) {
+        float4 a;
+        if (MODE == 0) {
+          a = float4(*reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(
+              x + at + i));
+        } else if (MODE == 1) {
+          const float4 g = float4(
+              *reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(x + at + i));
+          const float4 u = float4(
+              *reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(up + at + i));
+          a = float4(vec<VPIPE_ELT, 4>(g / (1.0f + exp(-g)) * u));
+        } else {
+          // A lane's eight elements share one g64 group.
+          const float4 c = affine_codes4<BITS>(codes, at + i);
+          const int64_t gi =
+              (int64_t)row * (K / 64) + (b * 256 + (int)lane * 8) / 64;
+          a = float4(vec<VPIPE_ELT, 4>(c * (float)ascales[gi] +
+                                       (float)abiases[gi]));
+        }
+        v[nb][i] = a.x; v[nb][i + 1] = a.y;
+        v[nb][i + 2] = a.z; v[nb][i + 3] = a.w;
+      }
+      i8c_fwht<256>(v[nb], lane);
+#pragma clang loop unroll(full)
+      for (int i = 0; i < 8; ++i) { am = max(am, fabs(v[nb][i])); }
+    }
+  }
+  am = i8pt_row_amax(am, sgid, lane, (T + 31) / 32, sm);
+  const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+#pragma clang loop unroll(full)
+  for (int nb = 0; nb < 2; ++nb) {
+    const int b = (int)sgid + nb * S;
+    if (b < G) {
+      const int64_t at = base + b * 256 + (int)lane * 8;
+#pragma clang loop unroll(full)
+      for (int i = 0; i < 8; i += 4) {
+        const int4 r = clamp(int4(rint(float4(v[nb][i], v[nb][i + 1],
+                                              v[nb][i + 2], v[nb][i + 3]) *
+                                       inv)),
+                             int4(-127), int4(127));
+        *reinterpret_cast<device char4*>(q + at + i) = char4(r);
+      }
+    }
+  }
+  if (sgid == 0 && lane == 0) { *scale = am * (1.0f / 127.0f); }
+}
+
+kernel void quant_i8_tok_r(
+    const device VPIPE_ELT* x [[buffer(0)]],
+    device char* q [[buffer(1)]],
+    device float* scales [[buffer(2)]],
+    const constant int& K [[buffer(3)]],
+    I8PT_ARGS)
+{
+  threadgroup float sm[32];
+  quant_i8_tok_r_impl<0>(x, x, nullptr, nullptr, nullptr, q,
+                         scales + tgid.y, K, tgid.y, T2.x, sgid, lane, sm);
+}
+
+kernel void swiglu_quant_i8_tok_r(
+    const device VPIPE_ELT* gate [[buffer(0)]],
+    const device VPIPE_ELT* up [[buffer(1)]],
+    device char* q [[buffer(2)]],
+    device float* scales [[buffer(3)]],
+    const constant int& K [[buffer(4)]],
+    I8PT_ARGS)
+{
+  threadgroup float sm[32];
+  quant_i8_tok_r_impl<1>(gate, up, nullptr, nullptr, nullptr, q,
+                         scales + tgid.y, K, tgid.y, T2.x, sgid, lane, sm);
+}
+
+kernel void affine_to_i8pt_w8_r(
+    const device uchar* codes [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    device char* q [[buffer(3)]],
+    device float* cscales [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    I8PT_ARGS)
+{
+  threadgroup float sm[32];
+  // In place is safe: the row's every read precedes the reduction's
+  // barrier.
+  quant_i8_tok_r_impl<2>(nullptr, nullptr, codes, scales, biases, q,
+                         cscales + tgid.y, K, tgid.y, T2.x, sgid, lane, sm);
+}
+
+kernel void affine_to_i8pt_w4_r(
+    const device uchar* codes [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    device char* q [[buffer(3)]],
+    device float* cscales [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    I8PT_ARGS)
+{
+  threadgroup float sm[32];
+  quant_i8_tok_r_impl<2, 4>(nullptr, nullptr, codes, scales, biases, q,
+                            cscales + tgid.y, K, tgid.y, T2.x, sgid, lane,
+                            sm);
+}
+
+
+kernel void i8pt_dequant_r(
+    const device char* q [[buffer(0)]],
+    const device float* cscales [[buffer(1)]],
+    device VPIPE_ELT* w [[buffer(2)]],
+    const constant int& K [[buffer(3)]],
+    I8PT_ARGS)
+{
+  const int G = K / 256, S = (int)T2.x / 32;
+  const float s = cscales[tgid.y];
+#pragma clang loop unroll(full)
+  for (int nb = 0; nb < 2; ++nb) {
+    const int b = (int)sgid + nb * S;
+    if (b < G) {
+      const int64_t at = (int64_t)tgid.y * K + b * 256 + (int)lane * 8;
+      float v[8];
+#pragma clang loop unroll(full)
+      for (int i = 0; i < 8; i += 4) {
+        const float4 c =
+            float4(*reinterpret_cast<const device char4*>(q + at + i)) * s;
+        v[i] = c.x; v[i + 1] = c.y; v[i + 2] = c.z; v[i + 3] = c.w;
+      }
+      i8c_fwht<256>(v, lane);
+#pragma clang loop unroll(full)
+      for (int i = 0; i < 8; i += 4) {
+        *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(w + at + i) =
+            vec<VPIPE_ELT, 4>(float4(v[i], v[i + 1], v[i + 2], v[i + 3]));
+      }
+    }
+  }
+}
+kernel void i8pt_dequant(
+    const device char* q [[buffer(0)]],
+    const device float* cscales [[buffer(1)]],
+    device VPIPE_ELT* w [[buffer(2)]],
+    const constant int& K [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+  const int64_t base = (int64_t)tgid.y * K;
+  const float s = cscales[tgid.y];
+  for (int k = (int)lid * 4; k < K; k += 1024) {
+    const char4 c = *reinterpret_cast<const device char4*>(q + base + k);
+    *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(w + base + k) =
+        vec<VPIPE_ELT, 4>(float4(c) * s);
+  }
+}
+
 // Per-(channel, 64-group) sums of an affine weight's codes, for the
 // native GEMM's offset correction (see gemm_u8q_impl). One thread per
 // group: 16 words of 4 bytes (w8) or 8 words of 8 nibbles (w4). Sums

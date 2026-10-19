@@ -2363,7 +2363,9 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
       std::string ge;
       (void)stream.commit().wait_ok(&ge);
       prof_add_(bucket, ms_since_(pclock));
-      stream = _mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       pclock = std::chrono::steady_clock::now();
     };

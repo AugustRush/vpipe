@@ -81,7 +81,9 @@ TEST(metal_lm_smoke, qwen_optiq_mtp_speculative_token_exact) {
   ASSERT_TRUE(child1.valid() && child2.valid());
 
   // Serial greedy reference on the root context (kGen set above; the speed
-  // baseline).
+  // baseline). Every row it and the MTP runs compute is hashed, to hold
+  // the speculative rows to the serial ones byte for byte.
+  model->set_row_hashes(true);
   std::vector<std::int32_t> ref;
   ref.push_back(first);
   const auto s0 = std::chrono::steady_clock::now();
@@ -111,17 +113,25 @@ TEST(metal_lm_smoke, qwen_optiq_mtp_speculative_token_exact) {
     for (std::size_t i = 0; i < nn; ++i) {
       if (ref[i] != got[i]) { ++mism; }
     }
+    // The rows it committed, the last one's aside (a rejected tail).
+    const int bad = first_row_unlike_decode(
+        *model, model->root_context(), cid, (int)ids.size(),
+        (int)std::min(ref.size(), got.size()) - 1);
     std::printf("[qwen_optiq_mtp] %s: %zu tok in %.0f ms (%.1f tok/s) | "
-                "speedup %.2fx | rounds=%ld tok/round=%.2f mism=%d\n",
+                "speedup %.2fx | rounds=%ld tok/round=%.2f mism=%d | first "
+                "row unlike decode %d\n",
                 tag, got.size(), ms, (double)got.size() / (ms / 1000.0),
                 ((double)got.size() / (ms / 1000.0)) / serial_tps, rounds,
-                rounds > 0 ? (double)got.size() / (double)rounds : 0.0, mism);
+                rounds > 0 ? (double)got.size() / (double)rounds : 0.0, mism,
+                bad);
     EXPECT_TRUE(mism == 0);
+    EXPECT_TRUE(bad < 0);
     EXPECT_TRUE(got.size() + 1 >= ref.size());
   };
   std::printf("[qwen_optiq_mtp] serial baseline %.1f tok/s\n", serial_tps);
   run_mtp(child1, /*draft_len=*/1, "depth-1");
   run_mtp(child2, /*draft_len=*/2, "depth-2");
+  EXPECT_TRUE(verify_scratch_planned(*model, 3, /*mtp_head=*/true));
 }
 
 // Dense (raw-HF bf16/f16) MTP token-exact verification, SINGLE model load.
@@ -273,6 +283,9 @@ TEST(metal_lm_smoke, uniform_mtp_drafter_token_exact) {
       model->context_manager()->branch(model->root_context());
   ASSERT_TRUE(child1.valid() && child2.valid() && child3.valid());
 
+  // Every row the serial and the MTP runs compute is hashed, to hold the
+  // speculative rows to the serial ones byte for byte.
+  model->set_row_hashes(true);
   std::vector<std::int32_t> ref;
   ref.push_back(first);
   for (int i = 0; i < kGen; ++i) {
@@ -305,16 +318,23 @@ TEST(metal_lm_smoke, uniform_mtp_drafter_token_exact) {
     for (std::size_t i = 0; i < nn; ++i) {
       if (ref[i] != got[i]) { ++mism; }
     }
+    // The rows it committed, the last one's aside (a rejected tail).
+    const int bad = first_row_unlike_decode(
+        *model, model->root_context(), cid, (int)ids.size(),
+        (int)std::min(ref.size(), got.size()) - 1);
     std::printf("[uniform_mtp] %s: %zu tok rounds=%ld tok/round=%.2f "
-                "mism=%d\n", tag, got.size(), rounds,
-                rounds > 0 ? (double)got.size() / (double)rounds : 0.0, mism);
+                "mism=%d | first row unlike decode %d\n", tag, got.size(),
+                rounds, rounds > 0 ? (double)got.size() / (double)rounds : 0.0,
+                mism, bad);
     EXPECT_TRUE(mism == 0);
+    EXPECT_TRUE(bad < 0);
     EXPECT_TRUE(got.size() + 1 >= ref.size());
     // A drafter that drafts well: more than one token a round.
     EXPECT_TRUE(rounds > 0 && (double)got.size() / (double)rounds > 1.3);
   };
   run_mtp(child1, /*draft_len=*/1, "depth-1");
   run_mtp(child2, /*draft_len=*/2, "depth-2");
+  EXPECT_TRUE(verify_scratch_planned(*model, 3, /*mtp_head=*/true));
 }
 
 // The same drafter through the MODEL MANAGER, as text-chat loads it

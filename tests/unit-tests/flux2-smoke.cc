@@ -14,6 +14,7 @@
 // = run the end-to-end pipeline test. Unset => the relevant tier skips.
 
 #include "minitest.h"
+#include "residency-reserve.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -26,6 +27,8 @@
 #include "generative-models/context-manager.h"
 #include "generative-models/flux2/metal-flux2-calibration.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
+#include "generative-models/shared/block-slots.h"
+#include "generative-models/shared/i8-gemm.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
 #include "generative-models/llama3/metal-llama-weights.h"
@@ -1581,7 +1584,7 @@ TEST(flux2_smoke, streamed_matches_preloaded)
     // Growth OFF by default: a promoted block would be served out of
     // _double / _single on the later forwards, which is a different
     // question and would hide the refill this test exists to check.
-    dit->set_residency_reserve(grow ? (2ull << 30) : 0);
+    dit->set_residency_reserve(grow ? test_residency_reserve(2ull << 30) : 0);
     if (grow) { dit->set_residency_schedule(4); }
     const auto& c = dit->config();
     nd_blocks = c.n_double;
@@ -1650,6 +1653,204 @@ TEST(flux2_smoke, streamed_matches_preloaded)
   EXPECT_TRUE(gdiff == 0);
 }
 
+// A MIXED PACK (VPIPE_FLUX2_MIXED_DIT = the transformer/ of a
+// model-quantize bits 4 + mixed run): whole blocks -- double or single --
+// at w8, the rest at w4, so a slot built for one width is asked to hold
+// the other, including the riffled linear_in and the single block's
+// split qkv / mlp halves (BlockSlots::Ops::same_layout). The pack must
+// really mix widths WITHIN a stack, and its four holds -- preloaded,
+// streamed, no slots, promoted -- must be BYTE-IDENTICAL with i8 off,
+// and on a matrix-core box under the signed layout and (when block 0,
+// which gates the fast tier, is w8) the fast and token tiers. Before
+// the slots rebuilt such a block, preloaded and no-slots agreed and the
+// two slot holds did not.
+TEST(flux2_smoke, a_mixed_pack_holds_agree)
+{
+  const char* ddir = std::getenv("VPIPE_FLUX2_MIXED_DIT");
+  if (ddir == nullptr || *ddir == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  int d8 = 0, d4 = 0, s8 = 0, s4 = 0;
+  {
+    auto ws = vpipe::genai::WeightSet::open(ddir, nullptr);
+    ASSERT_TRUE(ws != nullptr);
+    if (ws == nullptr) { return; }
+    for (int L = 0; L < 64; ++L) {
+      const int bd = vpipe::genai::stored_affine_bits(
+          *ws, "transformer_blocks." + std::to_string(L) + ".attn.to_q", 64);
+      const int bs = vpipe::genai::stored_affine_bits(
+          *ws, "single_transformer_blocks." + std::to_string(L) +
+                   ".attn.to_qkv_mlp_proj", 64);
+      d8 += bd == 8; d4 += bd == 4;
+      s8 += bs == 8; s4 += bs == 4;
+    }
+  }
+  std::printf("[flux2_smoke] mixed pack: double %d w8 / %d w4, single %d "
+              "w8 / %d w4\n", d8, d4, s8, s4);
+  // Each stack has its own slot pair, so a stack crosses widths only if
+  // it holds both. The ranking decides which: MEASURED on klein-9B,
+  // mixed_frac 0.25 put all 8 double blocks at w8 and every single at w4
+  // -- no slot ever crossed -- so this wants a pack where at least one
+  // stack is mixed (0.125 mixes the doubles, 0.5 the singles).
+  const bool dmix = d8 > 0 && d4 > 0, smix = s8 > 0 && s4 > 0;
+  ASSERT_TRUE(dmix || smix);
+  if (!dmix && !smix) { return; }
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int TS = 64, gh = 32, gw = 40, img_seq = gh * gw;
+  bool engaged = true;
+  bool fast_on = false;
+  int f8 = 0, f4 = 0;
+  int promoted = 0, relaid = 0, held_w4 = 0;
+  int stack = 0;
+  std::size_t grown_bytes = 0;
+  auto run = [&](int tier, bool stream, bool slots, bool grow,
+                 bool hold = false) {
+    std::vector<float> out;
+    std::unique_ptr<Env> ns;
+    if (!slots) { ns = std::make_unique<Env>("VPIPE_FLUX2_NO_SLOTS", "1"); }
+    MetalFlux2Transformer::Config cfg;
+    cfg.i8_gemm = tier >= 0;
+    cfg.i8_tier = tier < 0 ? 0 : tier;
+    cfg.i8_hold_w4 = hold;
+    auto dit = MetalFlux2Transformer::load(ddir, mc, cfg, stream);
+    if (dit == nullptr) { return out; }
+    if (tier == 0 && !dit->signed_layout()) { engaged = false; }
+    if (tier > 0) {
+      fast_on = dit->fast_tier();
+      if (!stream) {
+        f8 = dit->fast_weights(8);
+        f4 = dit->fast_weights(4);
+      }
+    }
+    dit->set_residency_reserve(grow ? test_residency_reserve(16ull << 30) : 0);
+    if (grow) { dit->set_residency_schedule(4); }
+    const auto& c = dit->config();
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    if (ctx.empty() || lat.empty()) { return out; }
+    std::mt19937 rng(20261018);
+    std::normal_distribution<float> ndist(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)ndist(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)ndist(rng);
+    }
+    SharedBuffer v;
+    for (int it = 0; it < (grow ? 2 : 1); ++it) {
+      v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    }
+    if (grow) {
+      promoted = dit->resident_block_count();
+      stack = dit->config().n_double + dit->config().n_single;
+      grown_bytes = dit->resident_block_bytes();
+      held_w4 = dit->held_w4_layouts();
+    }
+    if (stream && slots && !grow) { relaid = dit->slot_relayouts(); }
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (v.empty() || v.byte_size() < n * 2) { return out; }
+    const auto* p = static_cast<const _Float16*>(v.contents());
+    out.resize(n);
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+  std::vector<int> tiers = {-1};
+  if (mc->supports_matrix_cores()) { tiers.insert(tiers.end(), {0, 1, 2}); }
+  const char* tname[3] = {"accurate (signed)", "fast", "token"};
+  for (int tier : tiers) {
+    engaged = true;
+    const std::vector<float> pre = run(tier, false, true, false);
+    ASSERT_TRUE(!pre.empty());
+    if (pre.empty()) { return; }
+    if (tier > 0) {
+      // BOTH WIDTHS take the tier: a w8 block's codes converted once,
+      // a w4 one's into the scratch before each GEMM. Uniform w8 packs:
+      // fast_tier_matches_accurate.
+      std::printf("[flux2_smoke] mixed pack, %s: %d w8 and %d w4 "
+                  "projections in its layout\n", tname[tier], f8, f4);
+      EXPECT_TRUE(fast_on && f8 > 0 && f4 > 0);
+      if (!fast_on) { continue; }
+    }
+    const std::vector<float> str = run(tier, true, true, false);
+    const std::vector<float> flat = run(tier, true, false, false);
+    const std::vector<float> grown = run(tier, true, true, true);
+    const std::size_t grown_pc = grown_bytes;
+    const int held_pc = held_w4;
+    // A HELD layout reached by PROMOTION: residency converts each w4
+    // projection of a block it keeps (keep_double_ / keep_single_),
+    // which then books more than the pack -- and must equal the held
+    // preload, which equals per call.
+    const auto grown_held =
+        tier > 0 ? run(tier, true, true, true, true) : grown;
+    const std::size_t grown_h = grown_bytes;
+    const int grown_n = promoted;
+    const int held_h = held_w4;
+    // ...and with NO SLOTS, where promote_into MOVES each per-block read
+    // into the resident set: the keep pass (keep_double_ / keep_single_)
+    // must leave it holding exactly what the slots' clone does.
+    const auto flat_held =
+        tier > 0 ? run(tier, true, false, true, true) : grown;
+    const std::size_t flat_h = tier > 0 ? grown_bytes : grown_h;
+    const int flat_n = tier > 0 ? promoted : grown_n;
+    // The bytes compare only where BOTH kept the whole streamed stack:
+    // a slotted run short of it still holds its slot pair, and a box
+    // with little room (a 16 GB M5) keeps what its budget allows.
+    const bool whole = grown_n == stack && flat_n == stack;
+    const int flat_w4 = tier > 0 ? held_w4 : held_h;
+    // The engine's other answer for a w4 pack: its int8 layout
+    // HELD (Config::i8_hold_w4) where it is converted per GEMM
+    // above -- the same values, so the same bytes.
+    const auto held =
+        tier > 0 ? run(tier, false, true, false, true) : pre;
+    auto same = [&](const std::vector<float>& a) {
+      return a.size() == pre.size() &&
+             std::memcmp(a.data(), pre.data(), a.size() * 4) == 0;
+    };
+    std::printf("[flux2_smoke] mixed pack, %s: streamed %s, no slots %s, "
+                "promoted (%d blocks) %s%s\n",
+                tier < 0 ? "no i8" : tname[tier],
+                same(str) ? "IDENTICAL" : "DIFFERENT",
+                same(flat) ? "IDENTICAL" : "DIFFERENT", promoted,
+                same(grown) ? "IDENTICAL" : "DIFFERENT",
+                engaged ? "" : " -- NOT ENGAGED");
+    EXPECT_TRUE(engaged);
+    EXPECT_TRUE(same(str));
+    EXPECT_TRUE(same(flat));
+    EXPECT_TRUE(promoted > 0 && same(grown));
+    if (tier > 0) {
+      std::printf("[flux2_smoke] ... w4 layout held: %s; held by promotion "
+                  "%s (%d w4 projections held, %zu MB booked, against %d / "
+                  "%zu per call); no slots %s (%d held, %zu MB)\n",
+                  same(held) ? "IDENTICAL" : "DIFFERENT",
+                  same(grown_held) ? "IDENTICAL" : "DIFFERENT", held_h,
+                  grown_h >> 20, held_pc, grown_pc >> 20,
+                  same(flat_held) ? "IDENTICAL" : "DIFFERENT", flat_w4,
+                  flat_h >> 20);
+      EXPECT_TRUE(same(grown_held));
+      EXPECT_TRUE(held_h > 0 && held_pc == 0 && grown_h > grown_pc);
+      // The moved blocks hold, and book, what the cloned ones do.
+      EXPECT_TRUE(same(flat_held) &&
+                  (!whole || (flat_w4 == held_h && flat_h == grown_h)));
+    }
+    EXPECT_TRUE(same(held));
+    // The slots crossed widths and REBUILT. A slot that refused such a
+    // block instead turns itself off, and its holds still agree.
+    std::printf("[flux2_smoke] ... %d streamed blocks built into their "
+                "slot\n", relaid);
+    EXPECT_TRUE(relaid > 0);
+  }
+}
+
 // THE SIGNED INT8 LAYOUT on a real quantized pack (VPIPE_FLUX2_DIT_DIR at a
 // model-quantize'd w4/w8 DiT; i8_gemm on; M5 only). The layout is converted
 // in three places -- in the entries a preloaded block keeps, in a streamed
@@ -1699,7 +1900,7 @@ TEST(flux2_smoke, signed_layout_matches_native)
       auto dit = MetalFlux2Transformer::load(tdir, mc, cfg, stream);
       if (dit == nullptr) { return false; }
       if (dit->signed_layout() != (sgn && i8)) { engaged = false; }
-      dit->set_residency_reserve(grow ? (2ull << 30) : 0);
+      dit->set_residency_reserve(grow ? test_residency_reserve(2ull << 30) : 0);
       if (grow) { dit->set_residency_schedule(4); }
       const auto& c = dit->config();
       SharedBuffer ctx =
@@ -1764,6 +1965,133 @@ TEST(flux2_smoke, signed_layout_matches_native)
     // gemm_i8.signed_layout_matches_oracle is the accuracy statement; a
     // misread layout is O(1) here.
     EXPECT_TRUE(rs <= 1.25 * rn);
+  }
+}
+
+// THE FAST AND TOKEN TIERS (i8_gemm_tier fast / token / token_plain) on
+// the image-stream projections, as qwen_image_21_dit.fast_tier_matches_
+// accurate: a w8 g64 pack (VPIPE_FLUX2_DIT_DIR) converted in the entries
+// a preloaded block keeps, in a streamed read, in a refilled slot and
+// copied by promotion -- every arm BYTE-IDENTICAL to the preloaded one --
+// and a bf16 checkpoint (VPIPE_FLUX2_TEST_MODEL_PATH's transformer/)
+// quantized once at load, or after each refill streamed (its four holds
+// byte-identical the same way). Each arm must ENGAGE (the tier at the
+// group it names) before anything is compared, and sit within a
+// gross-error bar of the accurate tier in distance from the dense (i8
+// off) forward. 1280 image rows, above the int8 floor of 1024; a 64-row
+// text stream, whose double-block projections stay on the accurate tier.
+// M5 only.
+TEST(flux2_smoke, fast_tier_matches_accurate)
+{
+  const char* qd = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  const std::string pack = qd != nullptr ? qd : "";
+  const std::string bf16 =
+      root != nullptr && *root != '\0' ? std::string(root) + "/transformer"
+                                        : std::string();
+  if (pack.empty() && bf16.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int gh = 32, gw = 40, img_seq = gh * gw, TS = 64;
+  bool engaged = true;
+  auto run = [&](const std::string& dir, bool i8, int tier, bool stream,
+                 bool grow, bool slots) {
+    std::vector<float> out;
+    std::unique_ptr<Env> e2;
+    if (!slots) { e2 = std::make_unique<Env>("VPIPE_FLUX2_NO_SLOTS", "1"); }
+    MetalFlux2Transformer::Config cfg{};
+    cfg.i8_gemm = i8;
+    cfg.i8_tier = tier;
+    auto dit = MetalFlux2Transformer::load(dir, mc, cfg, stream);
+    if (dit == nullptr) { return out; }
+    const int fg = dit->fast_group();
+    if (dit->fast_tier() != (i8 && tier != 0) ||
+        (i8 && tier >= 2 && fg != I8GemmContext::kTokenGroup) ||
+        (i8 && tier == 1 && (fg <= 0 || fg == I8GemmContext::kTokenGroup))) {
+      engaged = false;
+    }
+    dit->set_residency_reserve(grow ? test_residency_reserve(2ull << 30) : 0);
+    if (grow) { dit->set_residency_schedule(4); }
+    const auto& c = dit->config();
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    if (ctx.empty() || lat.empty()) { return out; }
+    std::mt19937 rng(20261018);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)nd(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)nd(rng);
+    }
+    SharedBuffer v;
+    for (int it = 0; it < (grow ? 2 : 1); ++it) {
+      v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    }
+    if (grow && dit->resident_block_count() == 0) { engaged = false; }
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (v.empty() || v.byte_size() < n * 2) { return out; }
+    const auto* p = static_cast<const _Float16*>(v.contents());
+    out.resize(n);
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+  auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+    return a.size() == b.size() && !a.empty() &&
+           std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+  };
+  // A GROSS-ERROR guard, not a ranking (see signed_layout_matches_native:
+  // random-input forwards are chaotic): the fast tier's GEMMs are
+  // 1.3-1.45x the accurate tier's error on outlier-free operands, the
+  // plain token tier's ~1.7x on real weights and the rotated one's about
+  // the fast tier's, so a misread layout is what this catches.
+  const double bar[4] = {0.0, 2.5, 3.0, 4.0};
+  const char* tname[4] = {"accurate", "fast", "token", "token_plain"};
+  for (const std::string& dir : {pack, bf16}) {
+    if (dir.empty()) { continue; }
+    const bool is_pack = dir == pack;
+    const auto dense = run(dir, false, 0, false, false, true);
+    const auto acc = run(dir, true, 0, false, false, true);
+    ASSERT_TRUE(!dense.empty() && acc.size() == dense.size());
+    if (dense.empty() || acc.size() != dense.size()) { continue; }
+    const double ra = rel_l2_(acc.data(), dense.data(), acc.size());
+    for (int tier : {1, 2, 3}) {
+      engaged = true;
+      const auto pre = run(dir, true, tier, false, false, true);
+      // Every hold, the bf16 checkpoint's too: a streamed bf16 block
+      // quantizes its refilled source into the layout (QWeight::ds) and
+      // a promotion keeps the layout alone, so each runs the tier the
+      // preload runs.
+      const auto str = run(dir, true, tier, true, false, true);
+      const auto flat = run(dir, true, tier, true, false, false);
+      const auto grown = run(dir, true, tier, true, true, true);
+      EXPECT_TRUE(engaged);
+      ASSERT_TRUE(pre.size() == dense.size());
+      if (pre.size() != dense.size()) { continue; }
+      const double rf = rel_l2_(pre.data(), dense.data(), pre.size());
+      std::printf("[flux2_smoke] %s tier, %s, %d+%d rows: vs the dense "
+                  "forward %.3e, accurate %.3e; streamed %s, no slots %s, "
+                  "promoted %s\n", tname[tier],
+                  is_pack ? "w8 pack" : "bf16", img_seq, TS, rf, ra,
+                  same(str, pre) ? "IDENTICAL" : "DIFFERENT",
+                  same(flat, pre) ? "IDENTICAL" : "DIFFERENT",
+                  same(grown, pre) ? "IDENTICAL" : "DIFFERENT");
+      EXPECT_TRUE(same(str, pre));
+      EXPECT_TRUE(same(flat, pre));
+      EXPECT_TRUE(same(grown, pre));
+      EXPECT_TRUE(rf <= bar[tier] * ra);
+    }
   }
 }
 

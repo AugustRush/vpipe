@@ -338,6 +338,11 @@ private:
   // onto _h3_cfg. See apply_h3_ane_().
   std::string ane_claim_label_() const;
   std::size_t h3_ane_bytes_() const;
+  // MiniMax-H3's packed sequence at the planned geometry (a 512-row
+  // prompt, the two conditioning frames), and the forward's activations
+  // there -- the denoise phase's scratch in both ledgers.
+  int h3_plan_seq_() const;
+  std::size_t h3_forward_scratch_bytes_(const std::string& dit) const;
   void apply_h3_ane_();
   int           _height = 480;
   int           _width  = 832;
@@ -346,6 +351,8 @@ private:
   int           _steps  = 40;
   // LOSSY dynamic-int8 block GEMMs (opt-in; minimax-h3 only)
   bool        _i8_gemm{};
+  int         _i8_tier{};            // i8_gemm_tier: 0 accurate, 1 fast,
+                                     // 2 token, 3 token_plain
   // Sol-Attn, family-agnostic beside _i8_gemm; see the config docs.
   genai::sol::Config _sol{};
   // Leading denoising steps Sol leaves dense (minimax-h3's loop only).
@@ -475,6 +482,18 @@ private:
   // revised the plan to, so a clip that moved nothing does not replan.
   void correct_plugin_holding_(const char* when);
   std::size_t _plugin_load_floor_ = 0;
+  // The int8 layout's growth a PRELOADED H3 holds beside its files when
+  // its w4 projections' layout is held (Config::i8_hold_w4); 0 when it
+  // converts per projection or streams. Set at load, read by
+  // declare_memory().
+  std::size_t _h3_i8_hold_growth_ = 0;
+  // The STREAMED H3 DiT's holding as residency grows it, corrected in
+  // both ledgers after every clip (correct_h3_holding_): the set sees only
+  // the cached trunk, and the promoted blocks are the model's own buffers.
+  std::string _h3_dit_dir_;
+  std::size_t _h3_load_floor_ = 0;
+  std::size_t _h3_revised_ = 0;
+  void correct_h3_holding_();
   std::size_t _plugin_revised_    = 0;
   // The plugin branch of process(), mirroring run_h3_: builds the
   // request from the beats already read and publishes what came back.
@@ -582,7 +601,7 @@ private:
   // refusing beats proceeding on a 16 GB box.
   // The idle-unload decision, made after the load so it can use the
   // streaming verdict. See the note on its definition.
-  void resolve_unload_policy_h3_(bool streamed);
+  void resolve_unload_policy_h3_(bool tight);
   // `L` and the PATCH grid are here because the VDN branch's scratch is
   // sized by the video geometry rather than by the packed sequence, and
   // it is the half of the forward's memory that used to go unplanned.

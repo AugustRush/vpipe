@@ -109,10 +109,11 @@ namespace vpipe {
 //              frames each shares with the next for the decode to
 //              cross-fade (sideband::kBlendHead / kBlendTail). What
 //              SAnodes-Streaming does for ComfyUI.
-//   color_fix  (bool) -- carry each restored frame's source channel
-//              statistics for the decode's colour fix. Unset, the
-//              release's reference decides: on for v1.1, off for
-//              FlashVSR+.
+//   color_fix  (bool, default true) -- correct each restored frame's
+//              colour toward its source frame, by the release's own fix
+//              (color_fix_method): v1.1's AdaIN, FlashVSR+'s wavelet. On
+//              for both: FlashVSR+'s reference makes it opt-in, and
+//              without it the restored colours drift from the source's.
 //   decoder    ("auto" | "vae" | "tiny") -- what vae-decode decodes the
 //              latents with: the Wan VAE, or the reference's TINY
 //              decoder (TCDecoder.ckpt beside the model), which reads the
@@ -170,6 +171,12 @@ public:
   enum class Continuity { kAuto, kStream, kClips };
   // What the first group decided, for tests. kAuto until then.
   Continuity continuity() const noexcept { return _mode; }
+
+  // The colour fix: as configured (kAuto: the release's own method), and
+  // as resolved once the release is loaded (kOff when the fix is off).
+  enum class ColorFix { kAuto, kOff, kAdain, kWavelet };
+  // What the loaded release resolved, for tests.
+  ColorFix color_fix() const noexcept { return _method; }
 
 private:
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -293,7 +300,6 @@ private:
   int           _blend_frames = 8;
   // The colour fix's method, as configured and as resolved for the
   // loaded release (off when the fix is), and the wavelet's levels.
-  enum class ColorFix { kAuto, kOff, kAdain, kWavelet };
   ColorFix      _cfg_method = ColorFix::kAuto;
   ColorFix      _method = ColorFix::kAdain;
   int           _wavelet_levels = 5;

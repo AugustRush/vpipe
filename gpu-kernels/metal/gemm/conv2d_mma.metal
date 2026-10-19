@@ -7,8 +7,14 @@
 // matmul2d -- saving the ~9x im2col DRAM round-trip at the VAE's high
 // resolutions.
 //
-//   out[oy, ox, oc] = sum_{ky,kx,ci} in[oy*S + ky - 1, ox*S + kx - 1, ci]
-//                                    * W[oc, (ky*3+kx)*Cin + ci]          (pad 1)
+//   out[oy, ox, oc] = sum_{ky,kx,ci} in[iy, ix, ci] * W[oc, (ky*3+kx)*Cin + ci]
+//   stride 1: iy = oy + ky - 1          (pad 1)
+//   stride 2: iy = 2*oy + ky            (pad (0,1,0,1): the encoders'
+//             downsample, as im2col_hwc_3x3_s2 and the hardware op's
+//             offset mode 3 -- it read 2*oy + ky - 1 until 2026-10-18, and
+//             a downsample the hardware op declined (an output side not a
+//             multiple of 8) came out a pixel shifted wherever the route
+//             tune picked this kernel)
 // Activation NHWC [H,W,Cin]; weights the SAME [Cout, 9*Cin] (ky,kx,ci)-flattened
 // layout the im2col path already builds (no relayout); dest NHWO [OH,OW,Cout].
 // A threadgroup owns a BM-output-pixel x BN-output-channel tile; the K loop
@@ -110,8 +116,8 @@ static inline void conv2d_mma_impl(
         const int oy = p / OW, ox = p % OW;
         const int tap = k / Cin, ci = k - tap * Cin;   // (ky,kx,ci)
         const int ky = tap / 3, kx = tap - ky * 3;
-        const int iy = oy * STRIDE + ky - 1;
-        const int ix = ox * STRIDE + kx - 1;
+        const int iy = STRIDE == 2 ? 2 * oy + ky : oy + ky - 1;
+        const int ix = STRIDE == 2 ? 2 * ox + kx : ox + kx - 1;
         if (iy >= 0 && iy < H && ix >= 0 && ix < W) {
           v = inp[((int64_t)iy * W + ix) * Cin + ci];
         }
@@ -1497,6 +1503,107 @@ CV_HW_CAUSAL3(conv3d_hw_causal_s2_tail_f16,      128,  8, 8, 4, 2, 1, 1)
 // encoder's conv_out, 1024 -> 48 -- guarded, and not tuned.
 CV_HW_CAUSAL3(conv3d_hw_causal_s1_c16_f16,        16,  8, 8, 4, 1, 1, 1)
 
+
+// ---------------------------------------------------------------------
+// INT8 3x3 CONVOLUTION on the hardware op, in PRODUCTION form (the
+// conv2d_hw_3x3_s1_i8f16 probe above stores the raw integer sum as f16,
+// with no scale and no bias): an int8 activation and int8 HWIO weights
+// into an INT32 cooperative accumulator, and an epilogue in threadgroup
+// memory that applies the scales and the bias and rounds ONCE:
+//
+//   out[p, o] = acc[p, o] * wscale[o] + bias[o]
+//
+// WHY ONE SCALE A CHANNEL, and no finer: the op sums a 3x3 WINDOW of
+// pixels in one pass, so an activation scale may not vary across the
+// pixels a window reads -- per token or per pixel group is not a sum it
+// can take. What it can take is a scale per INPUT channel, which is
+// constant across every pixel, so it is folded into the WEIGHT before
+// the weight's own per-output-channel quantization
+// (vae_i8_weight_fold_f16 below): wscale[o] then carries both steps.
+// A VAE's resnet convs read RMS-normed, SiLU'd activations, whose
+// per-pixel magnitude the norm has already evened out, which is why
+// that is close to all a scale could buy there.
+//
+// MEASURED as a raw op (conv2d_mma.hw_op_i8_vs_f16_perf): 1.45-1.88x
+// the f16 conv's rate. f16 library only (explicit half/int8 types).
+//   0:in[H,W,Cin] i8  1:W[3,3,Cin,Cout] i8  2:out[OH,OW,Cout] f16  3:W
+//   4:H  5:Cin  6:Cout  7:wscale[Cout] f32  8:bias[Cout] f16
+//   9:has_bias  10:off_mode (stride 2: as conv2d_hw_3x3_s2_f16)
+//   dispatch {(OW/8)*CV_THREADS, OH/8, Cout/TILE_C}, tg {CV_THREADS,1,1}
+#define CV_HW_I8(NAME, TILE_C, STRIDE)                                     \
+kernel void NAME(                                                          \
+    const device int8_t* inp     [[buffer(0)]],                            \
+    const device int8_t* wt      [[buffer(1)]],                            \
+    device half*         out     [[buffer(2)]],                            \
+    const constant int& img_w    [[buffer(3)]],                            \
+    const constant int& img_h    [[buffer(4)]],                            \
+    const constant int& cin      [[buffer(5)]],                            \
+    const constant int& cout     [[buffer(6)]],                            \
+    const device float*  wscale  [[buffer(7)]],                            \
+    const device half*   bias    [[buffer(8)]],                            \
+    const constant int& has_bias [[buffer(9)]],                            \
+    const constant int& off_mode [[buffer(10)]],                           \
+    uint3 tgid [[threadgroup_position_in_grid]],                           \
+    uint  lid  [[thread_index_in_threadgroup]])                            \
+{                                                                          \
+  threadgroup int32_t Ys[CV_TH * CV_TW * TILE_C];                          \
+  const int ow = img_w / STRIDE;                                           \
+  using T4I = tensor<device int8_t, dextents<int32_t, 4>, tensor_inline>;  \
+  T4I tA(const_cast<device int8_t*>(inp),                                  \
+         dextents<int32_t, 4>(cin, img_w, img_h, 1));                      \
+  T4I tW(const_cast<device int8_t*>(wt),                                   \
+         dextents<int32_t, 4>(cout, cin, 3, 3));                           \
+  constexpr auto desc = convolution2d_descriptor(                          \
+      /*destination_dimensions=*/int4(TILE_C, CV_TW, CV_TH, 1),            \
+      /*source_dimensions=*/int4(CV_CIN, CV_HW, CV_HW, 1),                 \
+      /*kernel_dimensions=*/int2(3, 3),                                    \
+      convolution2d_activation_layout::nhwc,                               \
+      convolution2d_weights_layout::hwio,                                  \
+      /*strides=*/int2(STRIDE, STRIDE), /*dilations=*/int2(1, 1),          \
+      /*groups=*/1, /*relaxed_precision=*/false,                           \
+      convolution2d_descriptor::mode::multiply);                           \
+  convolution2d<desc, execution_simdgroups<CV_SG>> op;                     \
+  const int ox0 = (int)tgid.x * CV_TW;                                     \
+  const int oy0 = (int)tgid.y * CV_TH;                                     \
+  const int oc0 = (int)tgid.z * TILE_C;                                    \
+  int2 off = int2(ox0, oy0);                                               \
+  if (STRIDE == 2) {                                                       \
+    if (off_mode == 1) { off = int2(ox0 * 2 - 1, oy0 * 2 - 1); }           \
+    if (off_mode == 2) { off = int2(ox0 * 2, oy0 * 2); }                   \
+    if (off_mode == 3) { off = int2(ox0 * 2 + 1, oy0 * 2 + 1); }           \
+  }                                                                        \
+  auto sW = tW.slice(oc0, 0, 0, 0);                                        \
+  auto cT = op.template get_destination_cooperative_tensor<                \
+      decltype(tA), decltype(sW), int32_t>();                              \
+  convolution2d_descriptor rd = desc;                                      \
+  rd.source_dimensions = int4(cin, img_w, img_h, 1);                       \
+  __convolution2d_detail::__run<execution_simdgroups<CV_SG>,               \
+                                decltype(tA), decltype(sW), decltype(cT)>( \
+      tA, sW, cT, rd, off);                                                \
+  using TS = tensor<threadgroup int32_t, dextents<int32_t, 4>,             \
+                    tensor_inline>;                                        \
+  TS tYs(Ys, dextents<int32_t, 4>(TILE_C, CV_TW, CV_TH, 1));               \
+  cT.store(tYs);                                                           \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                         \
+  for (int e = (int)lid; e < CV_TH * CV_TW * TILE_C; e += CV_THREADS) {    \
+    const int oc = e % TILE_C;                                             \
+    const int px = (e / TILE_C) % CV_TW;                                   \
+    const int py = e / (TILE_C * CV_TW);                                   \
+    const int64_t o = ((int64_t)(oy0 + py) * ow + (ox0 + px)) * cout       \
+                    + (oc0 + oc);                                          \
+    float v = (float)Ys[e] * wscale[oc0 + oc];                             \
+    if (has_bias != 0) { v += (float)bias[oc0 + oc]; }                     \
+    out[o] = (half)v;                                                      \
+  }                                                                        \
+}
+CV_HW_I8(conv2d_hw_3x3_s1_i8, 64, 1)
+CV_HW_I8(conv2d_hw_3x3_s1_c32_i8, 32, 1)
+CV_HW_I8(conv2d_hw_3x3_s1_c16_i8, 16, 1)
+CV_HW_I8(conv2d_hw_3x3_s2_i8, 64, 2)
+CV_HW_I8(conv2d_hw_3x3_s2_c32_i8, 32, 2)
+CV_HW_I8(conv2d_hw_3x3_s2_c16_i8, 16, 2)
+
+
 #else
 // Tensor ops unavailable for this target: emit stubs so the metallib still
 // builds. The loader never binds these on a non-tensor GPU.
@@ -1602,4 +1709,213 @@ kernel void conv3d_hw_causal_s2_tail_f16(
 kernel void conv3d_hw_causal_s1_c16_f16(
     device VPIPE_ELT* out [[buffer(2)]], uint tid [[thread_position_in_grid]])
 { if (tid == 0) { out[0] = (VPIPE_ELT)0; } }
+kernel void conv2d_hw_3x3_s1_i8(device half* out [[buffer(2)]],
+                                uint tid [[thread_position_in_grid]])
+{ if (tid == 0) { out[0] = (half)0; } }
+kernel void conv2d_hw_3x3_s1_c32_i8(device half* out [[buffer(2)]],
+                                    uint tid [[thread_position_in_grid]])
+{ if (tid == 0) { out[0] = (half)0; } }
+kernel void conv2d_hw_3x3_s1_c16_i8(device half* out [[buffer(2)]],
+                                    uint tid [[thread_position_in_grid]])
+{ if (tid == 0) { out[0] = (half)0; } }
+kernel void conv2d_hw_3x3_s2_i8(device half* out [[buffer(2)]],
+                                uint tid [[thread_position_in_grid]])
+{ if (tid == 0) { out[0] = (half)0; } }
+kernel void conv2d_hw_3x3_s2_c32_i8(device half* out [[buffer(2)]],
+                                    uint tid [[thread_position_in_grid]])
+{ if (tid == 0) { out[0] = (half)0; } }
+kernel void conv2d_hw_3x3_s2_c16_i8(device half* out [[buffer(2)]],
+                                    uint tid [[thread_position_in_grid]])
+{ if (tid == 0) { out[0] = (half)0; } }
 #endif
+
+// ---------------------------------------------------------------------
+// The QUANTIZERS of the int8 conv above (conv2d_hw_3x3_*_i8): plain
+// compute, outside the tensor guard -- they need no matrix units, and a
+// GPU without them never binds the conv they feed. f16 only (explicit
+// half), like the conv.
+//
+// Each activation channel's step comes from its amax over the whole
+// picture, so they run in this order on one conv:
+//   1. vae_i8_chan_amax_f16    amax[c] over every pixel
+//   2. vae_i8_steps_f16        each channel's step from the amaxes
+//   3. vae_i8_weight_fold_f16  the weight, with each input channel's
+//                              step folded in, quantized per OUTPUT
+//                              channel into the HWIO layout the op reads
+//   4. vae_i8_quant_chan_f16   the activation, a channel at its step
+// `silu` applies x * sigmoid(x) on the way in, in f32: a resnet's conv
+// reads norm -> SiLU, so the SiLU'd activation is never written at all.
+
+static inline float4
+vae_i8_act_(half4 h, int silu)
+{
+  const float4 v = (float4)h;
+  return silu != 0 ? v / (1.0f + exp(-v)) : v;
+}
+
+// amax[0..n) = 0, before vae_i8_chan_amax_f16 takes its maxima.
+//   0:amax[n] uint  1:n   dispatch {n, 1, 1}
+kernel void vae_i8_zero_u32(
+    device uint*        amax [[buffer(0)]],
+    const constant int& n    [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if ((int)gid < n) { amax[gid] = 0u; }
+}
+
+// amax[c] = max over rows of |act(x[r, c])|, kept as its f32 BIT
+// PATTERN in a uint: a non-negative float orders as its bits, so an
+// integer atomic max is a float max. `amax` must start at zero. A
+// thread takes four channels of `rows_per` rows; one-dimensional, with
+// whole threadgroups, because a {C/4, chunks} grid at C = 288 leaves a
+// threadgroup of 8 for every 64 -- MEASURED the quantizers at three
+// times their traffic's worth.
+//   0:x[rows, C] f16  1:amax[C] uint  2:C (% 4 == 0)  3:rows
+//   4:rows_per  5:silu
+//   dispatch {C/4 * ceil(rows/rows_per), 1, 1}, tg {256, 1, 1}
+kernel void vae_i8_chan_amax_f16(
+    const device half*  x        [[buffer(0)]],
+    device atomic_uint* amax     [[buffer(1)]],
+    const constant int& C        [[buffer(2)]],
+    const constant int& rows     [[buffer(3)]],
+    const constant int& rows_per [[buffer(4)]],
+    const constant int& silu     [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const int c4n = C / 4;
+  const int chunks = (rows + rows_per - 1) / rows_per;
+  if ((int)gid >= c4n * chunks) { return; }
+  const int c4 = (int)gid % c4n;
+  const int r0 = ((int)gid / c4n) * rows_per;
+  const int r1 = min(rows, r0 + rows_per);
+  float4 m = 0.0f;
+  for (int r = r0; r < r1; ++r) {
+    const half4 h = *reinterpret_cast<const device half4*>(
+        x + (int64_t)r * C + c4 * 4);
+    m = max(m, abs(vae_i8_act_(h, silu)));
+  }
+  for (int i = 0; i < 4; ++i) {
+    atomic_fetch_max_explicit(&amax[c4 * 4 + i], as_type<uint>(m[i]),
+                              memory_order_relaxed);
+  }
+}
+
+// amax[c] -> step[c], in place (both f32 bit patterns): the activation
+// channel's quantization step,
+//
+//   step[c] = amax[c]^alpha * G^(1 - alpha) / 127,  G = max_c amax[c]
+//
+// SMOOTHQUANT'S MIGRATION. A step is folded into the weight (below), so
+// alpha = 1 -- each channel at its own amax -- moves every channel's
+// range into the weight, where a few wide channels then set each
+// output channel's weight step for all the rest; alpha = 0 is one step
+// for the tensor, the activation's narrow channels paying instead.
+// MEASURED on Qwen-Image-2.1's VAE, two 1024^2 pictures, PSNR against
+// the f16 codec (decode / encode):
+//   alpha 1      49.8 / 33.8   58.4 / 44.9
+//   alpha 0.5    54.9 / 42.7
+//   alpha 0.35   53.6 / 46.9
+//   alpha 0.25   52.5 / 49.1   60.2 / 58.2
+//   alpha 0.15   50.8 / 48.8
+//   alpha 0      48.5 / 48.1
+// The encoder's deepest convs are the ones the full fold hurts (even
+// with only the 768-wide ones int8 it read 34.0). Never a clip: the
+// step is at least amax / 127. One threadgroup.
+//   0:amax[C] uint (in: amax, out: step)  1:C  2:alpha
+//   dispatch {256, 1, 1}, tg {256, 1, 1}
+kernel void vae_i8_steps_f16(
+    device uint*          amax  [[buffer(0)]],
+    const constant int&   C     [[buffer(1)]],
+    const constant float& alpha [[buffer(2)]],
+    uint lid  [[thread_index_in_threadgroup]],
+    uint sid  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup float part[8];
+  float g = 0.0f;
+  for (int c = (int)lid; c < C; c += 256) {
+    g = max(g, as_type<float>(amax[c]));
+  }
+  g = simd_max(g);
+  if (lane == 0) { part[sid] = g; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  g = part[0];
+  for (int i = 1; i < 8; ++i) { g = max(g, part[i]); }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int c = (int)lid; c < C; c += 256) {
+    const float a = as_type<float>(amax[c]);
+    const float st =
+        a > 0.0f ? pow(a, alpha) * pow(g, 1.0f - alpha) * (1.0f / 127.0f)
+                 : 0.0f;
+    amax[c] = as_type<uint>(st);
+  }
+}
+
+// q[r, c] = act(x[r, c]) at channel c's step, rounded, clamped to +-127.
+// A channel that was zero everywhere quantizes to zero. Four elements a
+// thread, one-dimensional (see above).
+//   0:x[rows, C] f16  1:q[rows, C] i8  2:step[C] f32  3:C  4:silu
+//   5:n4 (rows * C / 4)   dispatch {n4, 1, 1}, tg {256, 1, 1}
+kernel void vae_i8_quant_chan_f16(
+    const device half*  x    [[buffer(0)]],
+    device char4*       q    [[buffer(1)]],
+    const device float* step [[buffer(2)]],
+    const constant int& C    [[buffer(3)]],
+    const constant int& silu [[buffer(4)]],
+    const constant uint& n4  [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= n4) { return; }
+  const int c0 = (int)(gid % (uint)(C / 4)) * 4;
+  const float4 v = vae_i8_act_(
+      reinterpret_cast<const device half4*>(x)[gid], silu);
+  float4 inv;
+  for (int i = 0; i < 4; ++i) {
+    const float st = step[c0 + i];
+    inv[i] = st > 0.0f ? 1.0f / st : 0.0f;
+  }
+  q[gid] = char4(clamp(rint(v * inv), -127.0f, 127.0f));
+}
+
+// The weight [Cout, K] (K = 9*Cin, (ky, kx, ci) flattened -- the im2col
+// layout the f16 routes hold) with each input channel's activation step
+// folded in, quantized symmetric per output channel over all of K, into
+// HWIO [K, Cout] int8; wscale[o] is the step that undoes both.
+//   0:w[Cout, K] f16  1:step[Cin] f32  2:q[K, Cout] i8
+//   3:wscale[Cout] f32  4:Cin  5:Cout
+//   dispatch {Cout*256, 1, 1}, tg {256, 1, 1}: a threadgroup a channel
+kernel void vae_i8_weight_fold_f16(
+    const device half*  w      [[buffer(0)]],
+    const device float* step   [[buffer(1)]],
+    device char*        q      [[buffer(2)]],
+    device float*       wscale [[buffer(3)]],
+    const constant int& Cin    [[buffer(4)]],
+    const constant int& Cout   [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]],
+    uint sid  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup float part[8];
+  const int o = (int)tg;
+  const int K = 9 * Cin;
+  const device half* wo = w + (int64_t)o * K;
+  float m = 0.0f;
+  for (int k = (int)lid; k < K; k += 256) {
+    m = max(m, abs((float)wo[k] * step[k % Cin]));
+  }
+  m = simd_max(m);
+  if (lane == 0) { part[sid] = m; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  m = part[0];
+  for (int i = 1; i < 8; ++i) { m = max(m, part[i]); }
+  const float t = m * (1.0f / 127.0f);
+  const float inv = t > 0.0f ? 1.0f / t : 0.0f;
+  if (lid == 0) { wscale[o] = t; }
+  for (int k = (int)lid; k < K; k += 256) {
+    const float r =
+        clamp(rint((float)wo[k] * step[k % Cin] * inv), -127.0f, 127.0f);
+    q[(int64_t)k * Cout + o] = (char)r;
+  }
+}
+

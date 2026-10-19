@@ -83,6 +83,12 @@ class MiniMaxH3TextEncoder {
     // back to these, and a mismatch shows up as a shape failure at load
     // rather than as wrong pixels.
     MetalQwenVisionEncoder::Config vision;
+
+    // Where the WEIGHTS are, when not beside the config: a directory or a
+    // single file (a Draw Things .ckpt, presented under the release's
+    // names). Empty reads them from the encoder directory, as ever; the
+    // config and the tokenizer always come from there.
+    std::string weights;
   };
 
   // `path` may be the `text_encoder` directory, the partition root, or

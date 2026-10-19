@@ -26,6 +26,22 @@ namespace accel {
 
 // int8 GEMMs in the block. Bool; default false.
 inline constexpr std::string_view kI8Gemm = "i8_gemm";
+// ...and which TIER of them. String: "accurate" (groups of 64 on both
+// operands -- the default, and what an absent key means) or "fast"
+// (rotated int8 at a coarse group: fewer folds per contraction, more
+// error on outlier-free operands, less where a channel stands out). Read
+// only with kI8Gemm on; a family without the fast tier runs accurate.
+inline constexpr std::string_view kI8GemmTier = "i8_gemm_tier";
+inline constexpr std::string_view kI8TierAccurate = "accurate";
+inline constexpr std::string_view kI8TierFast = "fast";
+// "token": int8 per output channel x per token over all of K -- the
+// fastest -- with both operands Walsh-Hadamard rotated in blocks of 256
+// first, which keeps an outlier channel from setting its token's scale.
+// "token_plain": the same unrotated, the layout Draw Things' i8x
+// checkpoints store (whose codes it then reads as stored; "token"
+// requantizes them rotated).
+inline constexpr std::string_view kI8TierToken = "token";
+inline constexpr std::string_view kI8TierTokenPlain = "token_plain";
 
 // SageAttention -- the QK^T product in int8. Bool; default false.
 inline constexpr std::string_view kSageAttn = "sage_attn";

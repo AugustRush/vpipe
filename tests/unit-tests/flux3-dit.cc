@@ -26,6 +26,7 @@
 #include "common/flex-data.h"
 #include "common/perf-flops.h"
 #include "common/session.h"
+#include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/dit-flops.h"
 #include "generative-models/flux3/metal-flux3-transformer.h"
 #include "generative-models/train/lora-params.h"
@@ -455,6 +456,125 @@ golden_text_(const fs::path& g, const std::string& key, int* rows)
 }
 
 }  // namespace
+
+// A MIXED PACK (VPIPE_FLUX3_MIXED_DIT = the transformer/ of a
+// model-quantize bits 4 + mixed run): whole joint blocks at w8, the rest
+// at w4 -- and one slot pair streams the per-mode and joint blocks alike
+// -- so a slot built for one width is asked to hold the other
+// (BlockSlots::Ops::same_layout). The pack must really mix widths, and
+// its four holds -- preloaded, streamed, no slots, promoted -- must be
+// BYTE-IDENTICAL with i8 off and, on a matrix-core box, under the signed
+// layout. Before the slots rebuilt such a block, preloaded and no-slots
+// agreed and the two slot holds did not.
+TEST(flux3_dit, a_mixed_pack_holds_agree)
+{
+  const std::string qd = env_("VPIPE_FLUX3_MIXED_DIT");
+  if (qd.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalFlux3Transformer::Config cfg;
+  F3_REQUIRE(MetalFlux3Transformer::Config::read_dims(qd, &cfg));
+  int n8 = 0, n4 = 0;
+  {
+    auto ws = genai::WeightSet::open(qd, nullptr);
+    F3_REQUIRE(ws != nullptr);
+    for (int L = 0; L < cfg.n_single; ++L) {
+      const int b = genai::stored_affine_bits(
+          *ws, "single_transformer_blocks." + std::to_string(L) +
+                   ".attn.to_q", 64);
+      n8 += b == 8;
+      n4 += b == 4;
+    }
+  }
+  std::printf("[flux3_dit] mixed pack: %d joint blocks w8, %d w4\n", n8,
+              n4);
+  F3_REQUIRE(n8 > 0 && n4 > 0);
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int gh = 32, gw = 40, TS = 80;
+  std::vector<float> img((std::size_t)gh * gw * cfg.in_channels);
+  std::vector<float> txt((std::size_t)TS * cfg.joint_dim);
+  unsigned st = 20261018u;
+  auto rnd = [&]() {
+    st = st * 1664525u + 1013904223u;
+    return ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f);
+  };
+  for (float& v : img) { v = rnd(); }
+  for (float& v : txt) { v = rnd(); }
+  bool engaged = true;
+  int promoted = 0, relaid = 0;
+  auto run = [&](bool i8, bool stream, bool slots, bool grow) {
+    std::vector<float> out;
+    std::unique_ptr<Env> ns;
+    if (!slots) { ns = std::make_unique<Env>("VPIPE_FLUX3_NO_SLOTS", "1"); }
+    MetalFlux3Transformer::Config c = cfg;
+    c.i8_gemm = i8;
+    auto m = MetalFlux3Transformer::load(qd, mc, c, stream);
+    if (m == nullptr) { return out; }
+    if (m->signed_layout() != i8) { engaged = false; }
+    m->set_residency_reserve(grow ? (8ull << 30) : 0);
+    if (grow) { m->set_residency_schedule(4); }
+    SharedBuffer lat = to_bf16_(mc, img);
+    SharedBuffer tb = to_bf16_(mc, txt);
+    MetalFlux3Transformer::Request req;
+    req.latents = &lat;
+    req.grid_h = gh;
+    req.grid_w = gw;
+    req.text = &tb;
+    req.text_rows = TS;
+    req.t = 0.75f;
+    req.t_next = 0.5f;
+    std::string e;
+    SharedBuffer v;
+    for (int it = 0; it < (grow ? 2 : 1); ++it) { v = m->forward(req, &e); }
+    if (grow) { promoted = m->resident_block_count(); }
+    if (stream && slots && !grow) { relaid = m->slot_relayouts(); }
+    const std::size_t n = (std::size_t)gh * gw * cfg.in_channels;
+    if (v.empty() || v.byte_size() < n * 2) { return out; }
+    const auto* p = static_cast<const std::uint16_t*>(v.contents());
+    out.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint32_t u = (std::uint32_t)p[i] << 16;
+      std::memcpy(&out[i], &u, 4);
+    }
+    return out;
+  };
+  std::vector<bool> arms = {false};
+  if (mc->supports_matrix_cores()) { arms.push_back(true); }
+  for (bool i8 : arms) {
+    engaged = true;
+    const auto pre = run(i8, false, true, false);
+    const auto str = run(i8, true, true, false);
+    const auto flat = run(i8, true, false, false);
+    const auto grown = run(i8, true, true, true);
+    F3_REQUIRE(!pre.empty());
+    auto same = [&](const std::vector<float>& a) {
+      return a.size() == pre.size() &&
+             std::memcmp(a.data(), pre.data(), a.size() * 4) == 0;
+    };
+    std::printf("[flux3_dit] mixed pack, %s: streamed %s, no slots %s, "
+                "promoted (%d blocks) %s%s\n",
+                i8 ? "signed i8" : "no i8",
+                same(str) ? "IDENTICAL" : "DIFFERENT",
+                same(flat) ? "IDENTICAL" : "DIFFERENT", promoted,
+                same(grown) ? "IDENTICAL" : "DIFFERENT",
+                engaged ? "" : " -- NOT ENGAGED");
+    EXPECT_TRUE(engaged);
+    EXPECT_TRUE(same(str));
+    EXPECT_TRUE(same(flat));
+    EXPECT_TRUE(promoted > 0 && same(grown));
+    // The slots crossed widths and REBUILT. A slot that refused such a
+    // block instead turns itself off, and its holds still agree.
+    std::printf("[flux3_dit] ... %d streamed blocks built into their "
+                "slot\n", relaid);
+    EXPECT_TRUE(relaid > 0);
+  }
+}
 
 // THE SIGNED INT8 LAYOUT on a real quantized pack (VPIPE_FLUX3_QUANT_DIT at
 // a model-quantize'd DiT; i8_gemm on; M5 only), as flux2_smoke.signed_

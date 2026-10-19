@@ -24,7 +24,9 @@
 //     whichever mrope section owns it -- but that is an argument, and
 //     this is the measurement.
 //
-// Env: VPIPE_MINIMAX_H3_TEXT_ENC_PATH, VPIPE_MINIMAX_H3_TEXT_ENC_GOLDEN.
+// Env: VPIPE_MINIMAX_H3_TEXT_ENC_PATH, VPIPE_MINIMAX_H3_TEXT_ENC_GOLDEN;
+// VPIPE_DRAWTHINGS_QWEN3VL_CKPT (Draw Things' qwen_3_vl_32b_50_i8x.ckpt)
+// for the weights-from-a-.ckpt test.
 
 #include "minitest.h"
 
@@ -912,6 +914,64 @@ TEST(minimax_h3_text_enc, streaming_matches_resident)
   std::printf("[minimax_h3_text_enc] streamed re-encode: %zu words differ\n",
               diff2);
   EXPECT_TRUE(diff2 == 0);
+}
+
+// THE WEIGHTS FROM A DRAW THINGS .ckpt (Config::weights), the config and
+// tokenizer from the release: the same ids through both, at a shallow
+// tap. Draw Things stores the 32B's linears as i8x (dequantized here)
+// and its embedding table in f16 -- whose rows, copied raw into the bf16
+// backbone input as a bf16 table's are, were noise until the table was
+// converted. So the bar is the int8 floor, and the failure it guards
+// against is O(1).
+TEST(minimax_h3_text_enc, a_drawthings_checkpoint_encodes_as_the_release)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  const char* ck   = std::getenv("VPIPE_DRAWTHINGS_QWEN3VL_CKPT");
+  if (root == nullptr || *root == '\0' || ck == nullptr || *ck == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config base;
+  std::string cerr;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(root, base, &cerr));
+  base.tap = 4;
+  base.lm.n_layers = 4;
+  std::vector<std::int32_t> ids;
+  for (int i = 0; i < 48; ++i) { ids.push_back(1000 + 977 * i % 60000); }
+  auto run = [&](const std::string& weights, std::vector<float>* out) {
+    MiniMaxH3TextEncoder::Config c = base;
+    c.weights = weights;
+    auto m = MiniMaxH3TextEncoder::load(root, mc, &sess, c);
+    if (m == nullptr) { return false; }
+    std::string e;
+    SharedBuffer h = m->encode_ids(ids, &e);
+    if (h.empty()) {
+      std::printf("[minimax_h3_text_enc] %s\n", e.c_str());
+      return false;
+    }
+    const auto* p = static_cast<const std::uint16_t*>(h.contents());
+    out->resize(h.byte_size() / 2);
+    for (std::size_t i = 0; i < out->size(); ++i) {
+      (*out)[i] = bf16_to_f32_(p[i]);
+    }
+    return true;
+  };
+  std::vector<float> rel, dt;
+  ASSERT_TRUE(run({}, &rel));
+  ASSERT_TRUE(run(ck, &dt));
+  ASSERT_TRUE(rel.size() == dt.size() && !rel.empty());
+  if (rel.size() != dt.size() || rel.empty()) { return; }
+  double e2 = 0, r2 = 0;
+  for (std::size_t i = 0; i < rel.size(); ++i) {
+    e2 += ((double)dt[i] - rel[i]) * ((double)dt[i] - rel[i]);
+    r2 += (double)rel[i] * rel[i];
+  }
+  const double r = std::sqrt(e2 / std::max(r2, 1e-30));
+  std::printf("[minimax_h3_text_enc] the .ckpt's tap %d vs the release's: "
+              "rel-L2 %.4f over %zu values\n", base.tap, r, rel.size());
+  EXPECT_TRUE(std::isfinite(r) && r < 0.05);
 }
 
 // The REAL tap, at the production depth, with no reference to compare

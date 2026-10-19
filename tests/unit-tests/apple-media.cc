@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -70,6 +71,20 @@ write_file_(const std::string& path, const std::vector<std::uint8_t>& b)
   std::ofstream f(path, std::ios::binary);
   f.write(reinterpret_cast<const char*>(b.data()), (std::streamsize)b.size());
   return (bool)f;
+}
+
+// The first ProRes frame's alpha_info -- 0 none, 1 8-bit, 2 16-bit --
+// as a decoder reads it from the frame header after its 'icpf' (byte
+// 17, FFmpeg's proresdec); -1 with no frame found.
+int
+prores_alpha_info_(const std::string& path)
+{
+  std::ifstream f(path, std::ios::binary);
+  const std::string d((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+  const std::size_t i = d.find("icpf");
+  if (i == std::string::npos || i + 4 + 18 > d.size()) { return -1; }
+  return static_cast<unsigned char>(d[i + 4 + 17]) & 0xf;
 }
 
 }  // namespace
@@ -267,6 +282,60 @@ TEST(apple_media, prores4444_keeps_alpha)
   std::printf("[apple_media] prores worst error %.4f\n", worst);
   EXPECT_TRUE(worst < 0.02f);
   std::remove(path.c_str());
+}
+
+// ProRes 4444 (XQ) with no alpha kept -- a 3-channel picture, or a
+// 4-channel one's (half clear) dropped -- has no alpha PLANE: its frames
+// say none, as its track (depth 24) does. The encoder coded the A of the
+// half floats it was fed, a plane of 1s in every frame that decoders
+// reading the frames took for alpha. Kept, the plane is there. (An alpha
+// kept but opaque everywhere the track declares at depth 24 all the
+// same: AVFoundation's.)
+TEST(apple_media, prores4444_without_alpha_has_no_plane)
+{
+  const int H = 48, W = 64;
+  std::string err;
+  for (const char* codec : {"prores4444", "prores4444xq"}) {
+    for (const int ch : {3, 4}) {
+      for (const bool keep : {false, true}) {
+        if (keep && ch == 3) { continue; }
+        const std::string path = tmp_(std::string(codec) + "-" +
+                                      std::to_string(ch) +
+                                      (keep ? "-keep.mov" : ".mov"));
+        VideoWriteOptions wo;
+        wo.codec = codec;
+        wo.width = W;
+        wo.height = H;
+        wo.alpha = keep;
+        wo.color.primaries = 1;
+        wo.color.transfer = 1;
+        wo.color.matrix = 1;
+        VideoWriter w;
+        REQUIRE_(w.open(path, wo, &err));
+        for (int i = 0; i < 2; ++i) {
+          auto f = picture_(ch, H, W, [](int c, int, int) {
+            return c == 3 ? 0.5f : 0.3f + 0.1f * c;
+          });
+          REQUIRE_(w.write(f, i, &err));
+        }
+        REQUIRE_(w.finish(&err));
+        const int info = prores_alpha_info_(path);
+        std::printf("[apple_media] %s from %d channels%s: alpha_info %d\n",
+                    codec, ch, keep ? ", kept" : "", info);
+        EXPECT_TRUE(info >= 0);
+        EXPECT_TRUE((info > 0) == keep);
+        VideoReader r;
+        REQUIRE_(r.open(path, VideoReadOptions{}, &err));
+        EXPECT_TRUE(r.info().has_alpha == keep);
+        TensorBeat f;
+        std::int64_t pts = 0;
+        REQUIRE_(r.read(&f, &pts, &err));
+        EXPECT_TRUE(f.shape[0] == (keep ? 4 : 3));
+        EXPECT_TRUE(std::fabs(at_(f, 1, 10, 10) - 0.4f) < 0.02f);
+        std::remove(path.c_str());
+      }
+    }
+  }
 }
 
 // HEVC Main10 tagged PQ, with HDR10 metadata: the file declares BT.2020

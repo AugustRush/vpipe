@@ -20,6 +20,8 @@
 
 #include "tests/unit-tests/metal-lm/metal-lm-test-common.h"
 
+#include "apple-silicon/metal-compute/command-stream.h"
+
 #include "common/flex-bag.h"
 #include "common/flex-data.h"
 #include "generative-models/shared/dflash-drafter.h"
@@ -198,6 +200,10 @@ load_fixture_(Session& sess, int bits, int gen, bool bf16_dflt = true)
   mcfg.use_bf16 = bf16;
   mcfg.page_tokens = 512;
   mcfg.max_pages = std::max(16, (4 * (gen + 512)) / 512 + 8);
+  // VPIPE_DFLASH_PAGES: room for a long prompt (512-token pages).
+  if (const char* e = std::getenv("VPIPE_DFLASH_PAGES")) {
+    mcfg.max_pages = std::max(mcfg.max_pages, std::atoi(e));
+  }
   fx.model = genai::MetalQwenModel::load(target, mc, mcfg);
   if (!fx.model) { return fx; }
   genai::MetalDFlashDrafter::Options opt;
@@ -505,11 +511,18 @@ TEST(metal_lm_smoke, dflash_speculative_token_exact) {
     const genai::ContextId sb =
         m.context_manager()->branch(m.root_context());
     std::vector<std::int32_t> pids;
+    double g0 = 0.0, g1 = 0.0;
+    metal_compute::CommandStream::gpu_time_stats(&g0, nullptr);
     const auto s0 = std::chrono::steady_clock::now();
     EXPECT_TRUE(m.decode_pipelined(sb, first, std::min(kGen, 64), pids));
     const double ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - s0).count();
     serial_tps = (double)pids.size() / (ms / 1e3);
+    metal_compute::CommandStream::gpu_time_stats(&g1, nullptr);
+    if (g1 > g0 && !pids.empty()) {   // VPIPE_MC_GPU_TIME=1
+      std::printf("[dflash] serial: GPU busy %.2f of %.2f ms a token\n",
+                  (g1 - g0) / (double)pids.size(), ms / (double)pids.size());
+    }
   }
   std::printf("[dflash] %s w%d: prompt %zu tok, serial %.1f tok/s\n",
               m.dflash()->config().kind(), bits, ids.size(), serial_tps);
@@ -563,6 +576,9 @@ TEST(metal_lm_smoke, dflash_speculative_token_exact) {
   if (ksplit_expected_(m)) {
     EXPECT_TRUE(m.qmv_ksplit_dispatches() > ks0);
   }
+  EXPECT_TRUE(verify_scratch_planned(
+      m, std::max(Lt, *std::max_element(blocks.begin(), blocks.end())),
+      /*mtp_head=*/false));
 }
 
 // SAMPLED DFlash decode is token-exact with the GPU-resident pipelined
@@ -590,11 +606,10 @@ TEST(metal_lm_smoke, dflash_speculative_sampled_token_exact) {
   const std::int32_t first = argmax_(lg);
 
   // Exactness against the pipelined sampler needs the verify to round as
-  // the single-row decode does, so the first pass pins the row-identical
-  // GEMV tiles. The split-K default (another reduction order) then makes
-  // the same draws, held only to "the drafts land, the length is right":
-  // a 1-ulp logit difference moves a CDF boundary rarely, and when it does
-  // the run takes another, equally valid path from that token on.
+  // the single-row decode does: the first pass pins the row-identical
+  // batch tiles (decode on qmv_fast), the second the split-K default
+  // (decode on the one-row split-K tile, every row computed as the
+  // verify's tiles compute it). Both are held to the same draws.
   for (const bool ks : {false, true}) {
   if (ks && !ksplit_expected_(m)) { continue; }
   m.set_qmv_ksplit(ks, false);
@@ -655,12 +670,14 @@ TEST(metal_lm_smoke, dflash_speculative_sampled_token_exact) {
                 got.size(), st.rounds,
                 st.rounds ? (double)got.size() / st.rounds : 0.0, mism,
                 first_bad);
-    if (!ks) { EXPECT_TRUE(mism == 0); }
+    EXPECT_TRUE(mism == 0);
     EXPECT_TRUE(got.size() == ref.size());
     EXPECT_TRUE(st.rounds > 0 && (double)got.size() / st.rounds > 1.2);
   }
   if (ks) { EXPECT_TRUE(m.qmv_ksplit_dispatches() > ks0); }
   }
+  EXPECT_TRUE(verify_scratch_planned(m, m.dflash()->config().block_size,
+                                     /*mtp_head=*/false));
 }
 
 // The FRAMEWORK path, as text-chat runs it: the drafter named in a
@@ -714,7 +731,12 @@ TEST(metal_lm_smoke, dflash_chat_through_manager) {
     std::vector<std::int32_t> ids;
     tpl->render_user_turn(turns[t], /*is_first_turn=*/t == 0, &ids);
     ASSERT_TRUE(!ids.empty());
+    const auto tp0 = std::chrono::steady_clock::now();
     const std::int32_t first = lm->prefill(spec_ctx, ids);
+    const double prefill_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - tp0).count();
+    std::printf("[dflash_chat] prefill %zu tok in %.1f ms\n", ids.size(),
+                prefill_ms);
     ASSERT_TRUE(first >= 0);
     // Serial greedy on the branch, with each step's top-2 margin (the
     // near-tie rule of dflash_speculative_token_exact).

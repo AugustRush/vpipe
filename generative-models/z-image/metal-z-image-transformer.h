@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <string>
@@ -121,6 +122,20 @@ class MetalZImageTransformer {
 
     // Accel tiers, read from accel-settings.h by the caller.
     bool i8_gemm = false;
+    // ...and its tier (I8GemmContext::Tier): 0 accurate (groups of 64),
+    // 1 fast (the modulated blocks' projections held as rotated int8 at
+    // a coarse group), 2 token (int8 per channel x per token, both
+    // operands Hadamard-rotated in blocks of 256), 3 token unrotated.
+    // The context refiner stays accurate: its caption rows sit under the
+    // int8 floor, where a fast weight would only be dequantized back.
+    // VPIPE_I8_TIER / VPIPE_I8_TOKEN_ROT override it.
+    int i8_tier = 0;
+    // A w4 pack's block projections on the fast / token tiers: HOLD
+    // their int8 layout (true; twice their bytes, the fastest) or keep
+    // the pack and convert it before each GEMM into one scratch (false,
+    // the default; a streamed block always does). The engine's call --
+    // generate-image sets it where the box has room.
+    bool i8_hold_w4 = false;
     sage::Config sage;
     sol::Config  sol;
     bool ane_ffn   = false;
@@ -205,9 +220,43 @@ class MetalZImageTransformer {
   void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
+  // Drop what a forward keeps for the next one -- the dense stand-in,
+  // split-K planes and the int8 context's buffers; each regrows on
+  // demand. The stage calls it after a
+  // generation on a bounded box, before the decode wants the room.
+  void release_forward_scratch();
+  // A STREAMED stack residency has kept whole gives its slot pair
+  // back (BlockSlots::release_if_saturated) -- between generations; a
+  // forward does the same at its top. Returns the bytes freed.
+  std::size_t release_idle_slots()
+  {
+    return _slots.release_if_saturated(_blocks);
+  }
+  // Streamed blocks BUILT into their slot because the slot was laid
+  // out for another (a mixed pack's other width; BlockSlots::Ops::
+  // same_layout), over the model's life. For a test to show the slots
+  // crossed widths -- and did not give up and stream without them.
+  // Block projections the model holds in the fast or token layout from
+  // a pack at `bits` (4 or 8), over the blocks it HOLDS (all of them,
+  // preloaded): a test's proof that a tier took every width of a mixed
+  // pack rather than leaving one on the accurate tier.
+  int fast_weights(int bits) const;
+  int slot_relayouts() const { return _slots.relaid(); }
   // Whether the block projections run in the signed int8 layout (see
   // _sgn) -- what a test asserts before it compares anything.
   bool signed_layout() const { return _sgn; }
+  // Whether the modulated blocks' projections run the int8 FAST or TOKEN
+  // tier (see _fast), at which group (I8GemmContext::kTokenGroup on the
+  // token tier; 0 off both), and the token GEMM kernel the context took.
+  bool fast_tier() const { return _fast; }
+  int fast_group() const
+  {
+    return _fast && _i8 ? _i8->fast_group(_cfg.hidden) : 0;
+  }
+  std::string i8_token_kernel() const
+  {
+    return _i8 ? _i8->token_kernel() : std::string();
+  }
   std::size_t release_resident_blocks(std::size_t bytes);
   std::uint64_t resident_bytes() const;
 
@@ -258,6 +307,13 @@ class MetalZImageTransformer {
 
   static std::size_t ane_runtime_bytes(const Config& c, int seq) noexcept;
   static int ane_plan_seq(int width, int height) noexcept;
+  // What one forward allocates beyond the weights, for the plan's denoise
+  // phase: img_rows image tokens beside txt_rows of caption, `packed`
+  // for a pack (the dense stand-in), `matrix_cores` for the tiers that
+  // need them (int8, Sage, Sol). CFG runs its two forwards in turn.
+  static std::size_t forward_scratch_bytes(const Config& c, int img_rows,
+                                           int txt_rows, bool packed,
+                                           bool matrix_cores);
   bool streaming() const { return _stream_blocks; }
   int quant_bits() const { return _quant_bits; }
 
@@ -275,6 +331,27 @@ class MetalZImageTransformer {
     // q ^ 0x80 / 0x8 and b' = b + 128 s / 8 s. Only the int8 route and
     // the signed dequant read it; see _sgn.
     bool sgn = false;
+    // THE FAST TIER's layout (I8GemmContext::gemm_fast) when gc > 0:
+    // `codes` holds int8 [N, K] in the group-rotated basis and `cscales`
+    // [N, K/gc] (f32 [N] at kTokenGroup). A streamed slot also keeps the
+    // raw scales / qbias its refill lands, which post_refill converts
+    // from. A W4 pack's weight (bits 4) is held AS STORED -- codes,
+    // scales, qbias of the pack -- and converted per GEMM
+    // (fast_operand_). n / k are the weight's shape, which a refill
+    // needs and the buffers do not say.
+    int gc = 0;
+    int n = 0, k = 0;
+    metal_compute::SharedBuffer cscales;
+    // A w4 pack's weight kept AS STORED (its codes / scales / qbias) and
+    // converted per GEMM (fast_operand_); false for a layout held, w4 or
+    // w8 (Config::i8_hold_w4).
+    bool pc = false;
+    // A DENSE checkpoint's weight in the fast layout in a STREAMED slot:
+    // `w` keeps the bf16 a refill lands (the source, narrowed from F32
+    // on Turbo) and post_refill quantizes it into codes / cscales,
+    // exactly as a preloaded block's entry was built. A promotion keeps
+    // only the layout, as the entry does -- the source is the slot's.
+    bool ds = false;
     bool empty() const { return quantized ? codes.empty() : w.empty(); }
   };
 
@@ -312,11 +389,51 @@ class MetalZImageTransformer {
   // takes the signed layout when _sgn is set. The model-level linears
   // and each block's adaLN run at a row or two and stay as the
   // checkpoint has them.
+  // `fast`: a MODULATED block's projection (noise refiner, main layers),
+  // which takes the fast or token layout when _fast is set.
   QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r,
-                   bool sign = false);
+                   bool sign = false, bool fast = false);
   // Convert a quantized weight the model OWNS (a refilled slot) to the
   // signed layout in place, and say so on it. False touches nothing.
   bool sign_(QWeight& w) const;
+  // ...to the fast tier's layout, on the GPU, in place (a refilled slot
+  // whose build chose it); a weight not in that layout is untouched.
+  bool fast_(QWeight& w) const;
+  // The same conversion encoded on `e`, for a caller converting a whole
+  // block in one command buffer (post_refill). True with nothing encoded
+  // for a weight not in that layout.
+  bool encode_fast_(metal_compute::ComputeEncoder& e, QWeight& w) const;
+  // The fast-layout operands of a weight on the fast / token tier: its
+  // own codes and scales, or -- a w4 pack's weight, held as stored -- the
+  // context's scratch it is converted into here, on `enc`, for the GEMM
+  // encoded right after (I8GemmContext::encode_to_fast_scratch). False
+  // with nothing encoded where the conversion declines.
+  bool fast_operand_(metal_compute::ComputeEncoder& enc, const QWeight& w,
+                     const metal_compute::SharedBuffer** codes,
+                     const metal_compute::SharedBuffer** scales) const;
+  // A fast-layout weight dequantized into `out` [N, K] -- the values the
+  // fast GEMM reads, for a route that does not read the layout.
+  bool fast_dense_(metal_compute::ComputeEncoder& enc, const QWeight& w,
+                   const metal_compute::SharedBuffer& out, int N,
+                   int K) const;
+  // Is block L stored at the widths `b` was built for? (A mixed pack;
+  // see BlockSlots::Ops::same_layout.)
+  bool same_layout_(int L, const Block& b) const;
+  // THE FAST TIER over one input for several projections (q|k|v,
+  // w1|w3): one activation quantizer, then each GEMM -- what gemm_mma_
+  // would run per projection, less the repeated quantizer. False with
+  // NOTHING encoded unless every one is in the fast layout at one group
+  // with no adapter attached (the caller then runs each as before).
+  struct FastOut {
+    const QWeight* w;
+    const metal_compute::SharedBuffer* y;
+    std::size_t ye;
+    int n;                       // the projection's output width
+    bool adapted;                // a LoRA stack is attached
+  };
+  bool fast_shared_(metal_compute::ComputeEncoder& enc,
+                    const metal_compute::SharedBuffer& x, std::size_t xe,
+                    int M, int K, std::initializer_list<FastOut> outs);
   // A signed weight as a DENSE one, dequantized into _w_deq -- for the
   // routes that do not read the layout. `w` itself when it is not
   // signed; null when the scratch cannot be had.
@@ -343,6 +460,21 @@ class MetalZImageTransformer {
   void configure_slots_();
   static std::size_t qw_bytes_(const QWeight& w);
   static std::size_t block_bytes_(const Block& b);
+  // What a PROMOTION of slot block `b` keeps (clone_block_ with copy):
+  // a dense source and dead pack scales dropped, a w4 pack whose layout
+  // is held converted into it. What residency and the wired pool are
+  // asked for -- a slot-sized ask books bytes nothing keeps.
+  std::size_t kept_block_bytes_(const Block& b) const;
+  // ...and the same on a block ALREADY promoted, whatever route it came
+  // by: with no slot pair (VPIPE_Z_IMAGE_NO_SLOTS, or one that could not
+  // be allocated) BlockSlots::promote_into MOVES the per-block fallback
+  // rather than cloning it, so clone_block_'s copy-time work never ran.
+  // Idempotent: after a clone it finds nothing to do. False when a held
+  // layout could not be built (the block then keeps its pack, per call).
+  bool keep_block_(Block& b) const;
+  // post_refill's conversions, on a stream the reader thread keeps (a
+  // fresh queue's first commit costs ~1-1.9 ms; seven a block added up).
+  mutable metal_compute::CommandStream _cvt_stream;
 
   // The timestep sinusoid and its two Linears, on the host: 256
   // channels of one row is not worth a dispatch.
@@ -459,6 +591,18 @@ class MetalZImageTransformer {
   // refill in the slot. OFF under the ANE tiers, whose stagers read the
   // codes unsigned. VPIPE_I8_SIGNED=0 for the A/B.
   bool _sgn = false;
+  // THE FAST OR TOKEN TIER for the MODULATED blocks' projections
+  // (Config::i8_tier; both hold I8GemmContext's fast layout, at gc or
+  // kTokenGroup): g64 packs converted -- in the derived entry a
+  // retained block keeps, in the slot after every refill; a w4 weight is
+  // then held at int8's size, twice its nibbles' -- and dense
+  // checkpoints (bf16, or F32 narrowed) quantized once into the entry (a
+  // streamed dense block stays on the accurate tier). Off under the ANE
+  // tiers, whose stagers read the codes as affine. A GEMM the tier
+  // declined after its input was quantized latches _fast_failed and the
+  // forward reports it.
+  bool _fast = false;
+  bool _fast_failed = false;
   std::unique_ptr<MetalSageAttention> _sage;
   std::unique_ptr<MetalSolAttention> _sol;
   // perf-flops: GEMMs and attention counted as encoded, credited at

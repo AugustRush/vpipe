@@ -4028,6 +4028,17 @@ TEST(ane_module, activation_range_probe)
   probe("silu*x", K::SwiGluFfn, {I, I, I, Z, Z, Z},
         [&](double v) { return silu(v) * v; });
   probe("gelu", K::GeluFfn, {I, I, Z, Z}, gelu);
+  // MOSS-Image's SITU, each half alone: the gate's factor with u pinned
+  // by its bias (Wu = 0, bu = 10), and the hidden one's with g pinned.
+  auto situ_a = [](double g) {
+    return 4.0 * std::tanh(g / 4.0) / (1.0 + std::exp(-g));
+  };
+  auto situ_h = [](double h) { return 25.0 * std::tanh(h / 25.0); };
+  const Fill T{false, 10.0f};
+  probe("situ_g", K::SituFfn, {I, Z, I, Z, T, Z},
+        [&](double v) { return situ_a(v) * situ_h(10.0); });
+  probe("situ_u", K::SituFfn, {Z, I, I, T, Z, Z},
+        [&](double v) { return situ_a(10.0) * situ_h(v); });
   // Which op overflows: the product (a constant 256 through the up bias),
   // the down matmul (silu, then Wd = 256 I), or a bare matmul.
   const Fill C{false, 256.0f}, E{true, 256.0f};

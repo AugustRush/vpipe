@@ -50,6 +50,10 @@ class MetalFlux2Vae {
     int in_channels     = 3;
     int latent_channels = 32;
     int block_out[4]    = {128, 256, 512, 512};
+    // The DECODER's widths, when they differ from the encoder's:
+    // `decoder_block_out_channels`, the FLUX.2 "small decoder" MOSS-Image
+    // ships ([96, 192, 384, 384]). Absent, it is block_out.
+    int dec_block_out[4] = {128, 256, 512, 512};
     int layers_per_block = 2;
     int norm_groups     = 32;
     int patch           = 2;        // patch_size (per spatial dim); 1 = plain
@@ -109,6 +113,11 @@ class MetalFlux2Vae {
   // conv and the mid-block attention, counted as encoded and credited
   // as each command buffer retires. For a test to hold against shapes.
   const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
+
+  // 3x3 convs the hardware conv has run on a 32- or 16-channel
+  // destination tile (a width that is not a multiple of 64), counted as
+  // encoded. For a test to assert the narrow tile actually engaged.
+  int narrow_hw_convs() const noexcept { return _narrow_hw_convs; }
 
   // How the last decode() ran, for a test to assert the path it meant to
   // exercise actually ran (a budget that fits takes the whole decode and
@@ -386,13 +395,17 @@ class MetalFlux2Vae {
   // the full NHWC activation itself (zero-filled pad-1 halo included) -- no
   // im2col scratch, no DRAM round-trip; ~2-3x the im2col+matmul2d path at
   // decoder shapes, bit-identical. Gated on matrix cores; needs whole 8x8
-  // dest tiles + 64-channel tiles (others keep im2col). Bias folds via
+  // dest tiles and a destination channel tile the width divides by (64,
+  // else 32, else 16 -- see hw_tile_); others keep im2col. Bias folds via
   // bias_add_rows like the mma path. VPIPE_VAE_NO_HWCONV=1 opts out (A/B).
   // conv3x3_hw_ returns false -- nothing encoded -- when not applicable.
   bool conv3x3_hw_(metal_compute::ComputeEncoder& enc,
                    const metal_compute::SharedBuffer& in, const Conv& c,
                    const metal_compute::SharedBuffer& out, int H, int W,
                    int stride);
+  // The widest destination channel tile the hardware conv has for this
+  // width (64, 32, 16), or 0 when it has none.
+  int hw_tile_(int cout, int stride) const noexcept;
   // Simdgroup-MMA dense GEMM for the non-matrix-core conv path (see
   // conv_gemm_bias_). Best-effort: invalid leaves the scalar fallback.
   metal_compute::ComputeFunction _fn_gemm_t_bm64, _fn_gemm_t_bm64bn64;
@@ -498,7 +511,14 @@ class MetalFlux2Vae {
 
   metal_compute::ComputeLibrary _lib_convhw;
   metal_compute::ComputeFunction _fn_conv_hw_s1, _fn_conv_hw_s2;
+  // The 32- and 16-channel destination tiles, for a width that is not a
+  // multiple of 64: MOSS-Image's small decoder is 96 wide at full
+  // resolution, so without them its most expensive level is the one on
+  // im2col. VPIPE_VAE_NO_C32 / VPIPE_VAE_NO_C16 decline each (the A/B).
+  metal_compute::ComputeFunction _fn_conv_hw_s1_c32, _fn_conv_hw_s2_c32;
+  metal_compute::ComputeFunction _fn_conv_hw_s1_c16, _fn_conv_hw_s2_c16;
   bool _use_hwconv = false;
+  int _narrow_hw_convs = 0;   // see narrow_hw_convs()
 };
 
 }  // namespace genai

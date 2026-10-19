@@ -4,6 +4,7 @@
 #include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/shared/fp8-layout.h"
 
+#include "generative-models/shared/drawthings-store.h"
 #include "generative-models/shared/gguf-convert.h"
 #include "generative-models/shared/gguf-file.h"
 #include "generative-models/shared/torch-zip.h"
@@ -38,7 +39,72 @@ struct GgufBacking {
   std::optional<GgufFile>                           gguf;
   std::unique_ptr<GgufConverterBase>                conv;
   std::unordered_map<std::string, ConvertedTensorSpec> specs;
+  // A Draw Things `.ckpt` (shared/drawthings-store.h) rides here too,
+  // because this is the one place the class keeps format state without
+  // its layout -- an exported one -- changing. Its index, the recipe of
+  // every tensor it CONVERTS (shard == -3: a codec other than raw, a
+  // concatenation, a folded norm), and the file mapping they decode
+  // from, which the shard owns.
+  // A converted tensor's TensorInfo::offset is its recipe's index here,
+  // not a name lookup, so a rename of the table (translate_names_)
+  // cannot orphan it.
+  struct DrawThings {
+    enum class View { kDense, kCodes, kScales };
+    struct Recipe {
+      int mapped = -1;
+      View view = View::kDense;
+    };
+    std::vector<drawthings::Tensor> tensors;
+    std::vector<drawthings::Mapped> mapped;
+    std::vector<Recipe> recipes;
+    const std::uint8_t* file = nullptr;
+    std::size_t size = 0;
+  };
+  std::unique_ptr<DrawThings> dt;
 };
+
+namespace {
+
+// A converted Draw Things tensor into `dst`: the recipe its info's
+// offset names -- the rows gathered and decoded, in the dtype the info
+// says (the store's element type), or an i8x weight's gathered codes or
+// row scales.
+bool
+dt_convert_(const GgufBacking::DrawThings& dt,
+            const MetalLlamaWeights::TensorInfo& ti, void* dst)
+{
+  using View = GgufBacking::DrawThings::View;
+  if (ti.offset >= dt.recipes.size()) { return false; }
+  const auto& rc = dt.recipes[(std::size_t)ti.offset];
+  const drawthings::Mapped& m = dt.mapped[(std::size_t)rc.mapped];
+  if (rc.view == View::kCodes) {
+    return drawthings::gather_i8x(m, dt.tensors, dt.file, dt.size,
+                                  static_cast<std::int8_t*>(dst), nullptr,
+                                  nullptr);
+  }
+  if (rc.view == View::kScales) {
+    return drawthings::gather_i8x(m, dt.tensors, dt.file, dt.size, nullptr,
+                                  static_cast<std::uint8_t*>(dst), nullptr);
+  }
+  std::size_t n = 1;
+  for (std::int64_t d : m.shape) { n *= (std::size_t)d; }
+  const bool f32 = ti.dtype == "F32";
+  if (n * (f32 ? 4 : 2) > ti.nbytes) { return false; }
+  if (f32) {
+    return drawthings::gather_f32(m, dt.tensors, dt.file, dt.size,
+                                  static_cast<float*>(dst), nullptr);
+  }
+  std::vector<float> v(n);
+  if (!drawthings::gather_f32(m, dt.tensors, dt.file, dt.size, v.data(),
+                              nullptr)) {
+    return false;
+  }
+  auto* h = static_cast<__fp16*>(dst);
+  for (std::size_t i = 0; i < n; ++i) { h[i] = (__fp16)v[i]; }
+  return true;
+}
+
+}  // namespace
 
 bool
 MetalLlamaWeights::map_shard_(const std::string& safetensors_path)
@@ -92,6 +158,119 @@ MetalLlamaWeights::map_shard_(const std::string& safetensors_path)
       ti.shard = tidx;
       _tensors.emplace(std::move(t.name), std::move(ti));
     }
+    return true;
+  }
+
+  // A DRAW THINGS checkpoint: an SQLite table of contents with the bytes
+  // after it (shared/drawthings-store.h). Mapped whole, like the torch
+  // archive above, and presented under the diffusers names its model's
+  // loader reads. Raw tensors are served where they lie; an i8x weight
+  // is served THREE ways -- its codes (`<stem>.i8x`, I8 [N, K]) and row
+  // scales (`<stem>.i8x_scales`) where they lie, for a loader that runs
+  // them natively, and `<stem>.weight` dequantized on the way out for
+  // one that does not; everything else is converted on the way out.
+  if (drawthings::looks_like(fd)) {
+    std::vector<drawthings::Tensor> ts;
+    std::vector<drawthings::Mapped> ms;
+    std::string family, derr;
+    if (!drawthings::read_index(safetensors_path, file_size, &ts, &derr) ||
+        !drawthings::map_to_diffusers(ts, &ms, &family, &derr)) {
+      std::fprintf(stderr, "MetalLlamaWeights: %s: %s\n",
+                   safetensors_path.c_str(), derr.c_str());
+      ::close(fd);
+      return false;
+    }
+    void* dbase = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (dbase == MAP_FAILED) {
+      ::close(fd);
+      return false;
+    }
+    const int didx = static_cast<int>(_shards.size());
+    Shard sh;
+    sh.fd = fd;
+    sh.fd_stream = ::open(safetensors_path.c_str(), O_RDONLY);
+#ifdef F_NOCACHE
+    if (sh.fd_stream >= 0) { (void)::fcntl(sh.fd_stream, F_NOCACHE, 1); }
+#endif
+    sh.base = dbase;
+    sh.map_size = file_size;
+    sh.data_start = 0;
+    _shards.push_back(sh);
+    auto dt = std::make_unique<GgufBacking::DrawThings>();
+    dt->file = static_cast<const std::uint8_t*>(dbase);
+    dt->size = file_size;
+    using View = GgufBacking::DrawThings::View;
+    auto converted = [&](const std::string& nm, int mi, View view,
+                         const char* dtype, std::vector<std::int64_t> shape,
+                         std::uint64_t nbytes) {
+      TensorInfo ti;
+      ti.dtype = dtype;
+      ti.shape = std::move(shape);
+      ti.offset = dt->recipes.size();     // the recipe, see DrawThings
+      ti.nbytes = nbytes;
+      ti.shard = -3;                      // Draw Things, converted
+      dt->recipes.push_back({mi, view});
+      _tensors.emplace(nm, std::move(ti));
+    };
+    dt->mapped = std::move(ms);
+    for (std::size_t mi = 0; mi < dt->mapped.size(); ++mi) {
+      const drawthings::Mapped& m = dt->mapped[mi];
+      const drawthings::Tensor& t0 = ts[(std::size_t)m.parts[0].index];
+      const std::string full = m.name + "." + m.leaf;
+      const int elt = m.f32 ? 4 : t0.elt;
+      const char* dtype = elt == 4 ? "F32" : "F16";
+      // ONE stored tensor as it lies: no gather, no slice, no fold, no
+      // widening.
+      const bool one = m.parts.size() == 1 && !m.parts[0].rope &&
+                       m.parts[0].row0 == 0 && m.parts[0].nrows < 0 &&
+                       m.fn == drawthings::Mapped::Fn::kNone &&
+                       elt == t0.elt;
+      if (one && t0.codec == drawthings::kCodecRaw && t0.external) {
+        TensorInfo ti;
+        ti.dtype = dtype;
+        ti.shape = m.shape;
+        ti.offset = t0.offset;
+        ti.nbytes = (std::uint64_t)t0.count() * (std::uint64_t)t0.elt;
+        ti.shard = didx;
+        _tensors.emplace(full, std::move(ti));
+        continue;
+      }
+      if (m.leaf == "weight" && drawthings::i8x_whole(m, ts)) {
+        std::int64_t K = 1;
+        for (std::size_t d = 1; d < m.shape.size(); ++d) { K *= m.shape[d]; }
+        const std::int64_t N = m.shape[0];
+        if (one) {
+          TensorInfo c;
+          c.dtype = "I8";
+          c.shape = {N, K};
+          c.offset = t0.offset;
+          c.nbytes = (std::uint64_t)t0.count();
+          c.shard = didx;
+          _tensors.emplace(m.name + ".i8x", std::move(c));
+          TensorInfo s;
+          s.dtype = dtype;
+          s.shape = {N};
+          s.offset = t0.offset + drawthings::i8x_scale_offset(t0);
+          s.nbytes = (std::uint64_t)N * (std::uint64_t)t0.elt;
+          s.shard = didx;
+          _tensors.emplace(m.name + ".i8x_scales", std::move(s));
+        } else {
+          // Gathered from several, or reordered: still whole rows, each
+          // with its own scale, so still an i8x weight -- served by copy.
+          converted(m.name + ".i8x", (int)mi, View::kCodes, "I8", {N, K},
+                    (std::uint64_t)N * (std::uint64_t)K);
+          converted(m.name + ".i8x_scales", (int)mi, View::kScales, dtype,
+                    {N}, (std::uint64_t)N * (std::uint64_t)t0.elt);
+        }
+      }
+      std::int64_t n = 1;
+      for (std::int64_t d : m.shape) { n *= d; }
+      converted(full, (int)mi, View::kDense, dtype, m.shape,
+                (std::uint64_t)n * (std::uint64_t)elt);
+    }
+    dt->tensors = std::move(ts);
+    if (!_gguf) { _gguf = std::make_unique<GgufBacking>(); }
+    _gguf->dt = std::move(dt);
     return true;
   }
 
@@ -582,7 +761,7 @@ MetalLlamaWeights::alignment() const
 bool
 MetalLlamaWeights::is_gguf() const noexcept
 {
-  return _gguf != nullptr;
+  return _gguf != nullptr && _gguf->gguf.has_value();
 }
 
 bool
@@ -701,6 +880,14 @@ MetalLlamaWeights::load(const std::string& name,
     }
     return buf;
   }
+  // Draw Things: decoded straight into the SharedBuffer.
+  if (ti->shard == -3) {
+    if (!_gguf || !_gguf->dt ||
+        !dt_convert_(*_gguf->dt, *ti, buf.contents())) {
+      return {};
+    }
+    return buf;
+  }
   const Shard& sh = _shards[static_cast<std::size_t>(ti->shard)];
   const auto* src =
       static_cast<const std::uint8_t*>(sh.base) + sh.data_start + ti->offset;
@@ -776,6 +963,9 @@ MetalLlamaWeights::read_into(const std::string& name, void* dst,
     auto it = _gguf->specs.find(name);
     return it != _gguf->specs.end()
         && _gguf->conv->convert(it->second, static_cast<std::uint8_t*>(dst));
+  }
+  if (ti->shard == -3) {
+    return _gguf && _gguf->dt && dt_convert_(*_gguf->dt, *ti, dst);
   }
   if (ti->shard < 0 ||
       static_cast<std::size_t>(ti->shard) >= _shards.size()) {

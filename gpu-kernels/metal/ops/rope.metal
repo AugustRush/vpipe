@@ -522,6 +522,110 @@ kernel void transpose_rms_rope_pair_ftab_f16(
   }
 }
 
+// The per-head RMSNorm and the pair rope IN PLACE, TOKEN-major in and out:
+// for a consumer that reads q/k through strides (the steel / NAX flash
+// kernels take a head stride and a row stride), so no transpose follows.
+// It rounds TWICE, as rms_norm_fast then transpose_rope_pair_ftab do -- the
+// normalized value is stored to the element type before it is rotated --
+// which is the reference's own order when norm_q/norm_k run in the
+// model's bf16 (Qwen-Image-2.1). in == out is allowed: each lane reads its
+// pair before writing it, and the sum is taken before any write.
+// One simdgroup per (t, h).
+//   0:in 1:out 2:cos 3:sin 4:gamma[D] 5:H 6:T 7:D 8:eps
+//   grid {32, T, H}, tg {32, 1, 1}.
+kernel void rms_rope_pair_ftab_tm_f16(
+    const device VPIPE_ELT* in    [[buffer(0)]],
+    device VPIPE_ELT*       out   [[buffer(1)]],
+    const device float*     cosb  [[buffer(2)]],
+    const device float*     sinb  [[buffer(3)]],
+    const device VPIPE_ELT* gamma [[buffer(4)]],
+    constant int&           H     [[buffer(5)]],
+    constant int&           T     [[buffer(6)]],
+    constant int&           D     [[buffer(7)]],
+    constant float&         eps   [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint  lid [[thread_index_in_simdgroup]])
+{
+  const int t = (int)tid.y;
+  const int h = (int)tid.z;
+  if (t >= T || h >= H) { return; }
+  const uint ib = ((uint)t * (uint)H + (uint)h) * (uint)D;
+  float acc = 0.0f;
+  for (int i = (int)lid; i < D; i += 32) {
+    const float v = float(in[ib + i]);
+    acc += v * v;
+  }
+  acc = simd_sum(acc);
+  const float inv = rsqrt(acc / (float)D + eps);
+  const uint cb = (uint)t * (uint)D;
+  for (int p = (int)lid; p < D / 2; p += 32) {
+    const int d = 2 * p;
+    const float x1 =
+        float(VPIPE_ELT(float(in[ib + d]) * inv * float(gamma[d])));
+    const float x2 =
+        float(VPIPE_ELT(float(in[ib + d + 1]) * inv * float(gamma[d + 1])));
+    const float c = cosb[cb + d];
+    const float s = sinb[cb + d];
+    out[ib + d]     = VPIPE_ELT(x1 * c - x2 * s);
+    out[ib + d + 1] = VPIPE_ELT(x1 * s + x2 * c);
+  }
+}
+
+// The per-head RMSNorm and a HALF-SPLIT (NeoX, rotate_half) rope over
+// the WHOLE head, IN PLACE, token-major and STRIDED: row (t, h) lives at
+// x[t*stride + h*D], so the same kernel serves a [rows, H*D] projection
+// (stride H*D) and one slice of a fused [rows, 3*H*D] q|k|v (stride
+// 3*H*D, the slice bound at its column offset). MOSS-Image takes it for
+// both. Tables are f32 [T, D/2]: dim p pairs with p + D/2 and both
+// read entry p.
+//
+// The norm rounds as the reference's _RMSNorm does -- the normalized
+// value stored to the element type, multiplied by gamma and stored
+// again -- and the rotation then rounds once.
+//
+// IN PLACE IS SAFE HERE: a lane reads and writes only its own pairs
+// (p, p + D/2), and the sum of squares is reduced before any write.
+//   0:x 1:cos[T,D/2] 2:sin[T,D/2] 3:gamma[D] 4:H 5:T 6:D 7:stride 8:eps
+//   grid {32, T, H}, tg {32, 1, 1}.
+kernel void rms_rope_half_ftab_tm_f16(
+    device VPIPE_ELT*       x      [[buffer(0)]],
+    const device float*     cosb   [[buffer(1)]],
+    const device float*     sinb   [[buffer(2)]],
+    const device VPIPE_ELT* gamma  [[buffer(3)]],
+    constant int&           H      [[buffer(4)]],
+    constant int&           T      [[buffer(5)]],
+    constant int&           D      [[buffer(6)]],
+    constant int&           stride [[buffer(7)]],
+    constant float&         eps    [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint  lid [[thread_index_in_simdgroup]])
+{
+  const int t = (int)tid.y;
+  const int h = (int)tid.z;
+  if (t >= T || h >= H) { return; }
+  const uint ib = (uint)t * (uint)stride + (uint)h * (uint)D;
+  float acc = 0.0f;
+  for (int i = (int)lid; i < D; i += 32) {
+    const float v = float(x[ib + i]);
+    acc += v * v;
+  }
+  acc = simd_sum(acc);
+  const float inv = rsqrt(acc / (float)D + eps);
+  const int half_d = D / 2;
+  const uint cb = (uint)t * (uint)half_d;
+  for (int p = (int)lid; p < half_d; p += 32) {
+    const float a = float(VPIPE_ELT(
+        float(VPIPE_ELT(float(x[ib + p]) * inv)) * float(gamma[p])));
+    const float b = float(VPIPE_ELT(
+        float(VPIPE_ELT(float(x[ib + p + half_d]) * inv)) *
+        float(gamma[p + half_d])));
+    const float c = cosb[cb + p];
+    const float s = sinb[cb + p];
+    x[ib + p]          = VPIPE_ELT(a * c - b * s);
+    x[ib + p + half_d] = VPIPE_ELT(b * c + a * s);
+  }
+}
+
 // transpose_rope_pair_ftab with a PADDED output head-dim: reads TOKEN-major
 // in[(t*H+h)*D + 2i(,+1)], applies token t's interleaved-pair rope, and writes
 // HEAD-major out[(h*T+t)*Dp + 2i(,+1)] with the [D, Dp) tail ZEROED. The pad

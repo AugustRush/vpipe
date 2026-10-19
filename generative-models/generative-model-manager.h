@@ -172,16 +172,73 @@ public:
   // of the hold is exported -- its reaper is a lambda, see `_warm`.
   void keep_warm(const std::shared_ptr<LoadedLanguageModel>& lm,
                  const std::string& dir, double seconds);
-  // Drop the warm models whose directory this launch has not declared.
-  // Nothing when it declares no weights at all (an export, a probe):
-  // those compete for nothing a model holds. Returns how many went.
+  // Drop the warm models whose directory this launch has not declared --
+  // the language models and the models stages built (keep_model_warm,
+  // below). Nothing when it declares no weights at all (an export, a
+  // probe): those compete for nothing a model holds. Returns how many
+  // went.
   std::size_t release_warm_unclaimed();
+  // The language models kept warm; not the models stages built.
   std::size_t warm_count() const;
-  // The directories of the models kept warm now, and the bytes of K/V
-  // they hold -- their parked conversations' too. The weights planner
-  // (stages/model-memory.cc) weighs the directories against a launch.
+  // The directories of the models kept warm now -- both kinds, each once
+  // -- and the bytes of K/V the language models hold, their parked
+  // conversations' too. The weights planner (stages/model-memory.cc)
+  // weighs the directories against a launch.
   std::vector<std::string> warm_dirs() const;
   std::size_t warm_kv_bytes() const;
+
+  // ---- any other model kept WARM ------------------------------------
+  //
+  // The same hold for what a stage BUILDS from a checkpoint -- a DiT, a
+  // VAE, a conditioning encoder. A host running a graph per picture had
+  // each built again for every one: the weights read into the model's
+  // own buffers (a streamed DiT's resident set, an int8 layout, a VAE's
+  // converted convs), and handed back as the graph went. MEASURED on an
+  // M5 Ultra, Qwen-Image-2.1 Turbo 1024^2 x 8 steps from Draw Things'
+  // i8x DiT, the same prompt again: 5.4 s a picture, of which 0.85 s
+  // the DiT's blocks read back in its first step and 0.69 s the VAE's
+  // load and int8 conversion -- the steps themselves 0.36 s each.
+  //
+  // A stage that built a model hands it here as it ends
+  // (keep_model_warm), under its `kind` (the class, which is what
+  // take_warm casts back to), the checkpoint's `dir` (what launches
+  // claim) and a `key` naming every setting that changed what was
+  // built -- precision tier, attention, adapters. The next stage asking
+  // for all three is handed it (take_warm_model), built and resident;
+  // one hold a key. Another model of the same kind and directory under
+  // another key is let go when one is kept or taken: its settings
+  // changed, and the old build would only take room.
+  //
+  // It lives `seconds` from the keep (0 lets it go now), goes when a
+  // launch that does not claim its directory would not fit beside it
+  // (release_warm_unclaimed, as a warm language model) and at the
+  // manager's end -- which the session runs while its MetalCompute is
+  // still there, for a DiT gives its wired buffers back through it as it
+  // goes. `bytes` is what it holds, for that test. A plugin may keep its
+  // own models: plugins are never unloaded, so the deleter `model`
+  // carries outlives the hold.
+  //
+  // PLUGIN ABI 8: ADDITIONS, as keep_warm's; the members behind them sit
+  // after `_phase_asserted`. A plugin built before them never calls them
+  // and sees the same answers from the calls above until a host keeps a
+  // stage's model; one that calls them does not load on an ABI 8 host
+  // without them (the symbol is missing; no feature names them).
+  void keep_model_warm(const std::string& kind, const std::string& dir,
+                       const std::string& key, std::shared_ptr<void> model,
+                       std::size_t bytes, double seconds);
+  std::shared_ptr<void> take_warm_model(const std::string& kind,
+                                        const std::string& dir,
+                                        const std::string& key);
+  // The bytes the models kept warm for `dir` hold (0: none).
+  std::size_t warm_model_bytes(const std::string& dir) const;
+
+  template <class T>
+  std::shared_ptr<T>
+  take_warm(const std::string& kind, const std::string& dir,
+            const std::string& key)
+  {
+    return std::static_pointer_cast<T>(take_warm_model(kind, dir, key));
+  }
 
   // ---- a CONVERSATION kept by key ------------------------------------
   //
@@ -1167,6 +1224,33 @@ private:
   bool                     _warm_stop = false;
   // See set_before_park_for_test(). Guarded by _ws_mu.
   std::function<void()>    _before_park_for_test;
+  // canonical dir -> the phase interval stages ASSERTED for it at declare
+  // time ({first, last} positions in the running order), kept apart from
+  // `_phase`: an unphased declaration of the same key clears `_phase` to
+  // "undecided", and a later refinement must widen to these rather than
+  // replace them -- see set_declaration_phase.
+  //
+  // LAST, and new members go after it: this class is opaque, but the
+  // inline weights() above reads `_weights` at an offset compiled into
+  // every plugin that calls it, so nothing may be inserted ahead of it
+  // within ABI 8 (the snapshot records it: "read inline").
+  std::unordered_map<std::string, std::pair<int, int>> _phase_asserted;
+
+  // Models kept warm that are not language models (keep_model_warm),
+  // under _warm_mu with `_warm`, expired by the same reaper. Its loop is
+  // `_warm_reap`, a lambda the constructor makes, so keep_warm and
+  // keep_model_warm start one thread for both without a method of its
+  // own (see `_warm`).
+  struct WarmModel {
+    std::string                           kind;
+    std::string                           dir;
+    std::string                           key;
+    std::shared_ptr<void>                 model;
+    std::size_t                           bytes = 0;
+    std::chrono::steady_clock::time_point until;
+  };
+  std::vector<WarmModel>   _warm_models;
+  std::function<void()>    _warm_reap;
 };
 
 }

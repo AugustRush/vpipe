@@ -108,6 +108,7 @@ if(PYTHON AND LIB)
     execute_process(
       COMMAND "${PYTHON}" "${SOURCE_DIR}/cmake/abi-snapshot.py" write
               --prefix "${prefix}" --lib "${LIB}" --cxx "${CXX}"
+              --toolkit-sources "${BUILD_DIR}/vpipe-toolkit-sources.txt"
               --out "${snapshot}"
       RESULT_VARIABLE rc)
     if(NOT rc EQUAL 0)
@@ -121,6 +122,7 @@ if(PYTHON AND LIB)
     execute_process(
       COMMAND "${PYTHON}" "${SOURCE_DIR}/cmake/abi-snapshot.py" check
               --prefix "${prefix}" --lib "${LIB}" --cxx "${CXX}"
+              --toolkit-sources "${BUILD_DIR}/vpipe-toolkit-sources.txt"
               --snapshot "${snapshot}"
       RESULT_VARIABLE rc)
     if(NOT rc EQUAL 0)

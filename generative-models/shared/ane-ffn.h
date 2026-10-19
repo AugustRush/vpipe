@@ -144,6 +144,11 @@ class AneFeedForward {
     // {up, down}, and the fp16 headroom rides the DOWN projection, since
     // gelu(x / s) is not gelu(x) / s.
     bool  gelu    = false;
+    // MOSS-Image's SITU feed-forward, (4 tanh(g/4) sigmoid(g)) *
+    // (25 tanh(u/25)) @ Wd: staged as {gate, up, down} like a SwiGLU, but
+    // NEITHER input of the activation is linear in it, so the fp16
+    // headroom rides the DOWN projection (slot 2).
+    bool  situ    = false;
   };
 
   // Builds the module and its weight slots, or explains at warn/info why
@@ -281,6 +286,9 @@ class AneFeedForward {
   int _hidden = 0, _ffn = 0, _chunk = kChunkDefault;
   bool _matmul = false;
   bool _gelu   = false;      // {up, down}: the headroom rides slot 1 = down
+  // The slot the fp16 headroom scale divides: 1 (SwiGLU's up, GELU's
+  // down), or 2 (SITU's down).
+  std::size_t _scaled = 1;
   int  _out_w  = 0;          // output row width: hidden, or ffn for matmul
   std::uint64_t _row_flops = 0;  // one row's predict, for perf-flops
   std::unique_ptr<AneModule>      _rt;

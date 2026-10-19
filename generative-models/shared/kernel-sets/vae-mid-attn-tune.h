@@ -24,8 +24,8 @@
 // The caller owns the kernels and the dispatch -- it passes an `encode` that
 // runs one attention with a given member, the same entry point its decode uses,
 // so the tuner measures the shipping path rather than a re-derivation of it.
-// FLUX.2 offers all seven members; the Krea-2 VAE has no materialized path and
-// simply does not list kMat.
+// FLUX.2 offers all seven members; the Krea-2 VAE (Qwen-Image's) lists kMat
+// with K centred, which is what lets it pass the gate below.
 
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/shared/kernel-autotune.h"

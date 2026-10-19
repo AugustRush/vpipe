@@ -2286,6 +2286,99 @@ kernel void embed_gather_q4k_f16(
   out[(uint)t * H + h] = VPIPE_ELT(q4k_value(sb, h & 255));
 }
 
+// A VAE mid-block attention's K, CENTRED for a materialized Q.K^T
+// (MetalKrea2Vae's kMat). Softmax ignores a constant added to a row, and
+// q_i . mean(k) is one, so the scores against k - mean(k) are the same
+// attention -- without the offset a positive-mean K puts on every score
+// of a row, which in f16 rounds away the differences between keys (at
+// 1.4e4 the steps are 8 apart). It is also what SageAttention calls
+// smoothing K, for the same reason under int8.
+//
+// The column sums IN A FIXED ORDER, so a decode is the same run to run:
+// vae_attn_colsum_f16 writes one partial a chunk of rows (a thread four
+// columns of it), vae_attn_colsum_reduce_f32 sums the chunks in turn.
+// Atomic adds summed them in whatever order the chunks finished, and two
+// identical generations came out ~70 dB apart.
+//   colsum: 0:x[rows, C]  1:part[chunks, C] f32  2:C (% 4 == 0)  3:rows
+//     4:rows_per; dispatch {C/4, chunks, 1}
+//   reduce: 0:part  1:sum[C] f32  2:C  3:chunks; dispatch {C, 1, 1}
+kernel void vae_attn_colsum_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    device float*           part  [[buffer(1)]],
+    const constant int& C        [[buffer(2)]],
+    const constant int& rows     [[buffer(3)]],
+    const constant int& rows_per [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int c4 = (int)gid.x;
+  if (c4 * 4 >= C) { return; }
+  const int r0 = (int)gid.y * rows_per;
+  const int r1 = min(rows, r0 + rows_per);
+  float4 a = 0.0f;
+  for (int r = r0; r < r1; ++r) {
+    const device VPIPE_ELT* p = x + (ulong)r * (ulong)C + (ulong)(c4 * 4);
+    a += float4((float)p[0], (float)p[1], (float)p[2], (float)p[3]);
+  }
+  *reinterpret_cast<device float4*>(part + (ulong)gid.y * (ulong)C +
+                                    (ulong)(c4 * 4)) = a;
+}
+
+kernel void vae_attn_colsum_reduce_f32(
+    const device float* part   [[buffer(0)]],
+    device float*       sum    [[buffer(1)]],
+    const constant int& C      [[buffer(2)]],
+    const constant int& chunks [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const int c = (int)gid;
+  if (c >= C) { return; }
+  float a = 0.0f;
+  for (int i = 0; i < chunks; ++i) { a += part[(ulong)i * (ulong)C + c]; }
+  sum[c] = a;
+}
+
+// out[r, c] = (x[r, c] - sum[c] / rows) * scale -- K centred and carrying
+// the softmax's 1/sqrt(C), so the product's scores come out scaled.
+//   0:x[rows, C]  1:out[rows, C]  2:sum[C] f32  3:C  4:inv_rows  5:scale
+//   dispatch {C, rows, 1}
+kernel void vae_attn_center_f16(
+    const device VPIPE_ELT* x      [[buffer(0)]],
+    device VPIPE_ELT*       out    [[buffer(1)]],
+    const device float*     sum    [[buffer(2)]],
+    const constant int&     C      [[buffer(3)]],
+    const constant float&   inv_rows [[buffer(4)]],
+    const constant float&   scale  [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int c = (int)gid.x;
+  if (c >= C) { return; }
+  const ulong at = (ulong)gid.y * (ulong)C + (ulong)c;
+  out[at] = (VPIPE_ELT)(((float)x[at] - sum[c] * inv_rows) * scale);
+}
+
+// A speculative verify's per-position seen-sets, built on the GPU from
+// the round's own ids: row k = base | {ids[0..k]} -- the anchor and the
+// first k drafts, what the serial sampler's seen-set holds when it
+// samples position k. A penalised round so keeps its draft in the
+// verify's command buffer instead of reading the drafts back first.
+// 0:base [V] 1:ids [L] int32 2:rows [L, V] 3:V 4:L
+kernel void seen_rows_from_ids(
+    const device uchar* base [[buffer(0)]],
+    const device int*   ids  [[buffer(1)]],
+    device uchar*       rows [[buffer(2)]],
+    constant int&       V    [[buffer(3)]],
+    constant int&       L    [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int t = (int)gid.x, k = (int)gid.y;
+  if (t >= V || k >= L) { return; }
+  uchar s = base[t];
+  for (int i = 0; i <= k; ++i) {
+    if (ids[i] == t) { s = 1; }
+  }
+  rows[(size_t)k * (size_t)V + (size_t)t] = s;
+}
+
 // Plain f16 strided copy: out[off + gid] = src[gid] for gid in [0, N).
 // Folds an already-f16 sub-tensor (the Q8_0 a/b projections, dequant'd to
 // f16 at load) into the fused dequant scratch for the k-quant prefill GEMM,
@@ -5358,6 +5451,52 @@ kernel void swiglu_split_gate_first_f16(
   const float g = float(in[base + d]);
   const float v = float(in[base + D + d]);
   out[gid] = VPIPE_ELT(v * (g / (1.0f + exp(-g))));
+}
+
+// MOSS-Image's SITU activation, read off a fused [hidden | gate]
+// projection -- hidden FIRST, as the reference's `.chunk(2, -1)` spells
+// it:
+//   out[r,d] = (4 tanh(g/4) sigmoid(g)) * (25 tanh(h/25)),
+//   h = in[r,d], g = in[r,D+d].
+// Both squashes are part of the model, not guards: the gate is a
+// bounded swish (4 tanh(g/4) saturates it at 4) and the value is
+// soft-clipped at 25. PRECISE tanh: the fast one loses relative
+// accuracy near zero, where 25 tanh(h/25) ~ h is the whole signal.
+// f32 inside, one rounding out; the reference rounds after every op in
+// bf16, which is further from its own fp32 run.
+//   0:in[rows,2*D] 1:out[rows,D] 2:rows 3:D.  grid (rows*D).
+kernel void situ_split_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      rows [[buffer(2)]],
+    constant int&      D    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)(rows * D)) { return; }
+  const int r = (int)gid / D;
+  const int d = (int)gid % D;
+  const int64_t base = (int64_t)r * (2 * D);
+  const float h = float(in[base + d]);
+  const float g = float(in[base + D + d]);
+  const float gate = 4.0f * precise::tanh(g * 0.25f) / (1.0f + exp(-g));
+  out[gid] = VPIPE_ELT(gate * (25.0f * precise::tanh(h * 0.04f)));
+}
+
+// The same SITU over two SEPARATE buffers, hidden and gate -- MOSS-
+// Image's text blocks keep ffn_up and ffn_gate as two Linears.
+//   0:h[n] 1:g[n] 2:out[n] 3:n.  grid (n).  out may alias h or g.
+kernel void situ_f16(
+    const device VPIPE_ELT* hb  [[buffer(0)]],
+    const device VPIPE_ELT* gb  [[buffer(1)]],
+    device VPIPE_ELT*       out [[buffer(2)]],
+    constant int&      n   [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)n) { return; }
+  const float h = float(hb[gid]);
+  const float g = float(gb[gid]);
+  const float gate = 4.0f * precise::tanh(g * 0.25f) / (1.0f + exp(-g));
+  out[gid] = VPIPE_ELT(gate * (25.0f * precise::tanh(h * 0.04f)));
 }
 
 

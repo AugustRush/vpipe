@@ -1,0 +1,92 @@
+{
+  "id": "moss-image-text-to-image",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "OpenMOSS-Team/MOSS-Image-Base"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "A wide view of a refrigerator beside a kitchen counter with a fruit bowl. A small sticky note on the refrigerator door is handwritten in Chinese:\n\"记得买牛奶和鸡蛋！\n牛奶两盒，鸡蛋一打。\n顺便带一袋面包。\""
+      }
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "generate-image",
+      "type": "generate-image",
+      "iports": [
+        {
+          "src": "diffusion-conditioner",
+          "oport": 0
+        },
+        {
+          "src": "diffusion-conditioner",
+          "oport": 1
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 1024,
+        "height": 1024,
+        "seed": 42
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-image",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "path": "moss-image.png"
+      }
+    }
+  ],
+  "subpipelines": []
+}

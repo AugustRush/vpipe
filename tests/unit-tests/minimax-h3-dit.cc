@@ -34,6 +34,7 @@
 // either is unset.
 
 #include "minitest.h"
+#include "residency-reserve.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "generative-models/shared/riffle-rows.h"
@@ -3502,4 +3503,341 @@ TEST(minimax_h3_dit, layouts_agree)
   } else {
     EXPECT_TRUE(v.first == 0 && u.first == 0);
   }
+}
+
+// THE INT8 TIERS ON A STREAMED STACK. A preloaded block holds its
+// projections in the tier's layout (i8_linear_); a STREAMED one keeps the
+// layout too -- a dense weight's bf16 refilled and quantized after every
+// read (Linear::ds), a w8 pack's codes converted in place (ps), a w4 pack
+// converted per projection (pc) -- and a block residency keeps holds the
+// layout alone (keep_block_), cloned out of a slot or MOVED in from the
+// per-block fallback. Every hold must be BYTE-IDENTICAL to the preload, on
+// every tier, through a BAKED schedule: once the AdaLN tables replace the
+// projection, streamed blocks are built without it, and that must not
+// cost them the layout. 1333 rows clear the int8 GEMM's 1024-row floor.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (the release, any partition the
+// loader resolves) and/or VPIPE_MINIMAX_H3_PACK_DIT (a model-quantize'd
+// DiT: w8, w4 or mixed; adds the held-w4 arms), VPIPE_H3_TIER_LAYERS
+// (default 4). Matrix cores only (the tiers do not engage elsewhere).
+TEST(minimax_h3_dit, int8_tiers_hold_streamed_and_promoted)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  std::vector<std::string> dirs;
+  for (const char* var :
+       {"VPIPE_MINIMAX_H3_TEST_MODEL_PATH", "VPIPE_MINIMAX_H3_PACK_DIT"}) {
+    const char* e = std::getenv(var);
+    if (e != nullptr && *e != '\0') { dirs.emplace_back(e); }
+  }
+  if (dirs.empty()) { return; }
+  const int layers = [] {
+    const char* v = std::getenv("VPIPE_H3_TIER_LAYERS");
+    return v != nullptr && *v != '\0' ? std::max(2, std::atoi(v)) : 4;
+  }();
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  // Every tuner pinned: a route chosen by timing makes two loads of one
+  // model differ, and this compares bytes.
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  Env noqmm("VPIPE_H3_NO_QMM_AUTOTUNE", "1");
+  Env notile("VPIPE_H3_NO_ATTN_TILE_AUTOTUNE", "1");
+  const int latf = 5, lath = 32, latw = 32, naud = 37, ntext = 16;
+  const char* tname[4] = {"accurate", "fast", "token", "token_plain"};
+  for (const std::string& dir : dirs) {
+    MetalMiniMaxH3Transformer::Config base;
+    std::string cerr;
+    if (!MetalMiniMaxH3Transformer::config_from_json(dir, base, &cerr)) {
+      std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+      ASSERT_TRUE(false);
+      continue;
+    }
+    base.n_layers = layers;
+    h3::PackedLayout L;
+    const std::vector<int> tags((std::size_t)ntext, h3::kTextTag);
+    ASSERT_TRUE(h3::build_packed_sequence(tags, latf, lath, latw, naud,
+                                          base.patch_h, base.patch_w,
+                                          h3::kAudioChannels,
+                                          {h3::Anchor::kFirst}, &L));
+    const int n_video = (int)L.video_indices.size();
+    auto ramp = [](std::size_t n, float k) {
+      std::vector<float> v(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        v[i] = std::sin((float)i * k) * 0.5f;
+      }
+      return v;
+    };
+    const SharedBuffer vb = to_bf16_buf_(
+        mc, ramp((std::size_t)n_video * base.video_patch_elems(), 0.017f));
+    const SharedBuffer ab = to_bf16_buf_(
+        mc, ramp((std::size_t)L.num_audio_rows * base.audio_channels,
+                 0.031f));
+    const SharedBuffer tb = to_bf16_buf_(
+        mc, ramp((std::size_t)ntext * base.text_dim, 0.005f));
+    // Two baked steps: the second forward is the one compared, so a
+    // grown arm runs it on PROMOTED blocks.
+    const float kV[] = {0.9f, 0.5f};
+    const float kA[] = {0.8f, 0.45f};
+    std::vector<std::vector<float>> sched, uniqs(2);
+    std::vector<std::vector<int>> ridx(2);
+    for (int i = 0; i < 2; ++i) {
+      h3::build_row_timesteps(L, kV[i], kA[i], 1.0f, &uniqs[(std::size_t)i],
+                              &ridx[(std::size_t)i]);
+      sched.push_back(uniqs[(std::size_t)i]);
+    }
+    struct Out {
+      std::vector<std::uint16_t> v, a;
+      bool layout = false;
+      int kept = 0;
+      std::size_t held = 0;
+    };
+    // stream / slots / grow / hold.
+    auto run = [&](int tier, bool stream, bool slots, bool grow,
+                   bool hold) -> Out {
+      Out o;
+      std::unique_ptr<Env> ns;
+      if (!slots) { ns = std::make_unique<Env>("VPIPE_H3_NO_SLOTS", "1"); }
+      MetalMiniMaxH3Transformer::Config c = base;
+      c.i8_gemm = true;
+      c.i8_tier = tier;
+      c.i8_hold_w4 = hold;
+      auto m = MetalMiniMaxH3Transformer::load(dir, mc, c, stream);
+      if (m == nullptr) { return o; }
+      m->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32);
+      if (grow) {
+        m->set_residency_reserve(test_residency_reserve(2ull << 30));
+      }
+      std::string berr;
+      if (!m->bake_adaln(sched, &berr)) {
+        std::printf("[minimax_h3_dit] bake: %s\n", berr.c_str());
+        return o;
+      }
+      MetalMiniMaxH3Transformer::Velocity out;
+      for (int i = 0; i < 2; ++i) {
+        MetalMiniMaxH3Transformer::Step st;
+        st.video = &vb;  st.audio = &ab;  st.text = &tb;
+        st.layout = &L;
+        st.timesteps = &uniqs[(std::size_t)i];
+        st.row_timestep_index = &ridx[(std::size_t)i];
+        st.schedule_index = i;
+        std::string ferr;
+        out = m->forward(st, &ferr);
+        if (out.empty()) {
+          std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+          return o;
+        }
+      }
+      auto words = [](const SharedBuffer& b) {
+        const auto* p = static_cast<const std::uint16_t*>(b.contents());
+        return std::vector<std::uint16_t>(p, p + b.byte_size() / 2);
+      };
+      o.v = words(out.video);
+      o.a = words(out.audio);
+      o.layout = m->i8_layout();
+      o.kept = m->resident_block_count();
+      o.held = m->resident_block_bytes();
+      return o;
+    };
+    auto same = [](const Out& x, const Out& y) {
+      return !x.v.empty() && x.v == y.v && x.a == y.a;
+    };
+    for (int tier : {1, 2, 3}) {
+      const Out pre = run(tier, false, true, false, false);
+      const Out str = run(tier, true, true, false, false);
+      const Out flat = run(tier, true, false, false, false);
+      const Out grown = run(tier, true, true, true, false);
+      const Out grown_flat = run(tier, true, false, true, false);
+      // The w4 layout HELD (a pack's w4 projections): preloaded, and
+      // reached by promotion.
+      const Out hpre = run(tier, false, true, false, true);
+      const Out hgrown = run(tier, true, true, true, true);
+      ASSERT_TRUE(!pre.v.empty());
+      if (pre.v.empty()) { continue; }
+      std::printf("[minimax_h3_dit] %s, %s tier, %d layers, %d rows: "
+                  "layout %d; streamed %s, no slots %s, promoted (%d) %s, "
+                  "promoted with no slots (%d) %s; w4 held %s, held by "
+                  "promotion %s (%zu MB kept against %zu per call)\n",
+                  dir.c_str(), tname[tier], layers,
+                  (int)L.video_indices.size() + L.num_audio_rows + ntext,
+                  (int)pre.layout,
+                  same(str, pre) ? "IDENTICAL" : "DIFFERENT",
+                  same(flat, pre) ? "IDENTICAL" : "DIFFERENT", grown.kept,
+                  same(grown, pre) ? "IDENTICAL" : "DIFFERENT",
+                  grown_flat.kept,
+                  same(grown_flat, pre) ? "IDENTICAL" : "DIFFERENT",
+                  same(hpre, pre) ? "IDENTICAL" : "DIFFERENT",
+                  same(hgrown, pre) ? "IDENTICAL" : "DIFFERENT",
+                  hgrown.held >> 20, grown.held >> 20);
+      EXPECT_TRUE(pre.layout && str.layout && grown.layout);
+      EXPECT_TRUE(same(str, pre) && same(flat, pre));
+      EXPECT_TRUE(grown.kept > 0 && same(grown, pre));
+      EXPECT_TRUE(grown_flat.kept > 0 && same(grown_flat, pre));
+      EXPECT_TRUE(same(hpre, pre) && same(hgrown, pre));
+      // The moved blocks hold what the cloned ones do, where both kept
+      // the stack.
+      if (grown.kept == layers && grown_flat.kept == layers) {
+        EXPECT_TRUE(grown.held == grown_flat.held);
+      }
+    }
+  }
+}
+
+// A DRAW THINGS i8x CHECKPOINT as the DiT (VPIPE_DRAWTHINGS_H3_CKPT,
+// Draw Things' minimax_h3_fl2va_i8x.ckpt): on i8_gemm_tier token_plain
+// its codes and row scales are read as stored -- it must ENGAGE there,
+// be BYTE-IDENTICAL preloaded and streamed (3+ layers reach the slot
+// refill, which refills the codes raw by name and rebuilds the f32
+// scales), and sit near the dense forward of the same file (i8 off,
+// every weight dequantized on the way out); the rotated `token` tier
+// requantizes the file and must sit near it too. 1333 rows clear the
+// int8 GEMM's 1024-row floor. Env: _LAYERS (default 3).
+TEST(minimax_h3_dit, drawthings_i8x_runs_native)
+{
+  const char* ck = std::getenv("VPIPE_DRAWTHINGS_H3_CKPT");
+  if (ck == nullptr || *ck == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  const int layers = [] {
+    const char* v = std::getenv("VPIPE_DRAWTHINGS_H3_LAYERS");
+    return v != nullptr && *v != '\0' ? std::atoi(v) : 3;
+  }();
+  const int latf = 5, lath = 32, latw = 32, naud = 37, ntext = 16;
+  struct Arm {
+    std::vector<float> video, audio;
+    bool layout = false, native = false;
+    std::string kernel;
+  };
+  auto run = [&](bool i8, int tier, bool stream, bool db = false,
+                 bool wide = false) -> Arm {
+    MetalMiniMaxH3Transformer::Config cfg;
+    std::string cerr;
+    if (!MetalMiniMaxH3Transformer::config_from_json(ck, cfg, &cerr)) {
+      std::printf("[drawthings_h3] config: %s\n", cerr.c_str());
+      return {};
+    }
+    cfg.n_layers = layers;
+    cfg.i8_gemm = i8;
+    cfg.i8_tier = tier;
+    h3::PackedLayout L;
+    const std::vector<int> text_tags((std::size_t)ntext, h3::kTextTag);
+    if (!h3::build_packed_sequence(text_tags, latf, lath, latw, naud,
+                                   cfg.patch_h, cfg.patch_w,
+                                   h3::kAudioChannels, {h3::Anchor::kFirst},
+                                   &L)) {
+      return {};
+    }
+    std::vector<float> uniq;
+    std::vector<int> row_idx;
+    h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+    const int n_video = (int)L.video_indices.size();
+    std::vector<float> vin((std::size_t)n_video * cfg.video_patch_elems());
+    std::vector<float> ain((std::size_t)L.num_audio_rows * cfg.audio_channels);
+    std::vector<float> tin((std::size_t)ntext * cfg.text_dim);
+    std::uint32_t sd = 0x51ced00du;
+    auto fill = [&](std::vector<float>& v) {
+      for (auto& e : v) {
+        sd = sd * 1664525u + 1013904223u;
+        e = ((float)(sd >> 9) / 4194304.0f - 1.0f);
+      }
+    };
+    fill(vin);
+    fill(ain);
+    fill(tin);
+    const SharedBuffer vb = to_bf16_buf_(mc, vin);
+    const SharedBuffer ab = to_bf16_buf_(mc, ain);
+    const SharedBuffer tb = to_bf16_buf_(mc, tin);
+    MetalMiniMaxH3Transformer::Step step;
+    step.video  = &vb;
+    step.audio  = &ab;
+    step.text   = &tb;
+    step.layout = &L;
+    step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    // The engine's own token kernel unless the A/B knob names another
+    // (read when the model builds its int8 context, i.e. in load).
+    if (db || wide) {
+      ::setenv("VPIPE_I8_TOKEN_KERNEL",
+               db ? (wide ? "d64x128" : "d128x64") : "m64x128", 1);
+    }
+    auto m = MetalMiniMaxH3Transformer::load(ck, mc, cfg, stream);
+    ::unsetenv("VPIPE_I8_TOKEN_KERNEL");
+    if (m == nullptr) {
+      std::printf("[drawthings_h3] load failed\n");
+      return {};
+    }
+    std::string ferr;
+    MetalMiniMaxH3Transformer::Velocity out = m->forward(step, &ferr);
+    if (out.empty()) {
+      std::printf("[drawthings_h3] forward: %s\n", ferr.c_str());
+      return {};
+    }
+    auto to_f32 = [](const SharedBuffer& b) {
+      std::vector<float> v(b.byte_size() / 2);
+      const auto* p = static_cast<const std::uint16_t*>(b.contents());
+      for (std::size_t i = 0; i < v.size(); ++i) { v[i] = bf16_to_f32_(p[i]); }
+      return v;
+    };
+    Arm a;
+    a.video = to_f32(out.video);
+    a.audio = to_f32(out.audio);
+    a.layout = m->i8_layout();
+    a.native = m->i8x_native();
+    a.kernel = m->i8_token_kernel();
+    return a;
+  };
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      num += d * d;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : 0.0;
+  };
+  const Arm dense = run(false, 0, false);
+  const Arm pre = run(true, 3, false);
+  const Arm str = run(true, 3, true);
+  const Arm rot = run(true, 2, false);
+  ASSERT_TRUE(!dense.video.empty() && pre.video.size() == dense.video.size()
+              && str.video.size() == dense.video.size() &&
+              rot.video.size() == dense.video.size());
+  if (dense.video.empty() || pre.video.size() != dense.video.size() ||
+      str.video.size() != dense.video.size() ||
+      rot.video.size() != dense.video.size()) {
+    return;
+  }
+  const bool same = pre.video == str.video && pre.audio == str.audio;
+  std::printf("[drawthings_h3] %d layers, %d+%d+%d rows: vs the file's "
+              "dense forward -- native token video %.3e audio %.3e, "
+              "requantized rotated video %.3e audio %.3e; native engaged "
+              "%d/%d, streamed %s\n", layers, latf * lath * latw / 4, naud,
+              ntext, rel(pre.video, dense.video),
+              rel(pre.audio, dense.audio), rel(rot.video, dense.video),
+              rel(rot.audio, dense.audio), (int)pre.layout,
+              (int)pre.native, same ? "IDENTICAL" : "DIFFERENT");
+  EXPECT_TRUE(pre.layout && pre.native && str.layout && rot.layout);
+  EXPECT_TRUE(!rot.native);
+  EXPECT_TRUE(same);
+  // Another token GEMM (VPIPE_I8_TOKEN_KERNEL=d64x128: the double-
+  // buffered loop at the other tile): the same sums, so BYTE-IDENTICAL
+  // -- once it is shown to be the kernel that ran.
+  {
+    const Arm alt = run(true, 3, false, true, true);
+    const bool ident = alt.video == pre.video && alt.audio == pre.audio;
+    std::printf("[drawthings_h3] %s GEMM (default %s): %s\n",
+                alt.kernel.c_str(), pre.kernel.c_str(),
+                ident ? "IDENTICAL" : "DIFFERENT");
+    EXPECT_TRUE(pre.kernel == "blocked 128x64");
+    EXPECT_TRUE(alt.kernel == "double-buffered 64x128");
+    EXPECT_TRUE(ident);
+  }
+  // Gross-error bars: an int8 per row and per token over the file's own
+  // int8 weights, a few blocks deep -- a misread layout is O(1).
+  EXPECT_TRUE(rel(pre.video, dense.video) < 0.2);
+  EXPECT_TRUE(rel(rot.video, dense.video) < 0.2);
 }

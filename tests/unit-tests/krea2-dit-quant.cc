@@ -9,6 +9,7 @@
 // VPIPE_KREA2_GOLDEN. Skips if unset.
 
 #include "minitest.h"
+#include "residency-reserve.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -18,6 +19,8 @@
 #include "generative-models/krea2/metal-krea2-calibration.h"
 #include "generative-models/krea2/metal-krea2-transformer.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/shared/block-slots.h"
+#include "generative-models/shared/i8-gemm.h"
 #include "generative-models/quantize/model-quantizer.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
@@ -623,7 +626,7 @@ TEST(krea2_dit_quant, signed_layout_matches_native)
       auto m = MetalKrea2Transformer::load(ddir, mc, cfg, stream);
       if (!m) { return v; }
       if (m->signed_layout() != (sgn && i8)) { engaged = false; }
-      m->set_residency_reserve(grow ? (4ull << 30) : 0);
+      m->set_residency_reserve(grow ? test_residency_reserve(4ull << 30) : 0);
       if (grow) { m->set_residency_schedule(4); }
       const int HID = cfg.hidden, IC = cfg.in_channels;
       SharedBuffer fused = mc->make_shared_buffer((std::size_t)TS * HID * 2);
@@ -682,6 +685,307 @@ TEST(krea2_dit_quant, signed_layout_matches_native)
     // gemm_i8.signed_layout_matches_oracle is the accuracy statement; a
     // misread layout is O(1) here.
     EXPECT_TRUE(rs <= 1.25 * rn);
+  }
+}
+
+// A MIXED PACK (VPIPE_KREA2_MIXED_DIT = the transformer/ of a
+// model-quantize bits 4 + mixed run): whole main blocks at w8, the rest
+// at w4, so a slot built for one width is asked to hold the other --
+// including the gate|up weave it derives after the read
+// (BlockSlots::Ops::same_layout). The pack must really mix widths, and
+// its four holds -- preloaded, streamed, no slots, promoted -- must be
+// BYTE-IDENTICAL with i8 off, and on a matrix-core box under the signed
+// layout and (when block 0, which gates the fast tier, is w8) the fast
+// and token tiers. Before the slots rebuilt such a block, preloaded and
+// no-slots agreed and the two slot holds did not.
+TEST(krea2_dit_quant, a_mixed_pack_holds_agree)
+{
+  const char* ddir = std::getenv("VPIPE_KREA2_MIXED_DIT");
+  if (ddir == nullptr || *ddir == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  int n8 = 0, n4 = 0;
+  {
+    auto ws = vpipe::genai::WeightSet::open(ddir, nullptr);
+    ASSERT_TRUE(ws != nullptr);
+    if (ws == nullptr) { return; }
+    for (int L = 0; L < 64; ++L) {
+      const int b = vpipe::genai::stored_affine_bits(
+          *ws, "transformer_blocks." + std::to_string(L) + ".attn.to_q", 64);
+      n8 += b == 8;
+      n4 += b == 4;
+    }
+  }
+  std::printf("[krea2_dit_quant] mixed pack: %d main blocks w8, %d w4\n",
+              n8, n4);
+  ASSERT_TRUE(n8 > 0 && n4 > 0);
+  if (n8 == 0 || n4 == 0) { return; }
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int gh = 32, gw = 40, img_seq = gh * gw, TS = 64;
+  bool engaged = true;
+  bool fast_on = false;
+  int f8 = 0, f4 = 0;
+  int promoted = 0, relaid = 0;
+  int stack = 0;
+  std::size_t grown_bytes = 0;
+  auto run = [&](int tier, bool stream, bool slots, bool grow,
+                 bool hold = false) {
+    std::unique_ptr<Env> ns;
+    if (!slots) { ns = std::make_unique<Env>("VPIPE_KREA2_NO_SLOTS", "1"); }
+    MetalKrea2Transformer::Config cfg;
+    cfg.i8_gemm = tier >= 0;
+    cfg.i8_tier = tier < 0 ? 0 : tier;
+    cfg.i8_hold_w4 = hold;
+    std::vector<float> v;
+    auto m = MetalKrea2Transformer::load(ddir, mc, cfg, stream);
+    if (!m) { return v; }
+    if (tier == 0 && !m->signed_layout()) { engaged = false; }
+    if (tier > 0) {
+      fast_on = m->fast_tier();
+      if (!stream) {
+        f8 = m->fast_weights(8);
+        f4 = m->fast_weights(4);
+      }
+    }
+    m->set_residency_reserve(grow ? test_residency_reserve(16ull << 30) : 0);
+    if (grow) { m->set_residency_schedule(4); }
+    const int HID = cfg.hidden, IC = cfg.in_channels;
+    SharedBuffer fused = mc->make_shared_buffer((std::size_t)TS * HID * 2);
+    SharedBuffer lat = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
+    std::mt19937 rng(20261018);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    { auto* d = static_cast<_Float16*>(fused.contents());
+      for (std::size_t i = 0; i < (std::size_t)TS * HID; ++i) {
+        d[i] = (_Float16)nd(rng);
+      } }
+    { auto* d = static_cast<_Float16*>(lat.contents());
+      for (std::size_t i = 0; i < (std::size_t)img_seq * IC; ++i) {
+        d[i] = (_Float16)nd(rng);
+      } }
+    SharedBuffer out;
+    for (int it = 0; it < (grow ? 2 : 1); ++it) {
+      out = m->forward_dit(fused, TS, lat, img_seq, gh, gw, 0.5f, -1);
+    }
+    if (grow) {
+      promoted = m->resident_block_count();
+      stack = m->config().n_layers;
+      grown_bytes = m->held_block_bytes();
+    }
+    if (stream && slots && !grow) { relaid = m->slot_relayouts(); }
+    if (out.empty()) { return v; }
+    const auto* p = static_cast<const _Float16*>(out.contents());
+    v.resize((std::size_t)img_seq * IC);
+    for (std::size_t i = 0; i < v.size(); ++i) { v[i] = (float)p[i]; }
+    return v;   // m freed here: one model resident at a time
+  };
+  std::vector<int> tiers = {-1};
+  if (mc->supports_matrix_cores()) { tiers.insert(tiers.end(), {0, 1, 2}); }
+  const char* tname[3] = {"accurate (signed)", "fast", "token"};
+  for (int tier : tiers) {
+    engaged = true;
+    const std::vector<float> pre = run(tier, false, true, false);
+    ASSERT_TRUE(!pre.empty());
+    if (pre.empty()) { return; }
+    if (tier > 0) {
+      // BOTH WIDTHS take the tier: a w8 block's codes converted once,
+      // a w4 one's into the scratch before each GEMM. Uniform w8 packs:
+      // fast_tier_matches_accurate.
+      std::printf("[krea2_dit_quant] mixed pack, %s: %d w8 and %d w4 "
+                  "projections in its layout\n", tname[tier], f8, f4);
+      EXPECT_TRUE(fast_on && f8 > 0 && f4 > 0);
+      if (!fast_on) { continue; }
+    }
+    const std::vector<float> str = run(tier, true, true, false);
+    const std::vector<float> flat = run(tier, true, false, false);
+    const std::vector<float> grown = run(tier, true, true, true);
+    const std::size_t grown_pc = grown_bytes;
+    // A HELD layout reached by PROMOTION: residency converts each w4
+    // block it keeps (clone_block_), which then holds more than the
+    // pack -- and must equal the held preload.
+    const std::vector<float> grown_held =
+        tier > 0 ? run(tier, true, true, true, true) : grown;
+    const std::size_t grown_h = grown_bytes;
+    const int grown_n = promoted;
+    // ...and with NO SLOTS, where promote_into MOVES each per-block read
+    // into the resident set: the keep pass (keep_block_) must leave it
+    // holding exactly what the slots' clone does.
+    const std::vector<float> flat_held =
+        tier > 0 ? run(tier, true, false, true, true) : grown;
+    const std::size_t flat_h = tier > 0 ? grown_bytes : grown_h;
+    const int flat_n = tier > 0 ? promoted : grown_n;
+    // The bytes compare only where BOTH kept the whole streamed stack:
+    // a slotted run short of it still holds its slot pair, and a box
+    // with little room (a 16 GB M5) keeps what its budget allows.
+    const bool whole = grown_n == stack && flat_n == stack;
+    // The engine's other answer for a w4 pack: its int8 layout
+    // HELD (Config::i8_hold_w4) where it is converted per GEMM
+    // above -- the same values, so the same bytes.
+    const auto held =
+        tier > 0 ? run(tier, false, true, false, true) : pre;
+    auto same = [&](const std::vector<float>& a) {
+      return a.size() == pre.size() &&
+             std::memcmp(a.data(), pre.data(), a.size() * 4) == 0;
+    };
+    std::printf("[krea2_dit_quant] mixed pack, %s: streamed %s, no slots "
+                "%s, promoted (%d blocks) %s%s\n",
+                tier < 0 ? "no i8" : tname[tier],
+                same(str) ? "IDENTICAL" : "DIFFERENT",
+                same(flat) ? "IDENTICAL" : "DIFFERENT", promoted,
+                same(grown) ? "IDENTICAL" : "DIFFERENT",
+                engaged ? "" : " -- NOT ENGAGED");
+    EXPECT_TRUE(engaged);
+    EXPECT_TRUE(same(str));
+    EXPECT_TRUE(same(flat));
+    EXPECT_TRUE(promoted > 0 && same(grown));
+    if (tier > 0) {
+      std::printf("[krea2_dit_quant] ... w4 layout held: %s; held by "
+                  "promotion %s (%zu MB kept against %zu per call), with "
+                  "no slots %s (%zu MB)\n",
+                  same(held) ? "IDENTICAL" : "DIFFERENT",
+                  same(grown_held) ? "IDENTICAL" : "DIFFERENT",
+                  grown_h >> 20, grown_pc >> 20,
+                  same(flat_held) ? "IDENTICAL" : "DIFFERENT",
+                  flat_h >> 20);
+      EXPECT_TRUE(same(grown_held) && grown_h > grown_pc);
+      // The moved blocks must hold the bytes the cloned ones do.
+      EXPECT_TRUE(same(flat_held) && (!whole || flat_h == grown_h));
+    }
+    EXPECT_TRUE(same(held));
+    // The slots crossed widths and REBUILT. A slot that refused such a
+    // block instead turns itself off, and its holds still agree.
+    std::printf("[krea2_dit_quant] ... %d streamed blocks built into their "
+                "slot\n", relaid);
+    EXPECT_TRUE(relaid > 0);
+  }
+}
+
+// THE FAST AND TOKEN TIERS (i8_gemm_tier fast / token / token_plain) on
+// the main blocks, as qwen_image_21_dit.fast_tier_matches_accurate: a w8
+// g64 pack (VPIPE_KREA2_DIT_DIR) converted in the entries a preloaded
+// block keeps, in a streamed read, in a refilled slot and copied by
+// promotion -- every arm BYTE-IDENTICAL to the preloaded one -- and a
+// bf16 checkpoint (VPIPE_KREA2_TEST_MODEL_PATH's transformer/) quantized
+// once at load, or after each refill when streamed, its every hold
+// byte-identical too. Each arm must ENGAGE (the tier at the group it names)
+// before anything is compared, and sit within a gross-error bar of the
+// accurate tier in distance from the dense (i8 off) forward. 1280 image
+// rows, above the int8 floor of 1024; a 64-row text stream, whose fusion
+// tower stays on the accurate tier. M5 only.
+TEST(krea2_dit_quant, fast_tier_matches_accurate)
+{
+  const char* qd = std::getenv("VPIPE_KREA2_DIT_DIR");
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  const std::string pack = qd != nullptr ? qd : "";
+  const std::string bf16 =
+      root != nullptr && *root != '\0' ? std::string(root) + "/transformer"
+                                        : std::string();
+  if (pack.empty() && bf16.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int gh = 32, gw = 40, img_seq = gh * gw, TS = 64;
+  bool engaged = true;
+  auto run = [&](const std::string& dir, bool i8, int tier, bool stream,
+                 bool grow, bool slots) {
+    std::unique_ptr<Env> e2;
+    if (!slots) { e2 = std::make_unique<Env>("VPIPE_KREA2_NO_SLOTS", "1"); }
+    MetalKrea2Transformer::Config cfg;
+    cfg.i8_gemm = i8;
+    cfg.i8_tier = tier;
+    std::vector<float> v;
+    auto m = MetalKrea2Transformer::load(dir, mc, cfg, stream);
+    if (!m) { return v; }
+    const int fg = m->fast_group();
+    if (m->fast_tier() != (i8 && tier != 0) ||
+        (i8 && tier >= 2 && fg != I8GemmContext::kTokenGroup) ||
+        (i8 && tier == 1 && (fg <= 0 || fg == I8GemmContext::kTokenGroup))) {
+      engaged = false;
+    }
+    m->set_residency_reserve(grow ? test_residency_reserve(4ull << 30) : 0);
+    if (grow) { m->set_residency_schedule(4); }
+    const int HID = cfg.hidden, IC = cfg.in_channels;
+    SharedBuffer fused = mc->make_shared_buffer((std::size_t)TS * HID * 2);
+    SharedBuffer lat = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
+    std::mt19937 rng(20261018);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    { auto* d = static_cast<_Float16*>(fused.contents());
+      for (std::size_t i = 0; i < (std::size_t)TS * HID; ++i) {
+        d[i] = (_Float16)nd(rng);
+      } }
+    { auto* d = static_cast<_Float16*>(lat.contents());
+      for (std::size_t i = 0; i < (std::size_t)img_seq * IC; ++i) {
+        d[i] = (_Float16)nd(rng);
+      } }
+    SharedBuffer out;
+    for (int it = 0; it < (grow ? 2 : 1); ++it) {
+      out = m->forward_dit(fused, TS, lat, img_seq, gh, gw, 0.5f, -1);
+    }
+    if (grow && m->resident_block_count() == 0) { engaged = false; }
+    if (out.empty()) { return v; }
+    const auto* p = static_cast<const _Float16*>(out.contents());
+    v.resize((std::size_t)img_seq * IC);
+    for (std::size_t i = 0; i < v.size(); ++i) { v[i] = (float)p[i]; }
+    return v;   // m freed here: one model resident at a time
+  };
+  auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+    return a.size() == b.size() && !a.empty() &&
+           std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+  };
+  // A GROSS-ERROR guard, not a ranking (see signed_layout_matches_native:
+  // random-input forwards are chaotic): the fast tier's GEMMs are
+  // 1.3-1.45x the accurate tier's error on outlier-free operands, the
+  // plain token tier's ~1.7x on real weights and the rotated one's about
+  // the fast tier's, so a misread layout is what this catches.
+  const double bar[4] = {0.0, 2.5, 3.0, 4.0};
+  const char* tname[4] = {"accurate", "fast", "token", "token_plain"};
+  for (const std::string& dir : {pack, bf16}) {
+    if (dir.empty()) { continue; }
+    const bool is_pack = dir == pack;
+    const std::vector<float> dense = run(dir, false, 0, false, false, true);
+    const std::vector<float> acc = run(dir, true, 0, false, false, true);
+    ASSERT_TRUE(!dense.empty() && acc.size() == dense.size());
+    if (dense.empty() || acc.size() != dense.size()) { continue; }
+    const double ra = rel_l2q_(acc.data(), dense.data(), acc.size());
+    for (int tier : {1, 2, 3}) {
+      engaged = true;
+      const std::vector<float> pre = run(dir, true, tier, false, false, true);
+      // EVERY HOLD of either checkpoint runs the tier the preload runs: a
+      // pack's codes converted in the slot, a bf16 block's source
+      // quantized after each refill (QWeight::ds) and a promotion keeping
+      // the layout alone.
+      const std::vector<float> str = run(dir, true, tier, true, false, true);
+      const std::vector<float> flat =
+          run(dir, true, tier, true, false, false);
+      const std::vector<float> grown =
+          run(dir, true, tier, true, true, true);
+      EXPECT_TRUE(engaged);
+      ASSERT_TRUE(pre.size() == dense.size());
+      if (pre.size() != dense.size()) { continue; }
+      const double rf = rel_l2q_(pre.data(), dense.data(), pre.size());
+      std::printf("[krea2_dit_quant] %s tier, %s, %d+%d rows: vs the dense "
+                  "forward %.3e, accurate %.3e; streamed %s, no slots %s, "
+                  "promoted %s\n", tname[tier],
+                  is_pack ? "w8 pack" : "bf16", img_seq, TS, rf, ra,
+                  same(str, pre) ? "IDENTICAL" : "DIFFERENT",
+                  same(flat, pre) ? "IDENTICAL" : "DIFFERENT",
+                  same(grown, pre) ? "IDENTICAL" : "DIFFERENT");
+      EXPECT_TRUE(same(str, pre));
+      EXPECT_TRUE(same(flat, pre));
+      EXPECT_TRUE(same(grown, pre));
+      EXPECT_TRUE(rf <= bar[tier] * ra);
+    }
   }
 }
 

@@ -173,8 +173,14 @@ MiniMaxH3TextEncoder::streaming_floor_bytes(const std::string& enc_dir)
   // at 64201 MB -- a peak reported against a graph that then ran to
   // completion, because the encoder had been streaming its layers all
   // along.
+  // And a third spelling, the bare `language_model.layers.` of the
+  // Qwen3-VL / Qwen3.5 encoders Krea-2 and MOSS-Image ship: matching
+  // neither of the above gave both NO floor, so their encoders -- which
+  // always stream their layers -- were planned whole (MOSS-Image's 16 GB
+  // against a ~2.8 GB floor put a 16 GB box's conditioning phase over
+  // its RAM).
   for (const char* stem : {"model.language_model.layers.",
-                           "model.layers."}) {
+                           "model.layers.", "language_model.layers."}) {
     const std::size_t f = stream_floor_bytes(*wts, stem);
     if (f > 0) { return f; }
   }
@@ -387,7 +393,8 @@ MiniMaxH3TextEncoder::load_vision(const std::string& enc_dir, MetalCompute* mc,
     return nullptr;
   };
   if (mc == nullptr) { return fail("no metal compute"); }
-  const std::string dir = resolve_encoder_dir(enc_dir);
+  const std::string dir =
+      cfg.weights.empty() ? resolve_encoder_dir(enc_dir) : cfg.weights;
   auto ws = WeightSet::open(dir, mc->session());
   if (!ws) { return fail("cannot open " + dir); }
 
@@ -429,7 +436,8 @@ MiniMaxH3TextEncoder::load(const std::string& enc_dir, MetalCompute* mc,
   }
   m->_cfg.lm.n_layers = m->_cfg.tap;
 
-  m->_ws = open_weight_set(dir, session);
+  m->_ws = open_weight_set(cfg.weights.empty() ? dir : cfg.weights,
+                           session);
   if (!m->_ws) { return nullptr; }
   m->_lm = MetalQwenModel::load(m->_ws, mc, m->_cfg.lm);
   if (!m->_lm) { return nullptr; }
@@ -439,9 +447,46 @@ MiniMaxH3TextEncoder::load(const std::string& enc_dir, MetalCompute* mc,
   // shares the bytes rather than mapping a second copy. Two spellings:
   // the diffusers checkpoint nests the text stack under
   // `model.language_model.`, Comfy-Org's conversion drops that segment.
+  //
+  // Its rows are copied straight into the backbone's bf16 input, so the
+  // table must BE bf16: a Draw Things .ckpt stores f16, whose rows read
+  // as bf16 are noise. Such a table is converted once (rounded; the f16
+  // came from a bf16 original, so this gives that original back).
   for (const char* nm : {"model.language_model.embed_tokens.weight",
                          "model.embed_tokens.weight"}) {
-    m->_embed = m->_ws->tensor(nm, mc, WeightSet::Residency::Copied);
+    const auto* ti = m->_ws->src().info(nm);
+    if (ti == nullptr) { continue; }
+    if (ti->dtype == "BF16") {
+      m->_embed = m->_ws->tensor(nm, mc, WeightSet::Residency::Copied);
+    } else if (ti->dtype == "F16" || ti->dtype == "F32") {
+      WeightSet& ws = *m->_ws;
+      m->_embed = ws.derived(std::string(kComfyKey) + "/embed-bf16/" + nm,
+                             [&]() -> SharedBuffer {
+        SharedBuffer raw = ws.read(nm, mc, WeightSet::Residency::Copied);
+        std::size_t n = 1;
+        for (auto d : ti->shape) { n *= (std::size_t)d; }
+        const bool f32 = ti->dtype == "F32";
+        if (raw.empty() || raw.byte_size() < n * (f32 ? 4 : 2)) { return {}; }
+        SharedBuffer out = mc->make_shared_buffer(n * 2);
+        if (out.empty()) { return {}; }
+        const auto* src = static_cast<const std::uint8_t*>(raw.contents());
+        auto* d = static_cast<std::uint16_t*>(out.contents());
+        for (std::size_t i = 0; i < n; ++i) {
+          float f;
+          if (f32) {
+            std::memcpy(&f, src + i * 4, 4);
+          } else {
+            _Float16 h;
+            std::memcpy(&h, src + i * 2, 2);
+            f = (float)h;
+          }
+          std::uint32_t u;
+          std::memcpy(&u, &f, 4);
+          d[i] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+        }
+        return out;
+      });
+    }
     if (!m->_embed.empty()) { break; }
   }
   if (m->_embed.empty()) { return nullptr; }

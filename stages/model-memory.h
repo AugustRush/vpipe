@@ -20,6 +20,7 @@
 #include "pipeline/resource-plan.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -540,6 +541,46 @@ StreamPlan plan_streaming(const SessionContextIntf* session,
                           std::size_t               headroom,
                           std::size_t               dit_retires = 0,
                           std::string_view          phase = kPhaseDenoise);
+
+// Whether a model `plan` PRELOADS still passes plan_streaming's own rule
+// with `extra` bytes more -- the question a choice that trades memory for
+// speed asks before taking it (a w4 pack's int8 copy on the int8 tiers).
+// False for a plan that streams. Inline: it composes what the header
+// already exports, so it adds no symbol a plugin could miss on an older
+// host.
+inline bool
+preload_fits_extra(const StreamPlan& plan, std::size_t extra,
+                   std::size_t headroom)
+{
+  const std::size_t ram = phys_ram();
+  if (plan.stream || ram == 0) { return false; }
+  // plan_streaming's rule, verbatim, on the larger figure.
+  const std::size_t f = plan.footprint + extra;
+  return f <= ram / 3 && ram >= f + headroom;
+}
+
+// STREAM, THEN RETAIN: whether a DiT that can stream its blocks does,
+// apart from plan.stream's verdict on the box.
+//
+// The two answers used to be one. `plan.stream` says the box is TIGHT --
+// peers act on it (note_streaming), and so do the behaviours only a
+// bounded box wants: deferring the load past the conditioning, revising
+// the declaration down to the trunk, releasing the forward's scratch.
+// The MECHANISM is a separate choice, and on a box with room it is now
+// streaming too: the first forward reads each block as it needs it and
+// residency KEEPS it (every block on the first pass when the wired pool
+// is on -- BlockResidency::set_schedule), so the run converges on what a
+// preload holds, one pass in, by measuring the box rather than trusting
+// an estimate taken before the run. A 64 GB box never preloaded the
+// large checkpoints; a 256 GB one preloads them all, and this retires
+// that second path. VPIPE_PRELOAD=1 restores it, for the A/B.
+inline bool
+stream_blocks_by_default(const StreamPlan& plan)
+{
+  if (plan.stream) { return true; }
+  const char* e = std::getenv("VPIPE_PRELOAD");
+  return e == nullptr || *e == '\0' || *e == '0';
+}
 
 // The `unload_when_idle` config value shared by the model-holding stages.
 // THREE things can happen to idle weights, not two:

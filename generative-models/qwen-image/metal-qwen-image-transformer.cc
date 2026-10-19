@@ -204,9 +204,10 @@ MetalQwenImageTransformer::each_block_tensor_(
   const std::string p = "transformer_blocks." + std::to_string(L) + ".";
   // A MATRIX is three tensors when quantized and one when dense, and
   // which it is was decided when the slot was built -- so the layout
-  // comes from the QWeight, not from the checkpoint. A pack that
-  // disagrees fails the refill's size check and forces a rebuild, which
-  // is the right answer to "these are not the same weights".
+  // comes from the QWeight, not from the checkpoint. A block that
+  // disagrees is not REFILLED at all: same_layout_ has the slot built for
+  // it, because a refill's size check rebuilds the codes yet keeps the
+  // slot's `bits` (a mixed pack's other width).
   auto qw = [&fn](const std::string& base, QWeight& w) {
     if (w.quantized) {
       fn(base + ".weight", w.codes, P::kRaw);
@@ -239,6 +240,31 @@ MetalQwenImageTransformer::each_block_tensor_(
   lin(p + "img_mlp.net.2", b.img_fc2_w, b.img_fc2_b);
   lin(p + "txt_mlp.net.0.proj", b.txt_fc1_w, b.txt_fc1_b);
   lin(p + "txt_mlp.net.2", b.txt_fc2_w, b.txt_fc2_b);
+}
+
+// Widths of block L in the checkpoint against the slot's, per matrix
+// (BlockSlots::Ops::same_layout): a mixed pack holds whole blocks at w8
+// and the rest at w4.
+bool
+MetalQwenImageTransformer::same_layout_(int L, const Block& b) const
+{
+  if (_quant_bits == 0 || _ws == nullptr) { return true; }
+  const std::string p = "transformer_blocks." + std::to_string(L) + ".";
+  const std::pair<const QWeight*, const char*> all[] = {
+      {&b.img_mod_w, "img_mod.1"},        {&b.txt_mod_w, "txt_mod.1"},
+      {&b.qw, "attn.to_q"},               {&b.kw, "attn.to_k"},
+      {&b.vw, "attn.to_v"},               {&b.ow, "attn.to_out.0"},
+      {&b.aqw, "attn.add_q_proj"},        {&b.akw, "attn.add_k_proj"},
+      {&b.avw, "attn.add_v_proj"},        {&b.aow, "attn.to_add_out"},
+      {&b.img_fc1_w, "img_mlp.net.0.proj"}, {&b.img_fc2_w, "img_mlp.net.2"},
+      {&b.txt_fc1_w, "txt_mlp.net.0.proj"}, {&b.txt_fc2_w, "txt_mlp.net.2"}};
+  for (const auto& [w, nm] : all) {
+    if (stored_affine_bits(*_ws, p + nm, _quant_group) !=
+        (w->quantized ? w->bits : 0)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // Allocate `dst` with `src`'s shapes and flags, optionally copying the
@@ -318,6 +344,9 @@ MetalQwenImageTransformer::configure_slots_()
   };
   ops.bytes = [](const Block& b) { return block_bytes_(b); };
   ops.empty = [](const Block& b) { return b.qw.empty(); };
+  ops.same_layout = [this](int L, const Block& b) {
+    return same_layout_(L, b);
+  };
   _slots.set_weight_set(_ws.get());
   _slots.configure(_mc, std::move(ops), "MetalQwenImageTransformer",
                    "VPIPE_QIE_NO_SLOTS");
@@ -1204,7 +1233,9 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     auto flush = [&]() {
       enc.end();
       stream.commit().wait();
-      stream = _mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
     };
     // Profiling barrier: commit+wait the accumulated ops, add the elapsed slice
@@ -1215,7 +1246,9 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       stream.commit().wait();
       acc += std::chrono::duration<double, std::milli>(
                  std::chrono::steady_clock::now() - mark).count();
-      stream = _mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       mark = std::chrono::steady_clock::now();
     };
@@ -1647,6 +1680,7 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       BlockSlots<Block>* s;
       ~SlotJoin() { s->join(); }
     } slot_join{&_slots};
+    (void)_slots.release_if_saturated(_blocks);
     _slots.begin_forward();
 
     for (int L = 0; L < n_layers; ++L) {
@@ -1842,7 +1876,9 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
           _slots.prefetch(nxt);
         }
         bf.wait();
-        stream = _mc->make_command_stream();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
         enc = stream.begin_compute();
         // The commit above has been WAITED for, which is why the
         // promotion happens here and not at the top of the iteration:
@@ -1926,6 +1962,14 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     return out;
   }
   return velo;
+}
+
+void
+MetalQwenImageTransformer::release_forward_scratch()
+{
+  _w_deq = {};
+  _splitk = {};
+  if (_i8) { _i8->release_scratch(); }
 }
 
 }  // namespace genai

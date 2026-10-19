@@ -154,7 +154,32 @@ class MetalBooguTransformer {
   // once the reserve is taken) and before the first forward.
   void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
+  // The streaming slot pairs, while they exist (BlockSlots::held_bytes).
+  std::size_t slot_bytes() const
+  {
+    return _single_slots.held_bytes() + _double_slots.held_bytes();
+  }
   int resident_block_count() const { return _resid.count(); }
+  // Drop what a forward keeps for the next one -- the dense stand-in,
+  // split-K planes and the int8 context's buffers; each regrows on
+  // demand. The stage calls it after a
+  // generation on a bounded box, before the decode wants the room.
+  void release_forward_scratch();
+  // A STREAMED stack residency has kept whole gives its slot pair
+  // back (BlockSlots::release_if_saturated) -- between generations; a
+  // forward does the same at its top. Returns the bytes freed.
+  std::size_t release_idle_slots()
+  {
+    return _double_slots.release_if_saturated(_double) +
+           _single_slots.release_if_saturated(_single);
+  }
+  // Streamed blocks BUILT into their slot because the slot was laid
+  // out for another (a mixed pack's other width; BlockSlots::Ops::
+  // same_layout), over the model's life. For a test to show the slots
+  // crossed widths -- and did not give up and stream without them.
+  int slot_relayouts() const {
+    return _single_slots.relaid() + _double_slots.relaid();
+  }
   std::size_t release_resident_blocks(std::size_t bytes);
 
   // Cooperative stop polled per block in streaming mode, so a pipeline stop is
@@ -392,6 +417,10 @@ class MetalBooguTransformer {
       int L, DoubleBlock& b,
       const BlockSlots<DoubleBlock>::TensorFn& fn) const;
   bool clone_single_(const Block& src, Block& dst, bool copy) const;
+  // Is block L stored at the widths `b` was built for? (A mixed pack;
+  // see BlockSlots::Ops::same_layout.)
+  bool same_layout_(int L, const Block& b) const;
+  bool same_layout_(int L, const DoubleBlock& b) const;
   bool clone_double_(const DoubleBlock& src, DoubleBlock& dst,
                      bool copy) const;
   metal_compute::SharedBuffer rebuild_one_(

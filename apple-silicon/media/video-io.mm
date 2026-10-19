@@ -659,6 +659,15 @@ VideoWriter::open(const std::string& path, const VideoWriteOptions& opt,
           (__bridge NSString*)(t.premultiplied
                                    ? kVTAlphaChannelMode_PremultipliedAlpha
                                    : kVTAlphaChannelMode_StraightAlpha);
+    } else if (c == "prores4444" || c == "prores4444xq") {
+      // No alpha kept -- three channels, or a fourth dropped: no alpha
+      // PLANE either. The encoder codes the A of the half-float RGBA it
+      // is fed unless told not to, so a 4444 carried a plane of 1s in
+      // every frame (the frame header's alpha_info 2) while its track
+      // said depth 24: AVFoundation read the movie opaque, FFmpeg and the
+      // tools on it with alpha.
+      comp[(__bridge NSString*)
+               kVTCompressionPropertyKey_PreserveAlphaChannel] = @NO;
     }
     NSMutableDictionary* settings = [@{
       AVVideoCodecKey : type,

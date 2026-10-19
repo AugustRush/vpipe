@@ -48,6 +48,7 @@ public:
     std::uint64_t        offset;   // bytes from the start of the data blob
     std::uint64_t        nbytes;
     int                  shard = 0;  // index into _shards; -2 => GGUF-backed
+                                     // -3 => Draw Things, converted
   };
 
   // Open a model directory. Three layouts are recognised, in order:

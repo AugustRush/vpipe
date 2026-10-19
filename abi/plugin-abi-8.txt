@@ -25,11 +25,13 @@ common/flex-data.h
 common/i18n.h
 common/job.h
 common/oport-policy.h
+common/perf-flops.h
 common/session-member.h
 common/vertex.h
 common/vpipe-format.h
 generative-models/accel-keys.h
 generative-models/conditioner-profile.h
+generative-models/content-screen.h
 generative-models/context-manager.h
 generative-models/detect-profile.h
 generative-models/family-profile.h
@@ -47,6 +49,7 @@ generative-models/quantize-profile.h
 generative-models/shared/ane-tier.h
 generative-models/shared/wired-pool.h
 generative-models/spec-keys.h
+generative-models/speculative-decode.h
 generative-models/token-muxer.h
 generative-models/tokenizer.h
 generative-models/vae-model-registry.h
@@ -213,6 +216,9 @@ record vpipe::CoreMLLoadedModel
   232 | int _compute_units
   | [sizeof=240, dsize=236, align=8,
   | nvsize=236, nvalign=8]
+record vpipe::CoreMLModelManager (opaque: read inline)
+  0 | const LogSinkIntf * _log
+  8 | class std::unique_ptr<class vpipe::AneWorker> _ane
 record vpipe::CoreMLOutputDesc
   0 | struct vpipe::CoreMLOutputDesc
   0 | class std::vector<long long> shape
@@ -256,6 +262,9 @@ record vpipe::DataBuffer
   128 | class std::shared_ptr<void> owner
   | [sizeof=144, dsize=144, align=8,
   | nvsize=144, nvalign=8]
+record vpipe::EdgeReader (opaque: read inline)
+  0 | OportBuffer * _parent
+  8 | unsigned int _cursor_idx
 record vpipe::EdgeReader::AcquireAwaiter
   0 | struct vpipe::EdgeReader::AcquireAwaiter
   0 | EdgeReader * _reader
@@ -494,6 +503,9 @@ record vpipe::NullUiTextStream
   0 | class vpipe::UiTextStream (primary base)
   | [sizeof=8, dsize=8, align=8,
   | nvsize=8, nvalign=8]
+record vpipe::OportBuffer (opaque: read inline)
+  16 | unsigned int _hard_cap
+  28 | OverrunPolicy _mode
 record vpipe::OportBuffer::WriteAwaiter
   0 | struct vpipe::OportBuffer::WriteAwaiter
   0 | OportBuffer * _buf
@@ -669,6 +681,8 @@ record vpipe::StagePortHandle
   8 | unsigned int oport
   | [sizeof=16, dsize=12, align=8,
   | nvsize=12, nvalign=8]
+record vpipe::StageRegistry (opaque: read inline)
+  0 | class std::vector<struct vpipe::StageRegistry::Entry> _entries
 record vpipe::StageSpec
   0 | struct vpipe::StageSpec
   0 | std::uint32_t struct_size
@@ -817,6 +831,8 @@ record vpipe::VpipeFormat
   0 | class std::function<std::string (void)> _f
   | [sizeof=32, dsize=32, align=8,
   | nvsize=32, nvalign=8]
+record vpipe::VpipePluginContext (opaque: read inline)
+  32 | std::uint32_t _plugin_abi
 record vpipe::genai::AudioVaeDecodeRequest
   0 | struct vpipe::genai::AudioVaeDecodeRequest
   0 | const float * latent
@@ -890,6 +906,8 @@ record vpipe::genai::ContextManager::Spec
   188 | int ssm_v_head_dim
   | [sizeof=192, dsize=192, align=8,
   | nvsize=192, nvalign=8]
+record vpipe::genai::GenerativeModelManager (opaque: read inline)
+  528 | class vpipe::genai::WeightRegistry _weights
 record vpipe::genai::GenerativeModelManager::SwapSupply
   0 | struct vpipe::genai::GenerativeModelManager::SwapSupply
   0 | std::size_t anon
@@ -1295,6 +1313,35 @@ record vpipe::genai::QuantizableFamily
   0 | (QuantizableFamily vtable pointer)
   | [sizeof=8, dsize=8, align=8,
   | nvsize=8, nvalign=8]
+record vpipe::genai::SpecDecodeExt
+  0 | class vpipe::genai::SpecDecodeExt
+  0 | (SpecDecodeExt vtable pointer)
+  | [sizeof=8, dsize=8, align=8,
+  | nvsize=8, nvalign=8]
+record vpipe::genai::SpecDecodeRequest
+  0 | struct vpipe::genai::SpecDecodeRequest
+  0 | struct vpipe::genai::ContextId ctx
+  4 | std::int32_t first_token
+  8 | int max_tokens
+  12 | int rope_first
+  16 | struct vpipe::genai::GpuSamplerParams sampler
+  72 | class std::span<const int> prime
+  88 | const std::function<_Bool (std::int32_t)> * is_stop
+  96 | const std::function<_Bool (std::span<const std::int32_t>)> * on_tokens
+  104 | int block
+  112 | const FlexData * borrowed_extra
+  | [sizeof=120, dsize=120, align=8,
+  | nvsize=120, nvalign=8]
+record vpipe::genai::SpecDecodeResult
+  0 | struct vpipe::genai::SpecDecodeResult
+  0 | int produced
+  4 | _Bool hit_stop
+  8 | long rounds
+  16 | long drafted
+  24 | long accepted
+  32 | class vpipe::FlexData extra
+  | [sizeof=40, dsize=40, align=8,
+  | nvsize=40, nvalign=8]
 record vpipe::genai::TokenRef
   0 | struct vpipe::genai::TokenRef
   0 | Kind kind
@@ -1473,6 +1520,8 @@ record vpipe::genai::WeightRegistry::Stats
   24 | std::size_t total_bytes
   | [sizeof=32, dsize=32, align=8,
   | nvsize=32, nvalign=8]
+record vpipe::genai::WeightSet (opaque: read inline)
+  32 | _Bool _integrity
 record vpipe::genai::WeightSet::Stats
   0 | struct vpipe::genai::WeightSet::Stats
   0 | std::size_t entries
@@ -1497,6 +1546,48 @@ record vpipe::genai::ane::Binding
   16 | const metal_compute::SharedBuffer * buf
   | [sizeof=24, dsize=24, align=8,
   | nvsize=24, nvalign=8]
+record vpipe::genai::screen::ChatPart
+  0 | struct vpipe::genai::screen::ChatPart
+  0 | Kind kind
+  8 | std::string text
+  | [sizeof=32, dsize=32, align=8,
+  | nvsize=32, nvalign=8]
+record vpipe::genai::screen::ChatRequest
+  0 | struct vpipe::genai::screen::ChatRequest
+  0 | class std::vector<struct vpipe::genai::screen::ChatPart> parts
+  24 | std::string stop
+  48 | int max_new_tokens
+  56 | const FlexData * borrowed_extra
+  | [sizeof=64, dsize=64, align=8,
+  | nvsize=64, nvalign=8]
+record vpipe::genai::screen::ContentScreen
+  0 | class vpipe::genai::screen::ContentScreen
+  0 | (ContentScreen vtable pointer)
+  | [sizeof=8, dsize=8, align=8,
+  | nvsize=8, nvalign=8]
+record vpipe::genai::screen::EncoderChat
+  0 | class vpipe::genai::screen::EncoderChat
+  0 | (EncoderChat vtable pointer)
+  | [sizeof=8, dsize=8, align=8,
+  | nvsize=8, nvalign=8]
+record vpipe::genai::screen::ScreenInput
+  0 | struct vpipe::genai::screen::ScreenInput
+  0 | std::string prompt
+  24 | int images
+  28 | int pass
+  32 | int passes
+  40 | const FlexData * borrowed_extra
+  | [sizeof=48, dsize=48, align=8,
+  | nvsize=48, nvalign=8]
+record vpipe::genai::screen::Verdict
+  0 | struct vpipe::genai::screen::Verdict
+  0 | _Bool blocked
+  8 | class std::vector<std::string> categories
+  32 | std::string reason
+  56 | std::string raw
+  80 | class vpipe::FlexData extra
+  | [sizeof=88, dsize=88, align=8,
+  | nvsize=88, nvalign=8]
 record vpipe::metal_compute::BufferView
   0 | struct vpipe::metal_compute::BufferView
   0 | DType dtype
@@ -1533,6 +1624,15 @@ record vpipe::metal_compute::CommandStream::Fence::GpuTimes
   8 | double kernel_s
   | [sizeof=16, dsize=16, align=8,
   | nvsize=16, nvalign=8]
+record vpipe::metal_compute::CommandStream::GpuSpan
+  0 | struct vpipe::metal_compute::CommandStream::GpuSpan
+  0 | double commit
+  8 | double kstart
+  16 | double kend
+  24 | double start
+  32 | double end
+  | [sizeof=40, dsize=40, align=8,
+  | nvsize=40, nvalign=8]
 record vpipe::metal_compute::ComputeEncoder
   0 | class vpipe::metal_compute::ComputeEncoder
   0 | MTL::ComputeCommandEncoder * _enc
@@ -1770,6 +1870,13 @@ record vpipe::model_memory::StreamPlan
   48 | class vpipe::FlexData extra
   | [sizeof=56, dsize=56, align=8,
   | nvsize=56, nvalign=8]
+record vpipe::perf_flops::Totals
+  0 | struct vpipe::perf_flops::Totals
+  0 | std::uint64_t flops
+  8 | std::uint64_t records
+  16 | std::uint64_t latest_ns
+  | [sizeof=24, dsize=24, align=8,
+  | nvsize=24, nvalign=8]
 
 [virtuals]
 class vpipe::BeatPayloadIntf
@@ -2008,6 +2115,10 @@ class vpipe::genai::QuantizableFamily
   claims bool (const std::string &) const = 0
   components std::vector<QuantizableComponent> () const = 0
   query_extension void *(std::string_view) noexcept
+class vpipe::genai::SpecDecodeExt
+  drafter std::string_view () const noexcept = 0
+  attach_drafter bool (const std::string &, int, std::string *) = 0
+  generate bool (const SpecDecodeRequest &, SpecDecodeResult *) = 0
 class vpipe::genai::VaeDecoder
   ~VaeDecoder void ()
   latent_channels int () const = 0
@@ -2069,6 +2180,14 @@ class vpipe::genai::WeightOwner
   end_restore void (bool)
   note_parked void (bool)
   weight_label std::string () const
+class vpipe::genai::screen::ContentScreen
+  ~ContentScreen void ()
+  screen Verdict (EncoderChat &, const ScreenInput &) = 0
+  query_extension void *(std::string_view) noexcept
+class vpipe::genai::screen::EncoderChat
+  ~EncoderChat void ()
+  generate bool (const ChatRequest &, std::string *, std::string *) = 0
+  query_extension void *(std::string_view) noexcept
 
 [symbols]
 typeinfo for vpipe::OportBuffer
@@ -2325,6 +2444,7 @@ vpipe::SessionIntf::drop_chat_context(std::__1::basic_string_view<char, std::__1
 vpipe::SessionIntf::load_pipeline(vpipe::FlexData const&)
 vpipe::SessionIntf::progress() const
 vpipe::SessionIntf::progress_version() const
+vpipe::SessionIntf::release_idle_models()
 vpipe::SessionIntf::reports() const
 vpipe::SessionIntf::reports_version() const
 vpipe::SessionIntf::set_log_listener(std::__1::function<void (int, std::__1::basic_string_view<char, std::__1::char_traits<char>>)>)
@@ -2560,10 +2680,14 @@ vpipe::genai::GenerativeModelManager::clear_declarations()
 vpipe::genai::GenerativeModelManager::clear_scratch()
 vpipe::genai::GenerativeModelManager::declare_scratch(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, unsigned long, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::declare_weights(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, unsigned long, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, unsigned long)
+vpipe::genai::GenerativeModelManager::declares(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
 vpipe::genai::GenerativeModelManager::drop_context(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
+vpipe::genai::GenerativeModelManager::drop_unborrowed()
 vpipe::genai::GenerativeModelManager::drop_weights(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::enforce_memory_cap()
 vpipe::genai::GenerativeModelManager::holds_weights(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
+vpipe::genai::GenerativeModelManager::keep_model_warm(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::shared_ptr<void>, unsigned long, double)
+vpipe::genai::GenerativeModelManager::keep_warm(std::__1::shared_ptr<vpipe::genai::LoadedLanguageModel> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, double)
 vpipe::genai::GenerativeModelManager::load(vpipe::genai::LoadSpec const&)
 vpipe::genai::GenerativeModelManager::lookup_shared_(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::memory_cap() const
@@ -2572,6 +2696,7 @@ vpipe::genai::GenerativeModelManager::note_streaming(std::__1::basic_string<char
 vpipe::genai::GenerativeModelManager::note_wired_pool_refused()
 vpipe::genai::GenerativeModelManager::park_context(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::shared_ptr<vpipe::genai::LoadedLanguageModel> const&, vpipe::genai::LoadedLanguageModel::Context, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::park_if_unborrowed_(std::__1::shared_ptr<vpipe::genai::WeightSet> const&, long)
+vpipe::genai::GenerativeModelManager::park_if_unborrowed_(std::__1::shared_ptr<vpipe::genai::WeightSet> const&, long, unsigned long long)
 vpipe::genai::GenerativeModelManager::park_weights(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::per_dir_bytes_(bool) const
 vpipe::genai::GenerativeModelManager::phase_footprint(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
@@ -2586,6 +2711,7 @@ vpipe::genai::GenerativeModelManager::pooled_bytes() const
 vpipe::genai::GenerativeModelManager::reclaim_at_least(unsigned long)
 vpipe::genai::GenerativeModelManager::release_external_wired(unsigned long)
 vpipe::genai::GenerativeModelManager::release_unheld_()
+vpipe::genai::GenerativeModelManager::release_warm_unclaimed()
 vpipe::genai::GenerativeModelManager::reopen_wired_pool()
 vpipe::genai::GenerativeModelManager::resident_bytes() const
 vpipe::genai::GenerativeModelManager::resident_kv_bytes() const
@@ -2593,6 +2719,7 @@ vpipe::genai::GenerativeModelManager::resident_weight_bytes() const
 vpipe::genai::GenerativeModelManager::revise_declaration(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, unsigned long)
 vpipe::genai::GenerativeModelManager::revise_scratch(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, unsigned long)
 vpipe::genai::GenerativeModelManager::scratch_bytes(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
+vpipe::genai::GenerativeModelManager::set_before_park_for_test(std::__1::function<void ()>)
 vpipe::genai::GenerativeModelManager::set_declaration_phase(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::set_memory_cap(unsigned long)
 vpipe::genai::GenerativeModelManager::set_phase_order(std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>>)
@@ -2600,6 +2727,7 @@ vpipe::genai::GenerativeModelManager::set_swap_allowance_bytes(unsigned long)
 vpipe::genai::GenerativeModelManager::set_wired_pool_bytes(unsigned long)
 vpipe::genai::GenerativeModelManager::set_wired_pool_enforced(bool)
 vpipe::genai::GenerativeModelManager::set_wired_pool_pct(int)
+vpipe::genai::GenerativeModelManager::settle_unborrowed()
 vpipe::genai::GenerativeModelManager::shared_count() const
 vpipe::genai::GenerativeModelManager::shared_key_(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
 vpipe::genai::GenerativeModelManager::store_shared_(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::shared_ptr<void> const&)
@@ -2607,9 +2735,12 @@ vpipe::genai::GenerativeModelManager::swap_allowance_bytes() const
 vpipe::genai::GenerativeModelManager::swap_supply()
 vpipe::genai::GenerativeModelManager::swappable_other_bytes()
 vpipe::genai::GenerativeModelManager::take_context(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::shared_ptr<vpipe::genai::LoadedLanguageModel> const&, vpipe::genai::LoadedLanguageModel::Context*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>*)
+vpipe::genai::GenerativeModelManager::take_warm_model(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::unwire_from_pool(vpipe::metal_compute::SharedBuffer&)
+vpipe::genai::GenerativeModelManager::warm_count() const
 vpipe::genai::GenerativeModelManager::warm_dirs() const
 vpipe::genai::GenerativeModelManager::warm_kv_bytes() const
+vpipe::genai::GenerativeModelManager::warm_model_bytes(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
 vpipe::genai::GenerativeModelManager::weight_report() const
 vpipe::genai::GenerativeModelManager::weight_set(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::weight_set_count() const
@@ -2639,9 +2770,11 @@ vpipe::genai::LoadedLanguageModel::Context::operator=(vpipe::genai::LoadedLangua
 vpipe::genai::LoadedLanguageModel::Context::seq_len() const
 vpipe::genai::LoadedLanguageModel::Context::~Context()
 vpipe::genai::LoadedLanguageModel::LoadedLanguageModel(vpipe::genai::LoadedWeights, std::__1::unique_ptr<vpipe::genai::Tokenizer, std::__1::default_delete<vpipe::genai::Tokenizer>>, vpipe::genai::ComputeDtype, int, unsigned int, vpipe::MlxRuntime*, vpipe::SessionContextIntf const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
+vpipe::genai::LoadedLanguageModel::LoadedLanguageModel(vpipe::genai::LoadedWeights, std::__1::unique_ptr<vpipe::genai::Tokenizer, std::__1::default_delete<vpipe::genai::Tokenizer>>, vpipe::genai::ComputeDtype, int, unsigned int, vpipe::MlxRuntime*, vpipe::SessionContextIntf const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::LoadedLanguageModel::WiredScope::WiredScope(vpipe::genai::LoadedLanguageModel::WiredScope&&)
 vpipe::genai::LoadedLanguageModel::WiredScope::operator=(vpipe::genai::LoadedLanguageModel::WiredScope&&)
 vpipe::genai::LoadedLanguageModel::WiredScope::~WiredScope()
+vpipe::genai::LoadedLanguageModel::attach_draft_model(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, int, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>*)
 vpipe::genai::LoadedLanguageModel::audio_encoder() const
 vpipe::genai::LoadedLanguageModel::base_suppressed_tokens() const
 vpipe::genai::LoadedLanguageModel::branch(vpipe::genai::LoadedLanguageModel::Context const&)
@@ -2668,9 +2801,11 @@ vpipe::genai::LoadedLanguageModel::make_context()
 vpipe::genai::LoadedLanguageModel::metal_audio_encoder() const
 vpipe::genai::LoadedLanguageModel::metal_gemma4_audio_encoder() const
 vpipe::genai::LoadedLanguageModel::metal_gemma4_vision_encoder() const
+vpipe::genai::LoadedLanguageModel::metal_pixtral_vision_encoder() const
 vpipe::genai::LoadedLanguageModel::metal_vision_encoder() const
 vpipe::genai::LoadedLanguageModel::mtp_available() const
 vpipe::genai::LoadedLanguageModel::mtp_generate(vpipe::genai::LoadedLanguageModel::Context&, int, int, vpipe::genai::SamplerParams const&, std::__1::function<bool (int)> const&, std::__1::function<bool (std::__1::span<int const, 18446744073709551615ul>)> const&, int*, bool*)
+vpipe::genai::LoadedLanguageModel::mtp_generate(vpipe::genai::LoadedLanguageModel::Context&, int, int, vpipe::genai::SamplerParams const&, std::__1::function<bool (int)> const&, std::__1::function<bool (std::__1::span<int const, 18446744073709551615ul>)> const&, int*, bool*, std::__1::span<int const, 18446744073709551615ul>)
 vpipe::genai::LoadedLanguageModel::next_token(vpipe::genai::LoadedLanguageModel::Context&)
 vpipe::genai::LoadedLanguageModel::next_token(vpipe::genai::LoadedLanguageModel::Context&, int)
 vpipe::genai::LoadedLanguageModel::next_token_greedy(vpipe::genai::LoadedLanguageModel::Context&)
@@ -2690,6 +2825,9 @@ vpipe::genai::LoadedLanguageModel::set_i8_prefill(bool)
 vpipe::genai::LoadedLanguageModel::set_mtp_prefix_seed(bool)
 vpipe::genai::LoadedLanguageModel::set_profile(bool)
 vpipe::genai::LoadedLanguageModel::set_suppressed_tokens(std::__1::span<int const, 18446744073709551615ul>)
+vpipe::genai::LoadedLanguageModel::spec_decode_available() const
+vpipe::genai::LoadedLanguageModel::spec_drafter() const
+vpipe::genai::LoadedLanguageModel::spec_generate(vpipe::genai::LoadedLanguageModel::Context&, int, int, vpipe::genai::SamplerParams const&, std::__1::function<bool (int)> const&, std::__1::function<bool (std::__1::span<int const, 18446744073709551615ul>)> const&, int*, bool*, std::__1::span<int const, 18446744073709551615ul>, int, vpipe::genai::SpecDecodeResult*)
 vpipe::genai::LoadedLanguageModel::tokenizer() const
 vpipe::genai::LoadedLanguageModel::valid() const
 vpipe::genai::LoadedLanguageModel::vision_encoder() const
@@ -2771,6 +2909,7 @@ vpipe::genai::WeightRegistry::stats() const
 vpipe::genai::WeightSet::WeightSet(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, vpipe::genai::MetalLlamaWeights, vpipe::SessionContextIntf const*)
 vpipe::genai::WeightSet::alias_(vpipe::genai::WeightSet::Entry const&) const
 vpipe::genai::WeightSet::begin_restore()
+vpipe::genai::WeightSet::borrow_epoch() const
 vpipe::genai::WeightSet::derived(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::function<vpipe::metal_compute::SharedBuffer ()> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::WeightSet::dir() const
 vpipe::genai::WeightSet::end_restore(bool)
@@ -2780,8 +2919,10 @@ vpipe::genai::WeightSet::for_each_weight(std::__1::function<void (vpipe::metal_c
 vpipe::genai::WeightSet::has(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
 vpipe::genai::WeightSet::hash_(vpipe::metal_compute::SharedBuffer const&) const
 vpipe::genai::WeightSet::last_use() const
+vpipe::genai::WeightSet::note_borrowed()
 vpipe::genai::WeightSet::note_parked(bool)
 vpipe::genai::WeightSet::open(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, vpipe::SessionContextIntf const*)
+vpipe::genai::WeightSet::park_unless_borrowed_since(unsigned long long)
 vpipe::genai::WeightSet::parked() const
 vpipe::genai::WeightSet::part_ready(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
 vpipe::genai::WeightSet::read(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, vpipe::metal_compute::MetalCompute*, vpipe::genai::WeightSet::Residency)
@@ -2867,10 +3008,13 @@ vpipe::metal_compute::CommandStream::encode_signal(vpipe::metal_compute::Event c
 vpipe::metal_compute::CommandStream::encode_wait(vpipe::metal_compute::Event const&, unsigned long long)
 vpipe::metal_compute::CommandStream::ensure_cb_()
 vpipe::metal_compute::CommandStream::fire_and_forget_stats(unsigned long long*, unsigned long long*)
+vpipe::metal_compute::CommandStream::gpu_time_stats(double*, unsigned long long*)
+vpipe::metal_compute::CommandStream::host_seconds()
 vpipe::metal_compute::CommandStream::note_encode_failure_(char const*)
 vpipe::metal_compute::CommandStream::on_completion(std::__1::function<void ()>)
 vpipe::metal_compute::CommandStream::operator=(vpipe::metal_compute::CommandStream&&)
 vpipe::metal_compute::CommandStream::split_encoder_(vpipe::metal_compute::ComputeEncoder&)
+vpipe::metal_compute::CommandStream::take_gpu_spans()
 vpipe::metal_compute::CommandStream::~CommandStream()
 vpipe::metal_compute::ComputeEncoder::ComputeEncoder(MTL::ComputeCommandEncoder*, MTL::CommandBuffer*)
 vpipe::metal_compute::ComputeEncoder::ComputeEncoder(vpipe::metal_compute::ComputeEncoder&&)
@@ -3016,6 +3160,9 @@ vpipe::normalize_language(std::__1::basic_string_view<char, std::__1::char_trait
 vpipe::null_session_services()
 vpipe::open_stage_command(vpipe::Stage&, std::__1::basic_string_view<char, std::__1::char_traits<char>>, vpipe::FlexData, std::__1::vector<vpipe::DataBuffer, std::__1::allocator<vpipe::DataBuffer>>)
 vpipe::parse_element_type(std::__1::basic_string_view<char, std::__1::char_traits<char>>, vpipe::ElementType*)
+vpipe::perf_flops::credit(vpipe::perf_flops::Unit, unsigned long long, unsigned long long, unsigned long long)
+vpipe::perf_flops::series(vpipe::perf_flops::Unit, unsigned long long, unsigned long long, unsigned long, double*)
+vpipe::perf_flops::totals(vpipe::perf_flops::Unit)
 vpipe::port_tags_compatible(std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::basic_string_view<char, std::__1::char_traits<char>>)
 vpipe::register_catalog_entries(std::__1::vector<vpipe::ModelCatalogEntry, std::__1::allocator<vpipe::ModelCatalogEntry>>)
 vpipe::register_channel_types(std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::basic_string_view<char, std::__1::char_traits<char>>)
@@ -3051,6 +3198,7 @@ vpipe::beat::kAllowEmpty = "allow_empty"
 vpipe::beat::kBatch = "batch"
 vpipe::beat::kHfDir = "hf_dir"
 vpipe::beat::kText = "text"
+vpipe::catalog_extra::kLocalSubdir = "local_subdir"
 vpipe::catalog_extra::kUrlFiles = "url_files"
 vpipe::genai::VaeModelFamily::kRoleAudio = "audio"
 vpipe::genai::VaeModelFamily::kRoleVideo = "video"
@@ -3060,6 +3208,11 @@ vpipe::genai::accel::kAneQkv = "ane_qkv"
 vpipe::genai::accel::kAneRows = "ane_rows"
 vpipe::genai::accel::kAneTemplates = "ane_templates"
 vpipe::genai::accel::kI8Gemm = "i8_gemm"
+vpipe::genai::accel::kI8GemmTier = "i8_gemm_tier"
+vpipe::genai::accel::kI8TierAccurate = "accurate"
+vpipe::genai::accel::kI8TierFast = "fast"
+vpipe::genai::accel::kI8TierToken = "token"
+vpipe::genai::accel::kI8TierTokenPlain = "token_plain"
 vpipe::genai::accel::kMotionCache = "motion_cache"
 vpipe::genai::accel::kMotionCacheEnd = "motion_cache_end"
 vpipe::genai::accel::kMotionCacheMaxSkips = "motion_cache_max_skips"
@@ -3140,6 +3293,7 @@ vpipe::genai::cond_sideband::kRefGridW = "ref_grid_w"
 vpipe::genai::cond_sideband::kReferences = "references"
 vpipe::genai::cond_sideband::kTokenTags = "token_tags"
 vpipe::genai::cond_sideband::kVideo = "video"
+vpipe::genai::create_args::kCoreMLLabel = "coreml_label"
 vpipe::genai::detect::kClassNames = "class_names"
 vpipe::genai::detect::kDomain = "detect"
 vpipe::genai::detect::kInputs = "inputs"
@@ -3149,7 +3303,15 @@ vpipe::genai::detect::kLabelVersionEdit = "label_version_edit"
 vpipe::genai::detect::kModelType = "model_type"
 vpipe::genai::detect::kModelTypeEdit = "model_type_edit"
 vpipe::genai::detect::kOutputs = "outputs"
+vpipe::genai::gpu_sampler::kPrime = "prime"
 vpipe::genai::kOutputPreviewX0 = "preview_x0"
+vpipe::genai::load_spec::kDraftBits = "draft_bits"
+vpipe::genai::load_spec::kDraftDir = "draft_dir"
+vpipe::genai::load_spec::kMtpDir = "mtp_dir"
+vpipe::genai::load_spec::kWireWeights = "wire_weights"
+vpipe::genai::model_config::kDefaultSystemPrompt = "default_system_prompt"
+vpipe::genai::model_config::kRopeParameters = "rope_parameters"
+vpipe::genai::model_config::kVisionImageSize = "vision.image_size"
 vpipe::genai::named_tensor::kBf16 = "bf16"
 vpipe::genai::named_tensor::kDtype = "dtype"
 vpipe::genai::named_tensor::kF16 = "f16"
@@ -3209,6 +3371,11 @@ vpipe::genai::scheduler_spec::kSimple = "simple"
 vpipe::genai::scheduler_spec::kSteps = "steps"
 vpipe::genai::scheduler_spec::kType = "type"
 vpipe::genai::scheduler_spec::kUnipcFlow = "unipc_flow"
+vpipe::genai::screen::kExtension = "vpipe.content-screen/1"
+vpipe::genai::spec_decode::kDrafterDFlash = "dflash"
+vpipe::genai::spec_decode::kDrafterDFlash2 = "dflash2"
+vpipe::genai::spec_decode::kDrafterMtp = "mtp"
+vpipe::genai::spec_decode::kExtensionId = "vpipe.speculative-decode/1"
 vpipe::genai::token_sampler_spec::kMinP = "min_p"
 vpipe::genai::token_sampler_spec::kPresencePenalty = "presence_penalty"
 vpipe::genai::token_sampler_spec::kRepetitionPenalty = "repetition_penalty"
@@ -3243,13 +3410,22 @@ vpipe::model_memory::kPhaseDecodeAudio = "decode-audio"
 vpipe::model_memory::kPhaseDenoise = "denoise"
 vpipe::model_memory::kScratchKind = "activation-scratch"
 vpipe::model_memory::kWeightsKind = "model-weights"
+vpipe::perf_flops::kUnitName = "gpu"
 vpipe::sideband::kAlphaMode = "alpha_mode"
+vpipe::sideband::kBlendHead = "blend_head"
+vpipe::sideband::kBlendTail = "blend_tail"
 vpipe::sideband::kColorFullRange = "color_full_range"
 vpipe::sideband::kColorMatrix = "color_matrix"
 vpipe::sideband::kColorPrimaries = "color_primaries"
+vpipe::sideband::kColorRef = "color_ref"
+vpipe::sideband::kColorRefFrames = "color_ref_frames"
+vpipe::sideband::kColorRefLevels = "color_ref_levels"
 vpipe::sideband::kColorTransfer = "color_transfer"
 vpipe::sideband::kContentBlocked = "content_blocked"
 vpipe::sideband::kContentLight = "content_light"
+vpipe::sideband::kCropBox = "crop_box"
+vpipe::sideband::kDecoder = "decoder"
+vpipe::sideband::kDecoderCondFrames = "decoder_cond_frames"
 vpipe::sideband::kFps = "fps"
 vpipe::sideband::kFpsDen = "fps_den"
 vpipe::sideband::kFpsNum = "fps_num"
@@ -3257,11 +3433,17 @@ vpipe::sideband::kFrame = "frame"
 vpipe::sideband::kFrames = "frames"
 vpipe::sideband::kLatentsPerSecond = "latents_per_second"
 vpipe::sideband::kMasteringDisplay = "mastering_display"
+vpipe::sideband::kMergeLead = "merge_lead"
+vpipe::sideband::kMergeWeights = "merge_weights"
 vpipe::sideband::kModelName = "model_name"
 vpipe::sideband::kPtsUs = "pts_us"
 vpipe::sideband::kRefusalHeight = "refusal_height"
 vpipe::sideband::kRefusalWidth = "refusal_width"
+vpipe::sideband::kRepeated = "repeated"
 vpipe::sideband::kSourceBits = "source_bits"
+vpipe::sideband::kStreamContinues = "stream_continues"
+vpipe::sideband::kStreamFinal = "stream_final"
+vpipe::sideband::kValidFrames = "valid_frames"
 vpipe::spec_key::kCategory = "category"
 vpipe::spec_key::kChoices = "choices"
 vpipe::spec_key::kSince = "since"

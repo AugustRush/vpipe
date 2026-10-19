@@ -80,6 +80,9 @@ struct MtpDecodeCtl {
   std::function<bool(std::span<const std::int32_t>)> on_round;
   // Set true iff a stop token (is_stop) ended generation (vs budget/abort).
   bool* hit_stop = nullptr;
+  // Draft tokens offered to the verifier, every round (the first has
+  // none): `accepted` of them kept -- an acceptance rate.
+  long* drafted = nullptr;
   // Sampler for the VERIFY (speculative sampling). greedy (default) accepts a
   // draft iff it == argmax(P); a non-greedy sampler accepts iff it == a token
   // SAMPLED from P at that position (per-position seed). Either way every
@@ -457,6 +460,12 @@ public:
   // prompt both ways.
   bool streaming_layers() const { return _stream_layers; }
   int  pinned_layers()    const { return _pinned_layers; }
+  // How many leading layers a prefill-streamed load of `c` over `wts`
+  // pins (0 unless it streams with a pin_frac) -- the rule load() takes,
+  // for a caller that must know before it builds (a model kept warm is
+  // only the one asked for if it pinned as many).
+  static int pinned_layer_count(const MetalLlamaWeights& wts,
+                                const Config& c);
 
   // ---- Raw-source layers (Config::load_quant_bits / stream_decode) -------
   // Whether the layers are built by this model (in-memory w8 or bf16
@@ -494,6 +503,17 @@ public:
   // (all of them, preloaded; the promoted ones, streaming), the two
   // streaming slots and the final norm. K/V is not included.
   std::uint64_t resident_bytes() const;
+  // The speculative verify's scratch, pooled for the model's life once a
+  // drafter runs: what it grows to for rounds of at most `rows` rows
+  // (every slot at its widest, the long-context attention's partials
+  // and `mtp_head`'s rows included) -- for a plan made before the model
+  // loads -- and what it holds now. `*conditional`: the share only some
+  // rounds take (that attention, a sampled round's rows, the fused
+  // in_proj of a uniform or k-quant model).
+  static std::size_t verify_scratch_bytes(const Config& c, int rows,
+                                          bool mtp_head,
+                                          std::size_t* conditional = nullptr);
+  std::size_t verify_scratch_held() const;
 
   // Sizes of a raw-source backbone, from the checkpoint alone -- for a
   // stage that has to plan before anything loads. `layer_prefix` is the
@@ -759,16 +779,28 @@ public:
   // or off for this model -- e.g. a test pinning the row-identical
   // ladder to prove the speculative loop exact against serial decode.
   // A no-op where the tiles did not load (8-bit, k-quant).
+  // Decode's GEMVs follow the verify's: on the one-row split-K tile while
+  // the verify runs split-K, so a speculative decode and the plain one
+  // compute every row alike (see _decode_ks).
   void set_qmv_ksplit(bool verify, bool batched) noexcept
   {
     _ks_verify = verify && _ks_loaded;
     _ks_batched = batched && _ks_loaded;
+    _decode_ks = _ks_verify && _ks1_ok;
   }
   // Split-K GEMV dispatches encoded so far: a test's proof the tier ran.
   std::uint64_t qmv_ksplit_dispatches() const noexcept
   {
     return _ks_dispatches;
   }
+  // Test hook: a hash of each logits row the greedy decode step
+  // (decode_step_fast) and the speculative verify compute, by context and
+  // position. A verify's later row at a position replaces its earlier
+  // one, so a speculative decode leaves the rows it committed (all but
+  // its last round's rejected tail): the plain decode's byte for byte, or
+  // a near-tie somewhere can turn. Off until set; setting it clears them.
+  void set_row_hashes(bool on);
+  std::uint64_t row_hash(ContextId cid, int pos) const;   // 0: none
   const MetalDFlashDrafter* dflash() const noexcept { return _dflash.get(); }
   // The attached drafter and this model's embedding + head as the drafter
   // sees them -- for a test that drives ingest / draft by hand. Null when
@@ -1078,6 +1110,9 @@ private:
   // 8-bit weights have no batched-GEMV -> qmv (M==1) / steel. This is THE
   // place the batched decode adapts to the (shrinking) active branch count.
   static constexpr int kQmvBatchMaxRows = 8;
+  // The verify's long-context attention, all its rows in one dispatch,
+  // takes up to this many key splits (its partials are pooled at it).
+  static constexpr int kVerifyRowsAttnSplits = 256;
   // MoE grouped-GEMM GEMV->steel crossover (prefill row count above which the
   // matrix-tiled steel expert GEMM beats the bandwidth GEMV). Machine-dependent
   // (matrix cores shift it down); default 1024, VPIPE_QWEN_MOE_STEEL_MIN sets
@@ -1403,6 +1438,8 @@ private:
       _fn_smp_max_partial, _fn_smp_max_combine,
       _fn_smp_zhist_partial, _fn_smp_zhist_combine,
       _fn_smp_thresh, _fn_smp_pick_partial, _fn_smp_pick_combine,
+      // A DFlash verify's penalty seen-sets from its ids (VerifyOpts).
+      _fn_seen_rows,
       // On-GPU Leviathan-Chen MTP correction (lc_sample / lc_accept): the
       // nucleus + accept/residual that the host L-C path used to grind over the
       // full vocab on the CPU, done one-threadgroup-per-row on the GPU.
@@ -1533,8 +1570,29 @@ private:
   // VPIPE_QMV_KSPLIT=0 off, 1 verify only, 2 verify + batched decode
   // (default); set_qmv_ksplit() overrides.
   enum class KsScope : std::uint8_t { kNone, kVerify, kBatched };
-  metal_compute::ComputeFunction _fn_qmv_ks[7], _fn_qmv_ks_swiglu[7];
+  metal_compute::ComputeFunction _fn_qmv_ks[9], _fn_qmv_ks_swiglu[9];
+  // The 8-bit twins (affine_qmv_ks<r>_w8g64): a mixed (OptiQ) model's
+  // 8-bit tensors -- 43% of the 27B's bytes -- verified on the batch
+  // tiles at 170-590 GB/s on an M5 Ultra where its 4-bit ones ran split-K
+  // at ~1 TB/s (DFlash's 8-row round 80 ms, 37 of them those GEMVs).
+  metal_compute::ComputeFunction _fn_qmv8_ks[9];
+  // y = r + x @ W^T twins of both (affine_qmv_ks<r>_add_w{4,8}g64): a
+  // verify folds each layer's two residual adds into its GEMVs.
+  metal_compute::ComputeFunction _fn_qmv_ks_add[9], _fn_qmv8_ks_add[9];
   bool _ks_loaded = false, _ks_verify = false, _ks_batched = false;
+  bool _ks8_loaded = false, _ks_add_loaded = false;
+  // Decode's affine GEMVs on the ONE-row split-K tile (affine_qmv_ks1_*):
+  // 4 output columns a threadgroup, K split over two simdgroups -- 4x the
+  // threadgroups of the 8-row qmv_fast tile, which an M5 Ultra's 80 cores
+  // need for the narrow projections; and a row's arithmetic is the split-K
+  // verify's, so decode and verify agree byte for byte.
+  // [0] plain, [1] residual-add, by width (4, 8); and the 4-bit SwiGLU.
+  // VPIPE_QWEN_DECODE_KS=0: decode on qmv_fast whatever the verify runs.
+  metal_compute::ComputeFunction _fn_ks1[2][2], _fn_ks1_swiglu;
+  bool _decode_ks = false, _ks1_ok = false;
+  // 7..8 rows: one 8-row tile (VPIPE_QMV_KS_TALL=1) or two 4-row tiles
+  // (the default: 32 accumulators a thread cost the tall one occupancy).
+  bool _ks_tall = false;
   KsScope _ks_scope = KsScope::kNone;
   mutable std::uint64_t _ks_dispatches = 0;
   // Marks which caller is encoding for the span of one encode.
@@ -1558,7 +1616,8 @@ private:
                     const metal_compute::SharedBuffer& b,
                     const metal_compute::SharedBuffer& xin,
                     const metal_compute::SharedBuffer& y,
-                    int Kk, int Nout, bool swiglu) const;
+                    int Kk, int Nout, bool swiglu, int bits = 4,
+                    const metal_compute::SharedBuffer* radd = nullptr) const;
   void qmv_ladder_defaults_();
   void autotune_qmv_ladder_();
   // Matrix-core prefill path (M5+). Set at load when the GPU has matrix
@@ -1789,6 +1848,10 @@ private:
     // with the step inputs captured into the gcache for a replay of the
     // kept prefix (encode_gdn_replay2_). Needs the ring on (depth >= 1).
     bool gdn_ring2 = false;
+    // Penalised sampling: the per-position seen-sets [n][vocab], written
+    // on the GPU by the prologue (seen_rows_from_ids), in place of the
+    // host's _mtp_seen_rows.
+    const metal_compute::SharedBuffer* seen_rows = nullptr;
   };
 
   // Re-advance every GDN layer from ring slot 0 to slot 1 over the first
@@ -1798,6 +1861,67 @@ private:
   // would have left. The caller advances the ring cursor afterwards.
   void encode_gdn_replay2_(metal_compute::ComputeEncoder& enc, ContextId cid,
                            int keep, const GdnVerifyCache& gc);
+  // The speculative verify's scratch, kept across calls: slot `slot`, at
+  // least `bytes`. A fresh set every round left an M5 Ultra's GPU idle
+  // ~5.5 ms before the round's first command buffer could start (the
+  // driver mapping and zeroing their pages), against ~35 ms of work. A
+  // verify waits for its buffers before it returns, so the next one finds
+  // them idle. Slots 0..39 and 42.. the verify's, 40..41 the replay's it
+  // encodes.
+  const metal_compute::SharedBuffer& verify_scratch_(std::size_t slot,
+                                                     std::size_t bytes);
+  std::deque<metal_compute::SharedBuffer> _vscratch;
+  metal_compute::SharedBuffer _vnone;   // the empty one a slot not used binds
+  // The verify's clocks, per model (two models verify on two threads).
+  struct VerifyStats {
+    // VPIPE_MTP_VPROFILE: main forward / verifier head / MTP head, each
+    // segment committed, waited for and timed.
+    double vp_main = 0.0, vp_vhead = 0.0, vp_mtp = 0.0;
+    long   vp_n = 0;
+    // VPIPE_DFLASH_PROFILE: scratch made, encoded, committed + waited.
+    double alloc = 0.0, enc = 0.0, wait = 0.0;
+    long   n = 0;
+    // VPIPE_MC_GPU_TIME=2: each verify's entry and its wait's return, on
+    // CommandStream::host_seconds' clock; the newest kMaxMarks kept.
+    static constexpr std::size_t kMaxMarks = 65536;
+    std::vector<std::pair<double, double>> marks;
+  };
+  VerifyStats _vstats;
+  // The verifier's lm_head is being encoded (VPIPE_VERIFY_SKIP: "head").
+  bool _vs_head = false;
+  // set_row_hashes: the hashes, and the verifier's rows copied before the
+  // MTP head reuses its logits buffer.
+  bool _row_hash_on = false;
+  std::unordered_map<std::uint64_t, std::uint64_t> _row_hashes;
+  metal_compute::SharedBuffer _row_hash_buf;
+  void note_row_hash_(ContextId cid, int pos, const void* row,
+                      std::size_t bytes);
+  // The speculative loops' command stream (one queue), kept across
+  // rounds: on a NEW queue the driver spent ~5.5 ms on a round's first
+  // command buffer before the GPU could start it (an M5 Ultra; ~0.05 ms
+  // on the buffers after it), the GPU idle meanwhile -- every round, as
+  // the verify made a stream a call. Each user commits and waits before
+  // the next encodes, so they never share an open buffer.
+  metal_compute::CommandStream& spec_stream_();
+  // The RMSNorm kernel for a row of Hd at these byte offsets: the vector
+  // one (rms_norm_vec_f16) for a hidden-size row -- 1024 <= Hd <= 8192,
+  // Hd % 4 == 0, 8-byte aligned -- else rms_norm_fast_f16 (a head's, which
+  // must match decode's rms_rope). Every norm of the model's goes through
+  // here, so decode, verify and prefill reduce alike.
+  // VPIPE_QWEN_RMS_VEC=0: always the scalar one.
+  const metal_compute::ComputeFunction& rms_fn_(int Hd, std::size_t xoff,
+                                                std::size_t yoff) const;
+  metal_compute::ComputeFunction _fn_rms_vec;
+  metal_compute::CommandStream _spec_stream;
+  // The GDN q|k L2 norms of `heads` q heads at qoff and as many k heads
+  // right after them (koff), in place: one fused dispatch
+  // (qwen3_5_gdn_qk_norm, as decode runs it) where k follows q, else the
+  // two weighted RMS norms. Every multi-row GDN path calls this -- the
+  // verify and both replays -- so a replayed state is the verify's.
+  void encode_gdn_qk_norm_(metal_compute::ComputeEncoder& enc,
+                           const metal_compute::SharedBuffer& buf,
+                           std::size_t qoff, std::size_t koff,
+                           int heads) const;
 
   // ---- DFlash state ----
   // The adaptive round length (dflash_decode with block 0): what a round

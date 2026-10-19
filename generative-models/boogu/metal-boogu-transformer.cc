@@ -19,8 +19,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <string>
+#include <utility>
 
 namespace vpipe {
 namespace genai {
@@ -596,9 +598,10 @@ using P = vpipe::genai::Placement;
 
 // A MATRIX is three tensors when quantized and one when dense, and which
 // it is was decided when the slot was built -- so the layout comes from
-// the QWeight, not from the checkpoint. A pack that disagrees fails the
-// refill's size check and forces a rebuild, which is the right answer to
-// "these are not the same weights".
+// the QWeight, not from the checkpoint. A pack whose block disagrees is
+// not REFILLED at all: same_layout_ has the slot built for it, because a
+// refill's size check rebuilds the codes yet keeps the slot's `bits` and
+// the woven gate|up of the other width (a mixed pack).
 namespace {
 template <class Fn, class QW>
 void
@@ -613,6 +616,78 @@ boogu_qw_(const std::string& base, QW& w, const Fn& fn)
   }
 }
 }  // namespace
+
+// Widths of block L in the checkpoint against the slot's, per matrix
+// (BlockSlots::Ops::same_layout). A mixed pack ranks the single-stream
+// blocks; the double ones are compared too, which costs nothing.
+namespace {
+template <class QW>
+bool
+boogu_same_width_(const WeightSet& ws, int group,
+                  std::initializer_list<std::pair<const QW*, std::string>> all)
+{
+  for (const auto& [w, stem] : all) {
+    if (stored_affine_bits(ws, stem, group) !=
+        (w->quantized ? w->bits : 0)) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
+bool
+MetalBooguTransformer::same_layout_(int L, const Block& b) const
+{
+  if (_quant_bits == 0 || _ws == nullptr) { return true; }
+  const std::string p = "single_stream_layers." + std::to_string(L) + ".";
+  return boogu_same_width_<QWeight>(
+      *_ws, _quant_group,
+      {{&b.q, p + "attn.to_q"},
+       {&b.k, p + "attn.to_k"},
+       {&b.v, p + "attn.to_v"},
+       {&b.o, p + "attn.to_out.0"},
+       {&b.ff_gate, p + "feed_forward.linear_1"},
+       {&b.ff_up, p + "feed_forward.linear_3"},
+       {&b.ff_down, p + "feed_forward.linear_2"},
+       {&b.mod, b.modulated ? p + "norm1.linear" : std::string()}});
+}
+
+bool
+MetalBooguTransformer::same_layout_(int L, const DoubleBlock& b) const
+{
+  if (_quant_bits == 0 || _ws == nullptr) { return true; }
+  const std::string p = "double_stream_layers." + std::to_string(L) + ".";
+  const std::string jp = p + "img_instruct_attn.";
+  const std::string pp = jp + "processor.";
+  const std::string sp = p + "img_self_attn.";
+  return boogu_same_width_<QWeight>(
+      *_ws, _quant_group,
+      {{&b.jq_i, pp + "img_to_q"},
+       {&b.jk_i, pp + "img_to_k"},
+       {&b.jv_i, pp + "img_to_v"},
+       {&b.jq_t, pp + "instruct_to_q"},
+       {&b.jk_t, pp + "instruct_to_k"},
+       {&b.jv_t, pp + "instruct_to_v"},
+       {&b.jout_i, pp + "img_out"},
+       {&b.jout_t, pp + "instruct_out"},
+       {&b.jo, jp + "to_out.0"},
+       {&b.sq, sp + "to_q"},
+       {&b.sk, sp + "to_k"},
+       {&b.sv, sp + "to_v"},
+       {&b.so, sp + "to_out.0"},
+       {&b.iff_gate, p + "img_feed_forward.linear_1"},
+       {&b.iff_up, p + "img_feed_forward.linear_3"},
+       {&b.iff_down, p + "img_feed_forward.linear_2"},
+       {&b.tff_gate, p + "instruct_feed_forward.linear_1"},
+       {&b.tff_up, p + "instruct_feed_forward.linear_3"},
+       {&b.tff_down, p + "instruct_feed_forward.linear_2"},
+       {&b.mi1, p + "img_norm1.linear"},
+       {&b.mi2, p + "img_norm2.linear"},
+       {&b.mi3, p + "img_norm3.linear"},
+       {&b.mt1, p + "instruct_norm1.linear"},
+       {&b.mt2, p + "instruct_norm2.linear"}});
+}
 
 void
 MetalBooguTransformer::each_single_tensor_(
@@ -860,6 +935,9 @@ MetalBooguTransformer::configure_slots_()
     o.post_refill = [this](int, Block& b) {
       return weave_into_(b.ff_gate, b.ff_up, b.ff_gu);
     };
+    o.same_layout = [this](int L, const Block& b) {
+      return same_layout_(L, b);
+    };
     _single_slots.set_weight_set(_ws.get());
     _single_slots.configure(_mc, std::move(o),
                             "MetalBooguTransformer(single)",
@@ -889,6 +967,9 @@ MetalBooguTransformer::configure_slots_()
     o.post_refill = [this](int, DoubleBlock& b) {
       return weave_into_(b.iff_gate, b.iff_up, b.iff_gu) &&
              weave_into_(b.tff_gate, b.tff_up, b.tff_gu);
+    };
+    o.same_layout = [this](int L, const DoubleBlock& b) {
+      return same_layout_(L, b);
     };
     _double_slots.set_weight_set(_ws.get());
     _double_slots.configure(_mc, std::move(o),
@@ -1554,6 +1635,7 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
       t->_double_slots.join();
     }
   } slot_join{this};
+  (void)release_idle_slots();
   _single_slots.begin_forward();
   _double_slots.begin_forward();
   const int H = c.hidden, HED = c.n_heads, KVH = c.n_kv_heads;
@@ -2285,7 +2367,9 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
       enc.end();
       stream.commit().wait();
       *acc[which] += ms_since(mk);
-      stream = _mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       op = make_ops(enc);
       mk = tnow();
@@ -2494,7 +2578,9 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
       enc.end();
       stream.commit().wait();
       *acc[which] += ms_since(mk);
-      stream = _mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       op = make_ops(enc);
       mk = tnow();
@@ -2594,6 +2680,14 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
     }
   }
   return velocity;
+}
+
+void
+MetalBooguTransformer::release_forward_scratch()
+{
+  _w_deq = {};
+  _splitk = {};
+  if (_i8) { _i8->release_scratch(); }
 }
 
 }  // namespace genai

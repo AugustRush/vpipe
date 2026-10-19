@@ -4,6 +4,8 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/shared/drawthings-store.h"
 #include "generative-models/shared/stream-sizing.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #include "stages/model-detect.h"
@@ -11,7 +13,9 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "interfaces/session-services-intf.h"
 
+#include <fcntl.h>
 #include <sys/sysctl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -99,6 +103,39 @@ dir_weights_bytes(const std::string& dir)
     const std::string ext = fs::path(dir).extension().string();
     if (ext != ".safetensors" && ext != ".pth" && ext != ".ckpt") {
       return 0;
+    }
+    // A DRAW THINGS store weighs what it is SERVED at, not what it stores:
+    // its i8x weights and q8p palettes are presented (and, on every route
+    // but the unrotated token tier, held) as f16 / bf16 -- about twice
+    // their bytes on disk -- and the AdaLN a MiniMax-H3 bake retires is
+    // subtracted in those same units (adaln_retired_bytes sums presented
+    // sizes). Sized by the file, the dense route held ~2x its estimate
+    // and an H3 .ckpt subtracted AdaLN at twice what the file carried for
+    // it. The i8x code / scale aliases are the same weight again and are
+    // not counted.
+    if (ext == ".ckpt") {
+      bool store = false;
+      const int fd = ::open(dir.c_str(), O_RDONLY);
+      if (fd >= 0) {
+        store = genai::drawthings::looks_like(fd);
+        ::close(fd);
+      }
+      if (store) {
+        if (auto w = genai::MetalLlamaWeights::open_model(dir)) {
+          std::size_t served = 0;
+          for (const std::string& nm : w->tensor_names()) {
+            const auto ends = [&](std::string_view sx) {
+              return nm.size() >= sx.size() &&
+                     nm.compare(nm.size() - sx.size(), sx.size(), sx) == 0;
+            };
+            if (ends(".i8x") || ends(".i8x_scales")) { continue; }
+            if (const auto* ti = w->info(nm)) {
+              served += (std::size_t)ti->nbytes;
+            }
+          }
+          if (served > 0) { return served; }
+        }
+      }
     }
     const std::uintmax_t n = fs::file_size(fs::path(dir), ec);
     return ec ? 0 : (std::size_t)n;
@@ -410,9 +447,19 @@ vae_decode_scratch_bytes(const std::string& root, int width, int height)
   // Base channels: max(block_out[0], block_out[1]), the width the 2K
   // overflow fix settled on -- block_out[0] alone under-modelled the
   // peak 2x. 128 is the stock AutoencoderKL default when unreadable.
+  // The DECODER's widths where the checkpoint states them apart (the
+  // FLUX.2 small decoder: [96, 192, 384, 384] beside an encoder of
+  // [128, 256, 512, 512]) -- this is a decode's arena.
+  // A `null` there (FLUX.3's VAE) is diffusers' "as the encoder's": the
+  // key present and no widths. Taken as widths it threw, and the throw
+  // refused every FLUX.3 graph at its launch.
   int base = 128;
-  if (o.contains("block_out_channels")) {
-    FlexData bo = o.at("block_out_channels");
+  const char* bkey = o.contains("decoder_block_out_channels") &&
+                             o.at("decoder_block_out_channels").is_array()
+                         ? "decoder_block_out_channels"
+                         : "block_out_channels";
+  if (o.contains(bkey) && o.at(bkey).is_array()) {
+    FlexData bo = o.at(bkey);
     auto arr = bo.as_array();          // owner `bo` outlives this view
     if (arr.size() >= 2) {
       const int b0 = (int)arr[0].as_real(0.0);
@@ -434,9 +481,20 @@ vae_decode_scratch_bytes(const std::string& root, int width, int height)
   // through MetalFlux2Vae -- the same code, so the same peak. Left at
   // the conservative 27 it over-declared Boogu 1.93x, which is the safe
   // direction but is still a number nobody computed.
-  const std::size_t mult =
-      (cls == "AutoencoderKLFlux2" || cls == "AutoencoderKL") ? 14 : 27;
-  return (std::size_t)height * (std::size_t)width * (std::size_t)base * mult;
+  const bool flux2_class =
+      cls == "AutoencoderKLFlux2" || cls == "AutoencoderKL";
+  const std::size_t hwb =
+      (std::size_t)height * (std::size_t)width * (std::size_t)base;
+  if (flux2_class) {
+    // ...plus the im2col band MetalFlux2Vae allocates on EVERY decode,
+    // gathering or not (decode_peak_bytes adds it on both paths): its
+    // whole-image size, capped at 128 MB. Left out, the plan sat up to
+    // 128 MB under the runtime's own figure.
+    const std::size_t band =
+        std::min(hwb * 9 * 2, (std::size_t)(128u << 20));
+    return hwb * 14 + band;
+  }
+  return hwb * 27;
 }
 
 bool
@@ -727,8 +785,9 @@ weight_claims_in_phase(std::vector<std::string> dirs,
 namespace {
 
 // A language model kept warm (text-chat's `keep_loaded`) -- and the
-// conversations parked on it -- that a launch has not claimed: released
-// when the launch does not FIT beside it, kept when it does.
+// conversations parked on it -- that a launch has not claimed, and a
+// model a stage built and keeps warm (keep_model_warm): released when
+// the launch does not FIT beside them, kept when it does.
 //
 // Releasing unconditionally cost the next turn of a conversation its
 // model's whole load and its context's read back (or prefill) after
@@ -760,7 +819,12 @@ release_warm_unless_it_fits_(const SessionContextIntf* session,
       + mgr->scratch_bytes(std::string()) + mgr->resident_kv_bytes();
   std::size_t warm = 0;
   for (const auto& d : dirs) {
-    if (!mgr->declares(d)) { warm += dir_weights_bytes(d); }
+    if (mgr->declares(d)) { continue; }
+    // A model a stage built and keeps warm says what it holds (a DiT's
+    // int8 layout, a VAE's converted convs); a language model's
+    // directory is its weights.
+    const std::size_t built = mgr->warm_model_bytes(d);
+    warm += built > 0 ? built : dir_weights_bytes(d);
   }
   const std::size_t ram = phys_ram();
   if (ram != 0 && held + warm + kHeadroom <= ram) {

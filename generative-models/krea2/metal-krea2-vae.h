@@ -5,9 +5,11 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
 #include "generative-models/shared/dit-flops.h"
+#include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/kernel-sets/vae-conv3x3-tune.h"
 #include "generative-models/shared/kernel-sets/vae-mid-attn-tune.h"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -138,6 +140,9 @@ class MetalKrea2Vae {
   // latent grid that is not a multiple of 8). For a preflight
   // memory_budget() check.
   std::size_t decode_peak_bytes(int h8, int w8) const noexcept;
+  // What every decode adds beside its level-sized tensors (see
+  // decode_peak_bytes).
+  static constexpr std::size_t kDecodeFixedBytes = 256u << 20;
 
   // Encode an RGB image [3, H, W] (channel-first, in [-1,1]) into the WHITENED
   // latent [z_dim, H/8, W/8] (channel-first) -- the posterior mode (mean),
@@ -158,6 +163,41 @@ class MetalKrea2Vae {
   unwhiten(const metal_compute::SharedBuffer& z, int h8, int w8);
 
   const Config& config() const { return _cfg; }
+
+  // ACCELERATED MODE (LOSSY), the stages' `i8_gemm` / `i8_gemm_tier`:
+  // the int8 matrix units for the codec's two kinds of big product.
+  //
+  //   THE 3x3 CONVS, on the hardware int8 convolution
+  //   (conv2d_hw_3x3_*_i8): an activation channel at a step of its own,
+  //   folded into a per-call int8 copy of the weight -- a 3x3 window sums
+  //   nine pixels in one pass, so no finer scale is possible there -- by
+  //   SmoothQuant's migration (vae_i8_steps_f16, alpha 0.25). A resnet's
+  //   conv reads RMS-norm -> SiLU, its pixels' magnitude already even,
+  //   and its SiLU goes into the quantizer.
+  //   THE MID-BLOCK ATTENTION, when it is materialized (kMat): Q.K^T and
+  //   P.V are ordinary GEMMs, and run on I8GemmContext.
+  //
+  //   THE TIER (0 accurate, 1 fast, 2 token, Hadamard-256 rotated, 3
+  //   token unrotated) is the DiTs' vocabulary. Accurate takes only the
+  //   resnet convs and runs the attention's GEMMs at the accurate tier;
+  //   every other tier takes each 3x3 the route fits -- conv_in and the
+  //   up / downsamples, which read the unnormalized residual stream --
+  //   and runs the GEMMs at itself. A GEMM whose depth a tier's layout
+  //   cannot take stays accurate (Qwen-Image-2.1's 1152-wide Q.K^T: no
+  //   fast group, no rotated token block; I8GemmContext::fast_group).
+  //   MEASURED in set_accel: accurate 1.14x the decode, fast 1.25x.
+  //
+  // Off by default and for the reason vae-decode-stage gives: a codec is
+  // the last step before the pixels, with nothing after it to absorb an
+  // approximation. Set before decode() / encode(); cheap, and a GPU
+  // without matrix cores (or the kernels) quietly keeps f16.
+  struct Accel {
+    bool i8_gemm = false;
+    int  i8_tier = 0;
+  };
+  void set_accel(const Accel& a);
+  // What set_accel turned on, for the stage's log line ("" for nothing).
+  std::string accel_note() const;
 
  private:
   MetalKrea2Vae() = default;
@@ -415,6 +455,33 @@ class MetalKrea2Vae {
                            int H, int W, int stride);
   bool _use_hwconv = false;
 
+  // The int8 resnet conv (set_accel). The conv and its three quantizers,
+  // loaded with the hardware conv; `_i8_conv` is set_accel's switch.
+  metal_compute::ComputeFunction _fn_conv_i8_s1, _fn_conv_i8_s1_c32,
+      _fn_conv_i8_s1_c16, _fn_conv_i8_s2, _fn_conv_i8_s2_c32,
+      _fn_conv_i8_s2_c16, _fn_i8_zero, _fn_i8_amax, _fn_i8_steps,
+      _fn_i8_quant, _fn_i8_fold;
+  bool _i8_conv = false;
+  // SmoothQuant's alpha for the activation steps (vae_i8_steps_f16 has
+  // the measurement); VPIPE_VAE_I8_ALPHA overrides it, for an A/B.
+  float _i8_alpha = 0.25f;
+  // VPIPE_VAE_I8_ALL_CONVS: every 3x3 the route fits, the residual
+  // stream's included -- for measuring what keeping them f16 is worth.
+  bool _i8_all_convs = false;
+  // A 3x3 at stride 1 or 2 through the int8 route, `silu` applied to its
+  // input on the way in. False with nothing encoded where the route is
+  // off or the shape does not fit it; `alloc` / `release` are the
+  // caller's pool, which lends the int8 copies.
+  using PoolAlloc = std::function<metal_compute::SharedBuffer&(std::size_t)>;
+  using PoolRelease = std::function<void(const metal_compute::SharedBuffer&)>;
+  bool conv3x3_i8_(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& in, const Conv& c,
+                   const metal_compute::SharedBuffer& out, int H, int W,
+                   int stride, bool silu, const PoolAlloc& alloc,
+                   const PoolRelease& release);
+  // The mid-block attention's int8 GEMMs (set_accel); null when off.
+  std::unique_ptr<I8GemmContext> _i8;
+
   // Libraries + kernel functions (all reused from the LM path except the VAE
   // kernels im2col_hwc_3x3{,_s2} / upsample_nearest2x_hwc in llm_elementwise).
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_sdpa;
@@ -453,12 +520,36 @@ class MetalKrea2Vae {
   metal_compute::ComputeFunction _fn_sdpa_full_wide16, _fn_sdpa_full_wide32,
       _fn_sdpa_full_wide64;
   void load_wide_attn_(int mid_d);
+  // The MATERIALIZED member (kMat): Q.K^T -> a row softmax -> P.V, the
+  // two products dense GEMMs on the matrix units (or int8, set_accel), in
+  // query bands whose scores fit kMatAttnScoreBytes. Qwen-Image-2.1's mid
+  // is 1152 wide -- past every flash kernel's head -- so before this its
+  // only member was the scalar one: 503 of a 1676 ms 1024^2 decode.
+  // The scores are stored f16, which is the trap vae-mid-attn-tune.h's
+  // correctness gate is built for: unscaled they overflow it, and a
+  // positive-mean K adds one offset to a whole row (1.4e4 in the gate's
+  // probe), at which f16's steps are 8 apart and the differences between
+  // keys are gone (the gate measured it at rel-L2 1.0). So K is CENTRED
+  // over the tokens first -- exact: softmax ignores a row's constant --
+  // and carries the softmax's 1/sqrt(C), in a copy.
+  // VPIPE_VAE_NO_MAT_ATTN leaves it out.
+  metal_compute::ComputeFunction _fn_softmax_rows, _fn_transpose,
+      _fn_attn_colsum, _fn_attn_colsum_reduce, _fn_attn_center;
+  static constexpr std::size_t kMatAttnScoreBytes = 256u << 20;
+  int mat_attn_band_(std::size_t hw) const noexcept;
+  // The attention's two GEMMs, y[M,N] = x[M,K] @ w[N,K]^T: int8 at the
+  // tier where set_accel turned it on and the shape takes it, else f16.
+  void attn_gemm_(metal_compute::ComputeEncoder& enc,
+                  const metal_compute::SharedBuffer& x, std::size_t xe,
+                  const metal_compute::SharedBuffer& w,
+                  const metal_compute::SharedBuffer& y, std::size_t ye,
+                  int M, int N, int K, const PoolAlloc& alloc,
+                  const PoolRelease& release);
   // The interchangeable mid-block attention kernels, picked by MEASUREMENT at
   // load rather than from supports_matrix_cores(). See vae-mid-attn-tune.h:
   // which member wins is a property of the GPU, and a query tile chosen by a
-  // sweep on one machine is not the tile the next one wants. This VAE has no
-  // materialized banded path (no gemm_t/softmax_rows/transpose here), so it
-  // never lists kMat.
+  // sweep on one machine is not the tile the next one wants. kMat is the
+  // materialized member above.
   using MidAttn = vae_mid_attn::Kind;
   MidAttn _attn_pick = MidAttn::kScalar;
   // `C` is the head width the candidate would run at: the scalar
@@ -469,7 +560,8 @@ class MetalKrea2Vae {
                         const metal_compute::SharedBuffer& k,
                         const metal_compute::SharedBuffer& v,
                         const metal_compute::SharedBuffer& att,
-                        std::size_t hw, int C, float scale);
+                        std::size_t hw, int C, float scale,
+                        const PoolAlloc& alloc, const PoolRelease& release);
   void autotune_mid_attn_(metal_compute::MetalCompute* mc, int C);
   // Simdgroup count the kernel of query tile `bq` was instantiated with; the
   // dispatch has to match it exactly (matmul2d's execution scope is UB

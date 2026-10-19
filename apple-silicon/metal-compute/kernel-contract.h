@@ -90,6 +90,13 @@ inline constexpr Kernel kKernels[] = {
   {"attn_steel", "attn_steel_h_bd128_bf16"},
   {"attn_steel_nax", "attn_steel_nax_h_bd64_bf16"},
   {"attn_steel_nax", "attn_steel_nax_h_bd128_bf16"},
+  // ...and their f16 twins, which the toolkit's Sol resolves for an f16
+  // forward (MetalSolAttention::_lib_for_width_). Every ABI 8 host has
+  // carried them; they were simply never listed.
+  {"attn_steel", "attn_steel_h_bd64"},
+  {"attn_steel", "attn_steel_h_bd128"},
+  {"attn_steel_nax", "attn_steel_nax_h_bd64"},
+  {"attn_steel_nax", "attn_steel_nax_h_bd128"},
 
   // ---- revision 2 ----
   // y += scale * (x @ W^T): the accumulate twin runtime LoRA adds an
@@ -163,6 +170,54 @@ inline constexpr ToolkitKernel kToolkitKernels[] = {
   {"dense_gemm_mma", "gemm_i8s_w4g64_sk"},
   {"dense_gemm_mma", "gemm_i8s_w8g64"},
   {"dense_gemm_mma", "gemm_i8s_w8g64_sk"},
+  // ...and the down projection's quantizer straight from a SwiGLU's
+  // halves (gemm_signed_swiglu). Optional the same way.
+  {"affine_dequant", "swiglu_quant_f16_i8s_row_g64"},
+  // THE FAST TIER (I8GemmContext::Tier::kFast): the rotated coarse-group
+  // quantizers and GEMMs, per group. Optional: without them fast_group()
+  // answers 0 and every weight stays on the accurate tier.
+  {"affine_dequant", "quant_i8_row_gc256_r"},
+  {"affine_dequant", "quant_i8_row_gc512_r"},
+  {"affine_dequant", "quant_i8_row_gc1024_r"},
+  {"affine_dequant", "swiglu_quant_i8_row_gc256_r"},
+  {"affine_dequant", "swiglu_quant_i8_row_gc512_r"},
+  {"affine_dequant", "swiglu_quant_i8_row_gc1024_r"},
+  {"affine_dequant", "affine_to_i8c_w8_gc256_r"},
+  {"affine_dequant", "affine_to_i8c_w8_gc512_r"},
+  {"affine_dequant", "affine_to_i8c_w8_gc1024_r"},
+  {"affine_dequant", "i8c_dequant_gc256_r"},
+  {"affine_dequant", "i8c_dequant_gc512_r"},
+  {"affine_dequant", "i8c_dequant_gc1024_r"},
+  {"dense_gemm_mma", "gemm_i8c_g256_t64x128"},
+  {"dense_gemm_mma", "gemm_i8c_g512_t64x128"},
+  {"dense_gemm_mma", "gemm_i8c_g1024_t64x128"},
+  {"dense_gemm_mma", "gemm_i8c_g256_t128x64"},
+  {"dense_gemm_mma", "gemm_i8c_g512_t128x64"},
+  {"dense_gemm_mma", "gemm_i8c_g1024_t128x64"},
+  // ...a w4 g64 pack's conversion into it, out of place. Optional apart
+  // from the tier: without it a w4 weight stays on the accurate tier.
+  {"affine_dequant", "affine_to_i8c_w4_gc256_r"},
+  {"affine_dequant", "affine_to_i8c_w4_gc512_r"},
+  {"affine_dequant", "affine_to_i8c_w4_gc1024_r"},
+  // THE TOKEN TIER (I8GemmContext::Tier::kToken): the per-row
+  // quantizers, plain and Hadamard-256 rotated, and the register-
+  // fragment GEMM at its two tiles and two K loops (set_token_kernel:
+  // m = blocked, d = double-buffered). Optional the same way.
+  {"affine_dequant", "quant_i8_tok"},
+  {"affine_dequant", "swiglu_quant_i8_tok"},
+  {"affine_dequant", "affine_to_i8pt_w8"},
+  {"affine_dequant", "i8pt_dequant"},
+  {"affine_dequant", "quant_i8_tok_r"},
+  {"affine_dequant", "swiglu_quant_i8_tok_r"},
+  {"affine_dequant", "affine_to_i8pt_w8_r"},
+  {"affine_dequant", "i8pt_dequant_r"},
+  {"dense_gemm_mma", "gemm_i8pt_m128x64"},
+  {"dense_gemm_mma", "gemm_i8pt_m64x128"},
+  {"dense_gemm_mma", "gemm_i8pt_d128x64"},
+  {"dense_gemm_mma", "gemm_i8pt_d64x128"},
+  // ...and a w4 pack's conversion, as the fast tier's.
+  {"affine_dequant", "affine_to_i8pt_w4"},
+  {"affine_dequant", "affine_to_i8pt_w4_r"},
   // SageAttention's quantization (shared/metal-sage-attention.h).
   {"sage_quant", "sage_k_sum_chunk"},
   {"sage_quant", "sage_k_mean_reduce"},

@@ -74,9 +74,11 @@ const ConfigKey kAttrs[] = {
    .def_int = 8},
   {.key = "color_fix", .type = ConfigType::Bool, .required = false,
    .doc = "correct each restored frame's colour toward its source frame "
-          "(color_fix_method says how). Unset, it follows the release's "
-          "own reference: on for FlashVSR-v1.1, which applies its fix by "
-          "default, and off for FlashVSR+, whose fix is opt-in (its --cf)",
+          "(color_fix_method says how). On by default for both releases: "
+          "FlashVSR-v1.1's reference applies its fix by default; "
+          "FlashVSR+'s makes it opt-in (its --cf), but without it the "
+          "restored colours drift from the source's. Set false for the "
+          "uncorrected output",
    .def_bool = true},
   {.key = "color_fix_method", .type = ConfigType::String, .required = false,
    .doc = "auto | adain | wavelet. `adain`: each channel's mean and spread "
@@ -210,8 +212,8 @@ FlashVsrSrcEncoderStage::FlashVsrSrcEncoderStage(
     fail_config(fmt("FlashVsrSrcEncoderStage('{}'): continuity must be "
                     "auto, stream or clips; got '{}'", this->id(), c));
   }
-  // Unset, the colour fix follows the release, which is known only once
-  // the model is: see ensure_loaded_().
+  // Whether the graph asked for the colour fix itself, which decides how
+  // loudly a missing wire is said: see process().
   {
     // this->: the constructor's own `config` parameter, moved from by
     // now, shadows the accessor.
@@ -401,9 +403,11 @@ FlashVsrSrcEncoderStage::ensure_loaded_()
   // stream and how many each later chunk takes -- 25 then 8 for v1.1, 17
   // then 16 for FlashVSR+.
   _sch = genai::flashvsr_schedule(layout);
-  // THE COLOUR FIX the release's reference applies: v1.1 its AdaIN, by
-  // default; FlashVSR+ its wavelet one, only when asked (--cf).
-  if (!_color_fix_set) { _color_fix = !_sch.is_plus(); }
+  // THE COLOUR FIX each release's reference has: v1.1 its AdaIN,
+  // FlashVSR+ its wavelet one. On for both unless the graph says not:
+  // FlashVSR+'s reference applies it only when asked (--cf), and without
+  // it a real 2x clip's channel means drifted 1.4-1.9 levels from the
+  // source's (0.15 with it, at no measurable cost).
   _method = !_color_fix ? ColorFix::kOff
           : _cfg_method != ColorFix::kAuto
               ? _cfg_method
@@ -521,14 +525,21 @@ FlashVsrSrcEncoderStage::process(RuntimeContext& ctx)
       session()->info(m);
     }
   }
+  // Asked for, a fix that cannot run is a warning; on by default, a note
+  // (a graph that never wired the pictures restores as it always did).
   if (_method == ColorFix::kWavelet && !_refs_wired && !_refs_noted &&
       _proj != nullptr) {
     _refs_noted = true;
-    session()->warn(fmt(
+    const auto m = fmt(
         "FlashVsrSrcEncoderStage('{}'): the wavelet colour fix needs this "
         "stage's color_reference output wired to vae-decode's "
         "color_reference input; nothing is, so the source restores "
-        "without a colour fix", this->id()));
+        "without a colour fix", this->id());
+    if (_color_fix_set || _cfg_method == ColorFix::kWavelet) {
+      session()->warn(m);
+    } else {
+      session()->info(m);
+    }
   }
 
   auto cb = co_await ctx.read(kSourcePort);
