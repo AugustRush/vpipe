@@ -84,6 +84,14 @@ add_vpipe_metal_kernel(rope_bf16 SRC ops/rope.metal
                        DEFINES VPIPE_ELT=bfloat)
 # The DFlash block-diffusion drafter (speculative decoding):
 # generative-models/shared/dflash-drafter.h.
+# Fish Audio Drama 3's speech LM: the frame embedding, the codebook-MTP
+# tower's own ops and the frame sampler (generative-models/drama3/).
+add_vpipe_metal_kernel(drama3 SRC ops/drama3.metal)
+add_vpipe_metal_kernel(drama3_bf16 SRC ops/drama3.metal
+                       DEFINES VPIPE_ELT=bfloat)
+# Fish Audio's modded DAC (the S2 Pro / Drama 3 codec): its VQ, its
+# windowed transformers' q/k/v and its LayerScale residuals.
+add_vpipe_metal_kernel(fish_dac SRC ops/fish_dac.metal)
 add_vpipe_metal_kernel(dflash SRC ops/dflash.metal)
 add_vpipe_metal_kernel(dflash_bf16 SRC ops/dflash.metal
                        DEFINES VPIPE_ELT=bfloat)

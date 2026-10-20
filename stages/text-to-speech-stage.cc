@@ -6,6 +6,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 #include "pipeline/memory-plan.h"
@@ -14,6 +15,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/tensor-beat.h"
 #include "common/ffmpeg-libraries.h"
+#include "common/media-decode.h"
 #include "generative-models/moss/metal-moss-tts-model.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/weight-set.h"
@@ -26,16 +28,22 @@
 #include "generative-models/moss/moss-delay-processor.h"
 #include "generative-models/moss/moss-text-normalizer.h"
 #include "generative-models/tokenizer.h"
+#include "generative-models/drama3/drama3-prompt.h"
+#include "generative-models/drama3/metal-drama3-model.h"
+#include "generative-models/drama3/metal-fish-codec.h"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <random>
 #include <utility>
 #endif
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -201,6 +209,7 @@ TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
 #endif
   _voice_lock        = attr_bool("voice_lock");
   _voice_ref_seconds = attr_real("voice_ref_seconds");
+  _reference_text    = attr_str("reference_text");
   // A wired PCM-reference iport1 means the codec needs its encode path, so a
   // reference voice can be analysed for cloning. iport_edges() reflects the
   // edges this stage was constructed with (the graph is frozen post-launch);
@@ -214,10 +223,68 @@ TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
         "TextToSpeechStage('{}'): config.hf_dir is required (non-empty "
         "string -- the MOSS-TTS LM directory)", this->id()));
   }
-  if (_codec_dir.empty()) {
+  // The MOSS variants need their codec named; Drama 3 ships its own.
+  bool own_codec = false;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  own_codec = !_hf_dir.empty() &&
+              genai::Drama3Config::is_drama3_dir(
+                  resolve_model_dir(session(), _hf_dir));
+#endif
+  if (_codec_dir.empty() && !own_codec) {
     fail_config(fmt(
         "TextToSpeechStage('{}'): config.codec_dir is required (non-empty "
         "string -- the MOSS-Audio-Tokenizer directory)", this->id()));
+  }
+  // Drama 3's long text, context and voices from files.
+  _d3_chunk_text = attr_bool("chunk_text");
+  _d3_context = attr_str("context");
+  if (_d3_context != "text" && _d3_context != "run") {
+    fail_config(fmt("TextToSpeechStage('{}'): context must be \"text\" or "
+                    "\"run\" (got \"{}\")", this->id(), _d3_context));
+  }
+  {
+    const FlexData refs = attr("references");
+    if (refs.is_array()) {
+      for (const FlexData& e : refs.as_array()) {
+        const FlexData ef = e;
+        if (!ef.is_object()) {
+          fail_config(fmt("TextToSpeechStage('{}'): references entries are "
+                          "{{\"audio\": file, \"text\": transcript}} "
+                          "objects", this->id()));
+          break;
+        }
+        auto o = ef.as_object();
+        D3RefSpec r;
+        if (o.contains("audio")) {
+          r.audio = std::string(o.at("audio").as_string(""));
+        }
+        if (o.contains("text")) {
+          r.text = std::string(o.at("text").as_string(""));
+        }
+        if (r.audio.empty() || r.text.empty()) {
+          fail_config(fmt("TextToSpeechStage('{}'): every reference needs "
+                          "both \"audio\" and \"text\" -- Drama 3 clones "
+                          "from the sound and its words", this->id()));
+          break;
+        }
+        r.audio = confine_local_(r.audio, /*for_write=*/false);
+        if (r.audio.empty()) { break; }
+        _d3_ref_specs.push_back(std::move(r));
+      }
+    } else if (!refs.is_null()) {
+      fail_config(fmt("TextToSpeechStage('{}'): references is a list of "
+                      "{{\"audio\", \"text\"}} objects", this->id()));
+    }
+  }
+  if (!_d3_ref_specs.empty()) {
+    if (!own_codec) {
+      session()->warn(fmt("TextToSpeechStage('{}'): references is read by "
+                          "Fish Audio Drama 3 only; ignoring it",
+                          this->id()));
+      _d3_ref_specs.clear();
+    } else {
+      _with_encoder = true;      // they are encoded at load
+    }
   }
 
   // Always allocate the PCM oport. When nothing is wired downstream the
@@ -229,20 +296,57 @@ TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
 namespace {
 constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
-   .doc = "MOSS-TTS LM model: a models-DB key (registered by model-fetch / "
+   .doc = "TTS LM model: a models-DB key (registered by model-fetch / "
           "model-quantize) or an HF-style model dir; a DB key wins over a "
           "same-named path. Delay-pattern MOSS-TTS 8B / MOSS-TTS-v1.5 "
           "(moss-tts; bf16 as published, or model-quantize'd), Local-v1.5 "
-          "(moss-tts-local), or realtime (moss-tts-realtime).",
+          "(moss-tts-local), realtime (moss-tts-realtime), or Fish Audio "
+          "Drama 3 (fish-drama3; its codec ships beside it).",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "moss-tts,moss-tts-local,moss-tts-realtime"},
-  {.key = "codec_dir", .type = ConfigType::String, .required = true,
+   .suggest_db_type =
+       "moss-tts,moss-tts-local,moss-tts-realtime,fish-drama3"},
+  {.key = "codec_dir", .type = ConfigType::String,
    .doc = "MOSS-Audio-Tokenizer (codec) model: a models-DB key or a "
-          "filesystem path; a DB key wins over a same-named path. Match the "
-          "LM variant: moss-codec (MOSS-TTS 8B / v1.5, realtime) or "
-          "moss-codec-v2 (Local-v1.5).",
+          "filesystem path; a DB key wins over a same-named path. Required "
+          "by the MOSS variants -- match the LM: moss-codec (MOSS-TTS 8B / "
+          "v1.5, realtime) or moss-codec-v2 (Local-v1.5). Fish Audio "
+          "Drama 3 reads the codec.pth in its own directory; set this only "
+          "to point it elsewhere.",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "moss-codec,moss-codec-v2"},
+  {.key = "reference_text", .type = ConfigType::String,
+   .doc = "Fish Audio Drama 3: the transcript of the reference voice on the "
+          "audio-ref iport -- Drama 3 clones a voice from its audio AND its "
+          "words, so a reference without one is not used. A text beat's "
+          "\"reference_text\" field overrides it. Speaker tags "
+          "(<|speaker:N|>) are allowed",
+   .def_str = ""},
+  {.key = "references", .type = ConfigType::Any,
+   .doc = "Fish Audio Drama 3: voices to clone from files, a list of "
+          "{\"audio\": file, \"text\": what it says} objects (any format "
+          "FFmpeg reads, cut to voice_ref_seconds, encoded once at load). A "
+          "transcript may lead with its speaker's tag (<|speaker:1|> ...; "
+          "speaker 0 without one), so each character of a scene keeps its "
+          "own voice. A voice on the audio-ref iport for the same speaker "
+          "replaces one from here"},
+  {.key = "chunk_text", .type = ConfigType::Bool,
+   .doc = "Fish Audio Drama 3: long text in chunks, as Fish Audio's server "
+          "cuts it -- about 300 bytes and at most 3 speakers a chunk, at "
+          "sentence ends (then clauses, then spaces), never inside a tag or "
+          "a [cue] -- spoken one after another with the first chunk and the "
+          "latest in the context, so the voice holds, and their audio "
+          "joined. false = one take of the whole text. max_frames is per "
+          "chunk",
+   .def_bool = true},
+  {.key = "context", .type = ConfigType::String,
+   .doc = "Fish Audio Drama 3: the earlier takes a chunk is spoken after. "
+          "\"text\" (default) = the chunks of the same text beat: its "
+          "first chunk and the latest, the reference's rule. \"run\" = the "
+          "same rule across beats: the run's first take and the latest, so "
+          "a reading fed in pieces (one paragraph a beat) keeps one voice "
+          "and pace. A text beat's \"previous_takes\" adds named takes "
+          "either way",
+   .def_str = "text"},
   {.key = "codec_quant", .type = ConfigType::String,
    .doc = "codec weight precision: \"int8\" stores the codec's transformer "
           "GEMM weights as int8 group-32 affine (~half the resident codec "
@@ -275,8 +379,9 @@ constexpr ConfigKey kAttrs[] = {
    .def_bool = true},
   // The depth-decoder variants' frame budget (Local-v1.5, realtime).
   {.key = "max_frames", .type = ConfigType::Int,
-   .doc = "Local-v1.5 / realtime only: per-beat frame budget (each ~= "
-          "80 ms); >= 1",
+   .doc = "Local-v1.5 / realtime / Drama 3: per-beat frame budget (each ~= "
+          "80 ms; ~46 ms for Drama 3, and per CHUNK of a long text there -- "
+          "Fish Audio's server allows 600, ~28 s); >= 1",
    .def_int = 1000},
   // Prompt fields (the processor's <user_inst> block). "None" is how the
   // reference renders an unset field.
@@ -371,7 +476,11 @@ const PortSpec kIports[] = {
           "barge-in only cuts the current utterance on a new beat when the "
           "current one is end_of_response (true, or absent -> defaults true). "
           "A mid-reply chunk (false, from text-chat's stream oport) is always "
-          "spoken in full",
+          "spoken in full. Drama 3 also reads \"reference_text\" (the "
+          "audio-ref voice's transcript) and \"previous_takes\": a list of "
+          "texts this stage spoke earlier in the run, whose takes go into "
+          "the context -- editing as continuation: re-say a changed line in "
+          "the delivery of the first",
    .type = &typeid(FlexDataPayload),
    .tags = "text", .clock_group = 0},
   {.name = "audio-ref",
@@ -379,13 +488,17 @@ const PortSpec kIports[] = {
           "honoured): a reference voice to clone. Latest beat is sticky "
           "(applies to all later utterances until superseded). Its own clock "
           "group -- it arrives independently of the text stream / PCM output, "
-          "not rate-locked to them.",
+          "not rate-locked to them. Drama 3 also needs its transcript "
+          "(the beat's sideband \"reference_text\", else the text beat's, "
+          "else the config's) and keeps one voice per speaker, the "
+          "transcript's leading <|speaker:N|> naming it.",
    .type = &typeid(TensorBeatPayload), .clock_group = 1},
   {.name = "audio-sampler",
    .doc = "OPTIONAL token-sampler spec FlexData (sampler-select) for the "
           "AUDIO-code channel; its seed is also the voice seed. Latched on "
-          "the first beat. Unwired keeps MOSS's own recommended sampling "
-          "(NOT greedy -- greedy audio degenerates into silent loops)",
+          "the first beat. Unwired keeps the model's own recommended "
+          "sampling (NOT greedy -- greedy audio degenerates into silent "
+          "loops)",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "text-sampler",
    .doc = "OPTIONAL token-sampler spec FlexData (sampler-select) for the "
@@ -399,19 +512,23 @@ const PortSpec kOports[] = {
    .doc = "TensorBeat f32 PCM (sideband.sample_rate set); downstream "
           "optional. Delay-pattern variants: rank-1 [n_samples] mono @ "
           "24 kHz. Local-v1.5: rank-2 [2, n_samples] stereo @ 48 kHz. "
-          "Realtime: [1, n_samples] mono @ 24 kHz.",
+          "Realtime: [1, n_samples] mono @ 24 kHz. Drama 3: rank-1 "
+          "[n_samples] mono @ 44.1 kHz.",
    .type = &typeid(TensorBeatPayload),
    .tags = "pcm-samples", .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "text-to-speech",
-  .doc       = "Text-to-speech (MOSS-TTS, metal): synthesizes each input "
-               "text beat into a PCM waveform and emits it as a TensorBeat. "
-               "The variant is chosen from the LM dir's config.json "
-               "model_type: \"moss_tts_delay\" / \"moss_tts\" (MOSS-TTS 8B "
-               "and MOSS-TTS-v1.5, delay pattern -> 24 kHz mono), "
-               "\"moss_tts_local\" (Local-v1.5 depth decoder -> 48 kHz "
-               "stereo) or \"moss_tts_realtime\" (24 kHz mono).",
+  .doc       = "Text-to-speech (MOSS-TTS, Fish Audio Drama 3; metal): "
+               "synthesizes each input text beat into a PCM waveform and "
+               "emits it as a TensorBeat. The variant is chosen from the LM "
+               "dir's config.json model_type: \"moss_tts_delay\" / "
+               "\"moss_tts\" (MOSS-TTS 8B and MOSS-TTS-v1.5, delay pattern "
+               "-> 24 kHz mono), \"moss_tts_local\" (Local-v1.5 depth "
+               "decoder -> 48 kHz stereo), \"moss_tts_realtime\" (24 kHz "
+               "mono) or \"fish_omni\" (Fish Audio Drama 3: speaker tags, "
+               "inline direction, voice cloning from audio + transcript -> "
+               "44.1 kHz mono).",
   .display_name = "Speak",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -576,10 +693,12 @@ rt_qwen_cfg_(const std::string& dir, const std::string& prefix,
 // What one of the three MOSS LM variants will hold, from its checkpoint
 // alone -- the only source available while a graph is being planned.
 struct LmPlan {
-  std::string variant;       // "delay" | "local" | "realtime"
+  std::string variant;       // "delay" | "local" | "realtime" | "drama3"
   std::string layer_prefix;  // the streamable backbone stack
   int n_layers = 0, n_kv = 8, head_dim = 128;
   genai::MetalMossTtsModel::MemoryPlan mem;
+  // Drama 3: its routed experts as held, and one layer's.
+  std::size_t experts = 0, layer_experts = 0;
 };
 
 LmPlan
@@ -587,6 +706,24 @@ lm_plan_(const std::string& dir, int quant_bits)
 {
   LmPlan p;
   const std::string mt = read_model_type_(dir);
+  if (mt == "fish_omni") {
+    // Fish Audio Drama 3: held as published (block-FP8 or GPTQ int4
+    // experts, bf16 the rest) where it fits. On a box too small for that,
+    // its ROUTED EXPERTS go to a cache (model_memory::moe_expert_cache)
+    // -- everything else resident and wired, a missed expert read from
+    // disk, the most-selected kept -- so the least it holds is the rest of
+    // the model and one layer of experts.
+    p.variant = "drama3";
+    p.mem.disk = model_memory::dir_weights_bytes(dir);
+    p.mem.preload = genai::MetalDrama3Model::weight_bytes(dir);
+    std::size_t layer = 0;
+    p.experts = genai::MetalDrama3Model::routed_expert_bytes(dir, &layer);
+    p.layer_experts = layer;
+    p.mem.floor = p.mem.preload > p.experts
+                      ? p.mem.preload - p.experts + layer
+                      : p.mem.preload;
+    return p;
+  }
   std::string sub = "language_config";
   if (mt == "moss_tts_local") {
     p.variant = "local";
@@ -638,6 +775,15 @@ TextToSpeechStage::release_models_()
   // their codec, so they must go before the codec they came from.
   _stream_v15.reset();
   _stream_v1.reset();
+  _d3.reset();
+  _fish_stream.reset();
+  _fish.reset();
+  _d3_refs.clear();
+  _d3_port_ref = -1;
+  _d3_run_hist.clear();
+  _d3_takes.clear();
+  _d3_beats.clear();
+  _d3_xstats = {};
   _lm_rt.reset();
   _lm_v15.reset();
   _codec_v15.reset();
@@ -663,6 +809,17 @@ TextToSpeechStage::release_models_()
 #endif
 
 std::string
+TextToSpeechStage::drama3_codec_path_(const std::string& lm_dir) const
+{
+  namespace fs = std::filesystem;
+  std::string base = lm_dir;
+  if (!_codec_dir.empty()) { base = resolve_model_dir(session(), _codec_dir); }
+  std::error_code ec;
+  if (fs::is_regular_file(fs::path(base), ec)) { return base; }
+  return (fs::path(base) / "codec.pth").string();
+}
+
+std::string
 TextToSpeechStage::scratch_label_() const
 {
   // Per STAGE: two TTS stages in one graph each allocate their own.
@@ -679,6 +836,31 @@ TextToSpeechStage::scratch_bytes_(const std::string& lm_dir,
 {
 #ifdef VPIPE_BUILD_APPLE_SILICON
   const LmPlan p = lm_plan_(lm_dir, _lm_quant_bits);
+  if (p.variant == "drama3") {
+    // The sequence: a prompt (the text, the cloned voices at 21.5 frames
+    // a second, and -- with chunking or a run's context -- the two earlier
+    // takes the history keeps, a chunk's frames and its text each) and a
+    // chunk's frames; the codec's decode of a chunk, and the PCM of a few
+    // (2048 samples a frame, f32) -- a beat joins its chunks' audio.
+    genai::Drama3Config dc;
+    if (!genai::Drama3Config::from_dir(lm_dir, &dc)) { return 0; }
+    const bool port = this->iport_edges().size() >= 2 &&
+                      this->iport_edges()[1].v != nullptr;
+    const int voices = (int)_d3_ref_specs.size() + (port ? 1 : 0);
+    const int ref_rows =
+        voices * (int)(std::max(0.0, _voice_ref_seconds) * 21.6);
+    const int hist_rows = (_d3_chunk_text || _d3_context == "run")
+                              ? 2 * (_max_frames + 160)
+                              : 0;
+    const int prompt = std::min(genai::drama3::kMaxPromptRows,
+                                512 + ref_rows + hist_rows + 64);
+    const int rows = prompt + _max_frames;
+    const std::size_t run =
+        genai::MetalDrama3Model::run_bytes(dc, rows, prompt);
+    if (kv_part != nullptr) { *kv_part = 0; }
+    return run + genai::MetalFishCodec::decode_scratch_bytes(_max_frames) +
+           (std::size_t)4 * _max_frames * genai::MetalFishCodec::kHop * 4;
+  }
   const bool delay = p.variant == "delay";
   const std::size_t budget =
       (std::size_t)(delay ? _max_new_tokens : _max_frames);
@@ -716,8 +898,18 @@ TextToSpeechStage::declare_memory() const
     const LmPlan p = lm_plan_(lm_dir, _lm_quant_bits);
     m.hold(lm_dir, p.mem.preload > 0 ? p.mem.preload
                                      : model_memory::dir_weights_bytes(lm_dir),
-           p.mem.raw ? p.mem.floor : 0,
+           p.mem.raw || p.variant == "drama3" ? p.mem.floor : 0,
            /*releases=*/false, /*reclaimable=*/false);
+    if (p.variant == "drama3") {
+      const std::string cp = drama3_codec_path_(lm_dir);
+      const std::size_t held =
+          genai::MetalFishCodec::plan_bytes(cp, _with_encoder);
+      m.hold(cp, held > 0 ? held : model_memory::dir_weights_bytes(cp));
+      m.scratch = scratch_bytes_(lm_dir);
+      const std::size_t frames = (std::size_t)_max_frames;
+      m.outputs = {frames * genai::MetalFishCodec::kHop * 4};
+      return m;
+    }
     if (!_codec_dir.empty()) {
       const std::string cd = resolve_model_dir(session(), _codec_dir);
       const std::size_t held =
@@ -748,6 +940,22 @@ TextToSpeechStage::declare_resources() const
   if (_hf_dir.empty()) { return out; }
   const std::string lm_dir = resolve_model_dir(session(), _hf_dir);
   const LmPlan p = lm_plan_(lm_dir, _lm_quant_bits);
+  if (p.variant == "drama3") {
+    // The LM directory's safetensors (codec.pth is not one of them) and
+    // the codec file, each its own checkpoint. The LM is STREAMABLE: its
+    // routed experts can be cached, which the loader does exactly when
+    // the box is short (moe_expert_cache).
+    out.push_back(model_memory::weight_claim_streamable(lm_dir, p.mem.floor));
+    for (auto& c :
+         model_memory::weight_claims({drama3_codec_path_(lm_dir)})) {
+      out.push_back(std::move(c));
+    }
+    for (auto& c : model_memory::scratch_claims(scratch_label_(),
+                                                scratch_bytes_(lm_dir), {})) {
+      out.push_back(std::move(c));
+    }
+    return out;
+  }
   // STREAMABLE when the backbone is raw: its floor -- the trunk plus a
   // slot pair -- is a promise the loader keeps (stream_decode), and the
   // claim is the only ledger the refusal check reads. A pack holds as it
@@ -783,6 +991,27 @@ TextToSpeechStage::revise_holdings_()
 #ifdef VPIPE_BUILD_APPLE_SILICON
   if (_lm_dir_resolved.empty()) { return; }
   std::size_t lm_held = 0, codec_held = 0, kv = 0;
+  if (_d3) {
+    // Held as loaded (nothing streams); the codec keeps its own file.
+    lm_held = _d3->resident_bytes();
+    if (_fish) { codec_held = _fish->resident_bytes(); }
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      mgr->revise_declaration(_lm_dir_resolved, lm_held);
+      if (codec_held > 0 && !_codec_dir_resolved.empty()) {
+        mgr->revise_declaration(_codec_dir_resolved, codec_held);
+      }
+    }
+    StageMemory m = declare_memory();
+    for (StageHolding& h : m.holdings) {
+      if (h.source == _lm_dir_resolved) {
+        correct_loaded_holding(h, lm_held);
+      } else if (h.source == _codec_dir_resolved && codec_held > 0) {
+        correct_loaded_holding(h, codec_held);
+      }
+    }
+    revise_memory(m);
+    return;
+  }
   if (_lm) {
     lm_held = _lm->resident_bytes();
     kv = _lm->kv_bytes();
@@ -864,12 +1093,205 @@ TextToSpeechStage::revise_holdings_()
 #endif
 }
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// Fish Audio Drama 3: the codec, then the speech LM, then its tokenizer.
+// Nothing streams (see lm_plan_), so there is no memory decision to take
+// here: the plan's claims are what the loads hold.
+void
+TextToSpeechStage::load_drama3_(const std::string& lm_dir,
+                                metal_compute::MetalCompute* mc)
+{
+  using clock = std::chrono::steady_clock;
+  auto ms = [](clock::duration d) {
+    return static_cast<int>(
+        std::chrono::duration<double, std::milli>(d).count());
+  };
+  const std::string cp = drama3_codec_path_(lm_dir);
+  _lm_dir_resolved = lm_dir;
+  _codec_dir_resolved = cp;
+  _lm_streams = false;
+  _lm_floor = 0;
+  _lm_trunk = 0;
+  auto* mgr = session()->services()->generative_model_manager();
+  const auto t0 = clock::now();
+  std::string err;
+  _fish = genai::MetalFishCodec::load(genai::open_weight_set(cp, session()),
+                                      mc, _with_encoder, &err);
+  if (!_fish) {
+    session()->error(fmt("TextToSpeechStage('{}'): Fish codec ('{}') did "
+                         "not load: {}; the stage is inert", this->id(), cp,
+                         err));
+    return;
+  }
+  if (mgr != nullptr) {
+    mgr->revise_declaration(cp, _fish->resident_bytes());
+  }
+  genai::Drama3Config dc;
+  if (!genai::Drama3Config::from_dir(lm_dir, &dc, &err)) {
+    session()->error(fmt("TextToSpeechStage('{}'): {}; the stage is inert",
+                         this->id(), err));
+    release_models_();
+    return;
+  }
+  // The reference's capacity: its longest prompt (references and earlier
+  // takes included) and a chunk's frames. The K/V grows with use, so the
+  // ceiling costs nothing until a prompt reaches it.
+  genai::MetalDrama3Model::LoadOptions lo;
+  lo.max_rows = genai::drama3::kMaxPromptRows + _max_frames;
+  // The routed experts cached when the whole model does not fit beside
+  // its peers (the engine's call; VPIPE_MOE_EXPERT_CACHE_MB the A/B).
+  {
+    const LmPlan p = lm_plan_(lm_dir, _lm_quant_bits);
+    lo.expert_cache_bytes = model_memory::moe_expert_cache(
+        session(), lm_dir, p.mem.preload, p.experts, p.layer_experts,
+        scratch_bytes_(lm_dir));
+    if (lo.expert_cache_bytes > 0) {
+      session()->info(fmt(
+          "TextToSpeechStage('{}'): Drama 3's {} MB of routed experts do "
+          "not fit this box beside the rest -- they go to a {} MB cache "
+          "(the rest of the model resident and wired)", this->id(),
+          p.experts >> 20, lo.expert_cache_bytes >> 20));
+    }
+  }
+  const auto t1 = clock::now();
+  _d3 = genai::MetalDrama3Model::load(genai::open_weight_set(lm_dir,
+                                                             session()),
+                                      mc, dc, lo, &err);
+  if (!_d3) {
+    session()->error(fmt("TextToSpeechStage('{}'): Drama 3 did not load "
+                         "from '{}': {}; the stage is inert", this->id(),
+                         lm_dir, err));
+    release_models_();
+    return;
+  }
+  _tokenizer = genai::Tokenizer::from_huggingface_json(
+      lm_dir + "/tokenizer.json", session());
+  if (!_tokenizer) {
+    session()->error(fmt("TextToSpeechStage('{}'): no tokenizer.json in "
+                         "'{}'; inert", this->id(), lm_dir));
+    release_models_();
+    return;
+  }
+  const auto t2 = clock::now();
+  // Cold start at load, as the MOSS variants do: the first forward pays
+  // every pipeline's compilation, so a throwaway two-frame take and a
+  // four-frame decode run here and the first real utterance runs warm.
+  // VPIPE_TTS_NO_WARMUP skips it (A/B).
+  int warm_ms = -1;
+  if (std::getenv("VPIPE_TTS_NO_WARMUP") == nullptr) {
+    const std::vector<std::int32_t> prompt =
+        genai::drama3::build_prompt(*_tokenizer, "Hello.", {},
+                                    dc.semantic_begin,
+                                    dc.tower.codebook_size);
+    genai::MetalDrama3Model::Sampling sp;
+    sp.max_frames = 2;
+    std::vector<genai::MetalDrama3Model::Frame> wf;
+    (void)_d3->generate(prompt, (int)(prompt.size() / 11), sp, {}, &wf);
+    std::vector<std::int32_t> zc(4 * 10, 0);
+    std::vector<float> pcm;
+    (void)_fish->decode(zc.data(), 4, &pcm);
+    warm_ms = ms(clock::now() - t2);
+  }
+  // The configured voices, encoded once.
+  std::string rerr;
+  if (!_d3_ref_specs.empty()) {
+    rerr = d3_load_references_();
+    if (!rerr.empty()) {
+      session()->warn(fmt("TextToSpeechStage('{}'): references: {}",
+                          this->id(), rerr));
+    }
+  }
+  revise_holdings_();
+  session()->info(fmt(
+      "TextToSpeechStage('{}'): ready (Fish Audio Drama 3, 44.1 kHz mono -- "
+      "LM loaded in {} ms holding {} MB, {} experts; codec {} MB{} "
+      "in {} ms; up to {} rows a sequence{})", this->id(),
+      ms(t2 - t1), _d3->resident_bytes() >> 20,
+      dc.experts == "int4" ? "GPTQ int4" : "block-FP8",
+      _fish->resident_bytes() >> 20,
+      _fish->has_encoder() ? " with its encoder (voice cloning)" : "",
+      ms(t1 - t0), lo.max_rows,
+      warm_ms >= 0 ? fmt("; warmed up in {} ms", warm_ms)() : std::string()));
+  if (!_d3_refs.empty()) {
+    std::string who;
+    for (const auto& r : _d3_refs) {
+      who += fmt("{}speaker {} ({} frames)", who.empty() ? "" : ", ",
+                 genai::drama3::speaker_of(r.transcript), r.frames())();
+    }
+    session()->info(fmt("TextToSpeechStage('{}'): cloning {} voice{} from "
+                        "references: {}", this->id(), _d3_refs.size(),
+                        _d3_refs.size() > 1 ? "s" : "", who));
+  }
+}
+
+void
+TextToSpeechStage::d3_add_reference_(genai::drama3::Reference r,
+                                     bool from_port)
+{
+  const int spk = genai::drama3::speaker_of(r.transcript);
+  for (std::size_t i = 0; i < _d3_refs.size(); ++i) {
+    if (genai::drama3::speaker_of(_d3_refs[i].transcript) != spk) {
+      continue;
+    }
+    _d3_refs.erase(_d3_refs.begin() + (std::ptrdiff_t)i);
+    if (_d3_port_ref == (int)i) {
+      _d3_port_ref = -1;
+    } else if (_d3_port_ref > (int)i) {
+      --_d3_port_ref;
+    }
+    break;
+  }
+  _d3_refs.push_back(std::move(r));
+  if (from_port) { _d3_port_ref = (int)_d3_refs.size() - 1; }
+}
+
+std::string
+TextToSpeechStage::d3_load_references_()
+{
+  if (!_fish || !_fish->has_encoder()) { return "the codec has no encoder"; }
+  const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
+  if (libs == nullptr) { return "FFmpeg is not available to decode them"; }
+  const int sr = genai::MetalFishCodec::kSampleRate;
+  std::string errs;
+  for (std::size_t k = 0; k < _d3_ref_specs.size(); ++k) {
+    const D3RefSpec& rs = _d3_ref_specs[k];
+    auto fail = [&](const std::string& why) {
+      errs += fmt("{}{} ('{}'): {}", errs.empty() ? "" : "; ", k + 1,
+                  rs.audio, why)();
+    };
+    if (std::string e = genai::drama3::validate_text(rs.text); !e.empty()) {
+      fail(e);
+      continue;
+    }
+    std::string derr;
+    auto au = decode_audio_file(libs, rs.audio, sr, &derr);
+    if (!au || au->pcm.empty()) {
+      fail(derr.empty() ? std::string("no audio") : derr);
+      continue;
+    }
+    std::size_t n = au->pcm.size();
+    if (_voice_ref_seconds > 0.0) {
+      n = std::min(n, (std::size_t)(_voice_ref_seconds * sr));
+    }
+    genai::drama3::Reference r;
+    r.transcript = rs.text;
+    std::string eerr;
+    if (!_fish->encode(au->pcm.data(), (int)n, &r.codes, &eerr)) {
+      fail(eerr);
+      continue;
+    }
+    d3_add_reference_(std::move(r), /*from_port=*/false);
+  }
+  return errs;
+}
+#endif
+
 Job
 TextToSpeechStage::initialize(RuntimeContext& ctx)
 {
   (void)ctx;
 #ifdef VPIPE_BUILD_APPLE_SILICON
-  if (_hf_dir.empty() || _codec_dir.empty()) {
+  if (_hf_dir.empty()) {
     co_return;  // ctor already recorded the config error.
   }
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
@@ -903,6 +1325,13 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
 
   const std::string lm_dir =
       resolve_model_dir(session(), _hf_dir);
+  if (genai::Drama3Config::is_drama3_dir(lm_dir)) {
+    load_drama3_(lm_dir, mc);
+    co_return;
+  }
+  if (_codec_dir.empty()) {
+    co_return;  // ctor already recorded the config error.
+  }
   const std::string codec_dir =
       resolve_model_dir(session(), _codec_dir);
   // "auto" follows the checkpoint's own processor: MOSS-TTS-v1.5 ships
@@ -1429,6 +1858,12 @@ TextToSpeechStage::process(RuntimeContext& ctx)
       _audio_sp = p;
       _audio_sp_set = true;
       warn_unsupported_knobs_(session(), who, _audio_sp);
+      if (_d3 && p.repetition_penalty != 1.0f) {
+        session()->warn(fmt("{}: repetition_penalty {} does not apply to "
+                            "Drama 3 (its draws are top-k / top-p with "
+                            "repetition-aware resampling); ignoring it",
+                            who, p.repetition_penalty));
+      }
     }
   }
   if (!_text_sp_read && ctx.num_iports() >= 4 && ctx.iport_connected(3)) {
@@ -1476,6 +1911,425 @@ TextToSpeechStage::process(RuntimeContext& ctx)
   auto new_text_pending = [&]() {
     return _interrupt_on_new_text && cur_is_eor && ctx.backlog(0) > 0;
   };
+
+  // ---- Fish Audio Drama 3 (fish_omni) -> 44.1 kHz mono ----------------
+  if (_d3) {
+    namespace d3 = genai::drama3;
+    if (!_fish || !_tokenizer) {
+      session()->warn(fmt("TextToSpeechStage('{}'): Drama 3 not loaded; "
+                          "dropping beat", this->id()));
+      co_return;
+    }
+    const auto* fdp = dynamic_cast<const FlexDataPayload*>(t.get());
+    if (fdp == nullptr) {
+      session()->warn(fmt(
+          "TextToSpeechStage('{}'): expected FlexDataPayload on in-port 0, "
+          "got {}; dropping beat", this->id(), t->describe()));
+      co_return;
+    }
+    // The text as written: speaker tags and inline direction are the
+    // model's own vocabulary, so nothing is normalized away. An object
+    // beat may also carry "reference_text" (the latest iport1 voice's
+    // transcript) and "previous_takes" (texts spoken earlier this run).
+    std::string text(fdp->data.as_string(""));
+    std::string beat_ref_text;
+    std::vector<std::string> prev_texts;
+    if (fdp->data.is_object()) {
+      auto obj = fdp->data.as_object();
+      if (text.empty() && obj.contains("text")) {
+        text = std::string(obj.at("text").as_string(""));
+      }
+      if (obj.contains("reference_text")) {
+        beat_ref_text = std::string(obj.at("reference_text").as_string(""));
+      }
+      if (obj.contains("previous_takes")) {
+        const FlexData pt = obj.at("previous_takes");
+        if (pt.is_array()) {
+          for (const FlexData& x : pt.as_array()) {
+            prev_texts.emplace_back(x.as_string(""));
+          }
+        } else if (pt.is_string()) {
+          prev_texts.emplace_back(pt.as_string(""));
+        }
+      }
+    }
+    using dclock = std::chrono::steady_clock;
+    const auto d0 = dclock::now();
+    // Reference voices on iport1, ONE PER SPEAKER (the transcript's
+    // leading tag): a later one replaces an earlier. Its transcript is the
+    // PCM beat's own "reference_text", else this text beat's, else the
+    // config's.
+    if (_with_encoder && _fish->has_encoder() && ctx.num_iports() >= 2) {
+      while (ctx.backlog(1) > 0) {
+        auto rp = co_await ctx.read(1);
+        if (!rp) { break; }
+        const auto* tbp = dynamic_cast<const TensorBeatPayload*>(rp.get());
+        if (tbp == nullptr || tbp->dtype != TensorBeat::DType::F32) {
+          session()->warn(fmt(
+              "TextToSpeechStage('{}'): reference iport expects an f32 PCM "
+              "TensorBeat, got {}; ignoring", this->id(), rp->describe()));
+          continue;
+        }
+        const std::vector<float> wave = build_mono_ref_wave_(
+            session(), *tbp, genai::MetalFishCodec::kSampleRate,
+            _voice_ref_seconds);
+        if (wave.empty()) { continue; }
+        d3::Reference r;
+        std::string eerr;
+        if (!_fish->encode(wave.data(), (int)wave.size(), &r.codes, &eerr)) {
+          session()->warn(fmt("TextToSpeechStage('{}'): reference encode "
+                              "failed: {}", this->id(), eerr));
+          continue;
+        }
+        if (tbp->sideband.is_object()) {
+          auto sb = tbp->sideband.as_object();
+          if (sb.contains("reference_text")) {
+            r.transcript = std::string(sb.at("reference_text").as_string(""));
+          }
+        }
+        if (r.transcript.empty()) {
+          r.transcript = !beat_ref_text.empty() ? beat_ref_text
+                                                : _reference_text;
+        }
+        const int frames = r.frames();
+        const bool titled = !r.transcript.empty();
+        const int spk = d3::speaker_of(r.transcript);
+        d3_add_reference_(std::move(r), /*from_port=*/true);
+        _ref_set = true;
+        session()->info(fmt(
+            "TextToSpeechStage('{}'): reference voice -> {} codec frames "
+            "({:.2f} s){}", this->id(), frames,
+            wave.size() / (double)genai::MetalFishCodec::kSampleRate,
+            titled ? fmt(" for speaker {}", spk)()
+                   : std::string(" -- no reference_text, so it cannot be "
+                                 "cloned")));
+      }
+    }
+    // A text beat's reference_text retitles the latest iport1 voice.
+    if (!beat_ref_text.empty() && _d3_port_ref >= 0 &&
+        _d3_refs[(std::size_t)_d3_port_ref].transcript != beat_ref_text) {
+      d3::Reference r = std::move(_d3_refs[(std::size_t)_d3_port_ref]);
+      _d3_refs.erase(_d3_refs.begin() + _d3_port_ref);
+      _d3_port_ref = -1;
+      r.transcript = beat_ref_text;
+      d3_add_reference_(std::move(r), /*from_port=*/true);
+    }
+    // A voice without its transcript cannot be cloned; it waits for one.
+    std::vector<d3::Reference> refs;
+    for (const d3::Reference& r : _d3_refs) {
+      if (!r.transcript.empty()) { refs.push_back(r); }
+    }
+    const genai::Drama3Config& dc = _d3->config();
+    const int sem0 = dc.semantic_begin, cbs = dc.tower.codebook_size;
+    // Long text in chunks, as the reference server cuts it; every chunk
+    // validated before any is spoken, so a bad one late in the text does
+    // not cut the audio short after it started.
+    std::vector<std::string> chunks;
+    if (_d3_chunk_text) { chunks = d3::split_text(text); }
+    if (chunks.empty()) { chunks.push_back(text); }
+    for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
+      std::string perr;
+      const auto pr = d3::build_prompt(*_tokenizer, chunks[ci], refs, {},
+                                       sem0, cbs, &perr);
+      if (pr.empty() || (int)(pr.size() / 11) >= _d3->max_rows()) {
+        session()->warn(fmt(
+            "TextToSpeechStage('{}'): {}{}; dropping beat", this->id(),
+            chunks.size() > 1 ? fmt("chunk {} of {}: ", ci + 1,
+                                    chunks.size())()
+                              : std::string(),
+            pr.empty() ? perr
+                       : fmt("the prompt has {} rows; no room left to "
+                             "generate", pr.size() / 11)()));
+        co_return;
+      }
+    }
+    // previous_takes: takes of THIS run, by their text (newest first), go
+    // into the context ahead of the chunk history -- editing as
+    // continuation: re-say a changed line in the delivery of the first.
+    std::vector<const d3::Take*> prev;
+    auto stripped = [](std::string_view v) {
+      std::size_t a = 0, b = v.size();
+      while (a < b && std::isspace((unsigned char)v[a])) { ++a; }
+      while (b > a && std::isspace((unsigned char)v[b - 1])) { --b; }
+      return v.substr(a, b - a);
+    };
+    for (const std::string& pt : prev_texts) {
+      const d3::Take* found = nullptr;
+      for (auto it = _d3_takes.rbegin(); it != _d3_takes.rend(); ++it) {
+        if (it->transcript == pt ||
+            stripped(it->transcript) == stripped(pt)) {
+          found = &*it;
+          break;
+        }
+      }
+      if (found != nullptr) {
+        prev.push_back(found);
+      } else {
+        session()->warn(fmt(
+            "TextToSpeechStage('{}'): previous_takes: nothing spoken this "
+            "run reads \"{}\"; skipping it", this->id(), pt));
+      }
+    }
+    d3::History beat_hist;
+    d3::History& hist = _d3_context == "run" ? _d3_run_hist : beat_hist;
+    // Unwired: the reference's request defaults (T 1.0, top_p 0.9, top_k
+    // 30) at a fixed seed. Wired: the spec's, top-k capped at the
+    // reference's 64 candidates; seed 0 draws a fresh seed each utterance.
+    genai::MetalDrama3Model::Sampling sp;
+    sp.seed = 0x66697368;                          // 'fish'
+    if (_audio_sp_set) {
+      sp.temperature = _audio_sp.temperature;
+      sp.top_p = _audio_sp.top_p > 0.0f ? _audio_sp.top_p : 1.0f;
+      sp.top_k = _audio_sp.top_k > 0 ? _audio_sp.top_k : 64;
+      sp.seed = _audio_sp.seed != 0 ? (std::uint32_t)_audio_sp.seed
+                                    : (std::uint32_t)std::random_device{}();
+    }
+    const int sr = genai::MetalFishCodec::kSampleRate;
+    auto pcm_beat = [&](const std::vector<float>& pcm) {
+      TensorBeat tb;
+      tb.dtype = TensorBeat::DType::F32;
+      tb.shape = {static_cast<std::int64_t>(pcm.size())};
+      tb.resize_contiguous(pcm.size());
+      std::memcpy(tb.as_f32(), pcm.data(), pcm.size() * sizeof(float));
+      tb.sideband = FlexData::make_object();
+      tb.sideband.as_object().insert("sample_rate", FlexData::make_int(sr));
+      return tb;
+    };
+    // STREAMING: every stream_chunk_frames frames through the codec's
+    // streamed decode (bit-identical to one decode of the take), each
+    // piece's PCM out as it is made. A chunk of the text restarts the
+    // stream: the reference decodes every chunk on its own and joins them.
+    const bool streaming = _stream_chunk > 0;
+    if (streaming) {
+      if (!_fish_stream || _fish_stream->max_chunk != _stream_chunk) {
+        _fish_stream = _fish->decode_stream_begin(_stream_chunk);
+      } else {
+        _fish_stream->reset();
+      }
+    }
+    std::vector<std::int32_t> pending;
+    bool open = true;
+    bool cut = false;
+    std::string serr;
+    auto flush = [&]() {
+      if (!streaming || !_fish_stream || pending.empty() || !open) { return; }
+      std::vector<float> pcm;
+      if (!_fish->decode_stream_chunk(*_fish_stream, pending.data(),
+                                      (int)(pending.size() / 10), &pcm,
+                                      &serr)) {
+        open = false;
+        return;
+      }
+      pending.clear();
+      open = ctx.write_sync(0, make_payload<TensorBeatPayload>(pcm_beat(pcm)));
+      if (open) { ++_clips_emitted; }
+    };
+    std::vector<std::int32_t> beat_codes;
+    std::vector<float> beat_pcm;
+    std::vector<std::int32_t> first_codes;
+    int total = 0, spoken = 0, capped = 0, max_prompt = 0, hist_rows = 0;
+    double first_prefill = 0.0, rate_sum = 0.0;
+    dclock::duration dec{};
+    // Progress: the speech so far, in seconds of it (the model decides the
+    // length, so there is no total), and the part of a long text spoken;
+    // then the last part's decode.
+    UiProgress bar = session()->open_progress("speech");
+    const double frame_s = (double)genai::MetalFishCodec::kHop / sr;
+    for (std::size_t ci = 0; ci < chunks.size() && open && !cut &&
+                             !ctx.stop_requested(); ++ci) {
+      const std::string& chunk = chunks[ci];
+      // The longest history that fits: previous takes (oldest dropped
+      // first), each with the chunk history's candidates in turn.
+      std::vector<std::int32_t> prompt;
+      std::string perr;
+      std::size_t used = 0;
+      bool fitted = false;
+      for (std::size_t d = 0; d <= prev.size() && !fitted; ++d) {
+        for (const auto& hc : hist.candidates()) {
+          std::vector<const d3::Take*> h(prev.begin() + (std::ptrdiff_t)d,
+                                         prev.end());
+          h.insert(h.end(), hc.begin(), hc.end());
+          bool too_long = false;
+          prompt = d3::build_prompt(*_tokenizer, chunk, refs, h, sem0, cbs,
+                                    &perr, &too_long);
+          if (!prompt.empty() &&
+              (int)(prompt.size() / 11) < _d3->max_rows()) {
+            fitted = true;
+            used = h.size();
+            break;
+          }
+          if (!prompt.empty()) { too_long = true; }
+          if (!too_long) { break; }
+        }
+      }
+      if (!fitted) {
+        session()->warn(fmt("TextToSpeechStage('{}'): chunk {} of {}: {}; "
+                            "stopping", this->id(), ci + 1, chunks.size(),
+                            perr));
+        break;
+      }
+      const int n_prompt = (int)(prompt.size() / 11);
+      max_prompt = std::max(max_prompt, n_prompt);
+      if (used > 0) { ++hist_rows; }
+      sp.max_frames = std::min(_max_frames, _d3->max_rows() - n_prompt);
+      if (ci > 0 && streaming && _fish_stream) { _fish_stream->reset(); }
+      std::vector<genai::MetalDrama3Model::Frame> frames;
+      std::string gerr;
+      int made = 0;
+      const bool ok = _d3->generate(
+          prompt, n_prompt, sp,
+          [&](const genai::MetalDrama3Model::Frame& f, int) {
+            if (streaming && _fish_stream) {
+              pending.insert(pending.end(), f.begin(), f.end());
+              if ((int)(pending.size() / 10) >= _stream_chunk) { flush(); }
+            }
+            ++made;
+            const double so_far = (total + made) * frame_s;
+            bar.update(0, 0, chunks.size() > 1
+                                 ? fmt("speaking: {:.1f} s, part {} of {}",
+                                       so_far, ci + 1, chunks.size())()
+                                 : fmt("speaking: {:.1f} s", so_far)());
+            // Barge-in: stop on new text; also stop once downstream
+            // closed, or the graph is asked to stop.
+            return open && !new_text_pending() && !ctx.stop_requested();
+          },
+          &frames, &gerr);
+      flush();
+      if (ctx.stop_requested()) { co_return; }
+      if (!ok) {
+        session()->warn(fmt("TextToSpeechStage('{}'): Drama 3 generation "
+                            "failed: {}", this->id(), gerr));
+        break;
+      }
+      cut = new_text_pending();
+      const auto& st = _d3->last_run();
+      if (ci == 0) { first_prefill = st.prefill_ms; }
+      if (!st.ended) { ++capped; }
+      if (frames.empty()) {
+        // The reference keeps an empty chunk out of the history too.
+        session()->warn(fmt("TextToSpeechStage('{}'): chunk {} of {}: end "
+                            "of speech before any frame", this->id(),
+                            ci + 1, chunks.size()));
+        continue;
+      }
+      ++spoken;
+      rate_sum += st.frames_per_s;
+      std::vector<std::int32_t> codes(frames.size() * 10);
+      for (std::size_t f = 0; f < frames.size(); ++f) {
+        std::copy(frames[f].begin(), frames[f].end(), codes.begin() + f * 10);
+      }
+      total += (int)frames.size();
+      if (first_codes.empty()) { first_codes = codes; }
+      beat_codes.insert(beat_codes.end(), codes.begin(), codes.end());
+      if (chunks.size() > 1) {
+        session()->info(fmt(
+            "TextToSpeechStage('{}'): chunk {} of {}: {} bytes, {} prompt "
+            "rows ({} earlier take(s)) -> {} frames{}, prefill {:.0f} ms, "
+            "{:.1f} frames/s", this->id(), ci + 1, chunks.size(),
+            chunk.size(), n_prompt, used, frames.size(),
+            st.ended ? "" : " (max_frames)", st.prefill_ms,
+            st.frames_per_s));
+      }
+      hist.push({chunk, codes});
+      if (!streaming || !_fish_stream) {
+        // ONE-SHOT: each chunk decoded on its own, joined.
+        if (ci + 1 == chunks.size()) { bar.update(0, 0, "decoding"); }
+        const auto e0 = dclock::now();
+        std::vector<float> pcm;
+        std::string derr;
+        if (!_fish->decode(codes.data(), (int)frames.size(), &pcm, &derr)) {
+          session()->warn(fmt("TextToSpeechStage('{}'): codec decode "
+                              "failed: {}", this->id(), derr));
+          break;
+        }
+        dec += dclock::now() - e0;
+        beat_pcm.insert(beat_pcm.end(), pcm.begin(), pcm.end());
+      }
+    }
+    if (streaming && !serr.empty()) {
+      session()->warn(fmt("TextToSpeechStage('{}'): streamed decode "
+                          "failed: {}", this->id(), serr));
+    }
+    _d3_beats.push_back({(int)chunks.size(), spoken, (int)prev.size(),
+                         (int)refs.size(), hist_rows, max_prompt, total});
+    if (beat_codes.empty()) {
+      session()->warn(fmt("TextToSpeechStage('{}'): Drama 3 generated 0 "
+                          "frames; emitting nothing", this->id()));
+      co_return;
+    }
+    if ((!streaming || !_fish_stream) && !beat_pcm.empty()) {
+      ++_clips_emitted;
+      co_await ctx.write(0,
+                         make_payload<TensorBeatPayload>(pcm_beat(beat_pcm)));
+    }
+    // The take, by its text, for a later beat's previous_takes.
+    _d3_takes.push_back({text, beat_codes});
+    while (_d3_takes.size() > 64) { _d3_takes.pop_front(); }
+    // voice_lock: the first chunk, with the words it said, becomes the
+    // reference for every later beat (unless one arrives on iport1). A
+    // transcript must match its audio, so it is taken only whole.
+    if (_voice_lock && _d3_refs.empty() && !first_codes.empty()) {
+      const std::size_t fr = first_codes.size() / 10;
+      if (_voice_ref_seconds <= 0.0 ||
+          fr <= (std::size_t)(_voice_ref_seconds * 21.5)) {
+        d3_add_reference_({chunks[0], first_codes}, /*from_port=*/false);
+        _ref_set = true;
+        session()->info(fmt("TextToSpeechStage('{}'): voice_lock engaged "
+                            "-- {} frames cached as the reference",
+                            this->id(), (int)fr));
+      }
+    }
+    const auto d2 = dclock::now();
+    auto dms = [](dclock::duration d) {
+      return static_cast<int>(
+          std::chrono::duration<double, std::milli>(d).count());
+    };
+    const double secs = total * (double)genai::MetalFishCodec::kHop /
+                        genai::MetalFishCodec::kSampleRate;
+    // The routed-expert cache over this text, when the experts are cached.
+    std::string xline;
+    if (const genai::MoeExpertCache* xc = _d3->backbone()->expert_cache()) {
+      const auto& st = xc->stats();
+      const double picks = (double)(st.picks - _d3_xstats.picks);
+      const double hits = (double)(st.hits - _d3_xstats.hits);
+      const double ar = (double)(st.ahead_read - _d3_xstats.ahead_read);
+      const double ah = (double)(st.ahead_hits - _d3_xstats.ahead_hits);
+      xline = fmt("; experts {:.1f}% hits, {:.0f} MB read, {:.0f} ms "
+                  "waited for", picks > 0 ? 100.0 * hits / picks : 0.0,
+                  (st.bytes_read - _d3_xstats.bytes_read) / 1048576.0,
+                  st.read_ms + st.wait_ms - _d3_xstats.read_ms -
+                      _d3_xstats.wait_ms)();
+      if (ar > 0) {
+        xline += fmt(", {:.0f} read ahead of which {:.0f}% were picked "
+                     "(width now {})", ar, 100.0 * ah / ar,
+                     xc->ahead_width())();
+      }
+      _d3_xstats = st;
+    }
+    session()->info(fmt(
+        "TextToSpeechStage('{}'): Drama 3 {} chars{} ({} prompt rows{}{}{}) "
+        "-> {} frames = {:.2f} s @ 44.1 kHz{} ({} ms: first prefill {:.0f} "
+        "ms, {:.1f} frames/s{}; {}{})", this->id(), (int)text.size(),
+        chunks.size() > 1 ? fmt(" in {} chunks", chunks.size())()
+                          : std::string(),
+        max_prompt,
+        refs.empty() ? "" : fmt(", {} cloned voice{}", refs.size(),
+                                refs.size() > 1 ? "s" : "")(),
+        prev.empty() ? "" : fmt(", {} previous take{}", prev.size(),
+                                prev.size() > 1 ? "s" : "")(),
+        hist_rows > 0 ? fmt(", {} with earlier takes", hist_rows)()
+                      : std::string(),
+        total, secs,
+        capped > 0 ? fmt(" -- {} chunk(s) hit max_frames before the end of "
+                         "speech", capped)()
+                   : std::string(),
+        dms(d2 - d0), first_prefill, spoken > 0 ? rate_sum / spoken : 0.0,
+        cut ? ", cut short by new text" : "",
+        streaming ? fmt("streamed in {}-frame pieces", _stream_chunk)()
+                  : fmt("{} ms decode", dms(dec))(),
+        xline));
+    co_return;
+  }
 
   // ---- realtime variant (Qwen3-1.7B backbone + depth decoder -> 24 kHz mono)
   if (_lm_rt) {

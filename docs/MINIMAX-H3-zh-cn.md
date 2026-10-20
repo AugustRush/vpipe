@@ -63,6 +63,7 @@ vpipe 自己的 Metal kernel，前向计算中不使用 Python，也不使用第
     - [获取并运行](#get-it-and-run-it)
     - [能省多少](#what-it-saves)
   - [更省的注意力——SageAttention 的 int8 QK](#cheaper-attention--sageattentions-int8-qk)
+  - [P·V 也用 int8——`sage_pv8`](#its-pv-in-int8-too--sage_pv8)
   - [更快的注意力——Sol-Attn 路由](#faster-attention--sol-attn-routing)
     - [能省多少](#what-it-saves-1)
     - [与 VDN 分支的对比](#against-the-vdn-branch)
@@ -319,6 +320,7 @@ stage 指向模型文件，而不是四个。
 | `seed` | 6 | 相同的 seed + 相同的设置 ⇒ 相同的片子。 |
 | `i8_gemm` | `true` | 一个需要显式开启的**有损**加速模式，本文随附的每个流水线都开着它。只有带矩阵核心的 GPU（M5 及更新）能用，所以在 M4 上它什么也不做——而在 M5 上关掉它更慢。它会让画面略有变化，所以当你在评判输出而非速度时，把它关掉。 |
 | `sage_attn` | `false` | 一个需要显式开启的**有损**加速模式，与 `i8_gemm` 和 `sol_attn` 都互相独立，可以和任一个一起设置——它把注意力的 QK^T 乘积用 int8 加逐块 scale 来算，而 `sol_attn` 决定哪些块根本参与注意力。在视频几何尺寸下注意力提速 1.20×，cosine 与 f16 kernel 相同。仅限矩阵核心。见[更省的注意力——SageAttention 的 int8 QK](#cheaper-attention--sageattentions-int8-qk)。 |
+| `sage_pv8` | `false` | 开启 `sage_attn` 时：注意力的 P·V 乘积也用 int8，在各 key 块之间以 int32 累积——1344 × 768 × 362 帧片段的一次注意力 2.46 s，`sage_attn` 为 2.90 s。旁边还有 `sage_pv8_from_step`（默认 `-1`：前四分之一的步骤不用）和 `sage_pv8_all_rows`（默认 `false`：提示词和配乐的行只用 `sage_attn`）。见[P·V 也用 int8](#its-pv-in-int8-too--sage_pv8)。 |
 | `ane_ffn` / `ane_qkv` | `false` | 需要显式开启的**有损**模式，把每个 block 的一部分放到 GPU 旁边的 **Apple Neural Engine** 上运行。在 **M4 系列** Mac 上值得开，在 M5 上通常不值得。见[Neural Engine](#the-neural-engine--for-m4-family-macs)。 |
 | `sol_attn` | `false` | 又一个需要显式开启的**有损**加速模式，而且是独立的——它改变 GEMM 之间的注意力的计算方式，而 `i8_gemm` 改变的是 GEMM。在 832 × 480 的 124 帧上，挂钟时间提速 1.27×，且不需要额外权重；旁边的各个选项见[更快的注意力——Sol-Attn 路由](#faster-attention--sol-attn-routing)。 |
 | `motion_cache` | `false` | 另一类需要显式开启的**有损**模式：上一步已经能预测出答案的去噪步，它整步跳过，因此能与上面每一个设置组合。它在长调度上才划算——`steps: 20` 时去噪提速 1.32×——而 8 步草稿或 Turbo 运行里几乎没有可跳的。见[更少的前向——MotionCache](#fewer-forwards--motioncache)。 |
@@ -2229,6 +2231,40 @@ key 块会被关注，而 `sage_attn` 决定被关注的那些怎么相乘。`sa
 一段密集的前缀。
 
 `generate-image` 上也有同一个设置，FLUX.2、Krea-2 和 Qwen-Image-Edit 都支持。
+
+<a id="its-pv-in-int8-too--sage_pv8"></a>
+### P·V 也用 int8——`sage_pv8`
+
+开启 `sage_attn` 时，flash kernel 的**第二个**乘积 `P·V` 也可以用 int8：
+
+```json
+"sage_attn": true, "sage_pv8": true
+```
+
+乘积在各 key 块之间**以 int32 累积**——kernel 直到最后都不保留 f32 输出块。
+`P` 以 uint8 相对于该行的运行最大值输入（0..255）；`V` 减去其在 token 上的均值，
+每个通道在整个序列上一个 scale，并加 128 也成为 uint8。某行最大值增大时，累积和
+按在线 softmax 自己的系数重新缩放；某行的和接近 int32 的范围时，`P` 的网格降一级。
+`Q` 按 token 量化。若改为把每个 key 块的乘积反量化进 f32 输出，开销比 int8 乘积省下的还多。
+
+**实测**，M5 Ultra，56 个头 × 109k 行 × head_dim 128（1344 × 768、362 帧的片段），
+bf16，一次注意力：
+
+| | 一次注意力 |
+|---|---|
+| f16 kernel | **4.04 s** |
+| `sage_attn` | **2.90 s** |
+| `sage_attn` + `sage_pv8` | **2.46 s** |
+
+该片段 16 步的整个去噪从 2110 s 降到 1927 s。
+
+**另外两个键。** `sage_pv8_from_step` 是它开始的采样步——之前的步骤只用
+`sage_attn`；默认 `-1` 让前四分之一的步骤不用它，这些步骤决定片段的布局。
+`sage_pv8_all_rows`（默认 `false`）让提示词和配乐的行也用它；关闭时这些行
+（不到片段全部行的 1%）在单独的一次 dispatch 里只用 `sage_attn`。
+
+`generate-image` 上也有 `sage_pv8`，FLUX.2、FLUX.3、Krea-2、MOSS-Image、
+Qwen-Image 和 Z-Image 在每一步、每一行都用它。
 
 <a id="faster-attention--sol-attn-routing"></a>
 ### 更快的注意力——Sol-Attn 路由

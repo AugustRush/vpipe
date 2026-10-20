@@ -1287,6 +1287,14 @@ TEST(flux3_dit, sol_attention_engages_and_stays_close)
 // matrix-core kernel), so it engages on an M5 and declines elsewhere --
 // said, and skipped. A segment must reach kSageMinSegment rows; the wide
 // golden's image segment is 1024.
+//
+// AND ITS SCRATCH IS BUILT ONCE. The image mode's stack, the
+// references', then the joint stack attend at different row counts, and
+// each change used to rebuild Sage's scratch (a private free and
+// allocation, two or three a forward). Each forward now reserves the
+// joint's: two forwards build it once, and the answer is the same bits
+// as without the reservation (VPIPE_FLUX3_SAGE_NO_RESERVE), which still
+// rebuilds per row count.
 TEST(flux3_dit, sage_attention_engages_and_stays_close)
 {
   const Small S = load_small_("wide");
@@ -1308,12 +1316,34 @@ TEST(flux3_dit, sage_attention_engages_and_stays_close)
   F3_REQUIRE(m != nullptr);
   const bool engaged = m->uses_sage_attn();
   const std::vector<float> on = run_small_(m.get(), mc, S, true, &e);
+  const std::vector<float> on2 = run_small_(m.get(), mc, S, true, &e);
+  const int builds = m->sage_scratch_builds();
   m.reset();
   if (!engaged) {
     std::printf("[flux3_dit] sage_attn needs the NAX attention (an M5); "
                 "skipped\n");
     return;
   }
+  ::setenv("VPIPE_FLUX3_SAGE_NO_RESERVE", "1", 1);
+  auto u = MetalFlux3Transformer::load(ckpt, mc, cfg, false);
+  ::unsetenv("VPIPE_FLUX3_SAGE_NO_RESERVE");
+  F3_REQUIRE(u != nullptr);
+  const std::vector<float> un = run_small_(u.get(), mc, S, true, &e);
+  const int ubuilds = u->sage_scratch_builds();
+  u.reset();
+  F3_REQUIRE(on2.size() == on.size() && un.size() == on.size());
+  const bool same2 =
+      std::memcmp(on.data(), on2.data(), on.size() * sizeof(float)) == 0;
+  const bool same_u =
+      std::memcmp(on.data(), un.data(), on.size() * sizeof(float)) == 0;
+  std::printf("[flux3_dit] sage scratch: %d build(s) over two forwards "
+              "reserved, %d in one without; second forward %s, without "
+              "the reservation %s\n", builds, ubuilds,
+              same2 ? "bit-identical" : "DIFFERS",
+              same_u ? "bit-identical" : "DIFFERS");
+  EXPECT_TRUE(builds == 1);
+  EXPECT_TRUE(ubuilds >= 2);
+  EXPECT_TRUE(same2 && same_u);
   F3_REQUIRE(!off.empty() && on.size() == off.size());
   const double d = rel_l2_(on, off), r = rel_l2_(on, S.out_f32);
   std::printf("[flux3_dit] sage: rel-L2 vs dense %.6f, vs reference "

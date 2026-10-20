@@ -3,6 +3,7 @@
 // they are and why they share one builder.
 
 #include "generative-models/qwen3/metal-qwen-raw-layers.h"
+#include "generative-models/moe-expert-cache.h"
 
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -962,7 +963,19 @@ MetalQwenModel::resident_bytes() const
                         &y.gus, &y.gub, &y.uw, &y.dw, &y.ds, &y.db,
                         &y.in_ln, &y.post_ln, &y.q_norm, &y.k_norm,
                         &y.kw, &y.ks, &y.kb, &y.vw, &y.vs, &y.vb});
+    // The gated-DeltaNet layers' and the MoE blocks' weights: a hybrid or
+    // MoE backbone (a Qwen3.5-MoE holds most of its bytes in the experts).
+    n += unique_bytes_({&y.iqw, &y.iqs, &y.iqb, &y.izw, &y.izs, &y.izb,
+                        &y.ibw, &y.ibs, &y.ibb, &y.iaw, &y.ias, &y.iab,
+                        &y.gow, &y.gos, &y.gob, &y.conv_w, &y.A_log,
+                        &y.dt_bias, &y.gdn_norm, &y.qkv_bias});
+    n += unique_bytes_({&y.rgw, &y.rgs, &y.rgb, &y.eguw, &y.egus, &y.egub,
+                        &y.euw, &y.eus, &y.eub, &y.edw, &y.eds, &y.edb,
+                        &y.sguw, &y.sgus, &y.sgub, &y.sdw, &y.sds, &y.sdb,
+                        &y.segw, &y.segs, &y.segb});
   }
+  // The routed-expert cache: its whole pool, which fills as it runs.
+  if (_xc) { n += _xc->bytes(); }
   return n;
 }
 

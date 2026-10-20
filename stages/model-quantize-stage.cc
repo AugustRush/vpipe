@@ -1169,6 +1169,18 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   // (config.json + a probe of the safetensors layer layout); explicit config
   // wins over the detection.
   const genai::QuantArchInfo meta = genai::detect_quant_arch(session(), src_dir);
+  // Fish Audio Drama 3 is read only as published: its routed experts are
+  // already block-FP8 (the bulk of the bytes), and the text-to-speech
+  // stage reads no pack of it -- a quantized copy would not load.
+  if (meta.arch == "fish_omni") {
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): {} is Fish Audio Drama 3, which runs as "
+        "published (its experts are already FP8); the text-to-speech stage "
+        "reads no quantized copy of it. For a smaller one, fetch "
+        "fishaudio/drama-3-int4 (~22 GB held), which it reads natively",
+        this->id(), src_dir));
+    return false;
+  }
   const std::string eff_arch = _arch.empty() ? meta.arch : _arch;
   const std::string eff_layer_prefix =
       _layer_prefix.empty() ? meta.layer_prefix : _layer_prefix;

@@ -685,7 +685,9 @@ MetalSolAttention::ensure_steel_(int q_tokens, int k_tokens,
   // THE SAGE FLAG IS PART OF THE KEY. It changes the exact function and
   // nothing else about the geometry does, so without it an A/B in one
   // process keeps whichever arm specialised first.
-  const int want_sage = (_sage != nullptr) ? 1 : 0;
+  // 2: Sage with its int8 P*V, whose function takes three operands more.
+  const int want_sage =
+      (_sage != nullptr) ? (_sage->pv8_ready() ? 2 : 1) : 0;
   // ...AND ON THE HEAD WIDTH, which now selects the entry point. Two
   // widths at one sequence length is not a shape anything runs today,
   // but the cache would hand the second one the first one's kernel and
@@ -704,6 +706,7 @@ MetalSolAttention::ensure_steel_(int q_tokens, int k_tokens,
       .set_bool(300, false).set_bool(301, false).set_bool(302, false)
       .set_bool(303, true).set_bool(304, true)
       .set_bool(sage::kQkInt8Constant, want_sage != 0);
+  MetalSageAttention::pv8_constants(fc, want_sage == 2);
   _fn_steel = _lib_for_width_(fc);
   if (!_fn_steel.valid()) {
     if (err != nullptr) {
@@ -851,7 +854,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   // dropped the driver on a box with no matrix cores, so this is the
   // one place that knows, and sage_engaged() is what a caller should
   // report and a bench should key its arms on.
-  _sage_on = (_sage != nullptr) && _steel_sage == 1;
+  _sage_on = (_sage != nullptr) && _steel_sage >= 1;
   // THE SCALE IS PER CALL AND THE SCRATCH IS NOT, so it is written here
   // rather than where the rest of AttnParams is filled.
   //

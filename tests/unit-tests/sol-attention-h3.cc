@@ -782,7 +782,8 @@ TEST(sol_attention_h3, sol_and_sage_compose_in_the_stack)
   ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
 
   auto run_arm = [&](const sol::Config& sc, const sage::Config& gc,
-                     const char* what, std::vector<std::uint16_t>* out) {
+                     const char* what, std::vector<std::uint16_t>* out,
+                     bool pv8_off = false) {
     MetalMiniMaxH3Transformer::Config c = cfg;
     c.sol = sc;
     c.sage = gc;
@@ -795,6 +796,7 @@ TEST(sol_attention_h3, sol_and_sage_compose_in_the_stack)
     step.layout = &L;
     step.timesteps = &uniq;
     step.row_timestep_index = &row_idx;
+    step.sage_pv8_off = pv8_off;
     std::string ferr;
     MetalMiniMaxH3Transformer::Velocity v = m->forward(step, &ferr);
     if (v.empty()) {
@@ -906,4 +908,55 @@ TEST(sol_attention_h3, sol_and_sage_compose_in_the_stack)
   std::printf("[h3_sage] sol+sage differs from sol alone in %zu/%zu\n",
               differ, both.size());
   EXPECT_TRUE(differ > both.size() / 100);
+
+  // THE INT8 P*V IN THE STACK (sage_pv8). By default on the video's rows
+  // only: the prompt's and the soundtrack's query blocks on the int8 QK
+  // alone, in a dispatch of their own, and the video's bound from their
+  // first block (bind(e, q_row0)) -- this geometry leads with 56 such
+  // rows, so the split is taken. With pv8_all_rows on every row; under
+  // Sol on the exact half. Each must land in Sage's regime and MOVE off
+  // the arm without it, or the P*V never ran. And a step that keeps it
+  // off (Step::sage_pv8_off -- the early steps) on a model configured
+  // with it is Sage alone BYTE FOR BYTE: the scratch was built with the
+  // P*V's buffers from the first call (reserve_pv8) and serves the int8
+  // QK alone, writing per-block scales into a buffer sized per token.
+  sage::Config pv8_on = sage_on;
+  pv8_on.pv8 = true;
+  sage::Config pv8_all = pv8_on;
+  pv8_all.pv8_all_rows = true;
+  std::vector<std::uint16_t> pv8_video, pv8_rows, pv8_sol, pv8_held;
+  ASSERT_TRUE(run_arm(sol_off, pv8_on, "sage_pv8", &pv8_video));
+  ASSERT_TRUE(run_arm(sol_off, pv8_all, "sage_pv8 all", &pv8_rows));
+  ASSERT_TRUE(run_arm(sol_on, pv8_on, "sol+sage_pv8", &pv8_sol));
+  ASSERT_TRUE(run_arm(sol_off, pv8_on, "sage_pv8 off", &pv8_held, true));
+  if (pv8_video.size() != dense.size() || pv8_rows.size() != dense.size() ||
+      pv8_sol.size() != dense.size() || pv8_held.size() != dense.size()) {
+    ASSERT_TRUE(false);
+    return;
+  }
+  auto differ_from = [](const std::vector<std::uint16_t>& a,
+                        const std::vector<std::uint16_t>& b) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) { n += a[i] != b[i]; }
+    return n;
+  };
+  const double r_pv = rel_to_dense(pv8_video);
+  const double r_pv_all = rel_to_dense(pv8_rows);
+  const double r_pv_sol = rel_to_dense(pv8_sol);
+  const std::size_t moved_pv = differ_from(pv8_video, only_sage);
+  const std::size_t moved_all = differ_from(pv8_rows, pv8_video);
+  const std::size_t moved_sol = differ_from(pv8_sol, both);
+  const std::size_t held_off = differ_from(pv8_held, only_sage);
+  std::printf("[h3_sage] vs dense: sage_pv8 %.4f (video rows) | %.4f "
+              "(every row) | sol+sage_pv8 %.4f; moved off sage %zu, every "
+              "row off video rows %zu, off sol+sage %zu, held off vs "
+              "sage %zu of %zu\n", r_pv, r_pv_all, r_pv_sol, moved_pv,
+              moved_all, moved_sol, held_off, dense.size());
+  EXPECT_TRUE(std::isfinite(r_pv) && r_pv < 0.5);
+  EXPECT_TRUE(std::isfinite(r_pv_all) && r_pv_all < 0.5);
+  EXPECT_TRUE(std::isfinite(r_pv_sol) && r_pv_sol < 0.5);
+  EXPECT_TRUE(moved_pv > dense.size() / 100);
+  EXPECT_TRUE(moved_all > 0);
+  EXPECT_TRUE(moved_sol > dense.size() / 100);
+  EXPECT_TRUE(held_off == 0);
 }

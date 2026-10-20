@@ -14,6 +14,7 @@
 #include "apple-silicon/metal-compute/kernel-contract.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/session.h"
+#include "generative-models/shared/sage-attention.h"
 #include "interfaces/session-services-intf.h"
 
 #include "gpu-kernels/metal/vendored/mlx/backend/metal/kernels/steel/attn/params.h"
@@ -44,6 +45,13 @@ SAME_FIELD(K_strides);  SAME_FIELD(V_strides);  SAME_FIELD(O_strides);
 static_assert(sizeof(contract::SteelAttnParams) ==
                   sizeof(mlx::steel::AttnParams),
               "kernel contract: SteelAttnParams size");
+// The toolkit's Sage spells the constants it sets on the contracted
+// flash entries itself (sage-attention.h); they must be the contract's.
+static_assert(genai::sage::kQkInt8Constant == contract::kAttnQkInt8 &&
+                  genai::sage::kPvInt8Constant == contract::kAttnPvInt8 &&
+                  genai::sage::kQTokenScaleConstant ==
+                      contract::kAttnQTokenScale,
+              "kernel contract: Sage's function constants");
 
 bool
 is_steel_(std::string_view lib)
@@ -92,6 +100,28 @@ TEST(kernel_contract, every_contracted_kernel_resolves)
                   std::string(k.entry).c_str());
     }
     ++checked;
+    // The matrix-core entries take SageAttention's int8 QK and its int8
+    // P*V too (kAttnPvInt8 / kAttnQTokenScale on top of kAttnQkInt8),
+    // and a toolkit specialises them so: each must BUILD that way.
+    if (k.library == "attn_steel_nax") {
+      FunctionConstants fc;
+      fc.set_bool(contract::kAttnAlignQ, true)
+          .set_bool(contract::kAttnAlignK, true)
+          .set_bool(contract::kAttnHasMask, false)
+          .set_bool(contract::kAttnCausal, false)
+          .set_bool(contract::kAttnSinks, false)
+          .set_bool(contract::kAttnQkInt8, true)
+          .set_bool(contract::kAttnPvInt8, true)
+          .set_bool(contract::kAttnQTokenScale, true);
+      const bool ok = lib.function(k.entry, fc).valid();
+      EXPECT_TRUE(ok);
+      if (!ok) {
+        std::printf("[contract] %s :: %s does not build with the int8 "
+                    "P*V\n", std::string(k.library).c_str(),
+                    std::string(k.entry).c_str());
+      }
+      ++checked;
+    }
   }
   for (const contract::QuantFamily& q : contract::kQuantFamilies) {
     const ComputeLibrary lib = mc->load_library(q.library);

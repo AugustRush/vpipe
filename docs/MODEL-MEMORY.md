@@ -103,9 +103,11 @@ than supplying one that is merely small.
 | 8 | Parking | May somebody else have my idle bytes? | per weight set | at an idle point |
 | 9 | The removable pool | May the *next launch* have what I finished with? | per weight set | at release |
 | 10 | The memory cap | What does the process insist on holding? | process-wide | from config |
+| 11 | The expert cache | Which of a mixture-of-experts model's experts do I keep? | per (layer, expert) | at load; refilled every step |
 
 Mechanisms 1–4 are mandatory for every model. 5–7 apply to models too big
-for the machine. 8–10 are how idle weights stop being dead weight.
+for the machine, and 11 is their counterpart for a mixture of experts.
+8–10 are how idle weights stop being dead weight.
 
 They are layers, not independent knobs: each answers a different question,
 and a model that wires one and skips another tends to behave correctly on
@@ -1964,6 +1966,153 @@ What is freed inside one item (a copy made for one pass, the pool's old
 buffers during a doubling) is the phased part. A generator also books
 the decode it feeds when only it knows the length — the VAE's arena and
 the samples it produces — as a video generator does for its soundtrack.
+
+---
+
+## 11. The expert cache — a mixture of experts on a smaller box
+
+A mixture-of-experts layer reads only the experts its router picks — 8 of
+256 a token in the Qwen3.5 / Qwen3.6 MoE family and in Drama 3 — so most
+of a 35B model is idle at any moment. The expert cache runs such a model
+on a box too small for all of it: **everything but the routed experts is
+held and wired**, and the experts live in a cache refilled from disk on a
+miss.
+
+**It is the host's, not the SDK's.** The cache is part of the host's Qwen
+MoE stack, and every model built on that stack takes it (see "What it
+covers"); a plugin's own mixture-of-experts model cannot use it through
+the SDK today. The one piece of it the SDK carries is the in-place sync
+it is built on, `CommandStream::sync_and_reopen`. The rest of this
+section is how it decides and how to read its numbers.
+
+It is the opposite design to block residency (mechanism 6), and on
+purpose. A forward is a cyclic scan of its blocks, so recency predicts
+nothing there; a router is SKEWED — some experts are picked far more often
+than others, and which ones follows the content — so a cache kept by
+**selection frequency** gets far more than its share of hits.
+
+### How it decides
+
+- **Slots, laid out as the model's own expert slab.** Part *k* of slot *s*
+  sits at `s * part_bytes[k]`, so the model's expert kernels run unchanged:
+  they index the pool by slot as they index a layer's slab by expert.
+  `resolve()` turns a step's routed ids into slot ids in place.
+- **A score per (layer, expert).** Each step adds the fraction of its rows
+  that routed there (a decode token adds 1 per pick, a prefill of *n* rows
+  what one token would), and every `half_life` steps every score halves,
+  so the cache follows the text being generated.
+- **Admission.** A miss is admitted to the resident set while there is
+  room, or when it scores above the least-selected resident expert that
+  this step does NOT need — which it then replaces. Otherwise it goes to a
+  SPARE slot (one layer's worth of them beyond the resident set), so a
+  one-off pick never evicts a hot expert.
+- **Slots are fungible.** At most the resident count of them form the
+  resident set; a spare keeps what it was last read with until it is
+  taken again, least recently used first, so an expert read for one step
+  is still a hit a few steps later. An expert found in a spare is admitted
+  by the same rule as a miss: the roles move, the bytes do not.
+- **Reading ahead.** A decode step also runs the NEXT layer's router over
+  this layer's input — the residual stream moves little from one layer to
+  the next — and the cache reads the likeliest of that layer's experts it
+  does not hold, behind this step's own misses and without waiting for
+  them. The next step takes what has arrived, waits only for the reads it
+  picks that are still under way, and drops those that have not started.
+  A read ahead never lands in a slot the current step uses.
+- **How many to read ahead is measured.** It depends on the drive and the
+  hit rate: where a decode's misses leave the drive idle, reading ahead
+  hides most of each step's wait; where they keep it busy, every guess
+  not picked is a read the next step waits behind. So the cache compares
+  candidate widths (none, half of `top_k`, `top_k`) on the steps it is
+  running, by the time each decode step BLOCKED on reads — the only time
+  the width changes. A round draws a width for each short block of
+  steps and charges a step to its width when the step before took the
+  same one (a step's reads answer both its own width and its
+  predecessor's, and the two do not add). Widths must be compared over
+  the same text: a step's cost moves 2–4× from one passage to the next,
+  which is more than the width moves it. The cheapest is kept for a while
+  (a smaller width within 3% of it wins), then the round runs again.
+  `VPIPE_MOE_EXPERT_AHEAD=<n>` pins the width for an A/B.
+
+  It is an estimate with a known lean: a width's effects outlast its
+  block (reads still under way slow the next one, experts read ahead stay
+  as hits a frame later), so on a busy drive it rates reading ahead a
+  little better than it is. The 3% rule absorbs that in every case
+  measured; the chooser never ran slower than reading nothing ahead.
+- **Reads.** Misses are read concurrently by a small thread pool, with
+  `pread` on descriptors opened `F_NOCACHE` — the cache is the copy, and
+  the file cache keeping a second one would compete with it for the same
+  memory. Page-aligned staging (an unaligned `F_NOCACHE` read silently
+  takes the cached path), and an expert whose tensors lie together in its
+  file is one read, not six.
+- **The sync.** The routes are on the GPU and the CPU has to see them: the
+  model commits after the route kernel, waits, resolves, and reopens the
+  stream in place (`CommandStream::sync_and_reopen`). That wait is also
+  what makes overwriting a slot safe — the GPU has finished everything
+  before it.
+
+**Bit-identical to resident**: the arithmetic is the same, only the
+addressing changes. Every model wired to the cache is tested that way
+(logits, decode and sampled runs, memcmp).
+
+### Sizing — the engine decides
+
+There is no stage key for the cache's size. The loader applies the same
+rule `plan_streaming()` applies to a DiT, against TOTAL RAM so every stage
+answers the same way: when this model's full preload, its peers and its
+scratch fit with the irreversible cushion (`kStreamHeadroom`), every
+expert stays resident; otherwise the cache is the experts' bytes minus
+the shortfall, and never less than one layer's worth. The stages that
+hold such a model and the LM loader apply it inside the host; it is not
+a call in the SDK.
+
+The claim follows: `weight_claim_streamable(dir, floor)` with the floor at
+`preload − experts + one layer of experts`, since that is the smallest
+cache the model runs with. `VPIPE_RAM_LIMIT_MB` simulates a smaller box;
+`VPIPE_MOE_EXPERT_CACHE_MB` overrides the size for an A/B (0 = resident).
+
+### What it covers
+
+The Qwen MoE stack (`MetalQwenModel`) in the formats whose experts it can
+read one at a time: block-FP8 per-expert tensors, GPTQ int4 per-expert
+tensors (converted to the affine layout on the read), and MLX affine
+stacked `switch_mlp` weights read as ranges of the stacked tensor (one
+bit width across the experts). A dense bf16 MoE, k-quant GGUF, a
+mixed-width stack and the layer-streaming mode stay resident, and the
+load line says why. Every model built on that stack takes it: the MoE
+LLMs through the LM loader (`text-chat` and the other LLM stages) and
+Drama 3 through `text-to-speech`.
+
+A pool is one buffer the kernels index by slot, so the slot count is
+capped where their offsets stop: the affine kernels take 32-bit expert
+offsets (no part past 2^33 bytes), the block-FP8 ones 64-bit (the
+device's buffer limit). The load line reports the slots actually made.
+
+### What it costs
+
+A miss is a read from the drive in the middle of a token, so speed is a
+property of the DRIVE and of the HIT RATE, and the hit rate of the
+cache's share of the experts. Measured on an M4 Pro, checkpoints on its
+internal SSD, smaller boxes simulated with `VPIPE_RAM_LIMIT_MB`, the
+engine choosing the size and the read-ahead:
+
+| model | box | experts cached | hits | speed (no read-ahead / resident) | process peak |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B 4-bit (text-chat) | 16 GB | 20% (4.0 GB) | 92% | 17.0 tok/s (10.0 / 85) | 7.0 GB |
+| Drama 3 release (block FP8) | 16 GB | 5% (2.2 GB) | 38% | 3.4 frames/s (3.4 / 33) | 8.7 GB |
+| Drama 3 release (block FP8) | 32 GB | 58% (18.6 GB) | 89% | 9.4 frames/s (8.5 / 33) | 25.1 GB |
+| Drama 3 int4 (GPTQ) | 16 GB | 8% (1.8 GB) | 40% | 5.4 frames/s (— / 35) | 8.4 GB |
+
+(The int4 row predates the spares and the read-ahead.) A hit counts an
+expert found in any slot, so it includes the spares and the reads
+ahead. The two regimes show in the read-ahead: the LLM at 16 GB reads
+1.6 GB/s from a drive that does 4.5, and reading the next layer's 8
+likeliest experts ahead hides most of each wait (1.7×); Drama 3's release
+at 16 GB already keeps the drive near its limit, and the chooser reads
+nothing ahead. On an external drive at under 1 GB/s every row is several
+times slower again (the LLM: 4.5 tok/s, read-ahead held at half width
+for no change). Read the line a model prints when it unloads —
+`expert cache: N% hits over P picks, ... MB read, T ms of it waited for;
+... read ahead` — before concluding anything about a box.
 
 ---
 

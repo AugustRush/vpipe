@@ -138,13 +138,19 @@ AudioToPcmStage::AudioToPcmStage(const SessionContextIntf* s,
   }
   {
     int v = static_cast<int>(attr_int("oport_capacity"));
-    if (v < 1) {
+    if (v < 0) {
       fail_config(fmt(
-          "AudioToPcmStage('{}'): oport_capacity must be >= 1",
+          "AudioToPcmStage('{}'): oport_capacity must be >= 0",
           this->id()));
       return;
     }
     _oport_capacity = static_cast<unsigned>(v);
+    // Asked for, the writer waits for its slowest reader: a file decodes
+    // far faster than a voice detector reads it, and the default depth
+    // gives up 2048 chunks ahead.
+    if (_oport_capacity > 0) {
+      set_oport_policy(0, {_oport_capacity, OverrunPolicy::Backpressure});
+    }
   }
   {
     int e = static_cast<int>(attr_int("emit_log_every"));
@@ -215,7 +221,9 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "hard-cap chunk seconds; >= chunk_duration_s",
    .def_real = 30.0},
   {.key = "oport_capacity", .type = ConfigType::Int,
-   .doc = "oport buffer depth in chunks, >= 1", .def_int = 4},
+   .doc = "chunks ahead of the slowest reader, at most (backpressure); "
+          "0 (the default): the default depth, which never waits",
+   .def_int = 0},
   {.key = "flush_on_eos", .type = ConfigType::Bool,
    .doc = "emit partial chunk when source closes", .def_bool = true},
   {.key = "emit_log_every", .type = ConfigType::Int,

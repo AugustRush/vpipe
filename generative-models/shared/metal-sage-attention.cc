@@ -78,6 +78,15 @@ MetalSageAttention::load(MetalCompute* mc, bool bf16, std::string* err)
       !s->_fn_quant.valid()) {
     return fail("sage_quant kernels did not validate");
   }
+  // The int8 P*V's four are OPTIONAL (the contract lists them so): a
+  // plugin's copy of this class may run on a host older than they are,
+  // and there the int8 QK alone is the answer, not a refused model.
+  s->_fn_qtok   = s->_lib.function("sage_quant_token");
+  s->_fn_vam    = s->_lib.function("sage_v_absmax_chunk");
+  s->_fn_var    = s->_lib.function("sage_v_absmax_reduce");
+  s->_fn_vq8    = s->_lib.function("sage_quant_v_channel_u8");
+  s->_pv8_kernels = s->_fn_qtok.valid() && s->_fn_vam.valid() &&
+                    s->_fn_var.valid() && s->_fn_vq8.valid();
   return s;
 }
 
@@ -108,8 +117,17 @@ MetalSageAttention::load_for_model(MetalCompute* mc, bool bf16,
   }
   if (sess != nullptr) {
     sess->log_normal(fmt(
-        "{}: SageAttention ON -- INT8 QK^T, layers {}+, key smoothing {}",
-        who, cfg.dense_layers, cfg.smooth_k ? "on" : "OFF (A/B only)"));
+        "{}: SageAttention ON -- INT8 QK^T{}, layers {}+, key smoothing {}",
+        who, s->pv8_for(cfg) ? " and P*V (held, uint8 P)" : "",
+        cfg.dense_layers, cfg.smooth_k ? "on" : "OFF (A/B only)"));
+    // Said, because the config asked: a host whose library predates the
+    // int8 P*V runs the int8 QK alone, and the run must not read as one
+    // with it.
+    if (cfg.pv8 && !s->pv8_available()) {
+      sess->log_normal(fmt(
+          "{}: sage_pv8 asked for but this host's kernels predate it -- "
+          "the int8 QK alone", who));
+    }
   }
   return s;
 }
@@ -136,7 +154,7 @@ MetalSageAttention::scratch_buffers_()
   // Everything ensure_scratch_ hands out, in ONE list, so counting them,
   // announcing them and giving them back cannot disagree about which
   // they are.
-  return {&_km, &_kmp, &_q8, &_k8, &_qs, &_ks};
+  return {&_km, &_kmp, &_q8, &_k8, &_qs, &_ks, &_v8, &_vs, &_vm, &_vmp};
 }
 
 namespace {
@@ -146,7 +164,7 @@ namespace {
 // carve simulation -- rather than two arithmetics that have to agree.
 bool
 sage_plan_(int heads, int kv_heads, int q_tokens, int k_tokens, int d,
-           int bq, int bk, std::vector<std::size_t>* out)
+           int bq, int bk, bool pv8, std::vector<std::size_t>* out)
 {
   out->clear();
   if (heads <= 0 || kv_heads <= 0 || q_tokens <= 0 || k_tokens <= 0 ||
@@ -167,8 +185,14 @@ sage_plan_(int heads, int kv_heads, int q_tokens, int k_tokens, int d,
   out->push_back(pad(KH * (std::size_t)sage::kMeanChunks * D * 4));   // kmp
   out->push_back(pad(H * (std::size_t)q_tokens * D));                 // q8
   out->push_back(pad(KH * (std::size_t)k_tokens * D));                // k8
-  out->push_back(pad(H * nq * 4));                                    // qs
+  out->push_back(pad(H * (pv8 ? (std::size_t)q_tokens : nq) * 4));  // qs
   out->push_back(pad(KH * nk * 4));                                   // ks
+  if (pv8) {
+    out->push_back(pad(KH * (std::size_t)k_tokens * D));              // v8
+    out->push_back(pad(KH * D * 4));                                  // vs
+    out->push_back(pad(KH * D * 4));                                  // vm
+    out->push_back(pad(KH * (std::size_t)sage::kMeanChunks * D * 4)); // vmp
+  }
   return true;
 }
 
@@ -176,10 +200,12 @@ sage_plan_(int heads, int kv_heads, int q_tokens, int k_tokens, int d,
 
 std::size_t
 MetalSageAttention::scratch_bytes(int heads, int kv_heads, int q_tokens,
-                                  int k_tokens, int d, int bq, int bk)
+                                  int k_tokens, int d, int bq, int bk,
+                                  bool pv8)
 {
   std::vector<std::size_t> plan;
-  if (!sage_plan_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk, &plan)) {
+  if (!sage_plan_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk, pv8,
+                  &plan)) {
     return 0;
   }
   std::size_t n = 0;
@@ -190,10 +216,12 @@ MetalSageAttention::scratch_bytes(int heads, int kv_heads, int q_tokens,
 std::size_t
 MetalSageAttention::private_bytes(int heads, int kv_heads, int q_tokens,
                                   int k_tokens, int d, int bq, int bk,
-                                  std::size_t lend_a, std::size_t lend_b)
+                                  std::size_t lend_a, std::size_t lend_b,
+                                  bool pv8)
 {
   std::vector<std::size_t> plan;
-  if (!sage_plan_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk, &plan)) {
+  if (!sage_plan_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk, pv8,
+                  &plan)) {
     return 0;
   }
   // THE SAME GREEDY CARVE ensure_scratch_ runs: first region that has
@@ -234,8 +262,11 @@ MetalSageAttention::set_arena(const SharedBuffer& a, const SharedBuffer& b)
   drop_residency_();
   for (SharedBuffer* p : scratch_buffers_()) { *p = SharedBuffer{}; }
   _heads = _qt = _kt = _d = 0;
+  _pv8 = false;
+  _reserved = false;
   _own = 0;
   _ready = false;
+  _pv8_ready = false;
   _arena_used[0] = 0;
   _arena_used[1] = 0;
 }
@@ -244,21 +275,86 @@ std::size_t
 MetalSageAttention::resident_bytes() const
 {
   std::size_t n = 0;
-  for (const SharedBuffer* b : {&_km, &_kmp, &_q8, &_k8, &_qs, &_ks}) {
+  for (const SharedBuffer* b : {&_km, &_kmp, &_q8, &_k8, &_qs, &_ks, &_v8,
+                                 &_vs, &_vm, &_vmp}) {
     n += b->byte_size();
   }
   return n;
 }
 
+std::string
+MetalSageAttention::check_geometry_(int heads, int kv_heads, int q_tokens,
+                                    int k_tokens, int d, int bq, int bk)
+{
+  if (heads <= 0 || kv_heads <= 0 || q_tokens <= 0 || k_tokens <= 0 ||
+      d <= 0) {
+    return "sage_attn: degenerate geometry";
+  }
+  // The kernel derives the KV head from gqa_factor = heads / kv_heads,
+  // so a ratio that is not whole would put it on a head this never
+  // quantized. Refused rather than rounded.
+  if (kv_heads > heads || (heads % kv_heads) != 0) {
+    return fmt("sage_attn: {} query heads is not a whole multiple of "
+               "{} kv heads", heads, kv_heads)();
+  }
+  // REFUSED rather than clamped. Both bounds are threadgroup array
+  // sizes inside sage_quant_block, so exceeding one writes past a
+  // threadgroup allocation -- which produces a plausible wrong answer
+  // rather than a fault, and would be found downstream as a bad frame.
+  if (d > kMaxD) {
+    return fmt("sage_attn: head_dim {} exceeds {}", d, kMaxD)();
+  }
+  if (bq > kMaxBlock || bk > kMaxBlock || bq <= 0 || bk <= 0) {
+    return fmt("sage_attn: block ({}, {}) outside 1..{}", bq, bk,
+               kMaxBlock)();
+  }
+  return {};
+}
+
+bool
+MetalSageAttention::reserve(int heads, int kv_heads, int q_tokens,
+                            int k_tokens, int d, int bq, int bk, bool pv8,
+                            std::string* err)
+{
+  if (_mc == nullptr) {
+    if (err != nullptr) { *err = "sage_attn not loaded"; }
+    return false;
+  }
+  const std::string bad =
+      check_geometry_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk);
+  if (!bad.empty()) {
+    if (err != nullptr) { *err = bad; }
+    return false;
+  }
+  return ensure_scratch_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk,
+                         pv8 && _pv8_kernels, /*exact=*/true, err);
+}
+
 bool
 MetalSageAttention::ensure_scratch_(int heads, int kv_heads, int q_tokens,
                                     int k_tokens, int d, int bq, int bk,
-                                    std::string* err)
+                                    bool pv8, bool exact, std::string* err)
 {
-  if (_heads == heads && _kvh == kv_heads && _qt == q_tokens &&
-      _kt == k_tokens && _d == d && _bq == bq && _bk == bk &&
-      !_q8.empty()) {
-    return true;
+  // A scratch with the int8 P*V's buffers serves a call without them
+  // (its Q scales are per token, more than per block needs), so a run
+  // that toggles pv8 -- MiniMax-H3's early steps -- rebuilds once at
+  // most, and never if the caller reserved them (reserve_pv8).
+  pv8 = pv8 || (_reserve_pv8 && _pv8_kernels);
+  // Every buffer's size grows with the token counts alone once heads,
+  // head dim and tiles agree, and prepare() writes (and the kernel
+  // reads) each call at its own geometry -- so a scratch for more
+  // tokens serves fewer. Taken only from a reservation: a caller that
+  // made none gets a scratch the size of its last call, as before,
+  // rather than one that only ever grows.
+  if (_heads == heads && _kvh == kv_heads && _d == d && _bq == bq &&
+      _bk == bk && (_pv8 || !pv8) && !_q8.empty()) {
+    if (_qt == q_tokens && _kt == k_tokens) {
+      if (exact) { _reserved = true; }
+      return true;
+    }
+    if (!exact && _reserved && q_tokens <= _qt && k_tokens <= _kt) {
+      return true;
+    }
   }
   // A REBUILD: the previous geometry's buffers are about to be
   // overwritten, and the assignments below are the last references to
@@ -298,11 +394,25 @@ MetalSageAttention::ensure_scratch_(int heads, int kv_heads, int q_tokens,
   _kmp = mk(KH * (std::size_t)sage::kMeanChunks * D * 4);
   _q8  = mk(H * (std::size_t)q_tokens * D);
   _k8  = mk(KH * (std::size_t)k_tokens * D);
-  _qs  = mk(H * (std::size_t)nq * 4);
+  _qs  = mk(H * (pv8 ? (std::size_t)q_tokens : (std::size_t)nq) * 4);
   _ks  = mk(KH * (std::size_t)nk * 4);
+  if (pv8) {
+    _v8  = mk(KH * (std::size_t)k_tokens * D);
+    _vs  = mk(KH * D * 4);
+    _vm  = mk(KH * D * 4);
+    _vmp = mk(KH * (std::size_t)sage::kMeanChunks * D * 4);
+  } else {
+    _v8 = SharedBuffer{};
+    _vs = SharedBuffer{};
+    _vm = SharedBuffer{};
+    _vmp = SharedBuffer{};
+  }
+  const bool v_ok = !pv8 || (!_v8.empty() && !_vs.empty() && !_vm.empty() &&
+                             !_vmp.empty());
   if (_km.empty() || _kmp.empty() || _q8.empty() || _k8.empty() ||
-      _qs.empty() || _ks.empty()) {
+      _qs.empty() || _ks.empty() || !v_ok) {
     _own = 0;
+    _reserved = false;
     for (SharedBuffer* p : scratch_buffers_()) { *p = SharedBuffer{}; }
     if (err != nullptr) { *err = "sage_attn scratch allocation failed"; }
     return false;
@@ -315,7 +425,9 @@ MetalSageAttention::ensure_scratch_(int heads, int kv_heads, int q_tokens,
   _mc->residency_commit();
 
   _heads = heads; _kvh = kv_heads; _qt = q_tokens; _kt = k_tokens; _d = d;
-  _bq = bq; _bk = bk;
+  _bq = bq; _bk = bk; _pv8 = pv8;
+  _reserved = exact;
+  ++_builds;
   return true;
 }
 
@@ -323,36 +435,19 @@ bool
 MetalSageAttention::prepare(ComputeEncoder& e, const Operand& q,
                             const Operand& k, int heads, int kv_heads,
                             int q_tokens, int k_tokens, int d, int bq, int bk,
-                            const sage::Config& cfg, std::string* err)
+                            const sage::Config& cfg, std::string* err,
+                            const Operand* v)
 {
   _ready = false;
+  _pv8_ready = false;
   auto fail = [&](const std::string& m) {
     if (err != nullptr) { *err = m; }
     return false;
   };
   if (_mc == nullptr) { return fail("sage_attn not loaded"); }
-  if (heads <= 0 || kv_heads <= 0 || q_tokens <= 0 || k_tokens <= 0 ||
-      d <= 0) {
-    return fail("sage_attn: degenerate geometry");
-  }
-  // The kernel derives the KV head from gqa_factor = heads / kv_heads,
-  // so a ratio that is not whole would put it on a head this never
-  // quantized. Refused rather than rounded.
-  if (kv_heads > heads || (heads % kv_heads) != 0) {
-    return fail(fmt("sage_attn: {} query heads is not a whole multiple of "
-                    "{} kv heads", heads, kv_heads)());
-  }
-  // REFUSED rather than clamped. Both bounds are threadgroup array
-  // sizes inside sage_quant_block, so exceeding one writes past a
-  // threadgroup allocation -- which produces a plausible wrong answer
-  // rather than a fault, and would be found downstream as a bad frame.
-  if (d > kMaxD) {
-    return fail(fmt("sage_attn: head_dim {} exceeds {}", d, kMaxD)());
-  }
-  if (bq > kMaxBlock || bk > kMaxBlock || bq <= 0 || bk <= 0) {
-    return fail(fmt("sage_attn: block ({}, {}) outside 1..{}", bq, bk,
-                    kMaxBlock)());
-  }
+  const std::string bad =
+      check_geometry_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk);
+  if (!bad.empty()) { return fail(bad); }
   if (q.buf == nullptr || k.buf == nullptr || q.buf->empty() ||
       k.buf->empty()) {
     return fail("sage_attn: no q/k");
@@ -360,8 +455,15 @@ MetalSageAttention::prepare(ComputeEncoder& e, const Operand& q,
   if (q.row <= 0 || k.row <= 0 || q.head <= 0 || k.head <= 0) {
     return fail("sage_attn: q/k strides must be positive");
   }
-  if (!ensure_scratch_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk,
-                       err)) {
+  // The int8 P*V wants V too, and its kernels; asked for without
+  // either, the int8 QK alone (pv8_for() says which to a caller).
+  const bool pv8 = pv8_for(cfg) && v != nullptr && v->buf != nullptr &&
+                   !v->buf->empty();
+  if (pv8 && (v->row <= 0 || v->head <= 0)) {
+    return fail("sage_attn: v strides must be positive");
+  }
+  if (!ensure_scratch_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk, pv8,
+                       /*exact=*/false, err)) {
     return false;
   }
 
@@ -394,8 +496,23 @@ MetalSageAttention::prepare(ComputeEncoder& e, const Operand& q,
     e.dispatch({D, KH, 1}, {D, 1, 1});
   }
 
-  // 2. Q, unsmoothed, at the QUERY block. See sage-attention.h for why
-  //    only the key side carries a mean.
+  // 2. Q, unsmoothed, at the QUERY block -- or, for the int8 P*V, per
+  //    TOKEN (its kernel reads constant 310's layout). See
+  //    sage-attention.h for why only the key side carries a mean.
+  if (pv8) {
+    e.set_function(_fn_qtok);
+    e.set_buffer(0, *q.buf);
+    e.set_buffer(1, _q8);
+    e.set_buffer(2, _qs);
+    e.set_constant(3, q_tokens);
+    e.set_constant(4, d);
+    e.set_constant(5, q.row);
+    e.set_constant(6, (unsigned)q.off);
+    e.set_constant(7, q.head);
+    e.set_buffer(8, _km);
+    e.set_constant(9, 0);
+    e.dispatch({256u, H, (unsigned)((q_tokens + 63) / 64)}, {256, 1, 1});
+  } else {
   e.set_function(_fn_quant);
   e.set_buffer(0, *q.buf);
   e.set_buffer(1, _km);
@@ -409,6 +526,7 @@ MetalSageAttention::prepare(ComputeEncoder& e, const Operand& q,
   e.set_constant(9, 0);
   e.set_constant(10, q.head);
   e.dispatch({256u, H, (unsigned)nq}, {256, 1, 1});
+  }
 
   // 3. K, smoothed, at the KEY block.
   e.set_function(_fn_quant);
@@ -425,6 +543,63 @@ MetalSageAttention::prepare(ComputeEncoder& e, const Operand& q,
   e.set_constant(10, k.head);
   e.dispatch({256u, KH, (unsigned)nk}, {256, 1, 1});
 
+  // 4. The int8 P*V's V: its mean over tokens (added back exactly after
+  //    the kernel's normalize), its absmax per channel over the whole
+  //    sequence -- one scale a channel, as the held int32 sum needs --
+  //    and V8 + 128 as uint8.
+  if (pv8) {
+    e.set_function(_fn_sum);
+    e.set_buffer(0, *v->buf);
+    e.set_buffer(1, _vmp);
+    e.set_constant(2, k_tokens);
+    e.set_constant(3, d);
+    e.set_constant(4, v->row);
+    e.set_constant(5, (unsigned)v->off);
+    e.set_constant(6, chunks);
+    e.set_constant(7, v->head);
+    e.dispatch({D, KH, (unsigned)chunks}, {D, 1, 1});
+
+    e.set_function(_fn_reduce);
+    e.set_buffer(0, _vmp);
+    e.set_buffer(1, _vm);
+    e.set_constant(2, k_tokens);
+    e.set_constant(3, d);
+    e.set_constant(4, chunks);
+    e.dispatch({D, KH, 1}, {D, 1, 1});
+
+    e.set_function(_fn_vam);
+    e.set_buffer(0, *v->buf);
+    e.set_buffer(1, _vm);
+    e.set_buffer(2, _vmp);
+    e.set_constant(3, k_tokens);
+    e.set_constant(4, d);
+    e.set_constant(5, v->row);
+    e.set_constant(6, (unsigned)v->off);
+    e.set_constant(7, chunks);
+    e.set_constant(8, v->head);
+    e.dispatch({D, KH, (unsigned)chunks}, {D, 1, 1});
+
+    e.set_function(_fn_var);
+    e.set_buffer(0, _vmp);
+    e.set_buffer(1, _vs);
+    e.set_constant(2, d);
+    e.set_constant(3, chunks);
+    e.dispatch({D, KH, 1}, {D, 1, 1});
+
+    e.set_function(_fn_vq8);
+    e.set_buffer(0, *v->buf);
+    e.set_buffer(1, _vm);
+    e.set_buffer(2, _vs);
+    e.set_buffer(3, _v8);
+    e.set_constant(4, k_tokens);
+    e.set_constant(5, d);
+    e.set_constant(6, v->row);
+    e.set_constant(7, (unsigned)v->off);
+    e.set_constant(8, v->head);
+    e.dispatch({D, KH, (unsigned)((k_tokens + 7) / 8)}, {D, 1, 1});
+    _pv8_ready = true;
+  }
+
   _ready = true;
   return true;
 }
@@ -432,11 +607,49 @@ MetalSageAttention::prepare(ComputeEncoder& e, const Operand& q,
 void
 MetalSageAttention::bind(ComputeEncoder& e) const
 {
-  if (!_ready) { return; }
+  (void)bind(e, 0);
+}
+
+bool
+MetalSageAttention::bind(ComputeEncoder& e, int q_row0) const
+{
+  if (!_ready || q_row0 < 0) { return false; }
+  if (q_row0 > 0) {
+    // Per token only: a per-block scale would be indexed by the
+    // dispatch's own block numbers, which no longer count from 0. What
+    // decides is what the LAST prepare() wrote, not the scratch's size:
+    // a pv8 scratch serves a call that wrote per-block scales.
+    if (!_pv8_ready) { return false; }
+    e.set_buffer(15, _q8, (std::size_t)q_row0 * (std::size_t)_d);
+    e.set_buffer(16, _k8);
+    e.set_buffer(17, _qs, (std::size_t)q_row0 * 4);
+    e.set_buffer(18, _ks);
+    if (_pv8_ready) {
+      e.set_buffer(19, _v8);
+      e.set_buffer(20, _vs);
+      e.set_buffer(21, _vm);
+    }
+    return true;
+  }
   e.set_buffer(15, _q8);
   e.set_buffer(16, _k8);
   e.set_buffer(17, _qs);
   e.set_buffer(18, _ks);
+  if (_pv8_ready) {
+    e.set_buffer(19, _v8);
+    e.set_buffer(20, _vs);
+    e.set_buffer(21, _vm);
+  }
+  return true;
+}
+
+void
+MetalSageAttention::pv8_constants(metal_compute::FunctionConstants& fc,
+                                  bool on)
+{
+  // 308 the int8 PV (its held uint8 form), 310 Q per token.
+  fc.set_bool(sage::kPvInt8Constant, on)
+      .set_bool(sage::kQTokenScaleConstant, on);
 }
 
 }  // namespace genai

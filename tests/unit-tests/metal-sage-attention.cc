@@ -518,7 +518,10 @@ TEST(metal_sage_attention, destroying_the_driver_gives_the_arena_back)
 // is exactly what H3 and Qwen-Image run and what every earlier test
 // here used. So this is the case that was passing while wrong.
 //
-// The reference attends head h against kv head h / gqa, in double.
+// The reference attends head h against kv head h / gqa, in double. Both
+// arms: the int8 QK alone, and with its P*V (sage_pv8), whose uint8 V,
+// scale and mean are indexed by the KV head too -- the kv heads' V are
+// scaled apart below, so V8 read at the query head is a large error.
 TEST(metal_sage_attention, grouped_kv_reads_the_kv_head)
 {
   Session sess;
@@ -541,6 +544,20 @@ TEST(metal_sage_attention, grouped_kv_reads_the_kv_head)
   }
   ComputeFunction f_i8 = r.fn(true);
   if (!f_i8.valid()) { return; }
+  ComputeFunction f_pv;
+  {
+    const int bq = MetalSageAttention::nax_query_block();
+    const int bk = MetalSageAttention::nax_key_block();
+    FunctionConstants fc;
+    fc.set_bool(200, (T % bq) == 0).set_bool(201, (T % bk) == 0)
+        .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+        .set_bool(303, false).set_bool(304, false).set_bool(305, false)
+        .set_bool(sage::kQkInt8Constant, true);
+    MetalSageAttention::pv8_constants(fc, true);
+    f_pv = r.lib.function("attn_steel_nax_h_bd128", fc);
+  }
+  ASSERT_TRUE(f_pv.valid() && sage->pv8_available());
+  if (!f_pv.valid()) { return; }
 
   // Q over H heads, K/V over KVH -- and the kv heads are made DELIBERATELY
   // unlike each other, so reading the wrong one is a large error rather
@@ -584,50 +601,58 @@ TEST(metal_sage_attention, grouped_kv_reads_the_kv_head)
 
   MetalSageAttention::Operand qo{&qb, 0, kD, T * kD};
   MetalSageAttention::Operand ko{&kb, 0, kD, T * kD};
-  sage::Config cfg;
-  cfg.enabled = true;
-  {
-    CommandStream st = mc->make_command_stream();
+  MetalSageAttention::Operand vo{&vb, 0, kD, T * kD};
+  for (const bool pv8 : {false, true}) {
+    sage::Config cfg;
+    cfg.enabled = true;
+    cfg.pv8 = pv8;
     {
-      ComputeEncoder e = st.begin_compute();
-      ASSERT_TRUE(sage->prepare(
-          e, qo, ko, H, KVH, T, T, kD,
-          MetalSageAttention::nax_query_block(),
-          MetalSageAttention::nax_key_block(), cfg, &err));
-      e.set_function(f_i8);
-      e.set_buffer(0, qb); e.set_buffer(1, kb); e.set_buffer(2, vb);
-      e.set_buffer(3, ob); e.set_buffer(4, r.pb);
-      sage->bind(e);
-      e.dispatch({32u * (unsigned)r.fn_blocks(), 4u * (unsigned)H, 1},
-                 {32, 4, 1});
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        ASSERT_TRUE(sage->prepare(
+            e, qo, ko, H, KVH, T, T, kD,
+            MetalSageAttention::nax_query_block(),
+            MetalSageAttention::nax_key_block(), cfg, &err, &vo));
+        ASSERT_TRUE(sage->pv8_ready() == pv8);
+        e.set_function(pv8 ? f_pv : f_i8);
+        e.set_buffer(0, qb); e.set_buffer(1, kb); e.set_buffer(2, vb);
+        e.set_buffer(3, ob); e.set_buffer(4, r.pb);
+        sage->bind(e);
+        e.dispatch({32u * (unsigned)r.fn_blocks(), 4u * (unsigned)H, 1},
+                   {32, 4, 1});
+      }
+      ASSERT_TRUE(st.commit().wait_ok(&err));
     }
-    ASSERT_TRUE(st.commit().wait_ok(&err));
-  }
 
-  const auto* o = static_cast<const std::uint16_t*>(ob.contents());
-  double worst = 1.0;
-  for (int h = 0; h < H; ++h) {
-    // The reference for query head h, against KV head h / gqa. Built by
-    // gathering that head's k/v into head-major position 0 so ref_ can
-    // be reused unchanged.
-    std::vector<float> qh((std::size_t)T * kD), kh, vh;
-    std::memcpy(qh.data(), q.data() + (std::size_t)h * T * kD,
-                (std::size_t)T * kD * sizeof(float));
-    const std::size_t kvo = (std::size_t)(h / gqa) * T * kD;
-    kh.assign(k.begin() + (long)kvo, k.begin() + (long)(kvo + (std::size_t)T * kD));
-    vh.assign(v.begin() + (long)kvo, v.begin() + (long)(kvo + (std::size_t)T * kD));
-    const std::vector<double> rf = ref_(qh, kh, vh, 0, T, r.scale);
-    std::vector<double> got(rf.size());
-    for (std::size_t i = 0; i < rf.size(); ++i) {
-      got[i] = (double)h2f_(o[(std::size_t)h * T * kD + i]);
+    const auto* o = static_cast<const std::uint16_t*>(ob.contents());
+    double worst = 1.0;
+    for (int h = 0; h < H; ++h) {
+      // The reference for query head h, against KV head h / gqa. Built by
+      // gathering that head's k/v into head-major position 0 so ref_ can
+      // be reused unchanged.
+      std::vector<float> qh((std::size_t)T * kD), kh, vh;
+      std::memcpy(qh.data(), q.data() + (std::size_t)h * T * kD,
+                  (std::size_t)T * kD * sizeof(float));
+      const std::size_t kvo = (std::size_t)(h / gqa) * T * kD;
+      kh.assign(k.begin() + (long)kvo,
+                k.begin() + (long)(kvo + (std::size_t)T * kD));
+      vh.assign(v.begin() + (long)kvo,
+                v.begin() + (long)(kvo + (std::size_t)T * kD));
+      const std::vector<double> rf = ref_(qh, kh, vh, 0, T, r.scale);
+      std::vector<double> got(rf.size());
+      for (std::size_t i = 0; i < rf.size(); ++i) {
+        got[i] = (double)h2f_(o[(std::size_t)h * T * kD + i]);
+      }
+      const double c = cos_(got, rf);
+      worst = c < worst ? c : worst;
     }
-    const double c = cos_(got, rf);
-    worst = c < worst ? c : worst;
+    std::printf("[sage-drv] gqa %d%s: worst head cosine %.8f\n", gqa,
+                pv8 ? " + int8 PV" : "", worst);
+    // A head reading its NEIGHBOUR's keys (or values) lands far below
+    // this; the kv heads were separated above precisely so that it would.
+    EXPECT_TRUE(worst > 0.995);
   }
-  std::printf("[sage-drv] gqa %d: worst head cosine %.8f\n", gqa, worst);
-  // A head reading its NEIGHBOUR's keys lands far below this; the kv
-  // heads were separated above precisely so that it would.
-  EXPECT_TRUE(worst > 0.995);
 }
 
 // THE TWO FLASH KERNELS AT QWEN-IMAGE'S SHAPE.
@@ -823,4 +848,607 @@ TEST(metal_sage_attention, the_private_estimate_matches_a_partial_lend)
                 got == want ? "" : "   MISMATCH");
     EXPECT_TRUE(got == want);
   }
+}
+
+namespace {
+
+std::uint16_t f2bf_(float f)
+{
+  std::uint32_t u;
+  std::memcpy(&u, &f, 4);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return (std::uint16_t)(u >> 16);
+}
+
+float bf2f_(std::uint16_t b)
+{
+  const std::uint32_t u = (std::uint32_t)b << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+}  // namespace
+
+// THE INT8 P*V THROUGH THE DRIVER (sage::Config::pv8): V's operand handed
+// to prepare(), Q per token, V's mean, scale and uint8 copy made by it,
+// the function built with pv8_constants(). Scored against f64 beside the
+// int8 QK alone, in f16 and bf16 -- the two the families run -- and then
+// from a FUSED [rows, 3*I] source against the head-major one, required
+// bit-identical, which is what says V's operand is addressed as given.
+TEST(metal_sage_attention, the_driver_runs_the_int8_pv)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!MetalSageAttention::available(mc)) { return; }
+  const int bq = MetalSageAttention::nax_query_block();
+  const int bk = MetalSageAttention::nax_key_block();
+
+  for (const bool bf16 : {false, true}) {
+    std::string err;
+    std::unique_ptr<MetalSageAttention> sage =
+        MetalSageAttention::load(mc, bf16, &err);
+    ASSERT_TRUE(sage != nullptr);
+    if (!sage) { return; }
+    auto enc = [&](float x) { return bf16 ? f2bf_(x) : f2h_(x); };
+    auto dec = [&](std::uint16_t x) { return bf16 ? bf2f_(x) : h2f_(x); };
+    for (const int T : {1024, 1000}) {
+      const int H = 4, I = H * kD;
+      Rig r;
+      if (!r.init(mc, H, T)) { return; }
+      auto build = [&](bool pv8) {
+        FunctionConstants fc;
+        fc.set_bool(200, (T % bq) == 0).set_bool(201, (T % bk) == 0)
+            .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+            .set_bool(303, false).set_bool(304, false).set_bool(305, false)
+            .set_bool(sage::kQkInt8Constant, true);
+        MetalSageAttention::pv8_constants(fc, pv8);
+        return r.lib.function(bf16 ? "attn_steel_nax_h_bd128_bf16"
+                                   : "attn_steel_nax_h_bd128", fc);
+      };
+      ComputeFunction f_qk = build(false), f_pv = build(true);
+      ASSERT_TRUE(f_qk.valid() && f_pv.valid());
+      if (!f_pv.valid()) { return; }
+
+      std::vector<float> q, k, v;
+      fill_(&q, &k, &v, H, T, 0x0b8f0001u + (unsigned)T);
+      const std::size_t n = (std::size_t)H * T * kD;
+      SharedBuffer qb = mc->make_shared_buffer(n * 2);
+      SharedBuffer kb = mc->make_shared_buffer(n * 2);
+      SharedBuffer vb = mc->make_shared_buffer(n * 2);
+      SharedBuffer fused = mc->make_shared_buffer((std::size_t)T * 3 * I * 2);
+      SharedBuffer o_qk = mc->make_shared_buffer(n * 2);
+      SharedBuffer o_hm = mc->make_shared_buffer(n * 2);
+      SharedBuffer o_fu = mc->make_shared_buffer(n * 2);
+      ASSERT_TRUE(!fused.empty() && !o_fu.empty());
+      if (o_fu.empty()) { return; }
+      auto* qp = static_cast<std::uint16_t*>(qb.contents());
+      auto* kp = static_cast<std::uint16_t*>(kb.contents());
+      auto* vp = static_cast<std::uint16_t*>(vb.contents());
+      auto* fu = static_cast<std::uint16_t*>(fused.contents());
+      for (int h = 0; h < H; ++h) {
+        for (int t = 0; t < T; ++t) {
+          for (int c = 0; c < kD; ++c) {
+            const std::size_t i =
+                ((std::size_t)h * T + (std::size_t)t) * kD + (std::size_t)c;
+            qp[i] = enc(q[i]); kp[i] = enc(k[i]); vp[i] = enc(v[i]);
+            const std::size_t f = (std::size_t)t * 3 * I +
+                                  (std::size_t)h * kD + (std::size_t)c;
+            fu[f] = qp[i];
+            fu[f + (std::size_t)I] = kp[i];
+            fu[f + (std::size_t)2 * I] = vp[i];
+          }
+        }
+      }
+      sage::Config cfg;
+      cfg.enabled = true;
+      auto run = [&](bool fused_src, bool pv8, SharedBuffer& out) {
+        MetalSageAttention::Operand qo, ko, vo;
+        if (fused_src) {
+          qo = {&fused, 0, 3 * I, kD};
+          ko = {&fused, (std::size_t)I, 3 * I, kD};
+          vo = {&fused, (std::size_t)2 * I, 3 * I, kD};
+          r.set_strides((std::int64_t)T * 3 * I, kD, 3 * I);
+        } else {
+          qo = {&qb, 0, kD, T * kD};
+          ko = {&kb, 0, kD, T * kD};
+          vo = {&vb, 0, kD, T * kD};
+          r.set_strides((std::int64_t)H * T * kD, (std::int64_t)T * kD, kD);
+        }
+        cfg.pv8 = pv8;
+        CommandStream st = mc->make_command_stream();
+        {
+          ComputeEncoder e = st.begin_compute();
+          if (!sage->prepare(e, qo, ko, H, H, T, T, kD, bq, bk, cfg, &err,
+                             &vo)) {
+            return false;
+          }
+          if (sage->pv8_ready() != pv8) { return false; }
+          e.set_function(pv8 ? f_pv : f_qk);
+          if (fused_src) {
+            e.set_buffer(0, fused, 0);
+            e.set_buffer(1, fused, (std::size_t)I * 2);
+            e.set_buffer(2, fused, (std::size_t)2 * I * 2);
+          } else {
+            e.set_buffer(0, qb); e.set_buffer(1, kb); e.set_buffer(2, vb);
+          }
+          e.set_buffer(3, out);
+          e.set_buffer(4, r.pb);
+          sage->bind(e);
+          e.dispatch({32u * (unsigned)r.fn_blocks(), 4u * (unsigned)H, 1},
+                     {32, 4, 1});
+        }
+        return st.commit().wait_ok(&err);
+      };
+      ASSERT_TRUE(run(true, true, o_fu));
+      ASSERT_TRUE(run(false, true, o_hm));
+      ASSERT_TRUE(run(false, false, o_qk));
+
+      const auto* a = static_cast<const std::uint16_t*>(o_qk.contents());
+      const auto* b = static_cast<const std::uint16_t*>(o_hm.contents());
+      double c_qk = 0.0, c_pv = 0.0;
+      for (int h = 0; h < H; ++h) {
+        const std::vector<double> rf = ref_(q, k, v, h, T, r.scale);
+        std::vector<double> x(rf.size()), y(rf.size());
+        for (std::size_t i = 0; i < rf.size(); ++i) {
+          x[i] = (double)dec(a[(std::size_t)h * T * kD + i]);
+          y[i] = (double)dec(b[(std::size_t)h * T * kD + i]);
+        }
+        c_qk += cos_(x, rf) / H;
+        c_pv += cos_(y, rf) / H;
+      }
+      std::size_t bad = 0;
+      const auto* c = static_cast<const std::uint16_t*>(o_fu.contents());
+      for (std::size_t i = 0; i < n; ++i) { bad += (b[i] != c[i]) ? 1 : 0; }
+      std::printf("[sage-drv] %s T=%4d: int8 QK cos %.6f | + int8 PV cos "
+                  "%.6f | fused vs head-major: %zu of %zu differ\n",
+                  bf16 ? "bf16" : "f16 ", T, c_qk, c_pv, bad, n);
+      EXPECT_TRUE(c_pv > 0.995);
+      EXPECT_TRUE(c_pv > c_qk - 0.002);
+      EXPECT_TRUE(bad == 0);
+    }
+  }
+}
+
+// A DISPATCH FROM A QUERY ROW ON (bind(e, q_row0)), as a family running
+// the int8 P*V on some rows only does it: the first `nb` query blocks on
+// one function, the rest on another, Q and O bound from row nb * BQ and
+// the params counting blocks from there. Each part must be BIT-IDENTICAL
+// to that function run over every row -- a row offset that missed the
+// int8 Q, its per-token scale or the ragged last block would still give
+// a plausible answer, of other rows. Fused and head-major sources both.
+TEST(metal_sage_attention, a_dispatch_from_a_query_row_is_the_same_rows)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!MetalSageAttention::available(mc)) { return; }
+  std::string err;
+  std::unique_ptr<MetalSageAttention> sage =
+      MetalSageAttention::load(mc, /*bf16=*/false, &err);
+  ASSERT_TRUE(sage != nullptr);
+  if (!sage) { return; }
+  const int bq = MetalSageAttention::nax_query_block();
+  const int bk = MetalSageAttention::nax_key_block();
+  const int H = 4, T = 1000, I = H * kD, nb = 3;
+  const int nq = (T + bq - 1) / bq;
+  Rig r;
+  if (!r.init(mc, H, T)) { return; }
+  auto build = [&](bool pv8) {
+    FunctionConstants fc;
+    fc.set_bool(200, (T % bq) == 0).set_bool(201, (T % bk) == 0)
+        .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+        .set_bool(303, false).set_bool(304, false).set_bool(305, false)
+        .set_bool(sage::kQkInt8Constant, true);
+    MetalSageAttention::pv8_constants(fc, pv8);
+    fc.set_bool(310, true);   // Q per token, as a pv8 prologue makes it
+    return r.lib.function("attn_steel_nax_h_bd128", fc);
+  };
+  ComputeFunction f_qk = build(false), f_pv = build(true);
+  ASSERT_TRUE(f_qk.valid() && f_pv.valid());
+  if (!f_pv.valid()) { return; }
+
+  std::vector<float> q, k, v;
+  fill_(&q, &k, &v, H, T, 0x0b8f0b0du);
+  const std::size_t n = (std::size_t)H * T * kD;
+  SharedBuffer qb = mc->make_shared_buffer(n * 2);
+  SharedBuffer kb = mc->make_shared_buffer(n * 2);
+  SharedBuffer vb = mc->make_shared_buffer(n * 2);
+  SharedBuffer fused = mc->make_shared_buffer((std::size_t)T * 3 * I * 2);
+  SharedBuffer o_qk = mc->make_shared_buffer(n * 2);
+  SharedBuffer o_pv = mc->make_shared_buffer(n * 2);
+  SharedBuffer o_sp = mc->make_shared_buffer(n * 2);
+  SharedBuffer pband = mc->make_shared_buffer(sizeof(AttnP));
+  ASSERT_TRUE(!fused.empty() && !o_sp.empty() && !pband.empty());
+  if (pband.empty()) { return; }
+  auto* qp = static_cast<std::uint16_t*>(qb.contents());
+  auto* kp = static_cast<std::uint16_t*>(kb.contents());
+  auto* vp = static_cast<std::uint16_t*>(vb.contents());
+  auto* fu = static_cast<std::uint16_t*>(fused.contents());
+  for (int h = 0; h < H; ++h) {
+    for (int t = 0; t < T; ++t) {
+      for (int c = 0; c < kD; ++c) {
+        const std::size_t i =
+            ((std::size_t)h * T + (std::size_t)t) * kD + (std::size_t)c;
+        qp[i] = f2h_(q[i]); kp[i] = f2h_(k[i]); vp[i] = f2h_(v[i]);
+        const std::size_t f = (std::size_t)t * 3 * I +
+                              (std::size_t)h * kD + (std::size_t)c;
+        fu[f] = qp[i];
+        fu[f + (std::size_t)I] = kp[i];
+        fu[f + (std::size_t)2 * I] = vp[i];
+      }
+    }
+  }
+  sage::Config cfg;
+  cfg.enabled = true;
+  cfg.pv8 = true;
+  for (const bool fused_src : {false, true}) {
+    MetalSageAttention::Operand qo, ko, vo;
+    std::size_t qoff = 0, koff = 0, voff = 0, qrow = kD;
+    const SharedBuffer* src_q = &qb;
+    const SharedBuffer* src_k = &kb;
+    const SharedBuffer* src_v = &vb;
+    if (fused_src) {
+      qo = {&fused, 0, 3 * I, kD};
+      ko = {&fused, (std::size_t)I, 3 * I, kD};
+      vo = {&fused, (std::size_t)2 * I, 3 * I, kD};
+      r.set_strides((std::int64_t)T * 3 * I, kD, 3 * I);
+      src_q = src_k = src_v = &fused;
+      koff = (std::size_t)I * 2;
+      voff = (std::size_t)2 * I * 2;
+      qrow = (std::size_t)3 * I;
+    } else {
+      qo = {&qb, 0, kD, T * kD};
+      ko = {&kb, 0, kD, T * kD};
+      vo = {&vb, 0, kD, T * kD};
+      r.set_strides((std::int64_t)H * T * kD, (std::int64_t)T * kD, kD);
+    }
+    std::memcpy(pband.contents(), r.pb.contents(), sizeof(AttnP));
+    static_cast<AttnP*>(pband.contents())->NQa -= nb;
+    const std::size_t r0 = (std::size_t)nb * bq;
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      ASSERT_TRUE(sage->prepare(e, qo, ko, H, H, T, T, kD, bq, bk, cfg,
+                                &err, &vo));
+      auto whole = [&](ComputeFunction& f, SharedBuffer& out) {
+        e.set_function(f);
+        e.set_buffer(0, *src_q, qoff); e.set_buffer(1, *src_k, koff);
+        e.set_buffer(2, *src_v, voff);
+        e.set_buffer(3, out); e.set_buffer(4, r.pb);
+        sage->bind(e);
+        e.dispatch({32u * (unsigned)nq, 4u * (unsigned)H, 1}, {32, 4, 1});
+      };
+      whole(f_qk, o_qk);
+      whole(f_pv, o_pv);
+      // The split: blocks [0, nb) on the int8 QK, the rest on the P*V.
+      e.set_function(f_qk);
+      e.set_buffer(0, *src_q, qoff); e.set_buffer(1, *src_k, koff);
+      e.set_buffer(2, *src_v, voff);
+      e.set_buffer(3, o_sp); e.set_buffer(4, r.pb);
+      sage->bind(e);
+      e.dispatch({32u * (unsigned)nb, 4u * (unsigned)H, 1}, {32, 4, 1});
+      e.set_function(f_pv);
+      e.set_buffer(0, *src_q, qoff + r0 * qrow * 2);
+      e.set_buffer(3, o_sp, r0 * kD * 2);
+      e.set_buffer(4, pband);
+      sage->bind(e, (int)r0);
+      e.dispatch({32u * (unsigned)(nq - nb), 4u * (unsigned)H, 1},
+                 {32, 4, 1});
+    }
+    ASSERT_TRUE(st.commit().wait_ok(&err));
+    const auto* a = static_cast<const std::uint16_t*>(o_qk.contents());
+    const auto* b = static_cast<const std::uint16_t*>(o_pv.contents());
+    const auto* c = static_cast<const std::uint16_t*>(o_sp.contents());
+    std::size_t bad_head = 0, bad_tail = 0, pv_differs = 0;
+    for (int h = 0; h < H; ++h) {
+      for (int t = 0; t < T; ++t) {
+        for (int ch = 0; ch < kD; ++ch) {
+          const std::size_t i =
+              ((std::size_t)h * T + (std::size_t)t) * kD + (std::size_t)ch;
+          if ((std::size_t)t < r0) {
+            bad_head += c[i] != a[i] ? 1 : 0;
+          } else {
+            bad_tail += c[i] != b[i] ? 1 : 0;
+          }
+          pv_differs += a[i] != b[i] ? 1 : 0;
+        }
+      }
+    }
+    std::printf("[sage-drv] %s rows split at %zu: prefix %zu differ, rest "
+                "%zu differ (the two functions differ at %zu of %zu)\n",
+                fused_src ? "fused     " : "head-major", r0, bad_head,
+                bad_tail, pv_differs, n);
+    EXPECT_TRUE(bad_head == 0 && bad_tail == 0);
+    EXPECT_TRUE(pv_differs > n / 2);
+  }
+}
+
+// ONE SCRATCH FOR BOTH ARMS. MiniMax-H3 runs its early steps on the int8
+// QK alone and the rest with the int8 P*V, and the scratch used to be
+// rebuilt at every toggle -- twice a clip, a private free and allocation
+// of ~3 bytes a q/k/v element where nothing is lent. A scratch with the
+// P*V's buffers now serves a call without them: no rebuild (its size
+// does not move), and the int8 QK's output BIT-IDENTICAL to a driver
+// that never had them -- its per-block Q scales written into a buffer
+// sized per token. reserve_pv8() builds them from the first call. And
+// bind(e, q_row0 > 0) refuses after a call that wrote per-block scales,
+// pv8-sized scratch or not: no row offset is right for those.
+TEST(metal_sage_attention, a_pv8_scratch_serves_the_int8_qk_alone)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!MetalSageAttention::available(mc)) { return; }
+  const int bq = MetalSageAttention::nax_query_block();
+  const int bk = MetalSageAttention::nax_key_block();
+  const int H = 4, T = 1000;
+  Rig r;
+  if (!r.init(mc, H, T)) { return; }
+  r.set_strides((std::int64_t)H * T * kD, (std::int64_t)T * kD, kD);
+  ComputeFunction f_qk = r.fn(true);
+  ASSERT_TRUE(f_qk.valid());
+  if (!f_qk.valid()) { return; }
+
+  std::vector<float> q, k, v;
+  fill_(&q, &k, &v, H, T, 0x5ca7c001u);
+  const std::size_t n = (std::size_t)H * T * kD;
+  SharedBuffer qb = mc->make_shared_buffer(n * 2);
+  SharedBuffer kb = mc->make_shared_buffer(n * 2);
+  SharedBuffer vb = mc->make_shared_buffer(n * 2);
+  ASSERT_TRUE(!qb.empty() && !kb.empty() && !vb.empty());
+  if (vb.empty()) { return; }
+  auto* qp = static_cast<std::uint16_t*>(qb.contents());
+  auto* kp = static_cast<std::uint16_t*>(kb.contents());
+  auto* vp = static_cast<std::uint16_t*>(vb.contents());
+  for (std::size_t i = 0; i < n; ++i) {
+    qp[i] = f2h_(q[i]); kp[i] = f2h_(k[i]); vp[i] = f2h_(v[i]);
+  }
+  const MetalSageAttention::Operand qo{&qb, 0, kD, T * kD};
+  const MetalSageAttention::Operand ko{&kb, 0, kD, T * kD};
+  const MetalSageAttention::Operand vo{&vb, 0, kD, T * kD};
+  const std::size_t plain =
+      MetalSageAttention::scratch_bytes(H, H, T, T, kD, bq, bk, false);
+  const std::size_t full =
+      MetalSageAttention::scratch_bytes(H, H, T, T, kD, bq, bk, true);
+  ASSERT_TRUE(full > plain);
+
+  // A prologue alone (pv8 asked or not) and, for the int8 QK arm, its
+  // attention into `out`; whether bind(e, 64) bound.
+  std::string err;
+  auto call = [&](MetalSageAttention& s, bool pv8, SharedBuffer* out,
+                  bool* row_bind) {
+    sage::Config cfg;
+    cfg.enabled = true;
+    cfg.pv8 = pv8;
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      if (!s.prepare(e, qo, ko, H, H, T, T, kD, bq, bk, cfg, &err, &vo)) {
+        return false;
+      }
+      if (row_bind != nullptr) { *row_bind = s.bind(e, 64); }
+      if (out != nullptr) {
+        e.set_function(f_qk);
+        e.set_buffer(0, qb); e.set_buffer(1, kb); e.set_buffer(2, vb);
+        e.set_buffer(3, *out);
+        e.set_buffer(4, r.pb);
+        s.bind(e);
+        e.dispatch({32u * (unsigned)r.fn_blocks(), 4u * (unsigned)H, 1},
+                   {32, 4, 1});
+      }
+    }
+    return st.commit().wait_ok(&err);
+  };
+
+  std::string lerr;
+  std::unique_ptr<MetalSageAttention> a =
+      MetalSageAttention::load(mc, /*bf16=*/false, &lerr);
+  std::unique_ptr<MetalSageAttention> b =
+      MetalSageAttention::load(mc, /*bf16=*/false, &lerr);
+  std::unique_ptr<MetalSageAttention> c =
+      MetalSageAttention::load(mc, /*bf16=*/false, &lerr);
+  ASSERT_TRUE(a && b && c && a->pv8_available());
+  if (!a || !b || !c) { return; }
+  SharedBuffer o_fresh = mc->make_shared_buffer(n * 2);
+  SharedBuffer o_served = mc->make_shared_buffer(n * 2);
+  ASSERT_TRUE(!o_fresh.empty() && !o_served.empty());
+  if (o_served.empty()) { return; }
+
+  // Sizes by private_held(): nothing is lent, so it is the whole carve,
+  // padded as scratch_bytes() pads it. `a` never sees pv8: the int8 QK
+  // on a scratch of its own size.
+  ASSERT_TRUE(call(*a, false, &o_fresh, nullptr));
+  const std::size_t a_held = a->private_held();
+  // `b` is built with it, then asked without: kept, not rebuilt.
+  bool rb_pv = false, rb_qk = true;
+  ASSERT_TRUE(call(*b, true, nullptr, &rb_pv));
+  const std::size_t b_pv = b->private_held();
+  ASSERT_TRUE(call(*b, false, &o_served, &rb_qk));
+  const std::size_t b_qk = b->private_held();
+  const bool b_ready = b->pv8_ready();
+  // `c` reserves them, and its FIRST call has none.
+  c->reserve_pv8(true);
+  ASSERT_TRUE(call(*c, false, nullptr, nullptr));
+  const std::size_t c_held = c->private_held();
+
+  const bool same = std::memcmp(o_fresh.contents(), o_served.contents(),
+                                n * 2) == 0;
+  std::printf("[sage-drv] scratch %zu / %zu KB (int8 QK / + P*V): fresh "
+              "%zu, pv8 then not %zu -> %zu, reserved %zu; int8 QK on the "
+              "pv8 scratch: %s; bind at row 64: %d after pv8, %d after "
+              "not\n", plain >> 10, full >> 10, a_held >> 10, b_pv >> 10,
+              b_qk >> 10, c_held >> 10, same ? "bit-identical" : "DIFFERS",
+              (int)rb_pv, (int)rb_qk);
+  EXPECT_TRUE(a_held == plain);
+  EXPECT_TRUE(b_pv == full && b_qk == full);
+  EXPECT_TRUE(c_held == full);
+  EXPECT_TRUE(!b_ready);
+  EXPECT_TRUE(same);
+  EXPECT_TRUE(rb_pv && !rb_qk);
+}
+
+// A RESERVATION COVERS THE SMALLER CALLS. A family whose attention runs
+// at several row counts in one forward (FLUX.3: each mode's stack over
+// its own rows, then the joint stack) rebuilt the scratch at every
+// change -- a private free and allocation, two or three a forward. With
+// reserve() at the largest, a prepare() it covers reuses it, and the
+// answer is the SAME BITS as a scratch built for that call alone (each
+// call is written and read at its own geometry), int8 QK alone and with
+// the P*V. A caller that reserves nothing keeps the old behaviour: its
+// scratch follows its last call, down as well as up. And reserve() is
+// exact: a smaller reservation shrinks it.
+TEST(metal_sage_attention, a_reservation_covers_smaller_calls)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!MetalSageAttention::available(mc)) { return; }
+  const int bq = MetalSageAttention::nax_query_block();
+  const int bk = MetalSageAttention::nax_key_block();
+  const int H = 4, big = 1000, small = 600;
+  // Two rigs: each call's params and functions are its own geometry's.
+  Rig rs;
+  if (!rs.init(mc, H, small)) { return; }
+  rs.set_strides((std::int64_t)H * small * kD, (std::int64_t)small * kD,
+                 kD);
+  ComputeFunction f_qk = rs.fn(true), f_pv;
+  {
+    FunctionConstants fc;
+    fc.set_bool(200, (small % bq) == 0).set_bool(201, (small % bk) == 0)
+        .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+        .set_bool(303, false).set_bool(304, false).set_bool(305, false)
+        .set_bool(sage::kQkInt8Constant, true);
+    MetalSageAttention::pv8_constants(fc, true);
+    f_pv = rs.lib.function("attn_steel_nax_h_bd128", fc);
+  }
+  ASSERT_TRUE(f_qk.valid() && f_pv.valid());
+  if (!f_pv.valid()) { return; }
+
+  std::vector<float> q, k, v;
+  fill_(&q, &k, &v, H, small, 0x7e5e7001u);
+  const std::size_t n = (std::size_t)H * small * kD;
+  SharedBuffer qb = mc->make_shared_buffer(n * 2);
+  SharedBuffer kb = mc->make_shared_buffer(n * 2);
+  SharedBuffer vb = mc->make_shared_buffer(n * 2);
+  ASSERT_TRUE(!qb.empty() && !kb.empty() && !vb.empty());
+  if (vb.empty()) { return; }
+  auto* qp = static_cast<std::uint16_t*>(qb.contents());
+  auto* kp = static_cast<std::uint16_t*>(kb.contents());
+  auto* vp = static_cast<std::uint16_t*>(vb.contents());
+  for (std::size_t i = 0; i < n; ++i) {
+    qp[i] = f2h_(q[i]); kp[i] = f2h_(k[i]); vp[i] = f2h_(v[i]);
+  }
+  const MetalSageAttention::Operand qo{&qb, 0, kD, small * kD};
+  const MetalSageAttention::Operand ko{&kb, 0, kD, small * kD};
+  const MetalSageAttention::Operand vo{&vb, 0, kD, small * kD};
+
+  // The `small` attention through `s` into `out`, int8 QK or with P*V.
+  std::string err;
+  auto run = [&](MetalSageAttention& s, bool pv8, SharedBuffer& out) {
+    sage::Config cfg;
+    cfg.enabled = true;
+    cfg.pv8 = pv8;
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      if (!s.prepare(e, qo, ko, H, H, small, small, kD, bq, bk, cfg, &err,
+                     &vo) ||
+          s.pv8_ready() != pv8) {
+        return false;
+      }
+      e.set_function(pv8 ? f_pv : f_qk);
+      e.set_buffer(0, qb); e.set_buffer(1, kb); e.set_buffer(2, vb);
+      e.set_buffer(3, out);
+      e.set_buffer(4, rs.pb);
+      s.bind(e);
+      e.dispatch({32u * (unsigned)rs.fn_blocks(), 4u * (unsigned)H, 1},
+                 {32, 4, 1});
+    }
+    return st.commit().wait_ok(&err);
+  };
+  auto size_of = [&](int t, bool pv8) {
+    return MetalSageAttention::scratch_bytes(H, H, t, t, kD, bq, bk, pv8);
+  };
+
+  std::string lerr;
+  std::unique_ptr<MetalSageAttention> fresh =
+      MetalSageAttention::load(mc, /*bf16=*/false, &lerr);
+  std::unique_ptr<MetalSageAttention> held =
+      MetalSageAttention::load(mc, /*bf16=*/false, &lerr);
+  std::unique_ptr<MetalSageAttention> plain =
+      MetalSageAttention::load(mc, /*bf16=*/false, &lerr);
+  ASSERT_TRUE(fresh && held && plain && held->pv8_available());
+  if (!fresh || !held || !plain) { return; }
+
+  bool same[2] = {false, false};
+  int builds_after[2] = {0, 0};
+  for (const bool pv8 : {false, true}) {
+    SharedBuffer o_fresh = mc->make_shared_buffer(n * 2);
+    SharedBuffer o_held = mc->make_shared_buffer(n * 2);
+    ASSERT_TRUE(!o_fresh.empty() && !o_held.empty());
+    if (o_held.empty()) { return; }
+    ASSERT_TRUE(run(*fresh, pv8, o_fresh));
+    // The capacity first, then the call it covers -- twice.
+    ASSERT_TRUE(held->reserve(H, H, big, big, kD, bq, bk, true, &err));
+    ASSERT_TRUE(run(*held, pv8, o_held));
+    ASSERT_TRUE(held->reserve(H, H, big, big, kD, bq, bk, true, &err));
+    ASSERT_TRUE(run(*held, pv8, o_held));
+    same[pv8 ? 1 : 0] =
+        std::memcmp(o_fresh.contents(), o_held.contents(), n * 2) == 0;
+    builds_after[pv8 ? 1 : 0] = held->scratch_builds();
+  }
+  const std::size_t held_big = held->private_held();
+  // ...and an exact smaller reservation shrinks it.
+  ASSERT_TRUE(held->reserve(H, H, small, small, kD, bq, bk, true, &err));
+  const std::size_t held_small = held->private_held();
+
+  // No reservation: the scratch follows the last call, down as well --
+  // a prologue at `big` (zeros will do), then the `small` attention.
+  std::size_t plain_big = 0, plain_small = 0;
+  {
+    const std::size_t nb = (std::size_t)H * big * kD * 2;
+    SharedBuffer qB = mc->make_shared_buffer(nb);
+    SharedBuffer kB = mc->make_shared_buffer(nb);
+    SharedBuffer vB = mc->make_shared_buffer(nb);
+    ASSERT_TRUE(!qB.empty() && !kB.empty() && !vB.empty());
+    if (vB.empty()) { return; }
+    for (SharedBuffer* b : {&qB, &kB, &vB}) {
+      std::memset(b->contents(), 0, nb);
+    }
+    const MetalSageAttention::Operand qoB{&qB, 0, kD, big * kD};
+    const MetalSageAttention::Operand koB{&kB, 0, kD, big * kD};
+    const MetalSageAttention::Operand voB{&vB, 0, kD, big * kD};
+    sage::Config cfg;
+    cfg.enabled = true;
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      ASSERT_TRUE(plain->prepare(e, qoB, koB, H, H, big, big, kD, bq, bk,
+                                 cfg, &err, &voB));
+    }
+    ASSERT_TRUE(st.commit().wait_ok(&err));
+    plain_big = plain->private_held();
+    SharedBuffer o = mc->make_shared_buffer(n * 2);
+    ASSERT_TRUE(run(*plain, false, o));
+    plain_small = plain->private_held();
+  }
+
+  std::printf("[sage-drv] reserved %d rows, called at %d: int8 QK %s, + "
+              "P*V %s against a scratch of the call's own; builds %d then "
+              "%d; held %zu KB (reserved), %zu KB after a %d-row "
+              "reservation; unreserved %zu -> %zu KB, %d builds\n", big,
+              small, same[0] ? "bit-identical" : "DIFFERS",
+              same[1] ? "bit-identical" : "DIFFERS", builds_after[0],
+              builds_after[1], held_big >> 10, held_small >> 10, small,
+              plain_big >> 10, plain_small >> 10, plain->scratch_builds());
+  EXPECT_TRUE(same[0] && same[1]);
+  EXPECT_TRUE(builds_after[0] == 1 && builds_after[1] == 1);
+  EXPECT_TRUE(held_big == size_of(big, true));
+  EXPECT_TRUE(held_small == size_of(small, true));
+  EXPECT_TRUE(held->scratch_builds() == 2);
+  EXPECT_TRUE(plain_big == size_of(big, false));
+  EXPECT_TRUE(plain_small == size_of(small, false));
+  EXPECT_TRUE(plain->scratch_builds() == 2);
 }

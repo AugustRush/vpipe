@@ -886,7 +886,8 @@ QK^T product of the flash attention in int8, with one scale per
 attention block and the key side quantized as `K - mean(K)` over tokens.
 That smoothing is exact rather than approximate: a per-channel shift
 moves every score in a row by the same amount and softmax does not see
-it. `P*V` stays in the tensor dtype. Measured on an M5 at 8 heads ×
+it. `P*V` stays in the tensor dtype unless `sage_pv8` asks for it too
+(below). Measured on an M5 at 8 heads ×
 20036 rows × 128: 156.6 → 130.6 ms including the quantization prologue,
 at cosine 0.99992 against a double-precision reference where the f16
 kernel is also 0.99992.
@@ -939,6 +940,53 @@ it two regions to carve from — the same lending the in-tree DiTs do out
 of their forward arena, so Sage costs the process nothing it was not
 already holding. If you lend, **take the loan back before you replace
 it**: the carved buffers are windows that hold your allocation alive.
+
+The scratch follows the geometry of the last call: a `prepare()` at a
+different row count rebuilds it. If your attention runs at several row
+counts in one forward — per-modality stacks, then a joint one — call
+`reserve()` with the largest before the first `prepare()` of every
+forward. Each call it covers (same heads, head dim and tiles, no more
+tokens) then reuses that scratch, and the output is bit-identical to a
+scratch sized for the call. `reserve()` is exact: a smaller reservation
+shrinks the scratch, so a forward at a new size builds it once. Book
+the scratch at that largest geometry.
+
+**`sage_pv8` — the second product in int8 too.** The same kernel can
+also run `P*V` in int8, holding the product in int32 across key blocks:
+`P` as uint8 against the row's running maximum, `V` minus its mean over
+tokens with one scale per channel over the sequence, offset by 128. It is
+lossier than the int8 QK alone (cosine 0.99957 against the dense kernel
+on random keys, Sage 0.99992) and faster (44.0 ms against Sage's 50.6 at
+8 heads × 20036 × 128 on an M5 Pro). Driving it is two more arguments:
+
+```cpp
+// The flash function: its two constants on top of 306, set from what the
+// driver says it will make -- never from the config alone.
+const bool pv8 = _sage->pv8_for(sage_cfg);
+fc.set_bool(vpipe::genai::sage::kQkInt8Constant, true);
+MetalSageAttention::pv8_constants(fc, pv8);
+
+// The prologue takes V's operand too (addressed as q and k are).
+MetalSageAttention::Operand v{&vt, 0, head_dim, seq * head_dim};
+if (_sage->prepare(enc, q, k, n_heads, n_kv_heads, qL, kL, head_dim,
+                   bq, bk, sage_cfg, &err, &v) &&
+    _sage->pv8_ready() == pv8) {
+  enc.set_function(fn_attn_i8);
+  /* ...your usual binds... */
+  _sage->bind(enc);          // buffers 15..18, and V's three at 19..21
+}
+```
+
+Build the function from `pv8_for()`, not from `sage_cfg.pv8`. It is false
+on a host whose kernels predate the int8 P·V, and there `prepare()` makes
+the int8 QK's operands alone: a function built with constants 308 and 310
+over those reads Q's scales in the wrong layout and V from unbound
+buffers. The four quantizers it needs are optional entries in the kernel
+contract, so `load()` never refuses for want of them, and the log says
+when a config asked for the int8 P·V and the host could not give it. Pass
+`pv8` to `scratch_bytes()` / `private_bytes()` so the plan books V's
+uint8 copy and Q's per-token scales; a family that turns it on part way
+through a run calls `reserve_pv8(true)` so the scratch is built once.
 
 #### `sol_attn` — which key blocks are attended at all
 

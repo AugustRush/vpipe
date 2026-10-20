@@ -212,6 +212,12 @@ class MetalFlux3Transformer {
   int gemm_tile() const { return _gemm_tile; }
   bool uses_attn_nax() const { return _use_attn_nax; }
   bool uses_sage_attn() const { return (bool)_sage; }
+  // How many times Sage's scratch was built: once for a run whose size
+  // stays put, since each forward reserves its largest attention (the
+  // joint stack) and the per-mode stacks reuse it.
+  int sage_scratch_builds() const {
+    return _sage ? _sage->scratch_builds() : 0;
+  }
   bool uses_i8_gemm() const { return (bool)_i8; }
   bool uses_sol_attn() const { return (bool)_sol; }
   // What the forwards have encoded for perf-flops, credited to the GPU
@@ -252,7 +258,9 @@ class MetalFlux3Transformer {
   // (text + image + references): the [rows, hidden] planes, the
   // [rows, 3 mlp] feed-forward pair and the f32 rotary tables. Linear
   // in the rows, and the term that dominates at large sizes -- 8.1 GB
-  // at 4096^2 against 11.1 GB of bf16 weights.
+  // at 4096^2 against 11.1 GB of bf16 weights. Plus, as `c` enables
+  // them, Sage's and Sol's own scratch at the joint stack's rows (c.sage
+  // with its pv8, c.sol): both allocate privately here.
   static std::size_t forward_scratch_bytes(const Config& c,
                                            int rows) noexcept;
   bool streaming() const { return _stream_blocks; }
@@ -410,6 +418,9 @@ class MetalFlux3Transformer {
   // codes unsigned. VPIPE_I8_SIGNED=0 for the A/B.
   bool _sgn = false;
   std::unique_ptr<MetalSageAttention> _sage;
+  // Reserve Sage's scratch at the forward's largest attention (false:
+  // VPIPE_FLUX3_SAGE_NO_RESERVE, the A/B -- it rebuilds per row count).
+  bool _sage_reserve = true;
   std::unique_ptr<MetalSolAttention> _sol;
   GpuFlopsTally _flops;
   SolFlops _sol_flops;

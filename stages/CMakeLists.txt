@@ -102,6 +102,7 @@ set(LOCAL_HEADERS
   model-fetch-stage.h
   model-register-stage.h
   model-remove-stage.h
+  model-memory-host.h
   model-registry.h
   model-select-stage.h
   output-path.h

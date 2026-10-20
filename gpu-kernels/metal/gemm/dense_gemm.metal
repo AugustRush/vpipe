@@ -902,6 +902,148 @@ kernel void dense_moe_gather_down_f16(
       xr, we, y + (int64_t)p * (int64_t)N, K, N, tid, simd_gid, simd_lid);
 }
 
+// ---- Block-FP8 routed experts (Fish Audio Drama 3) ------------------------
+// The checkpoint keeps each routed expert's gate / up / down as E4M3 codes
+// with one f32 scale per 128x128 block (DeepSeek's layout; vLLM's
+// "bsgemm-moe"). They are read as codes and widened in registers, so a
+// token reads one byte a weight -- the experts are 32 of the model's 40 GB.
+//
+// An E4M3 byte (s eeee mmm, exponent bias 7) is EXACTLY the half whose bits
+// are s << 15 | eeeemmm << 7, times 2^8: the half's five-bit exponent field
+// then holds 0eeee, eight below the half's own bias of 15, and an E4M3
+// subnormal (eeee = 0) lands on a half subnormal scaled by the same 2^8.
+// The loader folds that 256 into the block scales, so the widening is two
+// masks and two shifts a byte, and the product is the fp32 reference's
+// (code * scale) to the last bit. 0x7F / 0xFF (E4M3's NaN) never occur in
+// a weight.
+//
+// Contract shared by both kernels: K % 512 == 0 (a lane reads 16 codes, one
+// uint4, per 512-wide step, so its 16 always sit inside one 128-column
+// block), rows % 128 == 0, the codes slab 16-byte aligned.
+inline float4 fp8x4_(uint u)
+{
+  const uint a = ((u & 0x80u) << 8) | ((u & 0x7Fu) << 7) |
+                 ((u & 0x8000u) << 16) | ((u & 0x7F00u) << 15);
+  const uint b = ((u & 0x800000u) >> 8) | ((u & 0x7F0000u) >> 9) |
+                 (u & 0x80000000u) | ((u & 0x7F000000u) >> 1);
+  const half2 ha = as_type<half2>(a);
+  const half2 hb = as_type<half2>(b);
+  return float4((float)ha.x, (float)ha.y, (float)hb.x, (float)hb.y);
+}
+
+// sum over a lane's 16 codes of x * w (x already widened).
+inline float fp8_dot16_(const device uchar* w, const thread float4* xv)
+{
+  const uint4 q = *reinterpret_cast<const device uint4*>(w);
+  return dot(fp8x4_(q.x), xv[0]) + dot(fp8x4_(q.y), xv[1]) +
+         dot(fp8x4_(q.z), xv[2]) + dot(fp8x4_(q.w), xv[3]);
+}
+
+inline void fp8_load_x16_(const device VPIPE_ELT* x, thread float4* xv)
+{
+  for (int i = 0; i < 4; ++i) {
+    xv[i] = float4((float)x[4 * i], (float)x[4 * i + 1],
+                   (float)x[4 * i + 2], (float)x[4 * i + 3]);
+  }
+}
+
+// Gather gate|up + fused SwiGLU over block-FP8 codes: per pair p, expert
+// e = pair_eid[p], x row = p / top_k; the slab's rows are interleaved like
+// dense_moe_gather_swiglu_f16's (row 2g = gate g, 2g+1 = up g), its scales
+// stay per tensor: s[e][0] gate, s[e][1] up, each [inner/128, K/128].
+// grid {32, inner/2, npair} threads, tg {32, 2, 1}: 8 interleaved rows (4
+// features) a threadgroup, RPS 4 a simdgroup.
+//   0:codes[E,2I,K] 1:scales[E,2,I/128,K/128] (x256) 2:x[M,K] 3:y[np,I]
+//   4:K 5:N=2I 6:pair_eid[np] 7:top_k
+kernel void dense_moe_gather_swiglu_fp8(
+    const device uchar*     w        [[buffer(0)]],
+    const device float*     s        [[buffer(1)]],
+    const device VPIPE_ELT* x        [[buffer(2)]],
+    device VPIPE_ELT*       y        [[buffer(3)]],
+    const constant int&     K        [[buffer(4)]],
+    const constant int&     N        [[buffer(5)]],
+    const device int*       pair_eid [[buffer(6)]],
+    const constant int&     top_k    [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int RPS = 4, NSG = 2;
+  const int p = (int)tid.z;
+  const int e = pair_eid[p];
+  const int inner = N / 2, KB = K / 128, IB = inner / 128;
+  const device uchar* we = w + (int64_t)e * (int64_t)N * (int64_t)K;
+  const device float* se = s + (int64_t)e * 2 * IB * KB;
+  const device VPIPE_ELT* xr = x + (int64_t)(p / top_k) * (int64_t)K;
+  const int out_row = (int)tid.y * (NSG * RPS) + (int)simd_gid * RPS;
+  float result[RPS] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int k = 0; k < K; k += 512) {
+    const int c = k + (int)simd_lid * 16;
+    float4 xv[4];
+    fp8_load_x16_(xr + c, xv);
+    const int kb = c >> 7;
+#pragma clang loop unroll(full)
+    for (int row = 0; row < RPS; ++row) {
+      const int r = out_row + row;
+      const float sc = se[((r & 1) * IB + ((r >> 1) >> 7)) * KB + kb];
+      result[row] += sc * fp8_dot16_(we + (int64_t)r * K + c, xv);
+    }
+  }
+  for (int row = 0; row < RPS; ++row) { result[row] = simd_sum(result[row]); }
+  if (simd_lid == 0) {
+    device VPIPE_ELT* yo = y + (int64_t)p * (int64_t)inner + (out_row >> 1);
+    const float g0 = result[0], u0 = result[1];
+    const float g1 = result[2], u1 = result[3];
+    yo[0] = (VPIPE_ELT)((g0 / (1.0f + metal::exp(-g0))) * u0);
+    yo[1] = (VPIPE_ELT)((g1 / (1.0f + metal::exp(-g1))) * u1);
+  }
+}
+
+// Gather down over block-FP8 codes: per pair p, expert e = pair_eid[p];
+// partials[p, H] = down[e] . act[p] (UN-weighted; moe_combine applies the
+// routing weight). grid {32, H/4, npair} threads, tg {32, 2, 1}.
+//   0:codes[E,H,I] 1:scales[E,H/128,I/128] (x256) 2:act[np,I] 3:y[np,H]
+//   4:K=I 5:N=H 6:pair_eid[np]
+kernel void dense_moe_gather_down_fp8(
+    const device uchar*     w        [[buffer(0)]],
+    const device float*     s        [[buffer(1)]],
+    const device VPIPE_ELT* x        [[buffer(2)]],
+    device VPIPE_ELT*       y        [[buffer(3)]],
+    const constant int&     K        [[buffer(4)]],
+    const constant int&     N        [[buffer(5)]],
+    const device int*       pair_eid [[buffer(6)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int RPS = 4, NSG = 2;
+  const int p = (int)tid.z;
+  const int e = pair_eid[p];
+  const int KB = K / 128;
+  const device uchar* we = w + (int64_t)e * (int64_t)N * (int64_t)K;
+  const device float* se = s + (int64_t)e * (N / 128) * KB;
+  const device VPIPE_ELT* xr = x + (int64_t)p * (int64_t)K;
+  const int out_row = (int)tid.y * (NSG * RPS) + (int)simd_gid * RPS;
+  float result[RPS] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int k = 0; k < K; k += 512) {
+    const int c = k + (int)simd_lid * 16;
+    float4 xv[4];
+    fp8_load_x16_(xr + c, xv);
+    const int kb = c >> 7;
+#pragma clang loop unroll(full)
+    for (int row = 0; row < RPS; ++row) {
+      const int r = out_row + row;
+      const float sc = se[(r >> 7) * KB + kb];
+      result[row] += sc * fp8_dot16_(we + (int64_t)r * K + c, xv);
+    }
+  }
+  for (int row = 0; row < RPS; ++row) { result[row] = simd_sum(result[row]); }
+  if (simd_lid == 0) {
+    device VPIPE_ELT* yo = y + (int64_t)p * (int64_t)N + out_row;
+    for (int row = 0; row < RPS; ++row) { yo[row] = (VPIPE_ELT)result[row]; }
+  }
+}
+
 // ---- Raw simdgroup-MMA ALU rate probes ------------------------------
 // Register-resident simdgroup_multiply_accumulate loops with NO memory
 // traffic in the timed loop -- they measure the pure matrix-FMA pipe rate

@@ -360,6 +360,71 @@ TEST(load_audio, a_long_file_waits_for_a_slow_consumer)
   std::filesystem::remove(path);
 }
 
+// ---- small chunks for a reader that falls behind ----------------------
+//
+// A voice detector reads 32 ms chunks of a whole file the decoder turns
+// out far faster. On the default depth audio-to-pcm ran 2048 chunks --
+// 65 s of sound -- ahead of it, called that a structural imbalance and
+// drained: a transcription of a 2 1/2-minute speech stopped hearing at
+// 85% and never ended (MEASURED). With `oport_capacity` the writer waits
+// for its slowest reader. The reader here sleeps through its first chunk
+// while the whole file is decoded; every sample must come out (without
+// the capacity the pipeline never goes idle: wait_idle hangs).
+TEST(audio_to_pcm, small_chunks_wait_for_a_slow_reader)
+{
+  const int kRate = 16000, kSamples = kRate * 200;   // 3125 packets
+  const std::string path =
+      write_wav_(kRate, kSamples, "vpipe-ut-pcm-small-chunks.wav");
+  if (path.empty()) { return; }
+
+  class LateSink : public PcmSink {
+  public:
+    using PcmSink::PcmSink;
+    bool slept = false;
+    Job
+    process(RuntimeContext& ctx) override
+    {
+      if (!slept) {
+        slept = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+      }
+      co_await PcmSink::process(ctx);
+    }
+  };
+
+  Session sess;
+  auto pl = std::make_unique<Pipeline>("p", &sess);
+  auto lcfg = FlexData::make_object();
+  lcfg.as_object().insert_or_assign("input_url", FlexData::make_string(path));
+  auto* la = static_cast<LoadAudioStage*>(pl->insert_stage(
+      std::make_unique<LoadAudioStage>(&sess, "la", std::vector<InEdge>{},
+                                       lcfg)));
+  auto pcfg = FlexData::make_object();
+  pcfg.as_object().insert_or_assign("output_sample_rate",
+                                    FlexData::make_int(kRate));
+  pcfg.as_object().insert_or_assign("chunk_duration_s",
+                                    FlexData::make_real(0.032));
+  pcfg.as_object().insert_or_assign("oport_capacity", FlexData::make_int(64));
+  auto* tp = static_cast<AudioToPcmStage*>(pl->insert_stage(
+      std::make_unique<AudioToPcmStage>(&sess, "to-pcm",
+                                        std::vector<InEdge>{{la, 0}}, pcfg)));
+  auto* sink = static_cast<LateSink*>(pl->insert_stage(
+      std::make_unique<LateSink>(&sess, "sink", std::vector<InEdge>{{tp, 0}},
+                                 FlexData::make_object())));
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  std::printf("[audio_to_pcm] 32 ms chunks behind a late reader: %d "
+              "chunk(s), %zu of %d samples\n", sink->beats, sink->samples,
+              kSamples);
+  EXPECT_TRUE(sink->beats > 2048);
+  EXPECT_TRUE(sink->samples + 512 >= (std::size_t)kSamples &&
+              sink->samples <= (std::size_t)kSamples + 512);
+  std::filesystem::remove(path);
+}
+
 // ---- start_s / duration_s: a WINDOW of a long file ------------------
 //
 // The claim is that the stage reads a SLICE and not the file, so the

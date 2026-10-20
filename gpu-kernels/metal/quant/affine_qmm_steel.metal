@@ -1883,3 +1883,279 @@ kernel void affine_qmm_geglu_w8g64(
       w, scales, biases, x, y, Xs, Ws, K, N, M,
       tid, simd_gid, simd_lid);
 }
+
+// ===================================================================
+// BLOCK-FP8 grouped MoE GEMMs (Fish Audio Drama 3's routed experts: E4M3
+// codes, one f32 scale per 128 x 128 block). The affine grouped GEMMs above
+// with the weight loader swapped: each expert's weight is read ONCE per
+// tile, where the pair-batched gather (dense_moe_gather_*_fp8) reads it once
+// per routed row -- the prefill's whole cost. Codes are widened to half by
+// bit shift ((b & 0x80) << 8 | (b & 0x7F) << 7 is the E4M3 value / 2^8, NaN
+// codes excepted, which no checkpoint holds); the 2^8 is folded into the
+// scales at load, as for the gather kernels.
+// ===================================================================
+
+inline half fp8_e4m3_half_div256(uchar b) {
+  return as_type<half>((ushort)(((ushort)(b & 0x80) << 8) |
+                                ((ushort)(b & 0x7F) << 7)));
+}
+
+// The weight tile: BROWS output rows x BCOLS of the reduction, each thread
+// n_reads consecutive codes of one row scaled by that row's block. Rows of
+// an INTERLEAVED slab are gate|up pairs (row 2g gate g, 2g+1 up g) whose
+// scales are stored [2][N/2/128][K/128]; a plain slab's [N/128][K/128].
+// BCOLS divides 128, so a tile's columns share one scale block.
+template <typename T, short BROWS, short BCOLS, short dst_ld, short tgp_size,
+          bool Interleaved>
+struct Fp8BlockLoader {
+  STEEL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  STEEL_CONST short TCOLS = BCOLS / n_reads;
+  static_assert(n_reads == 8, "a lane reads 8 codes (one 8-byte load)");
+  static_assert(128 % BCOLS == 0, "a tile stays inside one scale block");
+  const short bi;
+  const short bj;
+  threadgroup T* dst;
+  const device uint8_t* src;
+  const device float* srow;
+  int k_off;
+  METAL_FUNC Fp8BlockLoader(
+      const device uint8_t* codes, const device float* scales, const int K,
+      const int N, const int y_col, threadgroup T* dst_,
+      ushort simd_group_id, ushort simd_lane_id)
+      : bi((short)((simd_group_id * 32 + simd_lane_id) / TCOLS)),
+        bj((short)(n_reads * ((simd_group_id * 32 + simd_lane_id) % TCOLS))),
+        dst(dst_ + bi * dst_ld + bj),
+        src(codes + (int64_t)(y_col + bi) * K + bj),
+        srow(scales + (int64_t)(Interleaved
+                                    ? ((y_col + bi) & 1) * (N / 256) +
+                                          ((y_col + bi) >> 1) / 128
+                                    : (y_col + bi) / 128) *
+                          (K / 128)),
+        k_off(0) {}
+  METAL_FUNC void load_unsafe() const {
+    const float s = srow[(k_off + bj) / 128];
+    const uint2 v = *(const device uint2*)(src + k_off);
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < 8; ++j) {
+      const uint word = j < 4 ? v.x : v.y;
+      const uchar b = (uchar)((word >> (8 * (j & 3))) & 0xFF);
+      dst[j] = (T)((float)fp8_e4m3_half_div256(b) * s);
+    }
+  }
+  METAL_FUNC void load_safe(short2) const { load_unsafe(); }
+  METAL_FUNC void next() { k_off += BCOLS; }
+};
+
+// The activation tile in F32 from S storage (bf16 / f16 widen exactly):
+// BROWS rows of BCOLS, a row either gathered (srow[base + r], < 0 a zero
+// pad row) or contiguous (srow null). The FP8 GEMMs multiply in F32 so the
+// dequantized weight is never rounded to bf16 -- the gather kernels' (and
+// the reference's) arithmetic, which the bf16 tile measurably was not.
+template <typename S, typename T, short BROWS, short BCOLS, short dst_ld,
+          short tgp_size>
+struct RowConvLoader {
+  STEEL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  STEEL_CONST short TCOLS = BCOLS / n_reads;
+  STEEL_CONST short TROWS = tgp_size / TCOLS;
+  const int src_ld;
+  const short bi;
+  const short bj;
+  threadgroup T* dst;
+  const device S* src;
+  const device int* srow;
+  const int base;
+  int k_off;
+  METAL_FUNC RowConvLoader(
+      const device S* src_, const int src_ld_, const device int* srow_,
+      const int base_, threadgroup T* dst_, ushort simd_group_id,
+      ushort simd_lane_id)
+      : src_ld(src_ld_),
+        bi((short)((simd_group_id * 32 + simd_lane_id) / TCOLS)),
+        bj((short)(n_reads * ((simd_group_id * 32 + simd_lane_id) % TCOLS))),
+        dst(dst_ + bi * dst_ld + bj), src(src_), srow(srow_), base(base_),
+        k_off(0) {}
+  METAL_FUNC void load_unsafe() const {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < BROWS; i += TROWS) {
+      const int r = srow != nullptr ? srow[base + bi + i] : base + bi + i;
+      if (r >= 0) {
+        const device S* p = src + (int64_t)r * src_ld + bj + k_off;
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < n_reads; ++j) {
+          dst[i * dst_ld + j] = (T)p[j];
+        }
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < n_reads; ++j) { dst[i * dst_ld + j] = T(0); }
+      }
+    }
+  }
+  METAL_FUNC void next() { k_off += BCOLS; }
+};
+
+// Grouped gate|up + SwiGLU over block-FP8 codes [E, N = 2*inner, K] (rows
+// interleaved) -> sorted act [npad, inner]; x gathered from the hidden via
+// srow (qmm_t_grouped_swiglu_impl with the FP8 loader, tiles in F32).
+template <typename S, const int BM = 32, const int BK = 32, const int BN = 32>
+METAL_FUNC void fp8_grouped_swiglu_impl(
+    const device uint8_t* w, const device float* scales, const device S* x,
+    device S* y, threadgroup float* Xs, threadgroup float* Ws,
+    const constant int& K, const constant int& N, const constant int& M,
+    const device int* tile2e, const device int* srow, uint3 tid,
+    uint simd_gid, uint simd_lid) {
+  using T = float;
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      RowConvLoader<S, T, BM, BK, BK_padded, WM * WN * SIMD_SIZE>;
+  using loader_w_t =
+      Fp8BlockLoader<T, BN, BK, BK_padded, WM * WN * SIMD_SIZE, true>;
+  const int e = tile2e[tid.y];
+  if (e < 0) { return; }
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  const device uint8_t* we = w + (int64_t)e * N * K;
+  const device float* se = scales + (int64_t)e * (N / 128) * (K / 128);
+  loader_x_t loader_x(x, K, srow, y_row, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(we, se, K, N, y_col, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_x.load_unsafe();
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_x.next();
+    loader_w.next();
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  constexpr int FS = 8;
+  constexpr int TM = BM / (FS * WM);
+  constexpr int TN = BN / (FS * WN);
+  const int outN = N / 2;
+  const short sm = mma_op.sm;
+  const short sn = mma_op.sn;
+  for (short ti = 0; ti < TM; ti++) {
+    const int row = y_row + sm + ti * FS * WM;
+    if (row >= M) { continue; }
+    for (short tj = 0; tj < TN; tj++) {
+      const int col = y_col + sn + tj * FS * WN;
+      const thread auto& fr = mma_op.Ctile.frag_at(ti, tj);
+      const float ga = (float)fr[0];
+      const float up = (float)fr[1];
+      const float s = ga / (1.0f + metal::exp(-ga));
+      y[(int64_t)row * outN + (col >> 1)] = (S)(s * up);
+    }
+  }
+}
+
+// Grouped down over block-FP8 codes [E, N = hidden, K = inner] with the
+// scatter store (qmm_t_grouped_down_impl with the FP8 loader, tiles in F32):
+// partials [np, N], row sdst[slot] (or nothing for a pad slot). Every
+// sorted slot is a row of x (pad slots hold the gate|up GEMM's zeros).
+template <typename S, const int BM = 32, const int BK = 32, const int BN = 32>
+METAL_FUNC void fp8_grouped_down_impl(
+    const device uint8_t* w, const device float* scales, const device S* x,
+    device S* y, threadgroup float* Xs, threadgroup float* Ws,
+    const constant int& K, const constant int& N, const constant int& M,
+    const device int* tile2e, const device int* sdst, uint3 tid,
+    uint simd_gid, uint simd_lid) {
+  using T = float;
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      RowConvLoader<S, T, BM, BK, BK_padded, WM * WN * SIMD_SIZE>;
+  using loader_w_t =
+      Fp8BlockLoader<T, BN, BK, BK_padded, WM * WN * SIMD_SIZE, false>;
+  const int e = tile2e[tid.y];
+  if (e < 0) { return; }
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  const device uint8_t* we = w + (int64_t)e * N * K;
+  const device float* se = scales + (int64_t)e * (N / 128) * (K / 128);
+  loader_x_t loader_x(x, K, nullptr, y_row, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(we, se, K, N, y_col, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_x.load_unsafe();
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_x.next();
+    loader_w.next();
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  constexpr int FS = 8;
+  constexpr int TM = BM / (FS * WM);
+  constexpr int TN = BN / (FS * WN);
+  const short sm = mma_op.sm;
+  const short sn = mma_op.sn;
+  for (short ti = 0; ti < TM; ti++) {
+    const int row = y_row + sm + ti * FS * WM;
+    if (row >= M) { continue; }
+    const int dr = sdst[row];
+    if (dr < 0) { continue; }
+    for (short tj = 0; tj < TN; tj++) {
+      const int col = y_col + sn + tj * FS * WN;
+      const thread auto& fr = mma_op.Ctile.frag_at(ti, tj);
+      y[(int64_t)dr * N + col] = (S)fr[0];
+      y[(int64_t)dr * N + col + 1] = (S)fr[1];
+    }
+  }
+}
+
+//   0:codes(u8) [E,N,K] 1:scales(f32) 2:x 3:y 4:K 5:N 6:M(npad) 7:tile2e
+//   8:srow (swiglu) / sdst (down).  threadgroup (32, 2, 2); grid
+//   (ceil(N/32)*32, ceil(npad/32)*2, 2) threads.
+kernel void fp8_qmm_grouped_swiglu_b128(
+    const device uint8_t* w        [[buffer(0)]],
+    const device float* scales     [[buffer(1)]],
+    const device VPIPE_ELT* x      [[buffer(2)]],   // hidden [M_in, K]
+    device VPIPE_ELT*       y      [[buffer(3)]],   // sorted act [npad, N/2]
+    const constant int& K          [[buffer(4)]],
+    const constant int& N          [[buffer(5)]],
+    const constant int& M          [[buffer(6)]],
+    const device int* tile2e       [[buffer(7)]],
+    const device int* srow         [[buffer(8)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(float));
+  threadgroup float Xs[BM * BK_padded];
+  threadgroup float Ws[BN * BK_padded];
+  fp8_grouped_swiglu_impl<VPIPE_ELT, BM, BK, BN>(
+      w, scales, x, y, Xs, Ws, K, N, M, tile2e, srow, tid, simd_gid,
+      simd_lid);
+}
+
+kernel void fp8_qmm_grouped_down_b128(
+    const device uint8_t* w        [[buffer(0)]],
+    const device float* scales     [[buffer(1)]],
+    const device VPIPE_ELT* x      [[buffer(2)]],   // sorted act [npad, K]
+    device VPIPE_ELT*       y      [[buffer(3)]],   // partials [np, N]
+    const constant int& K          [[buffer(4)]],
+    const constant int& N          [[buffer(5)]],
+    const constant int& M          [[buffer(6)]],
+    const device int* tile2e       [[buffer(7)]],
+    const device int* sdst         [[buffer(8)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(float));
+  threadgroup float Xs[BM * BK_padded];
+  threadgroup float Ws[BN * BK_padded];
+  fp8_grouped_down_impl<VPIPE_ELT, BM, BK, BN>(
+      w, scales, x, y, Xs, Ws, K, N, M, tile2e, sdst, tid, simd_gid,
+      simd_lid);
+}

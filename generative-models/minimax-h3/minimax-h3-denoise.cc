@@ -2,6 +2,7 @@
 
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 #include "generative-models/shared/motion-cache.h"
+#include "generative-models/shared/sage-attention.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -268,6 +269,20 @@ denoise(const DenoiseRequest& req, std::string* err)
   // undo this loop's patch packing.
   const motion_cache::Config mcfg =
       motion_cache::config_from_flex(req.accel);
+  // Sage's int8 P*V from this step on (sage::Config::pv8_from_step): the
+  // steps before, which settle a clip's layout, keep the int8 QK alone.
+  // Unsaid, the first quarter of the steps.
+  const sage::Config sage_cfg = sage::config_from_flex(req.accel);
+  const int pv8_from_cfg = sage_cfg.pv8_from_step;
+  const int pv8_from =
+      pv8_from_cfg >= 0 ? pv8_from_cfg : (req.num_steps + 3) / 4;
+  if (sess != nullptr && sage_cfg.pv8) {
+    sess->info(fmt("h3-denoise: sage_pv8 from step {} of {}{}, {}",
+                   pv8_from, req.num_steps,
+                   pv8_from_cfg >= 0 ? "" : " (default)",
+                   sage_cfg.pv8_all_rows ? "every row"
+                                         : "the video's rows"));
+  }
   motion_cache::Cache mcache;
   if (mcfg.enabled) {
     std::string why;
@@ -395,6 +410,7 @@ denoise(const DenoiseRequest& req, std::string* err)
       st.endpoints          = two_time ? &uniq_r : nullptr;
       st.schedule_index     = baked ? i : -1;
       st.dense_attention    = i < req.sol_dense_steps;
+      st.sage_pv8_off       = i < pv8_from;
       st.video_grid_h       = req.video_grid_h;
       st.video_grid_w       = req.video_grid_w;
       std::string ferr;

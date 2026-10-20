@@ -1,0 +1,19 @@
+{
+  "id": "prepare-drama3-int4",
+  "stages": [
+    {
+      "id": "fetch-drama3-int4",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "fishaudio/drama-3-int4",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

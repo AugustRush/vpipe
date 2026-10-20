@@ -431,3 +431,58 @@ TEST(accel_settings, the_vae_stages_settle_the_int8_tier)
   EXPECT_TRUE(accel::text(&none.accel_settings(), accel::kI8GemmTier) ==
               accel::kI8TierAccurate);
 }
+
+// SAGE'S INT8 P*V through generate-video: the switch, its first step and
+// its rows reach the bag the families read, and a graph that names none
+// gets pv8 off at the family's own first step (-1: MiniMax-H3's first
+// quarter), the video's rows alone. Read back through
+// sage::config_from_flex, the reader every family uses.
+TEST(accel_settings, the_video_stage_carries_sage_pv8)
+{
+  Session sess;
+  auto settled = [&](bool name_it, bool pv8, int from, bool all = false) {
+    FlexData cfg = FlexData::make_object();
+    auto o = cfg.as_object();
+    o.insert_or_assign("sage_attn", FlexData::make_bool(true));
+    if (name_it) {
+      o.insert_or_assign("sage_pv8", FlexData::make_bool(pv8));
+      if (from >= 0) {
+        o.insert_or_assign("sage_pv8_from_step", FlexData::make_int(from));
+      }
+      if (all) {
+        o.insert_or_assign("sage_pv8_all_rows", FlexData::make_bool(true));
+      }
+    }
+    GenerateVideoStage st(&sess, "gv", std::vector<InEdge>{}, cfg);
+    EXPECT_TRUE(st.config_error().empty());
+    const FlexData& bag = st.accel_settings();
+    return sage::config_from_flex(&bag);
+  };
+  const sage::Config none = settled(false, false, -1);
+  EXPECT_TRUE(none.enabled && !none.pv8 && none.pv8_from_step == -1);
+  EXPECT_TRUE(!none.pv8_all_rows);
+  const sage::Config on = settled(true, true, -1);
+  EXPECT_TRUE(on.enabled && on.pv8 && on.pv8_from_step == -1);
+  EXPECT_TRUE(!on.pv8_all_rows);
+  EXPECT_TRUE(settled(true, true, -1, true).pv8_all_rows);
+  const sage::Config from2 = settled(true, true, 2);
+  EXPECT_TRUE(from2.pv8 && from2.pv8_from_step == 2);
+}
+
+// ...and through generate-image, which has the switch alone: its
+// families run the int8 P*V on every step and every row.
+TEST(accel_settings, the_image_stage_carries_sage_pv8)
+{
+  Session sess;
+  for (const bool on : {false, true}) {
+    FlexData cfg = FlexData::make_object();
+    auto o = cfg.as_object();
+    o.insert_or_assign("sage_attn", FlexData::make_bool(true));
+    if (on) { o.insert_or_assign("sage_pv8", FlexData::make_bool(true)); }
+    GenerateImageStage st(&sess, "gi", std::vector<InEdge>{}, cfg);
+    EXPECT_TRUE(st.config_error().empty());
+    const FlexData& bag = st.accel_settings();
+    const sage::Config c = sage::config_from_flex(&bag);
+    EXPECT_TRUE(c.enabled && c.pv8 == on);
+  }
+}

@@ -257,6 +257,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         moss-image-pipeline.cc
         yue2.cc
         bs-roformer.cc
+        drama3.cc
+        moe-expert-cache.cc
         qwen-image-edit-text.cc
         qwen-image-edit-dit.cc
         qwen-image-edit-vision.cc

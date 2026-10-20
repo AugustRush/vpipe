@@ -391,8 +391,10 @@ web UI, and adds speech transcription. For image editing from a reference
 photo, **[docs/KLEIN.md](docs/KLEIN.md)**; for text-to-image,
 **[docs/KREA-2.md](docs/KREA-2.md)**; for text-to-video *with sound*,
 **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**; for whole songs from a style
-prompt and lyrics, **[docs/YUE2.md](docs/YUE2.md)**; to split a song into
-its vocals and accompaniment, **[docs/BS-ROFORMER.md](docs/BS-ROFORMER.md)**.
+prompt and lyrics, **[docs/YUE2.md](docs/YUE2.md)**; for speech with
+several voices, inline cues and voice cloning,
+**[docs/DRAMA3.md](docs/DRAMA3.md)**; to split a song into its vocals and
+accompaniment, **[docs/BS-ROFORMER.md](docs/BS-ROFORMER.md)**.
 Each ships the pipelines it describes.
 
 ---

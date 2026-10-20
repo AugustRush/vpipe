@@ -23,7 +23,12 @@ namespace vpipe::genai {
 // each round so they share the clock/thermal state -- the per-round WINNER (min
 // time) votes, which cancels the absolute clock (robust to DVFS / throttling;
 // the same property that lets A/B ratios hold at -O0). Returns the index with
-// the most round-wins (ties -> lowest index). Optionally reports the per-
+// the most round-wins; a TIE goes to the one with the least total time over
+// the rounds, not to the lowest index -- with two candidates and two rounds a
+// split vote is common (a timing here includes a fresh queue's first commit,
+// 1-2 ms on a 5 ms sample), and the index rule handed it to whichever came
+// first: MEASURED on Drama 3's prefill attention, qtile in 2 of 6 loads
+// against a flash 8-10% faster on the mean. Optionally reports the per-
 // candidate mean us/call (pass the reps each bench() call ran) and win counts.
 template <class Bench>
 inline int
@@ -56,7 +61,10 @@ autotune_vote(int n_cands, int rounds, int reps_for_us, Bench&& bench,
   }
   int w = 0;
   for (int i = 1; i < n_cands; ++i) {
-    if (wins[(std::size_t)i] > wins[(std::size_t)w]) { w = i; }
+    const std::size_t a = (std::size_t)i, b = (std::size_t)w;
+    if (wins[a] > wins[b] || (wins[a] == wins[b] && sum[a] < sum[b])) {
+      w = i;
+    }
   }
   if (us_out != nullptr) {
     us_out->assign(n, 0.0);
@@ -86,6 +94,26 @@ autotune_time(Mc* mc, int reps, Disp&& disp) {
     }
     st.commit().wait();
   }
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
+}
+
+// The same on a stream the caller keeps for the whole tune. A fresh stream
+// is a new queue, and its first commit costs 1-2 ms -- as much as the gap
+// between two attention kernels at 768 rows -- so a tuner whose samples are
+// a few ms reads that noise instead of the kernels: MEASURED on Drama 3's
+// prefill attention, the slower kernel won 5 of 24 loads, each time moving
+// the model's output (two kernels, two roundings).
+template <class Stream, class Disp>
+inline double
+autotune_time_on(Stream& st, int reps, Disp&& disp) {
+  const auto t0 = std::chrono::steady_clock::now();
+  {
+    auto enc = st.begin_compute();
+    for (int r = 0; r < reps; ++r) { disp(enc); }
+  }
+  st.commit().wait();
   return std::chrono::duration<double>(
              std::chrono::steady_clock::now() - t0)
       .count();

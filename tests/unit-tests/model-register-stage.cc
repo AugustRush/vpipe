@@ -255,6 +255,29 @@ TEST(model_register_stage, detects_qwen35_from_config)
   EXPECT_TRUE(has_modality_(d.outputs, "text"));
 }
 
+// Fish Audio Drama 3, by path and from its config.json alone (a copy
+// under another name): model_type "fish_omni" is the text-to-speech
+// stage's fish-drama3, text in, audio out.
+TEST(model_register_stage, detects_drama3)
+{
+  TempDir tdir;
+  const auto cat = make_model_dir_(tdir.path, "fishaudio", "drama-3", "{}");
+  const DetectedModel a = detect_model_dir(cat.string());
+  EXPECT_TRUE(a.detected_by == "catalog");
+  EXPECT_TRUE(a.model_type == "fish-drama3");
+  EXPECT_TRUE(a.family == "Fish Audio");
+  const auto dir = make_model_dir_(
+      tdir.path, "local", "drama3-copy",
+      R"({"model_type":"fish_omni","audio_decoder_config":{"dim":2048}})");
+  const DetectedModel d = detect_model_dir(dir.string());
+  EXPECT_TRUE(d.detected_by == "config");
+  EXPECT_TRUE(d.model_type == "fish-drama3");
+  EXPECT_TRUE(d.family == "Fish Audio");
+  EXPECT_TRUE(has_modality_(d.inputs, "text"));
+  EXPECT_TRUE(has_modality_(d.outputs, "audio"));
+  EXPECT_FALSE(has_modality_(d.outputs, "text"));
+}
+
 // The SAME family without a vision_config is text-only: the per-type
 // defaults describe the family at its fullest, so they are trimmed to
 // what this checkpoint actually carries. Claiming image input here would

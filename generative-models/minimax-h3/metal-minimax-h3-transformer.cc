@@ -3345,6 +3345,11 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
       }
       m->_sage.reset();
     }
+    // The early steps run without the int8 P*V (sage_pv8_from_step), so
+    // its buffers are built from the first prepare(): toggling it would
+    // otherwise rebuild the scratch mid-denoise, a private free and
+    // allocation of ~3 bytes a q/k/v element where nothing is lent.
+    if (m->_sage) { m->_sage->reserve_pv8(cfg.sage.pv8); }
   }
 
   // The matrix-core path takes precedence and keeps the FF it has. See
@@ -5953,7 +5958,8 @@ MetalMiniMaxH3Transformer::sage_scratch_bytes(int seq) const
   return MetalSageAttention::private_bytes(
       _cfg.n_heads, _cfg.n_heads, seq, seq, _cfg.head_dim,
       MetalSageAttention::nax_query_block(),
-      MetalSageAttention::nax_key_block(), sage_lend_bytes_(seq), 0);
+      MetalSageAttention::nax_key_block(), sage_lend_bytes_(seq), 0,
+      _sage->pv8_for(_cfg.sage));
 }
 
 std::size_t
@@ -6477,6 +6483,14 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     return {};
   };
   const Config& c = _cfg;
+  // Sage's int8 P*V for THIS forward: configured, its kernels on this
+  // host (pv8_for), and not one of the early steps the loop keeps on the
+  // int8 QK alone. `sage8` is the config the prologues are handed,
+  // saying so.
+  const bool pv8_on =
+      _sage && _sage->pv8_for(c.sage) && !in.sage_pv8_off;
+  sage::Config sage8 = c.sage;
+  sage8.pv8 = pv8_on;
   if (in.layout == nullptr || in.timesteps == nullptr ||
       in.row_timestep_index == nullptr || in.text == nullptr) {
     return fail("incomplete Step");
@@ -6965,6 +6979,11 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   const bool attn_dirty = _attn_seq != seq || _attn_text != n_text
                           || _attn_nax_built != (_attn_nax ? 1 : 0)
                           || _attn_sage_built != (sage_on ? 1 : 0)
+                          || _attn_pv8_built != (pv8_on ? 1 : 0)
+                          // ...and the band's first video block, the layout's
+                          || (pv8_on && _attn_band_nb != 0 &&
+                              _attn_band_nb !=
+                                  (L.video_start + A_BQ - 1) / A_BQ)
                           // ...AND the query tile, which is NOT a function of
                           // the sequence: a spans / Sol / Sage forward at some
                           // length leaves the wide pair unbuilt, and a later
@@ -7039,6 +7058,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           .set_bool(300, false).set_bool(301, false).set_bool(302, false)
           .set_bool(303, spans)
           .set_bool(sage::kQkInt8Constant, i8);
+      // The int8 P*V rides on the int8 QK's function only: its operands
+      // come from the same prologue, and only when it ran.
+      MetalSageAttention::pv8_constants(fc, i8 && pv8_on);
       return _attn_nax
                  ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
                  : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
@@ -7080,6 +7102,33 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       }
       _fn_attn_main_i8 =
           sage_on ? build(seq, false, true) : metal_compute::ComputeFunction{};
+      // The int8 P*V's band (see _fn_attn_main_i8_qk): the prefix rows'
+      // own function, and the video rows' params from their first block.
+      _fn_attn_main_i8_qk = metal_compute::ComputeFunction{};
+      _attn_band_nb = 0;
+      const bool band_on = !c.sage.pv8_all_rows;
+      const int nb = (L.video_start + A_BQ - 1) / A_BQ;
+      if (sage_on && pv8_on && band_on && nb > 0 &&
+          nb < (seq + A_BQ - 1) / A_BQ) {
+        metal_compute::FunctionConstants fq;
+        fq.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (seq % A_BK) == 0)
+            .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+            .set_bool(303, false)
+            .set_bool(sage::kQkInt8Constant, true);
+        MetalSageAttention::pv8_constants(fq, false);
+        fq.set_bool(sage::kQTokenScaleConstant, true);
+        _fn_attn_main_i8_qk = _lib_attn_nax.function(
+            "attn_steel_nax_h_bd128_bf16", fq);
+        if (_attn_p_band.empty()) {
+          _attn_p_band = _mc->make_shared_buffer(sizeof(P));
+        }
+        if (_fn_attn_main_i8_qk.valid() && !_attn_p_band.empty()) {
+          std::memcpy(_attn_p_band.contents(), _attn_p_main.contents(),
+                      sizeof(P));
+          static_cast<P*>(_attn_p_band.contents())->NQ_aligned -= nb;
+          _attn_band_nb = nb;
+        }
+      }
       // The same fallback as at load, for a sequence the matrix-core entry
       // refused: said once, so a Sage run that went dense is not reported
       // as a Sage run.
@@ -7095,6 +7144,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       _attn_text = n_text;
       _attn_nax_built = _attn_nax ? 1 : 0;
       _attn_sage_built = sage_on ? 1 : 0;
+      _attn_pv8_built = pv8_on ? 1 : 0;
       _attn_wide_built = wide_tile ? 1 : 0;
     }
   }
@@ -7553,6 +7603,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         if (sage_here) {
           const MetalSageAttention::Operand qo{&s.qh, 0, HD, rows * HD};
           const MetalSageAttention::Operand ko{&s.kh, 0, HD, rows * HD};
+          const MetalSageAttention::Operand vo{&s.vh, 0, HD, rows * HD};
           std::string gerr;
           // MetalSolAttention::compose, not c.sage: the key smoothing
           // is exact under ONE softmax and Sol's row is split across
@@ -7560,8 +7611,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           sage_ok = _sage->prepare(enc, qo, ko, NH, NH, rows, rows, HD,
                                    _sol->query_block(),
                                    _sol->key_block_unit(),
-                                   MetalSolAttention::compose(c.sage),
-                                   &gerr);
+                                   MetalSolAttention::compose(sage8),
+                                   &gerr, &vo);
           if (!sage_ok && sol_err.empty()) {
             sol_err = "sage_attn: " + gerr;
           }
@@ -7642,18 +7693,29 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                         layer >= c.sage.dense_layers;
         bool i8_ok = false;
         if (i8) {
-          MetalSageAttention::Operand qo, ko;
+          MetalSageAttention::Operand qo, ko, vo;
           if (fused_qkv) {
             qo = {&s.qkv, (std::size_t)Q_OFF, 3 * I, QKV_HSTRIDE};
             ko = {&s.qkv, (std::size_t)K_OFF, 3 * I, QKV_HSTRIDE};
+            vo = {&s.qkv, (std::size_t)V_OFF, 3 * I, QKV_HSTRIDE};
           } else {
             qo = {&s.qh, 0, HD, rows * HD};
             ko = {&s.kh, 0, HD, rows * HD};
+            vo = {&s.vh, 0, HD, rows * HD};
           }
           std::string gerr;
           // NH kv heads as well: H3 is MHA, gqa_factor 1.
           i8_ok = _sage->prepare(enc, qo, ko, NH, NH, rows, rows, HD, A_BQ,
-                                 A_BK, c.sage, &gerr);
+                                 A_BK, sage8, &gerr, &vo);
+          // The function was built with the int8 P*V's constants iff
+          // pv8_on; a prologue that made no V would leave its buffers
+          // unbound under them. Refused, never run so.
+          if (i8_ok && pv8_on != _sage->pv8_ready()) {
+            i8_ok = false;
+            if (sol_err.empty()) {
+              sol_err = "sage_attn: the int8 P*V's operands were not made";
+            }
+          }
           if (!i8_ok && sol_err.empty()) {
             sol_err = "sage_attn: " + gerr;
           }
@@ -7690,6 +7752,44 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         if (i8_ok) { _sage->bind(enc); }
         const unsigned bq = use_wide ? 128u : (unsigned)A_BQ;
         const unsigned wm = use_wide ? 8u : 4u;
+        // Sage's int8 P*V on the video rows only (_fn_attn_main_i8_qk):
+        // the prefix's blocks first on the int8 QK, then the video's
+        // from their first block -- Q and O bound from its row, K and V
+        // whole.
+        const int nq_all = (rows + A_BQ - 1) / A_BQ;
+        if (i8_ok && !use_wide && pv8_on && _sage->pv8_ready() &&
+            _attn_band_nb > 0 && _attn_band_nb < nq_all &&
+            _fn_attn_main_i8_qk.valid()) {
+          const int nb = _attn_band_nb;
+          const std::size_t r0 = (std::size_t)nb * A_BQ;
+          enc.set_function(_fn_attn_main_i8_qk);
+          enc.dispatch({32u * (unsigned)nb, 4u * (unsigned)NH, 1},
+                       {32, 4, 1});
+          enc.set_function(_fn_attn_main_i8);
+          const std::size_t qrow = fused_qkv ? (std::size_t)3 * I
+                                             : (std::size_t)HD;
+          const std::size_t orow = fused_out ? (std::size_t)I
+                                             : (std::size_t)HD;
+          if (fused_qkv) {
+            enc.set_buffer(0, s.qkv, ((std::size_t)Q_OFF + r0 * qrow) * 2);
+          } else {
+            enc.set_buffer(0, s.qh, r0 * qrow * 2);
+          }
+          enc.set_buffer(3, fused_out ? s.ob : s.oh, r0 * orow * 2);
+          enc.set_buffer(4, _attn_p_band);
+          // pv8_ready() above is what makes this bind; a false here
+          // would leave row 0's binding on the video rows' dispatch.
+          if (!_sage->bind(enc, (int)r0)) {
+            if (sol_err.empty()) {
+              sol_err = "sage_attn: the video rows' operands did not bind";
+            }
+            return;
+          }
+          enc.dispatch({32u * (unsigned)(nq_all - nb), 4u * (unsigned)NH,
+                        1}, {32, 4, 1});
+          _flops.attention(NH, dense, HD);
+          return;
+        }
         enc.dispatch({32 * (unsigned)(((unsigned)rows + bq - 1) / bq),
                       wm * (unsigned)NH, 1}, {32, wm, 1});
         _flops.attention(NH, dense, HD);

@@ -186,3 +186,149 @@ kernel void sage_quant_block(
   // the row limit. Zeroing the remainder here would be a write past the
   // [BH, L, D] destination for the sake of rows nobody reads.
 }
+
+// Q quantized PER TOKEN: one scale per row, its absmax over the head dim
+// -- the int8 GEMMs' Per Token tier's activation side, and what the
+// flash kernel's int8 P*V reads (function constant 310). A row is the
+// unit a query's score is made in, so a row with small values keeps its
+// own resolution instead of its block's largest row's.
+//
+// A source over its mean (`sub_mean`: K) as the per-block kernel takes.
+//
+//   0:x (VPIPE_ELT) 1:q (int8 [BH, L, D]) 2:scale (float [BH, L])
+//   3:L 4:D 5:row_stride 6:base_off 7:head_stride 8:mean (float [BH, D])
+//   9:sub_mean
+// grid (256, BH, ceil(L/64)) THREADS; threadgroup (256, 1, 1): 64 rows a
+// threadgroup, four threads a row, each ceil(D/4) channels of it (the
+// last thread's run cut at D). D <= 128 -- prepare() refuses more.
+kernel void sage_quant_token(
+    const device VPIPE_ELT* x           [[buffer(0)]],
+    device char*            q           [[buffer(1)]],
+    device float*           scale       [[buffer(2)]],
+    constant int&           L           [[buffer(3)]],
+    constant int&           D           [[buffer(4)]],
+    constant int&           row_stride  [[buffer(5)]],
+    constant uint&          base_off    [[buffer(6)]],
+    constant int&           head_stride [[buffer(7)]],
+    const device float*     mean        [[buffer(8)]],
+    constant int&           sub_mean    [[buffer(9)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+  threadgroup float red[256];
+  const int bh = (int)tid.y;
+  const int r = (int)tid.z * 64 + (int)lid / 4;
+  const int part = (int)lid % 4;
+  const int per = (D + 3) / 4;
+  const int c0 = part * per;
+  const int n = max(0, min(per, D - c0));
+  const device VPIPE_ELT* src = x + base_off + (uint)bh * head_stride;
+  float am = 0.0f;
+  float v[32];
+  if (r < L) {
+    for (int c = 0; c < n; ++c) {
+      v[c] = (float)src[(uint)r * row_stride + c0 + c];
+      if (sub_mean != 0) { v[c] -= mean[(uint)bh * D + c0 + c]; }
+      am = max(am, fabs(v[c]));
+    }
+  }
+  red[lid] = am;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int b4 = (int)lid & ~3;
+  am = max(max(red[b4], red[b4 + 1]), max(red[b4 + 2], red[b4 + 3]));
+  if (r >= L) { return; }
+  const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+  if (part == 0) { scale[(uint)bh * L + r] = am / 127.0f; }
+  device char* dst = q + ((uint)bh * L + r) * D + c0;
+  for (int c = 0; c < n; ++c) {
+    dst[c] = (char)clamp(rint(v[c] * inv), -127.0f, 127.0f);
+  }
+}
+
+// V's SCALE for the INT8 P*V: one per channel over the WHOLE sequence,
+// its absmax over V minus its mean (the mean is sage_k_sum_chunk /
+// sage_k_mean_reduce run over V). One a channel and not one a block: the
+// kernel holds the product in int32 across key blocks, so V's scale may
+// not change along them. Two stages, as the mean: chunks, then a reduce.
+//
+// sage_v_absmax_chunk: 0:v 1:mean (float [BH, D]) 2:partial (float
+//   [BH, CH, D]) 3:L 4:D 5:row_stride 6:base_off 7:chunks 8:head_stride
+//   grid (D, BH, CH) THREADS; threadgroup (D, 1, 1)
+// sage_v_absmax_reduce: 0:partial 1:scale (float [BH, D]: absmax / 127)
+//   2:D 3:chunks   grid (D, BH, 1); threadgroup (D, 1, 1)
+kernel void sage_v_absmax_chunk(
+    const device VPIPE_ELT* v           [[buffer(0)]],
+    const device float*     mean        [[buffer(1)]],
+    device float*           partial     [[buffer(2)]],
+    constant int&           L           [[buffer(3)]],
+    constant int&           D           [[buffer(4)]],
+    constant int&           row_stride  [[buffer(5)]],
+    constant uint&          base_off    [[buffer(6)]],
+    constant int&           chunks      [[buffer(7)]],
+    constant int&           head_stride [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint  c   [[thread_index_in_threadgroup]])
+{
+  if ((int)c >= D) { return; }
+  const int bh = (int)tid.y, ch = (int)tid.z;
+  const int per = (L + chunks - 1) / chunks;
+  const int t0 = ch * per, t1 = min(L, t0 + per);
+  const device VPIPE_ELT* src = v + base_off + (uint)bh * head_stride;
+  const float mu = mean[(uint)bh * D + c];
+  float am = 0.0f;
+  for (int t = t0; t < t1; ++t) {
+    am = max(am, fabs((float)src[(uint)t * row_stride + c] - mu));
+  }
+  partial[((uint)bh * chunks + ch) * D + c] = am;
+}
+
+kernel void sage_v_absmax_reduce(
+    const device float* partial [[buffer(0)]],
+    device float*       scale   [[buffer(1)]],
+    constant int&       D       [[buffer(2)]],
+    constant int&       chunks  [[buffer(3)]],
+    uint2 tid [[threadgroup_position_in_grid]],
+    uint  c   [[thread_index_in_threadgroup]])
+{
+  if ((int)c >= D) { return; }
+  const int bh = (int)tid.y;
+  float am = 0.0f;
+  for (int ch = 0; ch < chunks; ++ch) {
+    am = max(am, partial[((uint)bh * chunks + ch) * D + c]);
+  }
+  scale[(uint)bh * D + c] = am / 127.0f;
+}
+
+// V quantized for the INT8 P*V (the flash kernel's function constant 308):
+// V minus its mean, at the scale sage_v_absmax_reduce made, as int8 plus
+// 128 -- uint8, which the kernel multiplies against P's uint8 -- eight
+// tokens a threadgroup.
+//   0:v (VPIPE_ELT) 1:mean (float [BH, D]) 2:scale (float [BH, D])
+//   3:q (uint8 [BH, L, D]) 4:L 5:D 6:row_stride 7:base_off 8:head_stride
+//   grid (D, BH, ceil(L / 8)) THREADS; threadgroup (D, 1, 1)
+kernel void sage_quant_v_channel_u8(
+    const device VPIPE_ELT* v           [[buffer(0)]],
+    const device float*     mean        [[buffer(1)]],
+    const device float*     scale       [[buffer(2)]],
+    device uchar*           q           [[buffer(3)]],
+    constant int&           L           [[buffer(4)]],
+    constant int&           D           [[buffer(5)]],
+    constant int&           row_stride  [[buffer(6)]],
+    constant uint&          base_off    [[buffer(7)]],
+    constant int&           head_stride [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint  c   [[thread_index_in_threadgroup]])
+{
+  if ((int)c >= D) { return; }
+  const int bh = (int)tid.y;
+  const int t0 = (int)tid.z * 8, t1 = min(L, t0 + 8);
+  const device VPIPE_ELT* src = v + base_off + (uint)bh * head_stride;
+  const float s = scale[(uint)bh * D + c];
+  const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+  const float mu = mean[(uint)bh * D + c];
+  for (int t = t0; t < t1; ++t) {
+    const float x = (float)src[(uint)t * row_stride + c] - mu;
+    const int qi = (int)clamp(rint(x * inv), -127.0f, 127.0f);
+    q[((uint)bh * L + t) * D + c] = (uchar)(qi + 128);
+  }
+}

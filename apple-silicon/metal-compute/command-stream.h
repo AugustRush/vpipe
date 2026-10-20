@@ -214,6 +214,24 @@ public:
   // an empty Fence if no buffer was open.
   Fence commit();
 
+  // Commit everything `enc` has encoded so far, WAIT for the GPU to finish
+  // it, and reopen `enc` on a fresh command buffer of the same stream (same
+  // dispatch type), in place -- so a decision the host makes mid-forward
+  // (which weights to load next) can read what the GPU just wrote. Call it
+  // at a clean op boundary. Composes end / commit / wait_ok / begin_compute,
+  // inline. False, with nothing committed, on an encoder with no stream or
+  // inside a concurrent_scope; else Fence::wait_ok's answer (`why` set).
+  static bool sync_and_reopen(ComputeEncoder& enc, std::string* why = nullptr)
+  {
+    CommandStream* s = enc._stream;
+    if (s == nullptr || enc._scope_depth != 0) { return false; }
+    const DispatchType dt = enc._dt;
+    enc.end();
+    const bool ok = s->commit().wait_ok(why);
+    enc = s->begin_compute(dt);
+    return ok;
+  }
+
   MTL::CommandQueue* mtl_queue() const noexcept { return _queue; }
 
 private:

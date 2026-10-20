@@ -4,6 +4,11 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
 #include "generative-models/model-loader.h"
+#include "interfaces/session-services-intf.h"
+#include "generative-models/generative-model-manager.h"
+#include "generative-models/moe-expert-cache.h"
+#include "generative-models/safetensors-ranges.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/dflash-drafter.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/mma-tile.h"
@@ -28,6 +33,8 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <atomic>
+#include <thread>
 
 namespace vpipe::genai {
 
@@ -218,7 +225,7 @@ struct MetalQwenModel::LayerLoad {
   const bool bf16 = cfg.use_bf16;
   SharedBuffer to_elt(const std::string& name) {
     const auto* info = wts->info(name);
-    if (info == nullptr) { return {}; }
+    if (info == nullptr) { return gptq_dense(name); }
     const std::string want = bf16 ? "BF16" : "F16";
     // Already the compute dtype: an owned copy, uncached.
     //
@@ -258,6 +265,392 @@ struct MetalQwenModel::LayerLoad {
   }
   // Alias: all callers want the compute element type.
   SharedBuffer to_f16(const std::string& name) { return to_elt(name); }
+  // ---- GPTQ int4 (fishaudio/drama-3-int4) ----------------------------
+  // <base>.qweight I32 [K/8, N] -- value k at bits 4(k%8) of word k/8,
+  // offset 8 -- and .scales F16 [K/128, N]: symmetric, no act order (a
+  // dense one also carries qzeros, all 8, and g_idx = k/128, which are
+  // checked). The layout the checkpoint's quantize.py writes. Read whole,
+  // uncached: it is consumed into the model's own layout.
+  static constexpr int kGptqGroup = 128;
+  bool gptq_read(const std::string& base, int* N, int* K,
+                 std::vector<std::uint32_t>* qw,
+                 std::vector<_Float16>* sc) const {
+    const auto* qi = wts->info(base + ".qweight");
+    const auto* si = wts->info(base + ".scales");
+    if (qi == nullptr || si == nullptr || qi->dtype != "I32" ||
+        si->dtype != "F16" || qi->shape.size() != 2 ||
+        si->shape.size() != 2) {
+      return false;
+    }
+    *K = (int)qi->shape[0] * 8;
+    *N = (int)qi->shape[1];
+    if (*K % kGptqGroup != 0 || si->shape[0] != *K / kGptqGroup ||
+        si->shape[1] != *N) {
+      return false;
+    }
+    qw->resize((std::size_t)*K / 8 * *N);
+    sc->resize((std::size_t)*K / kGptqGroup * *N);
+    return wts->pread_into(base + ".qweight", qw->data(), qw->size() * 4,
+                           /*uncached=*/true) &&
+           wts->pread_into(base + ".scales", sc->data(), sc->size() * 2,
+                           /*uncached=*/true);
+  }
+  std::uint16_t elt_bits(float f) const {
+    if (bf16) { return f32_to_bf16_(f); }
+    _Float16 h = (_Float16)f;
+    std::uint16_t b;
+    std::memcpy(&b, &h, 2);
+    return b;
+  }
+  // A dense GPTQ projection asked for as <base>.weight: dequantized to the
+  // compute dtype [N, K] (w = s (q - 8); exact but for one rounding of the
+  // product). Empty when `name` is no such tensor.
+  SharedBuffer gptq_dense(const std::string& name) {
+    static constexpr std::string_view kW = ".weight";
+    if (name.size() <= kW.size() ||
+        name.compare(name.size() - kW.size(), kW.size(), kW) != 0) {
+      return {};
+    }
+    const std::string base = name.substr(0, name.size() - kW.size());
+    if (wts->info(base + ".qweight") == nullptr) { return {}; }
+    int N = 0, K = 0;
+    std::vector<std::uint32_t> qw;
+    std::vector<_Float16> sc;
+    if (!gptq_read(base, &N, &K, &qw, &sc)) { return {}; }
+    if (const auto* zi = wts->info(base + ".qzeros")) {
+      std::vector<std::uint32_t> z(numel_(zi->shape));
+      if (zi->dtype != "I32" ||
+          !wts->pread_into(base + ".qzeros", z.data(), z.size() * 4, true)) {
+        return {};
+      }
+      for (std::uint32_t v : z) {
+        if (v != 0x88888888u) { return {}; }     // symmetric: every zero 8
+      }
+    }
+    if (const auto* gi = wts->info(base + ".g_idx")) {
+      std::vector<std::int32_t> g(numel_(gi->shape));
+      if (gi->dtype != "I32" || (int)g.size() != K ||
+          !wts->pread_into(base + ".g_idx", g.data(), g.size() * 4, true)) {
+        return {};
+      }
+      for (int k = 0; k < K; ++k) {
+        if (g[(std::size_t)k] != k / kGptqGroup) { return {}; }  // no act order
+      }
+    }
+    SharedBuffer out = mc->make_shared_buffer((std::size_t)N * K * 2);
+    if (out.empty()) { return {}; }
+    auto* o = static_cast<std::uint16_t*>(out.contents());
+    for (int j = 0; j < K / 8; ++j) {
+      const std::uint32_t* row = qw.data() + (std::size_t)j * N;
+      for (int n = 0; n < N; ++n) {
+        const float s =
+            (float)sc[(std::size_t)(j * 8 / kGptqGroup) * N + n];
+        const std::uint32_t w = row[n];
+        for (int b = 0; b < 8; ++b) {
+          const int q = (int)((w >> (4 * b)) & 0xF) - 8;
+          o[(std::size_t)n * K + j * 8 + b] = elt_bits(s * (float)q);
+        }
+      }
+    }
+    return out;
+  }
+  // One layer's GPTQ int4 routed experts into the affine w4 group-64 slabs
+  // the MoE kernels read (as an MLX 4-bit MoE's): codes [N, K/8] -- the
+  // words transposed, the nibble order already MLX's -- and per 64 a scale
+  // (each 128-group's, twice) and a bias -8 s. EXACT but for the f16
+  // scale's rounding to the compute dtype. gate|up interleaved by row (2g
+  // gate g, 2g+1 up g) into eguw/egus/egub [E, 2I, ..]; down edw/eds/edb.
+  bool gptq_experts(const std::string& p, int E, int I, int H, Layer& ly) {
+    const std::vector<std::size_t> pb = affine_expert_parts(I, H, 4, 4);
+    SharedBuffer* bufs[6] = {&ly.eguw, &ly.egus, &ly.egub,
+                             &ly.edw, &ly.eds, &ly.edb};
+    for (int k = 0; k < 6; ++k) {
+      *bufs[k] = mc->make_shared_buffer((std::size_t)E * pb[(std::size_t)k]);
+      if (bufs[k]->empty()) { return false; }
+    }
+    // Experts in parallel, each thread its own (disjoint slab rows; the
+    // reads are pread, the staging per thread): one thread transposing
+    // 16 GB of codes was ~30 s of a load.
+    std::atomic<bool> ok{true};
+    auto work = [&](int t, int nt) {
+      for (int e = t; e < E && ok.load(); e += nt) {
+        std::uint8_t* dst[6];
+        for (int k = 0; k < 6; ++k) {
+          dst[k] = static_cast<std::uint8_t*>(bufs[k]->contents()) +
+                   (std::size_t)e * pb[(std::size_t)k];
+        }
+        if (!gptq_expert(p, e, I, H, dst)) { ok = false; return; }
+      }
+    };
+    const int nt = (int)std::clamp(std::thread::hardware_concurrency(), 1u,
+                                   8u);
+    std::vector<std::thread> pool;
+    for (int t = 1; t < nt; ++t) { pool.emplace_back(work, t, nt); }
+    work(0, nt);
+    for (auto& th : pool) { th.join(); }
+    if (!ok) { return false; }
+    ly.eg_bits = ly.eu_bits = ly.ed_bits = 4;
+    ly.moe_split = false;
+    return true;
+  }
+  // One affine expert's bytes in each of its six parts (the MLX MoE
+  // layout, gate|up interleaved): gate|up codes [2I, H*gb/32] u32, their
+  // scales and biases [2I, H/64] (the compute dtype), down codes [H,
+  // I*db/32], scales and biases [H, I/64].
+  static std::vector<std::size_t> affine_expert_parts(int I, int H, int gb,
+                                                      int db) {
+    return {(std::size_t)2 * I * H * gb / 8, (std::size_t)2 * I * (H / 64) * 2,
+            (std::size_t)2 * I * (H / 64) * 2, (std::size_t)H * I * db / 8,
+            (std::size_t)H * (I / 64) * 2, (std::size_t)H * (I / 64) * 2};
+  }
+  // The tensors an expert is read from, fetched: ONE read through `rr`
+  // when they lie together in a shard (as a checkpoint written in name
+  // order keeps an expert's), else each with pread_into. `src[i]` points
+  // at names[i]'s bytes, in the thread's own staging.
+  bool fetch_(const SafetensorsRanges* rr,
+              const std::vector<std::string>& names,
+              std::vector<const std::uint8_t*>& src) const {
+    thread_local std::vector<std::uint8_t> stage;
+    thread_local std::vector<std::vector<std::uint8_t>> each;
+    if (rr != nullptr && rr->read_together(names, stage, src)) { return true; }
+    each.resize(names.size());
+    src.resize(names.size());
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      const auto* ti = wts->info(names[i]);
+      if (ti == nullptr) { return false; }
+      if (each[i].size() < ti->nbytes) { each[i].resize(ti->nbytes); }
+      if (!wts->pread_into(names[i], each[i].data(), ti->nbytes,
+                           /*uncached=*/true)) {
+        return false;
+      }
+      src[i] = each[i].data();
+    }
+    return true;
+  }
+  // GPTQ expert `e` of the layer at `p` into its six affine parts.
+  // Thread-safe (scratch per thread).
+  bool gptq_expert(const std::string& p, int e, int I, int H,
+                   std::uint8_t* const* dst,
+                   const SafetensorsRanges* rr = nullptr) const {
+    const std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+    const std::string proj[3] = {ep + "gate_proj", ep + "up_proj",
+                                 ep + "down_proj"};
+    // Shapes first: qweight I32 [K/8, N], scales F16 [K/128, N].
+    const int Ns[3] = {I, I, H}, Ks[3] = {H, H, I};
+    std::vector<std::string> names;
+    for (int t = 0; t < 3; ++t) {
+      const auto* qi = wts->info(proj[t] + ".qweight");
+      const auto* si = wts->info(proj[t] + ".scales");
+      if (qi == nullptr || si == nullptr || qi->dtype != "I32" ||
+          si->dtype != "F16" || qi->shape.size() != 2 ||
+          si->shape.size() != 2 || qi->shape[0] * 8 != Ks[t] ||
+          qi->shape[1] != Ns[t] || si->shape[0] != Ks[t] / kGptqGroup ||
+          si->shape[1] != Ns[t]) {
+        return false;
+      }
+      names.push_back(proj[t] + ".qweight");
+      names.push_back(proj[t] + ".scales");
+    }
+    std::vector<const std::uint8_t*> src;
+    if (!fetch_(rr, names, src)) { return false; }
+    // [N, K] of one tensor into row `r0 + stride * n` of the parts: the
+    // words transposed in 32 x 32 blocks.
+    auto put = [&](const std::uint32_t* qw, const _Float16* sc, int N, int K,
+                   std::uint32_t* w, std::uint16_t* sp, std::uint16_t* bp,
+                   int r0, int stride) {
+      const std::size_t kw = (std::size_t)K / 8, kg = (std::size_t)K / 64;
+      constexpr std::size_t B = 32;
+      for (std::size_t j0 = 0; j0 < kw; j0 += B) {
+        for (std::size_t n0 = 0; n0 < (std::size_t)N; n0 += B) {
+          const std::size_t j1 = std::min(kw, j0 + B);
+          const std::size_t n1 = std::min((std::size_t)N, n0 + B);
+          for (std::size_t n = n0; n < n1; ++n) {
+            std::uint32_t* wr =
+                w + ((std::size_t)r0 + (std::size_t)stride * n) * kw;
+            for (std::size_t j = j0; j < j1; ++j) {
+              wr[j] = qw[j * (std::size_t)N + n];
+            }
+          }
+        }
+      }
+      for (int n = 0; n < N; ++n) {
+        const std::size_t r = (std::size_t)r0 + (std::size_t)stride * n;
+        for (std::size_t g = 0; g < kg; ++g) {
+          const float v = (float)sc[(g / 2) * (std::size_t)N + n];
+          sp[r * kg + g] = elt_bits(v);
+          bp[r * kg + g] = elt_bits(-8.0f * v);
+        }
+      }
+    };
+    for (int t = 0; t < 3; ++t) {
+      const auto* qw = reinterpret_cast<const std::uint32_t*>(src[2 * t]);
+      const auto* sc = reinterpret_cast<const _Float16*>(src[2 * t + 1]);
+      const int k0 = t < 2 ? 0 : 3;
+      put(qw, sc, Ns[t], Ks[t], reinterpret_cast<std::uint32_t*>(dst[k0]),
+          reinterpret_cast<std::uint16_t*>(dst[k0 + 1]),
+          reinterpret_cast<std::uint16_t*>(dst[k0 + 2]), t < 2 ? t : 0,
+          t < 2 ? 2 : 1);
+    }
+    return true;
+  }
+  // An MLX affine expert (mlp.switch_mlp.{gate,up,down}_proj, stacked [E,
+  // rows, ..]) into its six parts: expert e's rows of each stacked tensor
+  // read as a RANGE, gate|up interleaved by row as interleave_moe lays a
+  // layer slab out, scales and biases in the compute dtype as to_elt
+  // converts them. Thread-safe (scratch per thread; `rr` is).
+  bool affine_expert(const SafetensorsRanges& rr, const std::string& p,
+                     int e, int I, int H, int gb, int db,
+                     std::uint8_t* const* dst) const {
+    thread_local std::vector<std::uint8_t> t0, t1;
+    const std::size_t gw = (std::size_t)H * gb / 8;          // a gate row
+    const std::size_t gg = (std::size_t)H / 64;              // its groups
+    auto slice = [&](const std::string& nm, std::size_t row_bytes,
+                     int rows, std::vector<std::uint8_t>& to) {
+      const std::size_t n = row_bytes * (std::size_t)rows;
+      if (to.size() < n) { to.resize(n); }
+      return rr.read(nm, (std::size_t)e * n, n, to.data());
+    };
+    // The compute dtype from a stored 16/32-bit scale (to_elt's rule).
+    auto elt_rows = [&](const std::string& nm, std::size_t count,
+                        int rows, std::uint16_t* out, int stride,
+                        int r0) -> bool {
+      const auto* ti = wts->info(nm);
+      if (ti == nullptr) { return false; }
+      const std::size_t esz = ti->dtype == "F32" ? 4 : 2;
+      if (!slice(nm, count * esz, rows, t0)) { return false; }
+      for (int r = 0; r < rows; ++r) {
+        std::uint16_t* o =
+            out + ((std::size_t)r0 + (std::size_t)stride * r) * count;
+        const std::uint8_t* src = t0.data() + (std::size_t)r * count * esz;
+        for (std::size_t i = 0; i < count; ++i) {
+          float f;
+          if (ti->dtype == "F32") {
+            std::memcpy(&f, src + i * 4, 4);
+          } else if (ti->dtype == "BF16") {
+            std::uint16_t u;
+            std::memcpy(&u, src + i * 2, 2);
+            f = bf16_to_f32_(u);
+          } else {
+            _Float16 h;
+            std::memcpy(&h, src + i * 2, 2);
+            f = (float)h;
+          }
+          o[i] = elt_bits(f);
+        }
+      }
+      return true;
+    };
+    const std::string sw = p + "mlp.switch_mlp.";
+    for (int half = 0; half < 2; ++half) {
+      const std::string nm = sw + (half == 0 ? "gate_proj" : "up_proj");
+      if (!slice(nm + ".weight", gw, I, t1)) { return false; }
+      for (int g = 0; g < I; ++g) {
+        std::memcpy(dst[0] + ((std::size_t)2 * g + half) * gw,
+                    t1.data() + (std::size_t)g * gw, gw);
+      }
+      if (!elt_rows(nm + ".scales", gg, I,
+                    reinterpret_cast<std::uint16_t*>(dst[1]), 2, half) ||
+          !elt_rows(nm + ".biases", gg, I,
+                    reinterpret_cast<std::uint16_t*>(dst[2]), 2, half)) {
+        return false;
+      }
+    }
+    const std::size_t dwb = (std::size_t)I * db / 8;
+    const std::size_t dg = (std::size_t)I / 64;
+    return rr.read(sw + "down_proj.weight", (std::size_t)e * H * dwb,
+                   (std::size_t)H * dwb, dst[3]) &&
+           elt_rows(sw + "down_proj.scales", dg, H,
+                    reinterpret_cast<std::uint16_t*>(dst[4]), 1, 0) &&
+           elt_rows(sw + "down_proj.biases", dg, H,
+                    reinterpret_cast<std::uint16_t*>(dst[5]), 1, 0);
+  }
+  // One layer's block-FP8 routed experts (mlp.experts.<e>.<proj>.weight,
+  // E4M3 [rows, cols], + .weight_scale_inv, f32 [rows/128, cols/128]) into
+  // the slabs dense_moe_gather_{swiglu,down}_fp8 read: gate|up codes with
+  // their rows interleaved (2g gate g, 2g+1 up g) [E, 2I, H], down codes
+  // [E, H, I]; scales per tensor, x256 (the widening's exponent offset).
+  // Read straight into the slabs, UNCACHED: these are 0.75 GB a layer, 32
+  // GB a model, consumed as they arrive. A cached read leaves the file's
+  // pages in the page cache beside the slabs -- MEASURED on a 64 GB box, a
+  // 38 GB model so loaded left ~20 GB of file cache competing with it,
+  // free memory fell to a few MB, and the first prefill's allocations
+  // waited on reclaim (8-10 s against 3 s).
+  bool fp8_experts(const std::string& p, int E, int I, int H, Layer& ly) {
+    if (I % 128 != 0 || H % 128 != 0) { return false; }
+    const std::vector<std::size_t> pb = fp8_expert_parts(I, H);
+    ly.eguw = mc->make_shared_buffer((std::size_t)E * pb[0]);
+    ly.egus = mc->make_shared_buffer((std::size_t)E * pb[1]);
+    ly.edw = mc->make_shared_buffer((std::size_t)E * pb[2]);
+    ly.eds = mc->make_shared_buffer((std::size_t)E * pb[3]);
+    if (ly.eguw.empty() || ly.egus.empty() || ly.edw.empty() ||
+        ly.eds.empty()) {
+      return false;
+    }
+    SharedBuffer* bufs[4] = {&ly.eguw, &ly.egus, &ly.edw, &ly.eds};
+    for (int e = 0; e < E; ++e) {
+      std::uint8_t* dst[4];
+      for (int k = 0; k < 4; ++k) {
+        dst[k] = static_cast<std::uint8_t*>(bufs[k]->contents()) +
+                 (std::size_t)e * pb[(std::size_t)k];
+      }
+      if (!fp8_expert(p, e, I, H, dst)) { return false; }
+    }
+    return true;
+  }
+  // One FP8 expert's bytes in each of its four parts: gate|up codes [2I,
+  // H], their scales [2, I/128, H/128] f32, down codes [H, I], their
+  // scales [H/128, I/128] f32. A layer slab is E of these, part by part --
+  // and so is an expert-cache slot.
+  static std::vector<std::size_t> fp8_expert_parts(int I, int H) {
+    const std::size_t IB = (std::size_t)I / 128, HB = (std::size_t)H / 128;
+    return {(std::size_t)2 * I * H, 2 * IB * HB * 4, (std::size_t)H * I,
+            HB * IB * 4};
+  }
+  // Expert `e` of the layer at prefix `p` into its four parts (dst[k]),
+  // straight from the checkpoint (one read through `rr` where it can).
+  // Thread-safe: the scratch is the thread's own, and the reads are.
+  bool fp8_expert(const std::string& p, int e, int I, int H,
+                  std::uint8_t* const* dst,
+                  const SafetensorsRanges* rr = nullptr) const {
+    const std::size_t IB = (std::size_t)I / 128, HB = (std::size_t)H / 128;
+    const std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+    const std::string proj[3] = {ep + "gate_proj", ep + "up_proj",
+                                 ep + "down_proj"};
+    // Codes E4M3 [rows, cols], checked for the shape the slab assumes;
+    // scales F32 [rows/128, cols/128].
+    const int rows[3] = {I, I, H}, cols[3] = {H, H, I};
+    std::vector<std::string> names;
+    for (int t = 0; t < 3; ++t) {
+      const auto* wi = wts->info(proj[t] + ".weight");
+      const auto* si = wts->info(proj[t] + ".weight_scale_inv");
+      if (wi == nullptr || wi->dtype != "F8_E4M3" || wi->shape.size() != 2 ||
+          wi->shape[0] != rows[t] || wi->shape[1] != cols[t] ||
+          si == nullptr || si->dtype != "F32" ||
+          numel_(si->shape) != IB * HB) {
+        return false;
+      }
+      names.push_back(proj[t] + ".weight");
+      names.push_back(proj[t] + ".weight_scale_inv");
+    }
+    std::vector<const std::uint8_t*> src;
+    if (!fetch_(rr, names, src)) { return false; }
+    auto scales = [&](const std::uint8_t* from, float* to) {
+      std::memcpy(to, from, IB * HB * 4);
+      for (std::size_t i = 0; i < IB * HB; ++i) { to[i] *= 256.0f; }
+    };
+    for (int half = 0; half < 2; ++half) {
+      const std::uint8_t* codes = src[(std::size_t)2 * half];
+      for (int g = 0; g < I; ++g) {
+        std::memcpy(dst[0] + ((std::size_t)2 * g + half) * H,
+                    codes + (std::size_t)g * H, (std::size_t)H);
+      }
+      scales(src[(std::size_t)2 * half + 1],
+             reinterpret_cast<float*>(dst[1]) + (std::size_t)half * IB * HB);
+    }
+    std::memcpy(dst[2], src[4], (std::size_t)H * I);
+    scales(src[5], reinterpret_cast<float*>(dst[3]));
+    return true;
+  }
   SharedBuffer to_f32(const std::string& name) {
     const auto* info = wts->info(name);
     if (info == nullptr) { return {}; }
@@ -763,6 +1156,9 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     std::string quant_err;
     auto note = [&](const std::string& nm, int K) {
       if (!wts->has(nm + ".scales")) { return; }   // non-affine: not our path
+      // GPTQ (qweight + scales, fishaudio/drama-3-int4) is not MLX affine:
+      // the dense path dequantizes it (LayerLoad::gptq_dense).
+      if (wts->has(nm + ".qweight")) { return; }
       const int b = affine_bits(nm, K);
       const int g = affine_group(nm, K);
       if (b != 4 && b != 8) {
@@ -1394,6 +1790,27 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
       m->_kquant = false;
       m->_mixed = false;
     }
+    // Per-expert block-FP8 routed experts (Fish Audio Drama 3): a dense
+    // bf16 backbone whose experts are E4M3 codes + 128x128 block scales,
+    // one tensor per expert. Dense in every other respect.
+    const std::string ep = base + "mlp.experts.0.down_proj";
+    const auto* epi = wts->info(ep + ".weight");
+    if (!m->_kquant && cfg.is_moe() && epi != nullptr &&
+        epi->dtype == "F8_E4M3" && wts->has(ep + ".weight_scale_inv")) {
+      m->_dense = true;
+      m->_mixed = false;
+      m->_fp8_experts = true;
+    }
+    // ...or GPTQ int4 per expert (fishaudio/drama-3-int4): the experts
+    // converted to the affine w4 path's slabs, the GPTQ projections of the
+    // dense layers dequantized where the dense path reads them.
+    const auto* eqi = wts->info(ep + ".qweight");
+    if (!m->_kquant && cfg.is_moe() && eqi != nullptr &&
+        eqi->dtype == "I32" && wts->has(ep + ".scales")) {
+      m->_dense = true;
+      m->_mixed = false;
+      m->_gptq_experts = true;
+    }
   }
   // RAW-SOURCE LAYERS (metal-qwen-raw-layers.h): in-memory w8 and/or
   // decode-capable streaming of a raw dense backbone. Decided HERE -- once
@@ -1488,6 +1905,37 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
           !m->_fn_moe_gather_down_dense.valid() ||
           !m->_fn_moe_gate_dense.valid()) {
         return nullptr;
+      }
+      m->_fn_swiglu_il = m->_lib_elt.function("swiglu_interleaved_f16");
+      if (!m->_fn_swiglu_il.valid()) { return nullptr; }
+      if (m->_fp8_experts) {
+        m->_fn_moe_gather_swiglu_fp8 =
+            m->_lib_dense.function("dense_moe_gather_swiglu_fp8");
+        m->_fn_moe_gather_down_fp8 =
+            m->_lib_dense.function("dense_moe_gather_down_fp8");
+        // The kernels read a lane's 16 codes inside one 128-wide block.
+        const bool shape_ok = cfg.hidden % 512 == 0 &&
+                              cfg.moe_inner % 512 == 0 &&
+                              cfg.moe_inner % 128 == 0;
+        m->_fn_moe_qmm_grouped_swiglu_fp8 =
+            m->_lib_qmm.function("fp8_qmm_grouped_swiglu_b128");
+        m->_fn_moe_qmm_grouped_fp8 =
+            m->_lib_qmm.function("fp8_qmm_grouped_down_b128");
+        if (const char* e = std::getenv("VPIPE_QWEN_MOE_FP8_GROUPED_MIN")) {
+          m->_fp8_grouped_min = std::max(1, std::atoi(e));
+        }
+        if (!m->_fn_moe_gather_swiglu_fp8.valid() ||
+            !m->_fn_moe_gather_down_fp8.valid() ||
+            !m->_fn_moe_qmm_grouped_swiglu_fp8.valid() ||
+            !m->_fn_moe_qmm_grouped_fp8.valid() || !shape_ok) {
+          if (const SessionContextIntf* s = mc->session()) {
+            s->error(fmt("[qwen] block-FP8 experts: {}",
+                         shape_ok ? "the fp8 gather kernels did not load"
+                                  : "hidden and moe_inner must be "
+                                    "multiples of 512"));
+          }
+          return nullptr;
+        }
       }
       // Single-zero pair_eid for the shared-expert gather (slab 0, top_k=1).
       m->_moe_zero_eid = mc->make_shared_buffer(sizeof(std::int32_t));
@@ -1635,6 +2083,52 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
                      SharedBuffer& b, KQ& t, int& nrows) {
     return H.fuse_kq(n1, n2, b, t, nrows);
   };
+
+  // ---- routed experts in a cache (Config::expert_cache_bytes) ---------
+  // Decided before the stack is built: a streamed model's layers load
+  // everything but their routed experts. The cache serves the per-expert
+  // layouts (block FP8, GPTQ int4) and MLX affine at one gate|up width and
+  // one down width throughout; anything else loads resident, and says so.
+  // VPIPE_MOE_EXPERT_CACHE_MB is the A/B: a cache of that size whatever
+  // the engine decided (0 = every expert resident).
+  if (const char* e = std::getenv("VPIPE_MOE_EXPERT_CACHE_MB")) {
+    m->_cfg.expert_cache_bytes =
+        (std::size_t)std::max(0LL, std::atoll(e)) << 20;
+  }
+  if (m->_cfg.expert_cache_bytes > 0 && cfg.is_moe()) {
+    std::string why;
+    if (m->_kquant || m->_raw || m->_stream_layers || cfg.calib_stream) {
+      why = "this load already streams or converts its layers another way";
+    } else if (m->_fp8_experts || m->_gptq_experts) {
+      // One tensor per expert: nothing more to ask.
+    } else if (m->_dense) {
+      why = "a dense (bf16) MoE has no expert-cache layout yet";
+    } else if (m->_mixed) {
+      why = "its routed experts are not one width throughout";
+    } else {
+      for (int L = 0; L < cfg.n_layers && why.empty(); ++L) {
+        const std::string p = cfg.weight_prefix + cfg.model_seg + "layers." +
+                              std::to_string(L) + ".mlp.switch_mlp.";
+        const int gb = H.affine_bits(p + "gate_proj", cfg.hidden);
+        const int ub = H.affine_bits(p + "up_proj", cfg.hidden);
+        const int db = H.affine_bits(p + "down_proj", cfg.moe_inner);
+        if (gb != ub || (gb != 4 && gb != 8) || (db != 4 && db != 8)) {
+          why = "its routed experts are not one width throughout";
+        } else if (L == 0) {
+          m->_x_gb = gb;
+          m->_x_db = db;
+        } else if (gb != m->_x_gb || db != m->_x_db) {
+          why = "its routed experts are not one width throughout";
+        }
+      }
+    }
+    if (why.empty()) {
+      m->_xstream = true;
+    } else if (const SessionContextIntf* s = mc->session()) {
+      s->warn(fmt("[qwen] routed experts load resident, not cached: {}",
+                  why));
+    }
+  }
 
   m->_layers.resize(cfg.n_layers);
   // Pinned prefix (streaming only): as many leading layers as fit resident
@@ -2385,9 +2879,20 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   // in via set_i8_gemm (exec) and VPIPE_I8_GEMM=1 force-enables for
   // benches/A-B (the context handles the env override internally).
   m->set_i8_gemm(false);
+  if (m->_xstream) {
+    std::string xerr;
+    if (!m->setup_expert_cache_(&xerr)) {
+      if (const SessionContextIntf* s = mc->session()) {
+        s->error(fmt("[qwen] the routed-expert cache: {} -- model not "
+                     "loaded", xerr));
+      }
+      return nullptr;
+    }
+    m->wire_for_experts_();
+  }
   // A resident stack has no further use for the builder; only a streaming
-  // one calls back into it.
-  if (!m->_stream_layers) { m->_lload.reset(); }
+  // one (layers or experts) calls back into it.
+  if (!m->_stream_layers && !m->_xstream) { m->_lload.reset(); }
   return m;
 }
 
@@ -3005,7 +3510,29 @@ MetalQwenModel::LayerLoad::build_layer(int L)
          !ly.dt_bias.empty() && !ly.gdn_norm.empty();
   }
   // MLP (every layer).
-  if (m->_dense && cfg.is_moe()) {
+  if (m->_dense && cfg.is_moe() && (m->_fp8_experts || m->_gptq_experts)) {
+    // Routed experts one tensor per expert (Fish Audio Drama 3): block-FP8
+    // codes, or GPTQ int4 converted to the affine w4 slabs; router, shared
+    // expert and its gate are the dense path's below.
+    const int E = cfg.n_experts, I = cfg.moe_inner, S = cfg.moe_shared_inner;
+    ok = ok && !(ly.rgw = to_f16(p + "mlp.gate.weight")).empty();  // [E,H]
+    if (m->_xstream) {
+      // Cached: the experts come through MoeExpertCache, a slot at a time.
+      ly.eg_bits = ly.eu_bits = ly.ed_bits = 4;
+    } else {
+      ok = ok && (m->_fp8_experts ? fp8_experts(p, E, I, cfg.hidden, ly)
+                                  : gptq_experts(p, E, I, cfg.hidden, ly));
+    }
+    {
+      SharedBuffer gw = to_f16(p + "mlp.shared_expert.gate_proj.weight");
+      SharedBuffer uw = to_f16(p + "mlp.shared_expert.up_proj.weight");
+      ok = ok && interleave_w4_f16(gw, uw, S, ly.sguw);        // [2S,H]
+    }
+    ok = ok && !(ly.sdw =
+                 to_f16(p + "mlp.shared_expert.down_proj.weight")).empty();
+    ok = ok && !(ly.segw =
+                 to_f16(p + "mlp.shared_expert_gate.weight")).empty();
+  } else if (m->_dense && cfg.is_moe()) {
     // Dense f16 Mixture-of-Experts (raw-HF bf16 MoE). Router (mlp.gate),
     // batched experts (switch_mlp gate|up interleaved per slab + down), the
     // dense shared expert (gate|up interleaved + down) and the shared sigmoid
@@ -3096,7 +3623,14 @@ MetalQwenModel::LayerLoad::build_layer(int L)
     ly.ed_bits = (edb == 8) ? 8 : 4;
     ok = ok && qtri(p + "mlp.gate", ly.rgw, ly.rgs, ly.rgb);   // router
     ly.r_bits = affine_bits(p + "mlp.gate", cfg.hidden) == 8 ? 8 : 4;
-    {
+    if (m->_xstream) {
+      // Cached: the routed experts come through MoeExpertCache, a slot at
+      // a time (load() checked they are one width throughout).
+      ly.eg_bits = (egb == 8) ? 8 : 4;
+      ly.eu_bits = (eub == 8) ? 8 : 4;
+      ly.moe_split = false;
+    }
+    if (!m->_xstream) {
       SharedBuffer gw, gs, gb, uw, us, ub;
       ok = ok && qtri(p + "mlp.switch_mlp.gate_proj", gw, gs, gb);
       ok = ok && qtri(p + "mlp.switch_mlp.up_proj", uw, us, ub);
@@ -3122,7 +3656,10 @@ MetalQwenModel::LayerLoad::build_layer(int L)
         ly.eub  = std::move(ub);
       }
     }
-    ok = ok && qtri(p + "mlp.switch_mlp.down_proj", ly.edw, ly.eds, ly.edb);
+    if (!m->_xstream) {
+      ok = ok && qtri(p + "mlp.switch_mlp.down_proj", ly.edw, ly.eds,
+                      ly.edb);
+    }
     {
       SharedBuffer gw, gs, gb, uw, us, ub;
       ok = ok && qtri(p + "mlp.shared_expert.gate_proj", gw, gs, gb);
@@ -3164,6 +3701,346 @@ MetalQwenModel::~MetalQwenModel()
   // Give the wired pool back and join any streamed read BEFORE the layers
   // go: only unwire_from_pool decrements the pool's counter.
   if (_rs) { _rs->shutdown(); }
+  // The expert cache's readers call into the builder: they go first.
+  if (_xwire && _xwire->on()) {
+    _xwire->note_unwired(_xwire->wired_bytes());
+  }
+  // What the cache did over the model's life: the figure that says whether
+  // it was sized well (a stage that wants it per request reads stats()).
+  const SessionContextIntf* sess = _mc != nullptr ? _mc->session() : nullptr;
+  if (_xc && sess != nullptr && _xc->stats().picks > 0) {
+    const MoeExpertCache::Stats& st = _xc->stats();
+    sess->info(fmt("[qwen] expert cache: {:.1f}% hits over {} picks, {} "
+                   "admitted, {} evicted, {} one-off; {} MB read, {:.0f} "
+                   "ms of it waited for{}", 100.0 * st.hit_rate(), st.picks,
+                   st.admitted, st.evicted, st.transient,
+                   st.bytes_read >> 20, st.read_ms + st.wait_ms,
+                   st.ahead_read > 0
+                       ? fmt("; {} read ahead, {} of them picked, width "
+                             "now {}", st.ahead_read, st.ahead_hits,
+                             _xc->ahead_width())()
+                       : std::string()));
+  }
+  _xc.reset();
+}
+
+namespace {
+
+// Every weight buffer of a layer that a resident (non-k-quant) layer may
+// hold, the routed experts' included (empty when they are cached).
+template <typename L, typename F>
+void
+each_layer_buffer_(L& y, F&& f)
+{
+  for (auto* p : {&y.in_ln, &y.post_ln, &y.qw, &y.qs, &y.qb, &y.kw, &y.ks,
+                  &y.kb, &y.vw, &y.vs, &y.vb, &y.ow, &y.os, &y.ob,
+                  &y.q_norm, &y.k_norm, &y.qkv_bias, &y.iqw, &y.iqs, &y.iqb,
+                  &y.izw, &y.izs, &y.izb, &y.ibw, &y.ibs, &y.ibb, &y.iaw,
+                  &y.ias, &y.iab, &y.gow, &y.gos, &y.gob, &y.conv_w,
+                  &y.A_log, &y.dt_bias, &y.gdn_norm, &y.guw, &y.gus, &y.gub,
+                  &y.uw, &y.us, &y.ub, &y.dw, &y.ds, &y.db, &y.rgw, &y.rgs,
+                  &y.rgb, &y.eguw, &y.egus, &y.egub, &y.euw, &y.eus, &y.eub,
+                  &y.edw, &y.eds, &y.edb, &y.sguw, &y.sgus, &y.sgub, &y.sdw,
+                  &y.sds, &y.sdb, &y.segw, &y.segs, &y.segb}) {
+    f(*p);
+  }
+}
+
+}  // namespace
+
+bool
+MetalQwenModel::setup_expert_cache_(std::string* err)
+{
+  const Config& c = _cfg;
+  const int E = c.n_experts, I = c.moe_inner, H = c.hidden;
+  LayerLoad* ld = _lload.get();
+  if (ld == nullptr) {
+    if (err != nullptr) { *err = "no weight reader"; }
+    return false;
+  }
+  const std::string root = c.weight_prefix + c.model_seg + "layers.";
+  auto prefix = [root](int L) { return root + std::to_string(L) + "."; };
+  std::vector<std::size_t> parts;
+  MoeExpertCache::Fill fill;
+  const char* what = "";
+  // Every layout reads through the ranges: an expert's tensors in one read
+  // where they lie together, a stacked tensor's rows as a range.
+  _xranges = SafetensorsRanges::open(_ws->dir(), _ws->src(), err);
+  if (!_xranges) { return false; }
+  const SafetensorsRanges* rr = _xranges.get();
+  if (_fp8_experts) {
+    parts = LayerLoad::fp8_expert_parts(I, H);
+    what = "block-FP8";
+    fill = [ld, rr, prefix, I, H](int L, int e, std::uint8_t* const* dst,
+                                  std::string* er) {
+      if (ld->fp8_expert(prefix(L), e, I, H, dst, rr)) { return true; }
+      if (er != nullptr) {
+        *er = fmt("layer {} expert {}: its FP8 tensors did not read", L,
+                  e)();
+      }
+      return false;
+    };
+  } else if (_gptq_experts) {
+    parts = LayerLoad::affine_expert_parts(I, H, 4, 4);
+    what = "GPTQ int4";
+    fill = [ld, rr, prefix, I, H](int L, int e, std::uint8_t* const* dst,
+                                  std::string* er) {
+      if (ld->gptq_expert(prefix(L), e, I, H, dst, rr)) { return true; }
+      if (er != nullptr) {
+        *er = fmt("layer {} expert {}: its GPTQ tensors did not read", L,
+                  e)();
+      }
+      return false;
+    };
+  } else {
+    parts = LayerLoad::affine_expert_parts(I, H, _x_gb, _x_db);
+    what = _x_gb == 8 ? "affine 8-bit" : "affine 4-bit";
+    const int gb = _x_gb, db = _x_db;
+    fill = [ld, rr, prefix, I, H, gb, db](
+               int L, int e, std::uint8_t* const* dst, std::string* er) {
+      if (ld->affine_expert(*rr, prefix(L), e, I, H, gb, db, dst)) {
+        return true;
+      }
+      if (er != nullptr) {
+        *er = fmt("layer {} expert {}: its rows did not read", L,
+                  e)();
+      }
+      return false;
+    };
+  }
+  std::size_t slot = 0, widest = 0;
+  for (std::size_t b : parts) { slot += b; widest = std::max(widest, b); }
+  // What the bytes buy, a layer's worth of it transient (a prefill step
+  // may route to every expert of a layer at once). Capped so each pool is
+  // one buffer the kernels can address: the affine gathers and grouped
+  // GEMMs take 32-bit expert offsets, so no part past 2^33 bytes there
+  // (the FP8 kernels offset in 64 bits, and only the device's buffer
+  // limit binds them -- at 3 MB an expert the 2^33 cap would hold Drama
+  // 3's release to 12 GB of cache).
+  const std::size_t want = c.expert_cache_bytes / slot;
+  std::size_t lim = (std::size_t)1 << 33;
+  if (_fp8_experts) {
+    lim = _mc->max_buffer_length();
+    if (lim == 0) { lim = (std::size_t)1 << 33; }
+  }
+  const std::size_t cap = lim / widest;
+  const int total = (int)std::clamp<std::size_t>(want, (std::size_t)E, cap);
+  MoeExpertCache::Options o;
+  o.layers = c.n_layers;
+  o.experts = E;
+  o.part_bytes = parts;
+  o.transient = E;
+  o.resident = total - E;
+  o.threads =
+      (int)std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
+  // READING AHEAD, a decode step at a time: the next layer's router over
+  // this layer's input ranks that layer's experts, and the cache reads the
+  // likeliest it does not hold while this layer runs -- as many as it
+  // measures to pay (MoeExpertCache: HOW MANY TO READ AHEAD), from none to
+  // top_k. VPIPE_MOE_EXPERT_AHEAD=<n> pins the width (0 off): an A/B.
+  o.ahead_widths = {0, std::max(1, c.top_k / 2), c.top_k};
+  if (const char* v = std::getenv("VPIPE_MOE_EXPERT_AHEAD")) {
+    o.ahead_widths = {std::clamp(std::atoi(v), 0, E)};
+  }
+  _x_ahead = *std::max_element(o.ahead_widths.begin(), o.ahead_widths.end());
+  _xc = MoeExpertCache::create(_mc, o, std::move(fill), err);
+  if (!_xc) { return false; }
+  if (_x_ahead > 0) {
+    _x_pred_logits = _mc->make_shared_buffer((std::size_t)E * 2);
+    _x_rank.resize((std::size_t)E);
+    if (_x_pred_logits.empty()) {
+      if (err != nullptr) { *err = "out of memory"; }
+      return false;
+    }
+  }
+  if (const SessionContextIntf* s = _mc->session()) {
+    const double all = (double)c.n_layers * E;
+    s->info(fmt("[qwen] routed experts CACHED ({}): {} MB -- {} resident "
+                "slots ({:.1f}% of {} experts), {} spare, {:.2f} MB an "
+                "expert; read from disk on a miss, kept by how often they "
+                "are selected{}", what, _xc->bytes() >> 20, o.resident,
+                100.0 * o.resident / all, (int)all, o.transient,
+                slot / 1048576.0,
+                _x_ahead > 0 ? fmt("; a decode step reads ahead up to "
+                                   "the next layer's {} likeliest",
+                                   _x_ahead)()
+                             : std::string()));
+  }
+  return true;
+}
+
+void
+MetalQwenModel::wire_for_experts_()
+{
+  // The model resident beside the cache is read every token: wire it, then
+  // the cache's pools (its resident slots are the experts selected most).
+  _xwire = std::make_unique<WiredPool>();
+  _xwire->open(_mc);
+  if (!_xwire->on()) { return; }
+  std::size_t got = 0, want = 0, already = 0;
+  bool refused = false;
+  auto one = [&](SharedBuffer& b) {
+    if (b.empty()) { return; }
+    // The model manager wires what a load allocates as it goes, when its
+    // pool is on: those are charged already.
+    if (b.is_wired()) {
+      already += b.byte_size();
+      return;
+    }
+    if (refused) { return; }
+    want += b.byte_size();
+    const std::size_t n = _xwire->wire_one(_mc, b, true);
+    if (n == 0 && _xwire->refused(_mc, b)) { refused = true; return; }
+    got += n;
+  };
+  for (Layer& y : _layers) { each_layer_buffer_(y, one); }
+  for (SharedBuffer* b : {&_embed_w, &_embed_s, &_embed_b, &_lm_w, &_lm_s,
+                          &_lm_b, &_final_ln}) {
+    one(*b);
+  }
+  if (_ws) { _ws->for_each_weight([&](SharedBuffer& b) { one(b); }); }
+  for (int k = 0; k < _xc->parts(); ++k) { one(_xc->pool_mut(k)); }
+  _xwire->note_wired(_mc, got, want);
+  if (const SessionContextIntf* s = _mc->session()) {
+    s->info(fmt("[qwen] the model beside its experts, then the expert "
+                "cache: {} MB wired here of {} asked, {} MB wired as it "
+                "loaded{}", got >> 20, want >> 20, already >> 20,
+                refused ? " -- the pool refused the rest" : ""));
+  }
+}
+
+std::vector<std::uint64_t>
+MetalQwenModel::weight_digests() const
+{
+  std::vector<const SharedBuffer*> bufs;
+  for (const Layer& y : _layers) {
+    each_layer_buffer_(y, [&](const SharedBuffer& b) { bufs.push_back(&b); });
+  }
+  for (const SharedBuffer* b : {&_embed_w, &_embed_s, &_embed_b, &_lm_w,
+                                &_lm_s, &_lm_b, &_final_ln}) {
+    bufs.push_back(b);
+  }
+  // Each buffer in 64 MB pieces over the threads, a piece's digest mixed
+  // in by its index so the order of the threads does not matter.
+  constexpr std::size_t kPiece = (std::size_t)64 << 20;
+  struct Piece { std::size_t buf, off, n; };
+  std::vector<Piece> pieces;
+  for (std::size_t i = 0; i < bufs.size(); ++i) {
+    const std::size_t n = bufs[i]->empty() ? 0 : bufs[i]->byte_size();
+    for (std::size_t o = 0; o < n; o += kPiece) {
+      pieces.push_back({i, o, std::min(kPiece, n - o)});
+    }
+  }
+  std::vector<std::uint64_t> piece_d(pieces.size(), 0);
+  std::atomic<std::size_t> next{0};
+  auto work = [&] {
+    for (;;) {
+      const std::size_t k = next.fetch_add(1);
+      if (k >= pieces.size()) { return; }
+      const Piece& p = pieces[k];
+      const auto* s = static_cast<const std::uint8_t*>(
+                          bufs[p.buf]->contents()) + p.off;
+      std::uint64_t h = 0x9e3779b97f4a7c15ull ^ p.off;
+      std::size_t j = 0;
+      for (; j + 8 <= p.n; j += 8) {
+        std::uint64_t v;
+        std::memcpy(&v, s + j, 8);
+        h = (h ^ v) * 0x100000001b3ull;
+        h ^= h >> 29;
+      }
+      for (; j < p.n; ++j) { h = (h ^ s[j]) * 0x100000001b3ull; }
+      piece_d[k] = h;
+    }
+  };
+  const int nt = (int)std::clamp(std::thread::hardware_concurrency(), 1u,
+                                 8u);
+  std::vector<std::thread> pool;
+  for (int t = 1; t < nt; ++t) { pool.emplace_back(work); }
+  work();
+  for (auto& th : pool) { th.join(); }
+  std::vector<std::uint64_t> out(bufs.size(), 0);
+  for (std::size_t k = 0; k < pieces.size(); ++k) {
+    std::uint64_t& d = out[pieces[k].buf];
+    d = (d ^ piece_d[k]) * 0x9e3779b97f4a7c15ull + k;
+  }
+  return out;
+}
+
+std::size_t
+MetalQwenModel::routed_expert_bytes(const MetalLlamaWeights& wts,
+                                    const Config& c)
+{
+  if (!c.is_moe()) { return 0; }
+  std::size_t n = 0;
+  for (const std::string& nm : wts.tensor_names()) {
+    const bool stacked = nm.find(".mlp.switch_mlp.") != std::string::npos;
+    const bool per_e = nm.find(".mlp.experts.") != std::string::npos;
+    if (!stacked && !per_e) { continue; }
+    const auto* ti = wts.info(nm);
+    if (ti == nullptr) { continue; }
+    // As held: GPTQ codes gain a scale and bias per 64 (9/8 of them), and
+    // their own scales are consumed; everything else as stored.
+    if (nm.size() > 8 && nm.compare(nm.size() - 8, 8, ".qweight") == 0) {
+      n += (std::size_t)ti->nbytes * 9 / 8;
+    } else if (per_e && nm.size() > 7 &&
+               nm.compare(nm.size() - 7, 7, ".scales") == 0 &&
+               wts.info(nm.substr(0, nm.size() - 7) + ".qweight")) {
+      continue;
+    } else {
+      n += (std::size_t)ti->nbytes;
+    }
+  }
+  return n;
+}
+
+std::size_t
+MetalQwenModel::lm_expert_cache_bytes(const SessionContextIntf* session,
+                                      const std::string& dir,
+                                      const Config& c, std::size_t scratch)
+{
+  if (!c.is_moe()) { return 0; }
+  const std::size_t ram = stream_physical_ram();
+  if (ram == 0) { return 0; }
+  auto w = MetalLlamaWeights::open_model(dir);
+  if (!w.has_value()) { return 0; }
+  std::size_t disk = 0;
+  for (const std::string& nm : w->tensor_names()) {
+    if (const auto* ti = w->info(nm)) { disk += (std::size_t)ti->nbytes; }
+  }
+  const std::size_t experts = routed_expert_bytes(*w, c);
+  if (experts == 0) { return 0; }
+  // Beside it: whatever the manager holds or was told is coming, without
+  // this checkpoint (counted at about its size on disk if declared).
+  std::size_t others = 0;
+  auto* mgr = session != nullptr && session->services() != nullptr
+                  ? session->services()->generative_model_manager()
+                  : nullptr;
+  if (mgr != nullptr) {
+    others = mgr->phase_footprint(std::string());
+    if (mgr->accounts_for(dir)) { others -= std::min(others, disk); }
+  }
+  // The irreversible headroom (model_memory::kStreamHeadroom): a cache
+  // sized now is not resized while the model lives.
+  constexpr std::size_t kHeadroom = (std::size_t)8 << 30;
+  const std::size_t budget =
+      ram > others + scratch + kHeadroom ? ram - others - scratch - kHeadroom
+                                         : 0;
+  const std::size_t rest = disk > experts ? disk - experts : 0;
+  return expert_cache_plan(budget, rest, experts,
+                           experts / (std::size_t)std::max(1, c.n_layers));
+}
+
+std::size_t
+MetalQwenModel::expert_cache_plan(std::size_t budget, std::size_t rest,
+                                  std::size_t experts,
+                                  std::size_t layer_expert_bytes)
+{
+  if (experts == 0 || rest + experts <= budget) { return 0; }
+  // A layer's experts transient (a prefill step may route to all of them)
+  // and whatever room remains resident. Below a layer's worth the cache
+  // still runs -- a step at a time from disk -- so that is the floor.
+  const std::size_t left = budget > rest ? budget - rest : 0;
+  return std::max(left, layer_expert_bytes);
 }
 
 // A raw checkpoint tensor in the compute dtype, read uncached -- the
@@ -4801,19 +5678,109 @@ MetalQwenModel::encode_moe_mlp_(
   enc.set_constant(3, E); enc.set_constant(4, K);
   enc.set_constant(5, c.moe_norm_topk ? 1 : 0);
   enc.dispatch({32, 1, (unsigned)M}, {32, 1, 1});
-  if (grp == nullptr && _dense) {
+  // ROUTED EXPERTS IN A CACHE (Config::expert_cache_bytes): the routes
+  // just computed are read back, the experts they name that are not cached
+  // are read from disk, and every pair's id becomes the SLOT holding its
+  // expert -- in place, since only the expert kernels read the ids. The
+  // dispatches below bind the cache's pools where a resident model binds
+  // the layer's slabs (the same layout, slot for expert), and the grouped
+  // sort counts slots.
+  const bool xs = _xc != nullptr;
+  if (xs) {
+    std::string why;
+    const int Lx = (int)(&ly - _layers.data());
+    // READ AHEAD (a decode step): the NEXT layer's router over this
+    // layer's input -- the residual stream moves little between layers --
+    // ranks what that layer will pick, and the cache reads the likeliest it
+    // does not hold while the GPU runs this one.
+    const int aw = M == 1 ? std::min(_xc->ahead_width(), _x_ahead) : 0;
+    const Layer* nx = aw > 0 && Lx + 1 < c.n_layers
+                          ? &_layers[(std::size_t)Lx + 1]
+                          : nullptr;
+    if (nx != nullptr && nx->rgw.empty()) { nx = nullptr; }
+    if (nx != nullptr) {
+      if (_dense) {
+        dense_gemv_(enc, nx->rgw, hn, 0, _x_pred_logits, 0, H, E);
+      } else {
+        enc.set_function(nx->r_bits == 8 ? _fn_qmv8 : _fn_qmv);
+        sb012(nx->rgw, nx->rgs, nx->rgb);
+        enc.set_buffer(3, hn); enc.set_buffer(4, _x_pred_logits);
+        enc.set_constant(5, H); enc.set_constant(6, E);
+        enc.dispatch({32, (unsigned)(E / 4), 1}, {32, 2, 1});
+      }
+    }
+    auto* ids = static_cast<std::int32_t*>(eid.contents());
+    MoeExpertCache::Ahead ah;
+    if (metal_compute::CommandStream::sync_and_reopen(enc, &why) &&
+        nx != nullptr) {
+      // Rank by logit (the softmax keeps the order): the first `aw`.
+      const auto* lg =
+          static_cast<const std::uint16_t*>(_x_pred_logits.contents());
+      std::vector<float> v((std::size_t)E);
+      for (int e = 0; e < E; ++e) {
+        const std::uint16_t u = lg[e];
+        if (c.use_bf16) {
+          v[(std::size_t)e] = bf16_to_f32_(u);
+        } else {
+          _Float16 h;
+          std::memcpy(&h, &u, 2);
+          v[(std::size_t)e] = (float)h;
+        }
+      }
+      for (int e = 0; e < E; ++e) { _x_rank[(std::size_t)e] = e; }
+      std::partial_sort(_x_rank.begin(), _x_rank.begin() + aw,
+                        _x_rank.end(), [&](std::int32_t a, std::int32_t b) {
+        return v[(std::size_t)a] > v[(std::size_t)b];
+      });
+      ah = {Lx + 1, _x_rank.data(), aw};
+    }
+    if (!why.empty() ||
+        !_xc->resolve(Lx, ids, np, M, ids, &why,
+                      ah.layer >= 0 ? &ah : nullptr)) {
+      if (!_xc_failed) {
+        _xc_failed = true;
+        if (const SessionContextIntf* s = _mc->session()) {
+          s->error(fmt("[qwen] the routed-expert cache failed at layer {}: "
+                       "{} -- this output is wrong", Lx, why));
+        }
+      }
+      std::fill(ids, ids + np, 0);     // in bounds, at least
+    }
+  }
+  const SharedBuffer& XGW = xs ? _xc->pool(0) : ly.eguw;
+  const SharedBuffer& XGS = xs ? _xc->pool(1) : ly.egus;
+  const SharedBuffer& XGB = xs && !_fp8_experts ? _xc->pool(2) : ly.egub;
+  const SharedBuffer& XDW = xs ? _xc->pool(_fp8_experts ? 2 : 3) : ly.edw;
+  const SharedBuffer& XDS = xs ? _xc->pool(_fp8_experts ? 3 : 4) : ly.eds;
+  const SharedBuffer& XDB = xs && !_fp8_experts ? _xc->pool(5) : ly.edb;
+  const int Ex = xs ? _xc->slots() : E;
+  if (grp == nullptr && _fp8_experts) {
+    // Block-FP8 routed experts: the same pair-batched gather, reading codes
+    // + block scales (same grids as the dense twins below).
+    enc.set_function(_fn_moe_gather_swiglu_fp8);
+    enc.set_buffer(0, XGW); enc.set_buffer(1, XGS);
+    enc.set_buffer(2, hn); enc.set_buffer(3, act);
+    enc.set_constant(4, H); enc.set_constant(5, 2 * I);
+    enc.set_buffer(6, eid); enc.set_constant(7, K);
+    enc.dispatch({32, (unsigned)(I / 2), (unsigned)np}, {32, 2, 1});
+    enc.set_function(_fn_moe_gather_down_fp8);
+    enc.set_buffer(0, XDW); enc.set_buffer(1, XDS);
+    enc.set_buffer(2, act); enc.set_buffer(3, part);
+    enc.set_constant(4, I); enc.set_constant(5, H); enc.set_buffer(6, eid);
+    enc.dispatch({32, (unsigned)(H / 4), (unsigned)np}, {32, 2, 1});
+  } else if (grp == nullptr && _dense && !_gptq_experts) {
     // Dense f16 pair-batched gather: gate|up+SwiGLU -> act[np, I], then down
     // -> partials[np, H] (un-weighted). Grids match the f16 RPS=4/NSG=2 gather
     // kernels: 2*I out rows / 8 per tg for swiglu (I/2 features), H/8 for down.
     enc.set_function(_fn_moe_gather_swiglu_dense);
-    enc.set_buffer(0, ly.eguw); enc.set_buffer(1, hn); enc.set_buffer(2, act);
+    enc.set_buffer(0, XGW); enc.set_buffer(1, hn); enc.set_buffer(2, act);
     enc.set_constant(3, H); enc.set_constant(4, 2 * I);
     enc.set_buffer(5, eid); enc.set_constant(6, K);
     // grid.y in THREADS: #tg_y(=I/4) * tg.y(=2) = I/2 (8 out rows / 4 feats
     // per tg over the 2*I interleaved gate|up rows).
     enc.dispatch({32, (unsigned)(I / 2), (unsigned)np}, {32, 2, 1});
     enc.set_function(_fn_moe_gather_down_dense);
-    enc.set_buffer(0, ly.edw); enc.set_buffer(1, act); enc.set_buffer(2, part);
+    enc.set_buffer(0, XDW); enc.set_buffer(1, act); enc.set_buffer(2, part);
     enc.set_constant(3, I); enc.set_constant(4, H); enc.set_buffer(5, eid);
     // grid.y THREADS: #tg_y(=H/8) * 2 = H/4 (8 H rows per tg).
     enc.dispatch({32, (unsigned)(H / 4), (unsigned)np}, {32, 2, 1});
@@ -4826,8 +5793,8 @@ MetalQwenModel::encode_moe_mlp_(
       // count I (not 2*I), so grid.y in threads is I/4, not I/2.
       enc.set_function(ly.eg_bits == 8 ? _fn_moe_gather_swiglu_g8u4
                                        : _fn_moe_gather_swiglu_g4u8);
-      enc.set_buffer(0, ly.eguw); enc.set_buffer(1, ly.egus);
-      enc.set_buffer(2, ly.egub);
+      enc.set_buffer(0, XGW); enc.set_buffer(1, XGS);
+      enc.set_buffer(2, XGB);
       enc.set_buffer(3, ly.euw); enc.set_buffer(4, ly.eus);
       enc.set_buffer(5, ly.eub);
       enc.set_buffer(6, hn); enc.set_buffer(7, act);
@@ -4838,7 +5805,7 @@ MetalQwenModel::encode_moe_mlp_(
     // gathered gate|up + SwiGLU -> act[np, I]
     enc.set_function(ly.eg_bits == 8 ? _fn_moe_gather_swiglu_w8
                                      : _fn_moe_gather_swiglu);
-    sb012(ly.eguw, ly.egus, ly.egub);
+    sb012(XGW, XGS, XGB);
     enc.set_buffer(3, hn); enc.set_buffer(4, act);
     enc.set_constant(5, H); enc.set_constant(6, 2 * I);
     enc.set_buffer(7, eid); enc.set_constant(8, K);
@@ -4847,7 +5814,7 @@ MetalQwenModel::encode_moe_mlp_(
     // gathered down -> partials[np, H]
     enc.set_function(ly.ed_bits == 8 ? _fn_moe_gather_down_w8
                                      : _fn_moe_gather_down);
-    sb012(ly.edw, ly.eds, ly.edb);
+    sb012(XDW, XDS, XDB);
     enc.set_buffer(3, act); enc.set_buffer(4, part);
     enc.set_constant(5, I); enc.set_constant(6, H); enc.set_buffer(7, eid);
     enc.dispatch({32, (unsigned)(H / 4), (unsigned)np}, {32, 2, 1});
@@ -4858,7 +5825,7 @@ MetalQwenModel::encode_moe_mlp_(
     const int mt = grp->maxtiles, npad = grp->npad;
     const bool skip_gs = grp->abl_gs || grp->abl_gemm;   // gather/scatter cost
     if (!grp->abl_sort) {
-      ifill(*grp->hist, 0, E);
+      ifill(*grp->hist, 0, Ex);
       ifill(*grp->srow, -1, npad);
       ifill(*grp->sdst, -1, npad);
       ifill(*grp->t2e, -1, mt);
@@ -4870,7 +5837,7 @@ MetalQwenModel::encode_moe_mlp_(
       enc.set_buffer(0, *grp->hist); enc.set_buffer(1, *grp->boff);
       enc.set_buffer(2, *grp->t2e); enc.set_buffer(3, *grp->curs);
       enc.set_buffer(4, *grp->ntile);
-      enc.set_constant(5, E); enc.set_constant(6, grp->maxm);
+      enc.set_constant(5, Ex); enc.set_constant(6, grp->maxm);
       enc.set_constant(7, mt);
       enc.dispatch({1, 1, 1}, {1, 1, 1});
       enc.set_function(_fn_moe_scatter);         // pairs -> sorted slots
@@ -4880,7 +5847,28 @@ MetalQwenModel::encode_moe_mlp_(
       enc.set_constant(5, np); enc.set_constant(6, K);
       enc.dispatch({(unsigned)np, 1, 1}, {256, 1, 1});
     }
-    if (grp->steel) {
+    if (grp->steel && _fp8_experts) {
+      // The block-FP8 twins: the same sorted tiles, row gather and scatter
+      // store, the weight read as codes + block scales.
+      if (!grp->abl_gemm) {
+        enc.set_function(_fn_moe_qmm_grouped_swiglu_fp8);
+        enc.set_buffer(0, XGW); enc.set_buffer(1, XGS);
+        enc.set_buffer(2, hn); enc.set_buffer(3, *grp->gact);
+        enc.set_constant(4, H); enc.set_constant(5, 2 * I);
+        enc.set_constant(6, npad); enc.set_buffer(7, *grp->t2e);
+        enc.set_buffer(8, *grp->srow);
+        enc.dispatch({(unsigned)(((2 * I + 31) / 32) * 32),
+                     (unsigned)(((npad + 31) / 32) * 2), 2}, {32, 2, 2});
+        enc.set_function(_fn_moe_qmm_grouped_fp8);
+        enc.set_buffer(0, XDW); enc.set_buffer(1, XDS);
+        enc.set_buffer(2, *grp->gact); enc.set_buffer(3, part);
+        enc.set_constant(4, I); enc.set_constant(5, H);
+        enc.set_constant(6, npad); enc.set_buffer(7, *grp->t2e);
+        enc.set_buffer(8, *grp->sdst);
+        enc.dispatch({(unsigned)(((H + 31) / 32) * 32),
+                     (unsigned)(((npad + 31) / 32) * 2), 2}, {32, 2, 2});
+      }
+    } else if (grp->steel) {
       // Matrix-tiled grouped steel GEMM (BM=32 tiles, one expert per tile).
       // The row-gather (hn via srow) is fused into the gate|up GEMM loader and
       // the scatter (to partials via sdst) into the down GEMM store -- no
@@ -4889,7 +5877,7 @@ MetalQwenModel::encode_moe_mlp_(
         // gate|up+SwiGLU steel: gact[npad, I] = gather(hn,srow) @ eguw_e^T
         enc.set_function(ly.eg_bits == 8 ? _fn_moe_qmm_grouped_swiglu_w8
                                          : _fn_moe_qmm_grouped_swiglu);
-        sb012(ly.eguw, ly.egus, ly.egub);
+        sb012(XGW, XGS, XGB);
         enc.set_buffer(3, hn); enc.set_buffer(4, *grp->gact);
         enc.set_constant(5, H); enc.set_constant(6, 2 * I);
         enc.set_constant(7, npad); enc.set_buffer(8, *grp->t2e);
@@ -4899,7 +5887,7 @@ MetalQwenModel::encode_moe_mlp_(
         // down steel: partials[np, H] = gact @ edw_e^T, scattered via sdst
         enc.set_function(ly.ed_bits == 8 ? _fn_moe_qmm_grouped_w8
                                          : _fn_moe_qmm_grouped);
-        sb012(ly.edw, ly.eds, ly.edb);
+        sb012(XDW, XDS, XDB);
         enc.set_buffer(3, *grp->gact); enc.set_buffer(4, part);
         enc.set_constant(5, I); enc.set_constant(6, H);
         enc.set_constant(7, npad); enc.set_buffer(8, *grp->t2e);
@@ -4911,14 +5899,14 @@ MetalQwenModel::encode_moe_mlp_(
       // Bandwidth GEMV grouping (MAXM=2 tiles; medium prefill).
       enc.set_function(ly.eg_bits == 8 ? _fn_moe_grouped_swiglu_w8
                                        : _fn_moe_grouped_swiglu);
-      sb012(ly.eguw, ly.egus, ly.egub);
+      sb012(XGW, XGS, XGB);
       enc.set_buffer(3, hn); enc.set_buffer(4, *grp->gact);
       enc.set_constant(5, H); enc.set_constant(6, 2 * I);
       enc.set_buffer(7, *grp->srow); enc.set_buffer(8, *grp->t2e);
       enc.dispatch({32, (unsigned)(I / 2), (unsigned)mt}, {32, 2, 1});
       enc.set_function(ly.ed_bits == 8 ? _fn_moe_grouped_down_w8
                                        : _fn_moe_grouped_down);
-      sb012(ly.edw, ly.eds, ly.edb);
+      sb012(XDW, XDS, XDB);
       enc.set_buffer(3, *grp->gact); enc.set_buffer(4, *grp->gdout);
       enc.set_constant(5, I); enc.set_constant(6, H);
       enc.set_buffer(7, *grp->srow); enc.set_buffer(8, *grp->t2e);
@@ -4955,14 +5943,26 @@ MetalQwenModel::encode_moe_mlp_(
     // we pass the slab directly, top_k=1, one pair per row). Simplest correct
     // route: reuse the gather-swiglu kernel over M rows treating each row as
     // its own pair into the single shared slab.
-    for (int mrow = 0; mrow < M; ++mrow) {
-      enc.set_function(_fn_moe_gather_swiglu_dense);
-      enc.set_buffer(0, ly.sguw);
-      enc.set_buffer(1, hn, (std::size_t)mrow * H * 2);
-      enc.set_buffer(2, ssg, (std::size_t)mrow * Sh * 2);
-      enc.set_constant(3, H); enc.set_constant(4, 2 * Sh);
-      enc.set_buffer(5, _moe_zero_eid); enc.set_constant(6, 1);
-      enc.dispatch({32, (unsigned)(Sh / 2), 1}, {32, 2, 1});
+    if (M == 1 || !_fn_swiglu_il.valid() || K * I < 2 * Sh) {
+      for (int mrow = 0; mrow < M; ++mrow) {
+        enc.set_function(_fn_moe_gather_swiglu_dense);
+        enc.set_buffer(0, ly.sguw);
+        enc.set_buffer(1, hn, (std::size_t)mrow * H * 2);
+        enc.set_buffer(2, ssg, (std::size_t)mrow * Sh * 2);
+        enc.set_constant(3, H); enc.set_constant(4, 2 * Sh);
+        enc.set_buffer(5, _moe_zero_eid); enc.set_constant(6, 1);
+        enc.dispatch({32, (unsigned)(Sh / 2), 1}, {32, 2, 1});
+      }
+    } else {
+      // Many rows: ONE GEMM over the interleaved gate|up weight into the
+      // routed experts' act scratch (consumed by the down gather above;
+      // np*I >= M*2Sh because top_k*I >= 2Sh), then the interleaved
+      // SwiGLU -- a row a dispatch read the shared weight once per row.
+      dense_gemm_(enc, ly.sguw, hn, act, H, 2 * Sh, M);
+      enc.set_function(_fn_swiglu_il);
+      enc.set_buffer(0, act); enc.set_buffer(1, ssg);
+      enc.set_constant(2, M); enc.set_constant(3, Sh);
+      enc.dispatch({(unsigned)(M * Sh), 1, 1}, {256, 1, 1});
     }
     // shared down -> sout[M, H] (dense GEMV per row / GEMM).
     if (M == 1) {
@@ -6019,6 +7019,20 @@ MetalQwenModel::forward_embeddings_hidden(ContextId cid, const SharedBuffer& x,
 }
 
 metal_compute::SharedBuffer
+MetalQwenModel::forward_embeddings_hidden_all(ContextId cid,
+                                              const SharedBuffer& x, int n)
+{
+  const int H = _cfg.hidden;
+  if (n <= 0 || x.byte_size() < (std::size_t)n * H * 2) { return {}; }
+  SharedBuffer last, all;
+  // verify_all keeps the last layer's MLP on every row (a dense model
+  // prunes it to the last row otherwise; a MoE never does).
+  forward_chunk_(cid, x, n, nullptr, nullptr, /*verify_all=*/!_cfg.is_moe(),
+                 /*preds_out=*/nullptr, /*return_hidden=*/true, &last, &all);
+  return all;
+}
+
+metal_compute::SharedBuffer
 MetalQwenModel::forward_embeddings_taps(ContextId cid, const SharedBuffer& x,
                                         int n,
                                         const std::vector<int>& tap_layers,
@@ -6922,26 +7936,31 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
   // n >= 64; VPIPE_QWEN_MOE_GROUPED=1/0 forces on/off, VPIPE_QWEN_MOE_STEEL=1/0
   // forces the steel tier. npad pads each expert's block to the tile (maxm);
   // maxtiles bounds the segmented dispatch.
-  const bool moe_grouped = c.is_moe() && !_dense && [&] {
+  const bool moe_grouped =
+      c.is_moe() && (!_dense || _fp8_experts || _gptq_experts) && [&] {
     // Dense f16 MoE has no grouped/steel kernel twins -> always the
     // pair-batched gather path (correctness-first; this is for calibration).
+    // Block-FP8 experts have the steel tier only, from _fp8_grouped_min.
     const char* e = std::getenv("VPIPE_QWEN_MOE_GROUPED");
     if (e) { return std::atoi(e) != 0; }
-    return n >= 64;
+    return n >= (_fp8_experts ? _fp8_grouped_min : 64);
   }();
-  const bool moe_steel = moe_grouped && [&] {
+  const bool moe_steel = moe_grouped && (_fp8_experts || [&] {
     const char* e = std::getenv("VPIPE_QWEN_MOE_STEEL");
     if (e) { return std::atoi(e) != 0; }
     return n >= _moe_steel_min;          // per-machine crossover (tunable)
-  }();
+  }());
   const int kMoeMAXM = moe_steel ? 32 : 2;   // steel BM tile vs GEMV sweet spot
   // npad is a multiple of the tile size and >= every expert block padded to
   // MAXM (= ceil(np/MAXM) real tiles + one pad tile per expert), so the
   // segmented dispatch (ceil(npad/MAXM) tiles) never indexes past tile2e.
+  // With the experts in a cache the sort runs over SLOTS: a step touches
+  // at most np of them, which bounds the tiles as the expert count does.
+  const int moe_x = _xc ? _xc->slots() : c.n_experts;
   const int moe_maxtiles = moe_grouped
-      ? (moe_np + kMoeMAXM - 1) / kMoeMAXM + c.n_experts : 0;
+      ? (moe_np + kMoeMAXM - 1) / kMoeMAXM + std::min(moe_x, moe_np) : 0;
   const int moe_npad = moe_maxtiles * kMoeMAXM;
-  const std::size_t nE = (std::size_t)c.n_experts;
+  const std::size_t nE = (std::size_t)moe_x;
   const std::size_t npd = (std::size_t)moe_npad;
   auto gi = [&](std::size_t e) {   // grouped int buffer (or empty when off)
     return moe_grouped ? i32n(e) : SharedBuffer{};

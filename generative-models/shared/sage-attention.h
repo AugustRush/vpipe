@@ -67,6 +67,13 @@ namespace sage {
 // 15..18 (q8, k8, q_scale, k_scale); one built with it false is the
 // dense kernel, unchanged and not merely equivalent.
 inline constexpr int kQkInt8Constant = 306;
+// ...and the int8 P*V's two (Config::pv8), set together on top of it:
+// 308 takes V's three operands at 19..21, 310 reads q_scale per token
+// rather than per query block. Optional in the kernel contract -- set
+// them through MetalSageAttention::pv8_constants with pv8_for(), which
+// is false on a host that predates them.
+inline constexpr int kPvInt8Constant = 308;
+inline constexpr int kQTokenScaleConstant = 310;
 
 struct Config {
   bool enabled = false;
@@ -87,6 +94,27 @@ struct Config {
   // that shows why (see the note above), and is not a supported way to
   // run a model.
   bool smooth_k = true;
+
+  // P*V IN INT8 TOO, beyond the method. The flash kernel holds the
+  // product in int32 across key blocks with no f32 O at all: P on a
+  // uint8 grid against the row's running max (0..255), V with one scale
+  // per channel over the sequence and offset by 128, the online
+  // softmax's rescale applied to the int32 sum when a row's max grows,
+  // the offset taken out with P's exact row sum. Q goes per token.
+  // MEASURED on the M5 Pro, 8 heads x 20036 rows x 128, bf16: 44.0 ms
+  // against Sage's 50.6 and the dense kernel's 67.7; cosine against the
+  // dense kernel 0.99957 on random keys (Sage 0.99992), the gap
+  // narrowing as attention sharpens (sage_attention.int8_pv_held).
+  bool pv8 = false;
+  // ...from this sampling step on: the steps before run the int8 QK
+  // alone. -1 is the family's own choice -- MiniMax-H3's the first
+  // quarter of its steps, where a clip's layout is settled. A family
+  // whose loop does not say which step it is runs pv8 on every one.
+  int pv8_from_step = -1;
+  // ...on every query row. Off, a family whose sequence leads with the
+  // prompt's and the soundtrack's rows (MiniMax-H3's) runs those on the
+  // int8 QK alone, in a dispatch of their own.
+  bool pv8_all_rows = false;
 };
 
 // The same settings out of the acceleration BAG a generating stage hands
@@ -105,6 +133,10 @@ config_from_flex(const FlexData* bag)
   c.enabled = accel::flag(bag, accel::kSageAttn, c.enabled);
   c.dense_layers =
       (int)accel::integer(bag, accel::kSageDenseLayers, c.dense_layers);
+  c.pv8 = accel::flag(bag, accel::kSagePv8, c.pv8);
+  c.pv8_from_step = (int)accel::integer(bag, accel::kSagePv8FromStep,
+                                        c.pv8_from_step);
+  c.pv8_all_rows = accel::flag(bag, accel::kSagePv8AllRows, c.pv8_all_rows);
   return c;
 }
 

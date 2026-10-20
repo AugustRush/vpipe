@@ -53,6 +53,13 @@ class MetalSageAttention {
   // does not validate -- never an object that dispatches no-ops, which
   // is the failure this backend makes silent. `bf16` selects the
   // bfloat twin of the quantize kernels; false is f16.
+  //
+  // Only the int8 QK's three kernels are REQUIRED. The int8 P*V's four
+  // came later, and this class is compiled into plugins: one built
+  // against a newer SDK runs on hosts whose library lacks them, and
+  // refusing there would turn every Sage graph on such a host into a
+  // refused model. Without them pv8_available() is false and prepare()
+  // makes the int8 QK alone, whatever the config asks.
   static std::unique_ptr<MetalSageAttention>
   load(metal_compute::MetalCompute* mc, bool bf16, std::string* err);
 
@@ -90,8 +97,12 @@ class MetalSageAttention {
   // both grouped; H3 and Qwen-Image are not). K is quantized once per
   // KV head, not once per query head -- the kernel indexes it the same
   // way it indexes the f16 K.
+  // `pv8`: with the int8 P*V's operands too (sage::Config::pv8) -- V
+  // as uint8 [kv_heads, k_tokens, d], its scale and mean, and Q's scale
+  // per token rather than per block.
   static std::size_t scratch_bytes(int heads, int kv_heads, int q_tokens,
-                                   int k_tokens, int d, int bq, int bk);
+                                   int k_tokens, int d, int bq, int bk,
+                                   bool pv8 = false);
 
   // ...and what it will still allocate for ITSELF once `lend_a` and
   // `lend_b` bytes have been lent, which is the figure a caller's
@@ -100,7 +111,8 @@ class MetalSageAttention {
   // disagree about which buffers fit.
   static std::size_t private_bytes(int heads, int kv_heads, int q_tokens,
                                    int k_tokens, int d, int bq, int bk,
-                                   std::size_t lend_a, std::size_t lend_b);
+                                   std::size_t lend_a, std::size_t lend_b,
+                                   bool pv8 = false);
 
   // The steel NAX kernel's tiles at head_dim 128, which is what every
   // DiT in this tree runs. Named rather than open-coded at four call
@@ -157,10 +169,15 @@ class MetalSageAttention {
     int         head = 0;
   };
 
+  //
+  // `v`, with cfg.pv8: V's operand too, addressed as q and k are, and
+  // the int8 P*V's prologue after theirs -- Q then quantized per token,
+  // V's mean and per-channel scale over the sequence, V as uint8 + 128.
+  // Without either, the int8 QK alone, as before.
   bool prepare(metal_compute::ComputeEncoder& e, const Operand& q,
                const Operand& k, int heads, int kv_heads, int q_tokens,
                int k_tokens, int d, int bq, int bk, const sage::Config& cfg,
-               std::string* err);
+               std::string* err, const Operand* v = nullptr);
 
   // Bind the four operands at buffers 15..18 onto a dispatch whose
   // function was built with constant 306 true. Call AFTER set_function
@@ -169,7 +186,72 @@ class MetalSageAttention {
   // Binding these onto a function built WITHOUT 306 is harmless (the
   // slots are unused); the reverse is not, and is why prepare() refuses
   // rather than warns when its scratch is not there.
+  //
+  // After a pv8 prepare(), V's three at 19..21 as well: the function
+  // must then have been built with pv8_constants(fc, true).
   void bind(metal_compute::ComputeEncoder& e) const;
+  // ...for a dispatch whose query rows start at `q_row0` of those
+  // prepare() quantized (the caller's Q and O bound from there too, and
+  // its params counting blocks from there): Q's int8 and per-token scale
+  // bound from that row. K's and V's are whole. FALSE, binding nothing,
+  // when the last prepare() did not make per-token scales (a pv8 one)
+  // and q_row0 is not 0: a per-block scale is indexed by the dispatch's
+  // own block numbers, which no longer count from 0, so there is no
+  // offset that would be right. The caller must not dispatch then.
+  bool bind(metal_compute::ComputeEncoder& e, int q_row0) const;
+
+  // The int8 P*V's function constants (308, 310), on or off,
+  // for a caller building the flash function that bind() feeds.
+  static void pv8_constants(metal_compute::FunctionConstants& fc, bool on);
+
+  // Whether this host's library carries the int8 P*V's kernels (see
+  // load()). The flash kernel's constants 308 and 310 arrived with them,
+  // so their presence is also the answer for the kernel.
+  bool pv8_available() const noexcept { return _pv8_kernels; }
+
+  // Whether a prepare() under `cfg` will make the int8 P*V's operands:
+  // asked for AND available. BUILD THE FLASH FUNCTION FROM THIS, not
+  // from cfg.pv8 -- a function with 308 and 310 set over a prologue
+  // that made none reads Q's scales in the wrong layout and V's from
+  // unbound buffers. (Given V; prepare() without one makes none.)
+  bool pv8_for(const sage::Config& cfg) const noexcept {
+    return cfg.pv8 && _pv8_kernels;
+  }
+
+  // A CAPACITY, for a caller whose attention runs at several row counts
+  // in one forward -- FLUX.3 runs each token mode's stack over its own
+  // rows and then the joint stack over all of them. Without one, every
+  // change of row count rebuilds the scratch (a private free and
+  // allocation, two or three a forward there); with one, a prepare()
+  // whose geometry it COVERS -- the same heads, kv heads, head dim and
+  // tiles, no more query or key tokens, no P*V it was built without --
+  // reuses it. Its operands are written and read at the CALL's own
+  // geometry either way, so the answer is the same bit for bit.
+  //
+  // Built EXACTLY at this geometry -- it shrinks as well as grows -- unless
+  // the scratch already is that, so call it with the forward's largest
+  // attention before its first prepare(), every forward: a size that
+  // stays put builds once. A prepare() it does not cover rebuilds at the
+  // call's own geometry and drops the reservation. `pv8` builds the int8
+  // P*V's buffers too (only where pv8_available()). False, with `err`,
+  // when the geometry is refused or the allocation fails.
+  bool reserve(int heads, int kv_heads, int q_tokens, int k_tokens, int d,
+               int bq, int bk, bool pv8, std::string* err);
+
+  // How many times the scratch has been BUILT (allocated, carved), for a
+  // test or a caller that wants to know a forward did not rebuild it.
+  int scratch_builds() const noexcept { return _builds; }
+
+  // Build the scratch with the int8 P*V's buffers from the FIRST
+  // prepare(), whether or not that call uses them -- for a caller that
+  // turns pv8 on part way through a run (MiniMax-H3 keeps its early
+  // steps off). Without it, the first pv8 call rebuilds the scratch;
+  // either way a scratch that has them serves a call that does not, so
+  // a run toggles it once at most. Set it before the first prepare().
+  void reserve_pv8(bool on) noexcept { _reserve_pv8 = on; }
+
+  // Whether the last prepare() made the int8 P*V's operands too.
+  bool pv8_ready() const noexcept { return _ready && _pv8_ready; }
 
   // Whether the last prepare() produced usable operands. A caller that
   // wants to fall back to dense within one forward checks this rather
@@ -185,8 +267,15 @@ class MetalSageAttention {
  private:
   MetalSageAttention() = default;
   std::vector<metal_compute::SharedBuffer*> scratch_buffers_();
+  // `exact` (reserve) builds at this geometry unless it is exactly
+  // that; otherwise (prepare) a reservation that covers the call is
+  // kept, and anything else is rebuilt at the call's geometry.
   bool ensure_scratch_(int heads, int kv_heads, int q_tokens, int k_tokens,
-                       int d, int bq, int bk, std::string* err);
+                       int d, int bq, int bk, bool pv8, bool exact,
+                       std::string* err);
+  // The geometry checks prepare() and reserve() share; "" when valid.
+  static std::string check_geometry_(int heads, int kv_heads, int q_tokens,
+                                     int k_tokens, int d, int bq, int bk);
   // Every add to the process-wide residency set is owed a remove: the
   // set RETAINS what it holds and outlives every model, and most of
   // these buffers are windows into an arena the caller lent -- a
@@ -199,13 +288,19 @@ class MetalSageAttention {
   bool                          _bf16 = false;
   metal_compute::ComputeLibrary _lib;
   metal_compute::ComputeFunction _fn_sum, _fn_reduce, _fn_quant;
+  // The int8 P*V's: Q per token, V's absmax over the sequence, V8 + 128.
+  metal_compute::ComputeFunction _fn_qtok, _fn_vam, _fn_var, _fn_vq8;
 
   // [H, D] fp32 key mean, and the per-chunk partials it reduces from.
   metal_compute::SharedBuffer _km, _kmp;
   // [H, qL, D] / [H, kL, D] int8, tightly packed.
   metal_compute::SharedBuffer _q8, _k8;
-  // [H, NQ] / [H, NK] fp32, one scale per attention tile.
+  // [H, NQ] / [H, NK] fp32, one scale per attention tile ([H, qL] for
+  // Q with pv8: per token).
   metal_compute::SharedBuffer _qs, _ks;
+  // pv8: V as uint8 [KVH, kL, D]; its scale and mean [KVH, D] fp32; the
+  // per-chunk partials both reduce from.
+  metal_compute::SharedBuffer _v8, _vs, _vm, _vmp;
 
   metal_compute::SharedBuffer _arena_a, _arena_b;
   std::size_t                 _arena_used[2] = {0, 0};
@@ -214,7 +309,13 @@ class MetalSageAttention {
   std::size_t                 _own = 0;
 
   int  _heads = 0, _kvh = 0, _qt = 0, _kt = 0, _d = 0, _bq = 0, _bk = 0;
+  bool _pv8 = false;         // the scratch's geometry has pv8's buffers
+  bool _pv8_kernels = false; // the library carries pv8's four kernels
+  bool _reserve_pv8 = false; // build pv8's buffers from the first call
+  bool _reserved = false;    // the scratch is a reserve()d capacity
+  int  _builds = 0;          // scratch builds, see scratch_builds()
   bool _ready = false;
+  bool _pv8_ready = false;
 };
 
 }  // namespace genai

@@ -154,6 +154,7 @@ it, so you point **one** stage at a model rather than three.
 | `seed` | `generate-image` | 0 | Same seed + same settings ⇒ same image. |
 | `i8_gemm` | `generate-image` | `true` | An opt-in **lossy** accelerated mode. Matrix-core GPUs (M5 and newer) only — it does nothing on an M4, and the timing below assumes it is on. |
 | `sage_attn` | `generate-image` | `false` | A second opt-in **lossy** accelerated mode, and an independent one — [SageAttention](https://arxiv.org/abs/2410.02367) runs the attention's QK^T product in int8 with one scale per attention block, where `i8_gemm` changes the GEMMs around it. Both are settable together and neither reads the other. Measured 1.20× on the attention at 8 heads × 20036 rows, at cosine 0.99992 against a double-precision reference — the same the f16 kernel scores. Matrix cores only; an M4 says so once and runs dense. `sage_dense_layers` (default 0) leaves a leading run of blocks in f16. |
+| `sage_pv8` | `generate-image` | `false` | With `sage_attn`: the attention's P·V product in int8 too, held in int32 across key blocks, on every step and row. At 2048 × 2048 on an M5 Ultra the warm denoise went from 27.40 s to 25.61 s. |
 | `guidance_scale` | `generate-image` | (default 1) | **Leave it.** Turbo is CFG-distilled; above 1 it runs a second DiT pass per step and pushes toward a negative prompt it was never trained against. |
 | `shift` | `scheduler-select` | **0.3** | The tuned one. See below. |
 | `lora` / `lora_scale` | `krea2-model-config` | `mgwr/M87` / 1.0 | The adapter, by registry key. |

@@ -1352,6 +1352,91 @@ TEST(z_image_dit, sol_attention_engages_and_stays_close)
   EXPECT_TRUE(d < 0.6);
 }
 
+// SAGE, and its scratch built ONCE. Sage rides the NAX attention only,
+// so it engages on an M5 and is skipped elsewhere; a segment must reach
+// kSageMinSegment (512) rows, and the wide golden's image half and joint
+// sequence both do. The caption refiner, the noise refiner and the main
+// stack attend at different row counts, and each change used to rebuild
+// Sage's scratch -- a private free and allocation, twice a forward here.
+// Each forward now reserves the main stack's: two forwards build it
+// once, and the answer is the same bits as without the reservation
+// (VPIPE_Z_IMAGE_SAGE_NO_RESERVE), which still rebuilds per row count.
+TEST(z_image_dit, sage_attention_engages_and_builds_its_scratch_once)
+{
+  const Golden G = load_golden_("wide");
+  if (!G.ok) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalZImageTransformer::Config cfg;
+  const std::string ckpt = (G.dir / G.tag).string();
+  ZI_REQUIRE(MetalZImageTransformer::Config::read_dims(ckpt, &cfg));
+  // Both refiner and main stack clear Sage's floor, and differ in rows.
+  EXPECT_TRUE(G.lay.img_total >= 512 && G.lay.joint_len > G.lay.img_total);
+
+  auto base = MetalZImageTransformer::load(ckpt, mc, cfg, false);
+  ZI_REQUIRE(base != nullptr);
+  std::string e1;
+  const std::vector<float> off = run_golden_(base.get(), mc, G, &e1);
+  base.reset();
+
+  cfg.sage.enabled = true;
+  auto m = MetalZImageTransformer::load(ckpt, mc, cfg, false);
+  ZI_REQUIRE(m != nullptr);
+  const bool engaged = m->uses_sage_attn();
+  std::string e2;
+  const std::vector<float> on = run_golden_(m.get(), mc, G, &e2);
+  const std::vector<float> on2 = run_golden_(m.get(), mc, G, &e2);
+  const int builds = m->sage_scratch_builds();
+  const std::size_t held = m->sage_scratch_held();
+  m.reset();
+  if (!engaged) {
+    std::printf("[z_image_dit] sage_attn needs the NAX attention (an M5); "
+                "skipped\n");
+    return;
+  }
+  ::setenv("VPIPE_Z_IMAGE_SAGE_NO_RESERVE", "1", 1);
+  auto u = MetalZImageTransformer::load(ckpt, mc, cfg, false);
+  ::unsetenv("VPIPE_Z_IMAGE_SAGE_NO_RESERVE");
+  ZI_REQUIRE(u != nullptr);
+  const std::vector<float> un = run_golden_(u.get(), mc, G, &e2);
+  const int ubuilds = u->sage_scratch_builds();
+  u.reset();
+  ZI_REQUIRE(!off.empty() && on.size() == off.size() &&
+             on2.size() == on.size() && un.size() == on.size());
+  const double d = rel_l2_(on, off);
+  const double r = rel_l2_(on, G.out);
+  const bool same2 =
+      std::memcmp(on.data(), on2.data(), on.size() * sizeof(float)) == 0;
+  const bool same_u =
+      std::memcmp(on.data(), un.data(), on.size() * sizeof(float)) == 0;
+  std::printf("[z_image_dit] sage: rel-L2 vs bf16 %.6f, vs reference %.6f "
+              "(bf16 alone %.6f); scratch %d build(s) over two forwards "
+              "reserved, %d in one without; second forward %s, without "
+              "the reservation %s\n", d, r, rel_l2_(off, G.out), builds,
+              ubuilds, same2 ? "bit-identical" : "DIFFERS",
+              same_u ? "bit-identical" : "DIFFERS");
+  EXPECT_TRUE(std::isfinite(d) && std::isfinite(r));
+  EXPECT_TRUE(d > 0.0);          // it actually changed the arithmetic
+  EXPECT_TRUE(r < 0.12);         // and did not wreck it
+  EXPECT_TRUE(builds == 1);
+  EXPECT_TRUE(ubuilds >= 2);
+  EXPECT_TRUE(same2 && same_u);
+  // What the plan books for it is what it holds: ONE geometry, the main
+  // stack's -- the booking's Sage term, taken as the difference Sage
+  // makes to it (it summed all three geometries while they rebuilt).
+  MetalZImageTransformer::Config dense = cfg;
+  dense.sage.enabled = false;
+  const std::size_t booked =
+      MetalZImageTransformer::forward_scratch_bytes(
+          cfg, G.lay.img_tokens, G.cap_len, false, true) -
+      MetalZImageTransformer::forward_scratch_bytes(
+          dense, G.lay.img_tokens, G.cap_len, false, true);
+  std::printf("[z_image_dit] sage scratch held %zu KB, booked %zu KB\n",
+              held >> 10, booked >> 10);
+  EXPECT_TRUE(held > 0 && held == booked);
+}
+
 // ---- runtime LoRA ----------------------------------------------------
 //
 // Checked against the reference's OWN dense arithmetic: the dumper

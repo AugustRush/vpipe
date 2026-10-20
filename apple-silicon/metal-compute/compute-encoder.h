@@ -249,6 +249,13 @@ private:
     std::size_t   bytes_len = 0;
   };
 
+  // READ INLINE BY PLUGINS: CommandStream::sync_and_reopen (an inline in
+  // command-stream.h) compiles the MEANING of three fields below into
+  // every plugin that calls it -- _stream null means no stream,
+  // _scope_depth > 0 means inside a concurrent_scope, _dt is the dispatch
+  // type this encoder was opened with. The snapshot freezes their offsets
+  // (this type is held by value); changing what they mean is an ABI change
+  // too.
   MTL::ComputeCommandEncoder* _enc = nullptr;
   MTL::CommandBuffer* _cb = nullptr;   // owning command buffer (for reencode_)
   long _n_dispatch = 0;

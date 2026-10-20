@@ -504,6 +504,21 @@ LoadedLanguageModel::LoadedLanguageModel(
         mcfg.max_pages   = (int)max_pages;
         mcfg.use_bf16    = (compute_dtype_in == ComputeDtype::BF16);
         mcfg.mtp_dir     = mtp_dir;
+        // A Mixture-of-Experts model too big for the box keeps its ROUTED
+        // EXPERTS in a cache (the rest resident and wired, a missed expert
+        // read from disk, the most-selected kept): the engine's call, on
+        // the same rule the stages size by. 2 GB set aside for the K/V and
+        // activations a conversation grows.
+        if (mcfg.is_moe()) {
+          mcfg.expert_cache_bytes = MetalQwenModel::lm_expert_cache_bytes(
+              session, model_dir, mcfg, (std::size_t)2 << 30);
+          if (mcfg.expert_cache_bytes > 0 && session != nullptr) {
+            session->info(fmt("LoadedLanguageModel('{}'): the routed "
+                              "experts do not fit this box beside the rest "
+                              "-- a {} MB expert cache", model_dir,
+                              mcfg.expert_cache_bytes >> 20));
+          }
+        }
         _impl->metal_bf16 = mcfg.use_bf16;
         _impl->exec = make_unique<MetalQwenModelExec>(
             model_dir, mc_be, mcfg, session);

@@ -222,6 +222,16 @@ inline constexpr ToolkitKernel kToolkitKernels[] = {
   {"sage_quant", "sage_k_sum_chunk"},
   {"sage_quant", "sage_k_mean_reduce"},
   {"sage_quant", "sage_quant_block"},
+  // ...and its int8 P*V's prologue: Q per token, V's absmax over the
+  // sequence (chunks, then a reduce), V as uint8. Optional: a toolkit on
+  // a host older than these finds them invalid and runs the int8 QK
+  // alone (MetalSageAttention::pv8_available() false). The flash
+  // kernel's constants kAttnPvInt8 / kAttnQTokenScale arrived with them,
+  // so a toolkit sets those only where these resolve.
+  {"sage_quant", "sage_quant_token"},
+  {"sage_quant", "sage_v_absmax_chunk"},
+  {"sage_quant", "sage_v_absmax_reduce"},
+  {"sage_quant", "sage_quant_v_channel_u8"},
   // Sol-Attn's routing (shared/metal-sol-attention.h); its exact blocks
   // run on the steel kernels above.
   {"sol_attn_mma", "sol_summaries_mma"},
@@ -296,6 +306,18 @@ inline constexpr int kAttnHasMask = 300;   // a mask buffer is bound
 inline constexpr int kAttnCausal  = 301;   // causal masking
 inline constexpr int kAttnSinks   = 302;   // attention sinks are bound
 inline constexpr int kAttnQkInt8  = 306;   // SageAttention int8 QK path
+// ...and, on the attn_steel_nax entries with kAttnQkInt8 set, its P*V in
+// int8 too, held in int32 across key blocks (both set together; see
+// MetalSageAttention::pv8_constants). kAttnQTokenScale reads Q's scales
+// per TOKEN, [B, H, qL] at buffer 17, where kAttnQkInt8 alone reads one
+// per query block. kAttnPvInt8 takes three operands more: V as uint8
+// (V minus its mean, quantized, plus 128) [B, KVH, kL, D] at 19, its
+// per-channel scale and mean [B, KVH, D] fp32 at 20 and 21. Optional: a
+// host that predates them does not declare them, and a function built
+// with them set there is the int8 QK alone -- which is why the toolkit
+// sets them only where the sage_quant_token family resolves.
+inline constexpr int kAttnPvInt8      = 308;
+inline constexpr int kAttnQTokenScale = 310;
 
 }  // namespace contract
 }  // namespace metal_compute

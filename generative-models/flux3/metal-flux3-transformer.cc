@@ -868,6 +868,8 @@ MetalFlux3Transformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
       }
       m->_sage.reset();
     }
+    m->_sage_reserve =
+        std::getenv("VPIPE_FLUX3_SAGE_NO_RESERVE") == nullptr;
   }
   if (const char* t = std::getenv("VPIPE_FLUX3_GEMM_TILE")) {
     m->_gemm_tile = std::atoi(t);
@@ -1489,6 +1491,8 @@ MetalFlux3Transformer::forward(const Request& req, std::string* err)
     fc.set_bool(200, (R % A_BQ) == 0).set_bool(201, (R % A_BK) == 0)
         .set_bool(300, false).set_bool(301, false).set_bool(302, false)
         .set_bool(sage::kQkInt8Constant, i8);
+    MetalSageAttention::pv8_constants(
+        fc, i8 && _sage && _sage->pv8_for(_cfg.sage));
     metal_compute::ComputeFunction fn =
         nax ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
             : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
@@ -1535,9 +1539,15 @@ MetalFlux3Transformer::forward(const Request& req, std::string* err)
         (joint_idx < 0 || joint_idx >= _cfg.sage.dense_layers)) {
       const MetalSageAttention::Operand qo{&qh, 0, Hd, rows * Hd};
       const MetalSageAttention::Operand ko{&kh, 0, Hd, rows * Hd};
+      const MetalSageAttention::Operand vo{&vh, 0, Hd, rows * Hd};
       std::string gerr;
       i8_ok = _sage->prepare(enc, qo, ko, NH, NH, rows, rows, Hd, A_BQ,
-                             A_BK, _cfg.sage, &gerr);
+                             A_BK, _cfg.sage, &gerr, &vo);
+      // The int8 function takes the int8 P*V's operands iff pv8_for()
+      // says so: a prologue that made none runs dense.
+      if (i8_ok && _sage->pv8_for(_cfg.sage) != _sage->pv8_ready()) {
+        i8_ok = false;
+      }
     }
     const SharedBuffer* pp = params_for(rows);
     const metal_compute::ComputeFunction* fn = attn_fn(rows, i8_ok);
@@ -1782,6 +1792,32 @@ MetalFlux3Transformer::forward(const Request& req, std::string* err)
     _lora_scratch_rows = (std::size_t)JT;
     _lora.ensure_scratch(_lora_scratch_rows *
                          (std::size_t)_lora_rank_total);
+  }
+
+  // SAGE'S SCRATCH, sized ONCE for the forward's largest attention. The
+  // stacks attend at up to four row counts -- each mode's own rows, then
+  // the joint's -- and a prepare() at a new count rebuilt the scratch: a
+  // private free and allocation two or three times a forward. Reserved
+  // at the largest Sage will see (the joint covers every mode's), the
+  // smaller calls reuse it; a forward at the same size builds nothing.
+  if (_sage && nax && _cfg.sage.enabled && _sage_reserve) {
+    int big = 0;
+    auto take = [&](int rows) {
+      if (rows >= kSageMinSegment) { big = std::max(big, rows); }
+    };
+    take(IMG);
+    take(TXT);
+    if (COND > 0) { take(COND); }
+    if (_cfg.sage.dense_layers < _cfg.n_single) { take(JT); }
+    std::string rerr;
+    if (big > 0 &&
+        !_sage->reserve(NH, NH, big, big, Hd, A_BQ, A_BK,
+                        _sage->pv8_for(_cfg.sage), &rerr) &&
+        _mc->session() != nullptr) {
+      // Not fatal: each prepare() sizes its own call, as without one.
+      _mc->session()->log_debug(fmt(
+          "flux3: sage scratch not reserved at {} rows ({})", big, rerr));
+    }
   }
 
   // THE ORDER THE BLOCKS RUN IN, which is also the order streaming reads
@@ -2148,7 +2184,22 @@ MetalFlux3Transformer::forward_scratch_bytes(const Config& c,
   const std::size_t H = (std::size_t)c.hidden;
   const std::size_t F = (std::size_t)c.mlp_hidden;
   const std::size_t Hd = (std::size_t)c.head_dim;
-  return R * H * 2 * 11 + R * F * 3 * 2 + R * Hd * 4 * 2;
+  std::size_t n = R * H * 2 * 11 + R * F * 3 * 2 + R * Hd * 4 * 2;
+  // AND THE ATTENTION TIERS' OWN, which this forward lends them nothing
+  // for: Sage's int8 q / k (and with sage_pv8 V's uint8 copy and Q's
+  // per-token scales) and Sol's routing, each allocated privately at the
+  // widest attention -- the joint stack's, every row -- and kept.
+  if (c.sage.enabled && R > 0) {
+    n += MetalSageAttention::scratch_bytes(
+        c.n_heads, c.n_heads, (int)R, (int)R, c.head_dim,
+        MetalSageAttention::nax_query_block(),
+        MetalSageAttention::nax_key_block(), c.sage.pv8);
+  }
+  if (c.sol.enabled && R > 0) {
+    n += MetalSolAttention::scratch_bytes(c.n_heads, (int)R, c.head_dim,
+                                          c.sol.key_block, /*nax=*/true);
+  }
+  return n;
 }
 
 bool

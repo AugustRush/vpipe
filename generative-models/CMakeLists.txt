@@ -17,6 +17,8 @@ set(LOCAL_SOURCES
   generative-model-manager.cc
   weight-registry.cc
   weight-set.cc
+  moe-expert-cache.cc
+  safetensors-ranges.cc
   loaded-language-model.cc
   metal-token-muxer.cc
   model-exec-registry.cc
@@ -112,6 +114,10 @@ set(LOCAL_SOURCES
   yue2/yue2-vae-family.cc
   bs-roformer/bs-roformer-config.cc
   bs-roformer/metal-bs-roformer.cc
+  drama3/drama3-prompt.cc
+  drama3/metal-drama3-tower.cc
+  drama3/metal-drama3-model.cc
+  drama3/metal-fish-codec.cc
   flux2/metal-flux2-transformer.cc
   flux2/metal-flux2-vae.cc
   flux2/metal-flux2-calibration.cc
@@ -166,6 +172,8 @@ set(LOCAL_HEADERS
   generative-model-manager.h
   weight-registry.h
   weight-set.h
+  moe-expert-cache.h
+  safetensors-ranges.h
   loaded-language-model.h
   metal-token-muxer.h
   model-exec.h
@@ -197,6 +205,10 @@ set(LOCAL_HEADERS
   shared/overlap-demix.h
   bs-roformer/bs-roformer-config.h
   bs-roformer/metal-bs-roformer.h
+  drama3/drama3-prompt.h
+  drama3/metal-drama3-tower.h
+  drama3/metal-drama3-model.h
+  drama3/metal-fish-codec.h
   gemma4/gemma4-audio-feature-extractor.h
   gemma4/gemma4-unified-embedder.h
   gemma4/metal-gemma-model.h

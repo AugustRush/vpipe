@@ -41,6 +41,7 @@
 #include <vector>
 
 namespace vpipe::metal_compute { class MetalCompute; class ComputeEncoder; }
+namespace vpipe { class SessionContextIntf; }
 
 namespace vpipe::genai {
 
@@ -50,6 +51,9 @@ class WeightSet;       // generative-models/weight-set.h
 class MetalDFlashDrafter;   // shared/dflash-drafter.h
 class DFlashTarget;         // shared/dflash-drafter.h
 class MetalLlamaWeights;   // llama3/metal-llama-weights.h
+class MoeExpertCache;      // moe-expert-cache.h
+class SafetensorsRanges;   // safetensors-ranges.h
+class WiredPool;           // shared/wired-pool.h
 
 // k-quant family of a NATIVE GGUF weight (no requant). kNone => the weight
 // is on the affine (safetensors / gemma-style) path. The metal forward
@@ -226,6 +230,14 @@ public:
     // forward_embeddings_hidden and decode_embedding_hidden; pin_frac is
     // not used. Takes the place of stream_layers when it engages.
     bool   stream_decode = false;
+    // MIXTURE-OF-EXPERTS: hold the ROUTED experts in a cache of about this
+    // many bytes (generative-models/moe-expert-cache.h) instead of resident.
+    // Everything else loads as usual and is wired; an expert is read from
+    // disk when a step routes to it and it is not cached, and the cache
+    // keeps the experts selected most often. 0 (the default) = every
+    // expert resident. The engine decides (expert_cache_plan); the output
+    // is the resident model's, byte for byte.
+    std::size_t expert_cache_bytes = 0;
     // Weight-name root prepended before "model." / "lm_head." Qwen3.5-VL
     // nests the LM under "language_model."; Qwen3-ASR is at the root ("").
     std::string weight_prefix = "language_model.";
@@ -367,6 +379,13 @@ public:
   metal_compute::SharedBuffer
   forward_embeddings_hidden(ContextId cid,
                             const metal_compute::SharedBuffer& x, int n);
+  // The same forward, returning EVERY position's final-normed hidden
+  // ([n, hidden], compute dtype) -- for a model whose own heads run over
+  // the whole prompt (Fish Audio Drama 3's codebook tower keeps K/V for
+  // every row). Empty on failure.
+  metal_compute::SharedBuffer
+  forward_embeddings_hidden_all(ContextId cid,
+                                const metal_compute::SharedBuffer& x, int n);
 
   // Backbone forward over a pre-assembled [n*hidden] compute-dtype embedding
   // stream that captures the per-layer hidden states (the un-normed residual
@@ -460,6 +479,30 @@ public:
   // prompt both ways.
   bool streaming_layers() const { return _stream_layers; }
   int  pinned_layers()    const { return _pinned_layers; }
+  // The routed-expert cache (Config::expert_cache_bytes), null when every
+  // expert is resident: its hit rate, its reads.
+  const MoeExpertCache* expert_cache() const { return _xc.get(); }
+  // A checkpoint's routed-expert bytes AS HELD (0 for a dense model): what
+  // a cache stands in for. The rest is everything else the model holds.
+  static std::size_t routed_expert_bytes(const MetalLlamaWeights& wts,
+                                         const Config& c);
+  // How many bytes of cache to give the routed experts of a checkpoint
+  // with `experts` of them in a model holding `rest` besides, on a box
+  // that may spend `budget` on the whole of it: 0 when all of it fits (keep
+  // every expert), else what is left after `rest` -- at least one layer's
+  // worth of transient slots plus as many resident as there is room for.
+  // `layer_expert_bytes` is one layer's experts.
+  static std::size_t expert_cache_plan(std::size_t budget, std::size_t rest,
+                                       std::size_t experts,
+                                       std::size_t layer_expert_bytes);
+  // The same decision for an LM loaded on its own (the model manager's
+  // LoadedLanguageModel): the box's RAM (VPIPE_RAM_LIMIT_MB honoured), the
+  // models the manager holds or has declared beside this one, the
+  // irreversible headroom, and `scratch` (K/V, activations). 0 for a dense
+  // model, or a MoE that fits.
+  static std::size_t lm_expert_cache_bytes(
+      const SessionContextIntf* session, const std::string& dir,
+      const Config& c, std::size_t scratch);
   // How many leading layers a prefill-streamed load of `c` over `wts`
   // pins (0 unless it streams with a pin_frac) -- the rule load() takes,
   // for a caller that must know before it builds (a model kept warm is
@@ -503,6 +546,12 @@ public:
   // (all of them, preloaded; the promoted ones, streaming), the two
   // streaming slots and the final norm. K/V is not included.
   std::uint64_t resident_bytes() const;
+  // A digest of every weight buffer the model holds, one per buffer in a
+  // fixed order (each layer's, then the embedding, head and final norm;
+  // an empty buffer digests as 0): two loads of one checkpoint must agree
+  // entry for entry, and the first that does not names the buffer. A
+  // diagnostic -- it reads every byte, ~1 s for 36 GB.
+  std::vector<std::uint64_t> weight_digests() const;
   // The speculative verify's scratch, pooled for the model's life once a
   // drafter runs: what it grows to for rounds of at most `rows` rows
   // (every slot at its widest, the long-context attention's partials
@@ -1481,6 +1530,12 @@ private:
       // affine gather_swiglu / gather_down / moe_gate above.
       _fn_moe_gather_swiglu_dense, _fn_moe_gather_down_dense,
       _fn_moe_gate_dense,
+      // Block-FP8 routed experts (_fp8_experts) and the interleaved SwiGLU
+      // the dense shared expert's many-row GEMM feeds.
+      _fn_moe_gather_swiglu_fp8, _fn_moe_gather_down_fp8, _fn_swiglu_il,
+      // ...and their grouped steel GEMMs, the prefill's (each expert's
+      // weight read once a tile, not once a routed row).
+      _fn_moe_qmm_grouped_swiglu_fp8, _fn_moe_qmm_grouped_fp8,
       _fn_dense_gemv, _fn_dense_gemm;
   // Decode full-attn switches to the multi-simdgroup paged kernel once
   // the context reaches this length (scalar wins at short ctx).
@@ -2158,6 +2213,39 @@ private:
   // dispatches the dense GEMM/GEMV when the scales buffer is empty. Mutually
   // exclusive with _kquant / _mixed / is_moe().
   bool _dense = false;
+  // A _dense MoE whose ROUTED experts are block-FP8 per expert -- E4M3 codes
+  // with one f32 scale per 128x128 block, under mlp.experts.<e>.{gate,up,
+  // down}_proj.weight + .weight_scale_inv (Fish Audio Drama 3). The slabs
+  // keep the codes (eguw [E,2I,H] gate/up rows interleaved, edw [E,H,I]) and
+  // egus / eds the block scales (x256, see dense_moe_gather_swiglu_fp8);
+  // everything else in the layer is the plain dense path's.
+  bool _fp8_experts = false;
+  // Config::expert_cache_bytes engaged: the routed experts live in _xc
+  // (slots of the same layout as the resident slabs, which stay empty),
+  // read through _xranges (an MLX checkpoint's stacked tensors) or the
+  // per-expert tensors; the rest of the model wired through _xwire.
+  bool _xstream = false;
+  int _x_gb = 4, _x_db = 4;          // affine gate|up / down widths
+  std::unique_ptr<MoeExpertCache> _xc;
+  std::unique_ptr<SafetensorsRanges> _xranges;
+  std::unique_ptr<WiredPool> _xwire;
+  // READING AHEAD (a decode step): the next layer's router logits over
+  // this layer's input, and the experts they rank highest -- the first
+  // _x_ahead of which the cache reads behind this step (0: off).
+  metal_compute::SharedBuffer _x_pred_logits;
+  std::vector<std::int32_t> _x_rank;
+  int _x_ahead = 0;
+  bool _xc_failed = false;
+  bool setup_expert_cache_(std::string* err);
+  void wire_for_experts_();
+  // ...or whose routed experts are GPTQ int4 per expert (qweight + scales,
+  // symmetric, group 128: fishaudio/drama-3-int4), converted at load to the
+  // affine w4 g64 slabs, so they take the affine MoE kernels (gather and
+  // grouped) inside an otherwise dense model.
+  bool _gptq_experts = false;
+  // Rows from which a block-FP8 MoE takes the grouped steel GEMMs rather
+  // than the per-pair gather (VPIPE_QWEN_MOE_FP8_GROUPED_MIN).
+  int _fp8_grouped_min = 96;
   // MOSS-TTS text artifact: an AFFINE backbone whose embed/tied-lm_head were
   // kept bf16 on disk (no .scales). The embed table + tied lm_head bind via
   // the dense f16 path (muxer gather + dense GEMV head) so the full-precision

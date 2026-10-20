@@ -1,0 +1,58 @@
+{
+  "id": "drama3-scene",
+  "stages": [
+    {
+      "id": "load-scene",
+      "type": "load-text",
+      "iports": [],
+      "config": {
+        "path": [
+          "scene.txt"
+        ]
+      }
+    },
+    {
+      "id": "speak",
+      "type": "text-to-speech",
+      "iports": [
+        {
+          "src": "load-scene",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "fishaudio/drama-3",
+        "references": [
+          {
+            "audio": "narrator.wav",
+            "text": "The words spoken in narrator.wav, as spoken."
+          },
+          {
+            "audio": "character.wav",
+            "text": "<|speaker:1|> The words spoken in character.wav."
+          }
+        ],
+        "chunk_text": true,
+        "context": "text",
+        "voice_ref_seconds": 12.0,
+        "stream_chunk_frames": 0,
+        "interrupt_on_new_text": false,
+        "max_frames": 600
+      }
+    },
+    {
+      "id": "save-audio",
+      "type": "save-audio",
+      "iports": [
+        {
+          "src": "speak",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_path": "drama3-scene-%02d.wav"
+      }
+    }
+  ],
+  "subpipelines": []
+}

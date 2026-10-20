@@ -19,10 +19,16 @@
 #include "generative-models/moss/metal-moss-codec-v2.h"
 #include "generative-models/moss/metal-moss-v15-model.h"
 #include "generative-models/moss/metal-moss-rt-model.h"
+#include "generative-models/drama3/drama3-prompt.h"
+#include "generative-models/drama3/metal-drama3-model.h"
+#include "generative-models/drama3/metal-fish-codec.h"
+#include "generative-models/moe-expert-cache.h"
+#include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/tokenizer.h"
 #endif
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,10 +39,23 @@ class Tokenizer;
 
 namespace vpipe {
 
-// Text-to-speech stage (MOSS-TTS, metal/no-MLX).
+// Text-to-speech stage (MOSS-TTS and Fish Audio Drama 3, metal/no-MLX).
 //
-// Handles every MOSS-TTS variant from one stage, picked at load time from
-// the LM dir's config.json `model_type`:
+// Handles every variant from one stage, picked at load time from the LM
+// dir's config.json `model_type`:
+//
+//   * "fish_omni" -- Fish Audio Drama 3 (fishaudio/drama-3): a MetalDrama3
+//     Model (a Qwen3.5-35B-A3B backbone with block-FP8 experts + a 13-layer
+//     codebook-MTP tower, ten codes a frame) feeding the MetalFishCodec in
+//     the same directory (codec.pth; codec_dir optional) -> 44.1 kHz MONO
+//     PCM. The text may carry speaker tags (<|speaker:0|> .. <|speaker:15|>)
+//     and inline direction ([laughs], [pause]). A reference voice on
+//     iport1 needs its transcript (`reference_text`, or a "reference_text"
+//     field on the text beat). The audio sampler's unwired default is the
+//     reference's request default (T 1.0, top_p 0.9, top_k 30);
+//     `max_frames` is the frame budget (each ~46 ms). The MOSS-only keys
+//     (instruction, language, quality, ..., lm_quant, i8_gemm) do not
+//     apply.
 //
 //   * "moss_tts_delay" / "moss_tts" -- the DELAY-PATTERN 8B: MOSS-TTS 1.0
 //     and MOSS-TTS-v1.5 (one architecture). A MetalMossTtsModel (Qwen3-8B
@@ -215,6 +234,31 @@ public:
   // only when the PCM-reference iport1 SLOT is wired -- the sampler iports
   // that follow it must not turn it on.
   bool with_encoder()            const noexcept { return _with_encoder; }
+  const std::string& reference_text() const noexcept
+  { return _reference_text; }
+  bool chunk_text() const noexcept { return _d3_chunk_text; }
+  const std::string& context() const noexcept { return _d3_context; }
+  std::size_t configured_references() const noexcept
+  { return _d3_ref_specs.size(); }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // Test-only: the loaded Drama 3 model (null for the MOSS variants), the
+  // voices it clones now (one per speaker), the takes it remembers for
+  // `previous_takes`, and the last beat's chunk count.
+  genai::MetalDrama3Model* drama3() const noexcept { return _d3.get(); }
+  const std::vector<genai::drama3::Reference>& drama3_references() const
+  { return _d3_refs; }
+  std::size_t drama3_takes() const noexcept { return _d3_takes.size(); }
+  struct Drama3Beat {
+    int chunks = 0;        // the text's chunks
+    int spoken = 0;        // of them, those that produced frames
+    int previous = 0;      // previous_takes found
+    int voices = 0;        // voices cloned
+    int with_history = 0;  // chunks spoken after earlier takes
+    int max_prompt = 0;    // the longest prompt, in rows
+    int frames = 0;
+  };
+  const std::vector<Drama3Beat>& drama3_beats() const { return _d3_beats; }
+#endif
 
 private:
   // Config attributes; defaults live in kSpec.attrs and are read in the
@@ -265,6 +309,9 @@ private:
   std::string _lm_dir_resolved;
   std::string _codec_dir_resolved;
   std::string scratch_label_() const;
+  // Drama 3's codec.pth: in codec_dir when one is set (a directory holding
+  // it, or the file), else beside the LM.
+  std::string drama3_codec_path_(const std::string& lm_dir) const;
   std::size_t scratch_bytes_(const std::string& lm_dir,
                              std::size_t* kv_part = nullptr) const;
   void        revise_holdings_();
@@ -280,6 +327,18 @@ private:
   bool          _with_encoder{};
   bool          _voice_lock{};
   double        _voice_ref_seconds{};
+  // Drama 3: the transcript of the reference voice on iport1.
+  std::string   _reference_text;
+  // Drama 3: `chunk_text` (split long text as the reference server does),
+  // `context` ("text": a beat's chunks share the history; "run": every
+  // beat of the run does), and `references` (voices to clone, from files).
+  struct D3RefSpec {
+    std::string audio;
+    std::string text;
+  };
+  bool                   _d3_chunk_text = true;
+  std::string            _d3_context = "text";
+  std::vector<D3RefSpec> _d3_ref_specs;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // Per-channel token-sampler knobs, latched once off the OPTIONAL sampler
@@ -319,6 +378,28 @@ private:
   // the 24 kHz MetalMossCodec (_codec, shared with the 8B path). Loaded only
   // when the LM dir's config.json model_type is "moss_tts_realtime".
   std::unique_ptr<genai::MetalMossRtModel>  _lm_rt;
+  // Fish Audio Drama 3 (model_type fish_omni): the speech LM and its codec.
+  // The clone reference is [frames][10] codes + its transcript.
+  std::unique_ptr<genai::MetalDrama3Model>  _d3;
+  std::unique_ptr<genai::MetalFishCodec>    _fish;
+  // Drama 3's streamed decode (stream_chunk_frames > 0), reused across
+  // beats; its buffers are the codec's, so it goes before the codec.
+  std::unique_ptr<genai::MetalFishCodec::DecodeStream> _fish_stream;
+  // The voices cloned now, in prompt order: the configured `references`
+  // first, then those from iport1 -- ONE PER SPEAKER (the transcript's
+  // leading tag, 0 without one), a later one replacing an earlier. The
+  // index of the latest from iport1 is what a text beat's
+  // "reference_text" retitles.
+  std::vector<genai::drama3::Reference>     _d3_refs;
+  int                                       _d3_port_ref = -1;
+  // context "run": the run's history (its first take pinned, the latest).
+  genai::drama3::History                    _d3_run_hist;
+  // The takes spoken this run, newest last (bounded), for a beat's
+  // "previous_takes" to name by their text.
+  std::deque<genai::drama3::Take>           _d3_takes;
+  std::vector<Drama3Beat>                   _d3_beats;
+  // The expert cache's counters at the last beat (for per-text deltas).
+  genai::MoeExpertCache::Stats              _d3_xstats;
   std::unique_ptr<genai::Tokenizer>         _tokenizer;
   // Cached codec streaming state, reused across beats (the windowed K/V rings
   // are sized by stream_chunk_frames, not utterance length, so there is no need
@@ -337,6 +418,12 @@ private:
   // frees the previous run's weights BEFORE loading the next copy,
   // instead of transiently holding both.
   void release_models_();
+  void load_drama3_(const std::string& lm_dir,
+                    metal_compute::MetalCompute* mc);
+  // A voice into _d3_refs, replacing the one for its speaker.
+  void d3_add_reference_(genai::drama3::Reference r, bool from_port);
+  // Decode, trim and encode the configured `references`; "" or why not.
+  std::string d3_load_references_();
 #endif
 
   // Bookkeeping for tests / logging.

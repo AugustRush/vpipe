@@ -1002,6 +1002,75 @@ TEST(moss_image_stage, a_dit_kept_warm_is_taken_back_at_this_strength)
   EXPECT_TRUE(moved);
 }
 
+// ...and a graph under ANOTHER sage_pv8 does not take it. The family reads
+// its Sage settings off the config it was built with at every forward --
+// which flash function, which prologue -- so a DiT kept by a graph
+// without the int8 P*V and taken by one with it would run without it,
+// and the reverse; an A/B of the setting in one process would measure the
+// first arm twice. The warm key names it now. Asked on any box: the key
+// is the config's, so it decides the take where the GPU cannot run Sage
+// at all (here it then says so and runs dense). Three graphs, each
+// keeping its DiT: kept without, not taken with (kept in turn), taken by
+// the next one with -- which is what says the second's miss was the key.
+TEST(moss_image_stage, a_dit_kept_warm_is_not_taken_under_another_sage_pv8)
+{
+  const std::string root = env_("VPIPE_MOSS_IMAGE_TEST_MODEL_PATH");
+  const FlexData tman = manifest_("text");
+  if (root.empty() || !tman.is_object()) { return; }
+  const std::filesystem::path g(env_("VPIPE_MOSS_IMAGE_GOLDEN"));
+  const std::size_t np = tman.as_object().at("prompts").as_array().size();
+  const std::vector<float> pos = read_f32_(g / "text_hidden1.f32");
+  const std::vector<float> neg =
+      read_f32_(g / ("text_hidden" + std::to_string(np - 1) + ".f32"));
+  MP_REQUIRE(!pos.empty() && !neg.empty());
+  Session sess;
+  if (sess.metal_compute() == nullptr) { return; }
+
+  auto run = [&](double keep, bool pv8, bool* taken) {
+    auto pl = std::make_unique<Pipeline>("moss-image-warm-pv8", &sess);
+    auto su = std::make_unique<SourceCond>(
+        &sess, "src", std::vector<InEdge>{}, FlexData::make_object());
+    su->pos = pos;
+    su->neg = neg;
+    su->cols = 4096;
+    auto* src = pl->insert_stage(std::move(su));
+    FlexData gc = FlexData::make_object();
+    auto go = gc.as_object();
+    go.insert("hf_dir", FlexData::make_string(root));
+    go.insert("width", FlexData::make_int(384));
+    go.insert("height", FlexData::make_int(256));
+    go.insert("seed", FlexData::make_int(5));
+    go.insert("steps", FlexData::make_int(2));
+    go.insert("keep_loaded", FlexData::make_real(keep));
+    go.insert("sage_attn", FlexData::make_bool(true));
+    go.insert("sage_pv8", FlexData::make_bool(pv8));
+    auto* gen = static_cast<GenerateImageStage*>(pl->insert_stage(
+        std::make_unique<GenerateImageStage>(
+            &sess, "gen", std::vector<InEdge>{{src, 0}, {src, 1}},
+            std::move(gc))));
+    pl->insert_stage(std::make_unique<SinkCapture>(
+        &sess, "sink", std::vector<InEdge>{{gen, 0}},
+        FlexData::make_object()));
+    PipelineRuntime rt(pl.get(), &sess);
+    const bool ok = rt.launch() && gen->config_error().empty();
+    if (ok) { rt.wait_idle(); }
+    rt.stop();
+    *taken = gen->dit_taken_warm();
+    return ok;
+  };
+  // Preloaded, as in the test above: a streamed DiT is never kept warm.
+  setenv("VPIPE_MOSS_IMAGE_STREAM", "0", 1);
+  bool t0 = true, t1 = true, t2 = false;
+  const bool ok0 = run(60.0, false, &t0);   // built, kept
+  const bool ok1 = run(60.0, true, &t1);    // another arm: built, kept
+  const bool ok2 = run(60.0, true, &t2);    // the same arm: taken
+  unsetenv("VPIPE_MOSS_IMAGE_STREAM");
+  std::printf("[moss_image_stage] warm DiT taken: sage_pv8 off %d, then on "
+              "%d, then on again %d\n", (int)t0, (int)t1, (int)t2);
+  EXPECT_TRUE(ok0 && ok1 && ok2);
+  EXPECT_TRUE(!t0 && !t1 && t2);
+}
+
 namespace {
 
 // The real DiT forward over random inputs at (gh, gw) with a T-row

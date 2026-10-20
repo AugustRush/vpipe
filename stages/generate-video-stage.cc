@@ -261,6 +261,31 @@ const ConfigKey kAttrs[] = {
           "computes them in int8. No published profile needs a dense "
           "prefix here; the key exists so a measurement can act on one",
    .def_int = 0},
+  {.key = "sage_pv8", .type = ConfigType::Bool, .required = false,
+   .doc = "with sage_attn: the P*V product in INT8 TOO (LOSSY, more so "
+          "than sage_attn alone). The flash kernel holds the product in "
+          "int32 across key blocks with no f32 output tile -- P as uint8 "
+          "against the row's running max, V with one scale per channel "
+          "over the sequence, offset by 128 -- and rescales the held sum "
+          "only when a row's max grows; Q goes per token. The prompt's and "
+          "the soundtrack's query rows keep sage_attn alone unless "
+          "sage_pv8_all_rows. MEASURED on an M5 Ultra, MiniMax-H3 at "
+          "1344x768 x 362 frames (109k rows, 16 steps): the attention 2.46 "
+          "s against sage_attn's 2.90, the denoise 1927 s against 2110. "
+          "MiniMax-H3 only; matrix cores only, as sage_attn",
+   .def_bool = false},
+  {.key = "sage_pv8_from_step", .type = ConfigType::Int, .required = false,
+   .doc = "the first sampling step sage_pv8 runs at; the steps before "
+          "keep sage_attn alone. -1 -- the default -- is the family's: "
+          "MiniMax-H3 runs the first quarter of its steps without, the "
+          "steps that settle a clip's layout",
+   .def_int = -1},
+  {.key = "sage_pv8_all_rows", .type = ConfigType::Bool, .required = false,
+   .doc = "sage_pv8 on every query row. Off -- the default -- the "
+          "prompt's and the soundtrack's rows, which lead MiniMax-H3's "
+          "sequence (under 1% of it), keep sage_attn alone in a dispatch "
+          "of their own, and the video's run in int8",
+   .def_bool = false},
   // ---- Sol-Attn (NVlabs, arXiv:2607.24027) --------------------------
   // Family-agnostic like `i8_gemm` beside it, and here for the same
   // reason: it approximates ATTENTION, which every DiT in this tree has,
@@ -590,6 +615,9 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _i8_gemm = attr_bool("i8_gemm");
   _sage.enabled      = attr_bool("sage_attn");
   _sage.dense_layers = (int)attr_int("sage_dense_layers");
+  _sage.pv8          = attr_bool("sage_pv8");
+  _sage.pv8_from_step = (int)attr_int("sage_pv8_from_step");
+  _sage.pv8_all_rows = attr_bool("sage_pv8_all_rows");
   _sol.enabled      = attr_bool("sol_attn");
   _sol.tau          = (float)attr_real("sol_tau");
   _sol.dense_layers = (int)attr_int("sol_dense_layers");
@@ -650,6 +678,11 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   genai::accel::set_flag(&_accel, genai::accel::kSageAttn, _sage.enabled);
   genai::accel::set_integer(&_accel, genai::accel::kSageDenseLayers,
                             _sage.dense_layers);
+  genai::accel::set_flag(&_accel, genai::accel::kSagePv8, _sage.pv8);
+  genai::accel::set_integer(&_accel, genai::accel::kSagePv8FromStep,
+                            _sage.pv8_from_step);
+  genai::accel::set_flag(&_accel, genai::accel::kSagePv8AllRows,
+                         _sage.pv8_all_rows);
   genai::accel::set_flag(&_accel, genai::accel::kSolAttn, _sol.enabled);
   genai::accel::set_real(&_accel, genai::accel::kSolTau, (double)_sol.tau);
   genai::accel::set_integer(&_accel, genai::accel::kSolKeyBlock,

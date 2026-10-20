@@ -23,6 +23,7 @@
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/mistral3/metal-pixtral-vision.h"
 #include "generative-models/model-loader.h"
+#include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/qwen3/metal-audio-encoder.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
@@ -880,6 +881,31 @@ TextChatStage::declare_resources() const
     dirs.push_back(resolve_model_dir(session(), _draft_model));
   }
   std::vector<ResourceClaim> out = model_memory::weight_claims(dirs);
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // A Mixture-of-Experts LM is STREAMABLE: on a box too small for it the
+  // loader keeps its routed experts in a cache (MetalQwenModel::
+  // lm_expert_cache_bytes), so the least it holds is the rest of the
+  // model and one layer of experts -- the floor this claim states.
+  {
+    genai::ModelLoader loader(session());
+    const auto mcfg = loader.load_config(dirs[0]);
+    if (mcfg.has_value() && mcfg->hidden > 0) {
+      const auto qc = genai::MetalQwenModel::config_from(*mcfg);
+      auto w = qc.is_moe() ? genai::MetalLlamaWeights::open_model(dirs[0])
+                           : std::nullopt;
+      if (w.has_value()) {
+        const std::size_t ex =
+            genai::MetalQwenModel::routed_expert_bytes(*w, qc);
+        const std::size_t disk = model_memory::dir_weights_bytes(dirs[0]);
+        if (ex > 0 && disk > ex) {
+          out[0] = model_memory::weight_claim_streamable(
+              dirs[0],
+              disk - ex + ex / (std::size_t)std::max(1, qc.n_layers));
+        }
+      }
+    }
+  }
+#endif
   // A drafter's verify pools its scratch for the model's life (tens of
   // MB on a 27B: the long-context attention's partials, a block's
   // logits). Withdrawn at load when no drafter attaches.

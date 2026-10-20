@@ -84,8 +84,19 @@ struct EncodedSegment;
 //                                                   the encoder's
 //                                                   max_source_positions
 //                                                   ceiling.
-//   oport_capacity       (int,   default 4)      -- oport buffer depth
-//                                                   in chunks.
+//   oport_capacity       (int,   default 0)      -- chunks written
+//                                                   ahead of the
+//                                                   slowest reader, at
+//                                                   most: the writer
+//                                                   waits for it
+//                                                   (backpressure). 0:
+//                                                   the default depth,
+//                                                   which never waits
+//                                                   and fails past
+//                                                   2048 -- 65 s of
+//                                                   32 ms chunks a
+//                                                   voice detector has
+//                                                   not read yet.
 //   flush_on_eos         (bool,  default true)   -- emit a partial
 //                                                   chunk on drain
 //                                                   when the source

@@ -3433,6 +3433,8 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     fc.set_bool(200, (qL % A_BQ) == 0).set_bool(201, (kL % A_BK) == 0)
         .set_bool(300, false).set_bool(301, false).set_bool(302, false)
         .set_bool(sage::kQkInt8Constant, i8);
+    MetalSageAttention::pv8_constants(
+        fc, i8 && _sage && _sage->pv8_for(_cfg.sage));
     return nax ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
                : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
   };
@@ -3628,9 +3630,15 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
           fn_attn_i8.valid()) {
         const MetalSageAttention::Operand qo{&qt, 0, HD, seq * HD};
         const MetalSageAttention::Operand ko{&kt, 0, HD, KL * HD};
+        const MetalSageAttention::Operand vo{&vt, 0, HD, KL * HD};
         std::string gerr;
         i8_ok = _sage->prepare(*op.e, qo, ko, HED, KVH, QA, KL, HD, A_BQ,
-                               A_BK, _cfg.sage, &gerr);
+                               A_BK, _cfg.sage, &gerr, &vo);
+        // The int8 function takes the int8 P*V's operands iff pv8_for()
+        // says so: a prologue that made none runs dense.
+        if (i8_ok && _sage->pv8_for(_cfg.sage) != _sage->pv8_ready()) {
+          i8_ok = false;
+        }
       }
       // Group A: text + generated queries over every key.
       op.e->set_function(i8_ok ? fn_attn_i8 : fn_attn);
@@ -4725,7 +4733,7 @@ MetalFlux2Transformer::forward_scratch_bytes(const Config& c, int img_rows,
     n += MetalSageAttention::scratch_bytes(
         c.n_heads, c.n_heads, (int)R, (int)R, c.head_dim,
         MetalSageAttention::nax_query_block(),
-        MetalSageAttention::nax_key_block());
+        MetalSageAttention::nax_key_block(), c.sage.pv8);
   }
   return n;
 }

@@ -47,6 +47,18 @@ inline constexpr std::string_view kI8TierTokenPlain = "token_plain";
 inline constexpr std::string_view kSageAttn = "sage_attn";
 // Leading blocks left in the tensor dtype. Int; default 0.
 inline constexpr std::string_view kSageDenseLayers = "sage_dense_layers";
+// ...and its P*V in int8 too -- the product held in int32 across key
+// blocks, P on uint8 against V + 128 (attn_steel_nax's constants 308 and
+// 310). Bool; default false. Read only with kSageAttn on.
+inline constexpr std::string_view kSagePv8 = "sage_pv8";
+// The first sampling step it runs at; the steps before keep the int8 QK
+// alone. Int; absent, the family's own (MiniMax-H3: the first quarter of
+// its steps run without, the steps that settle a clip's layout).
+inline constexpr std::string_view kSagePv8FromStep = "sage_pv8_from_step";
+// ...on EVERY query row. Bool; default false: a family whose sequence
+// leads with prompt and soundtrack rows (MiniMax-H3's) keeps those on the
+// int8 QK alone -- under 1% of the rows -- and runs the video's in int8.
+inline constexpr std::string_view kSagePv8AllRows = "sage_pv8_all_rows";
 
 // Sol-Attn -- which key blocks are attended exactly. Bool; default
 // false.

@@ -40,12 +40,15 @@
 #include "common/session.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace {
@@ -758,4 +761,369 @@ TEST(sage_attention, int8_qk_bench)
               gflop / (ms_i8 / 1e3), ms_pro,
               ms_i8 > 0.0 ? ms_f16 / ms_i8 : 0.0);
   EXPECT_TRUE(ms_f16 > 0.0 && ms_i8 > 0.0);
+}
+
+namespace {
+
+// bf16 as the bf16 kernels read it: the top half of an f32, rounded to
+// nearest even.
+std::uint16_t
+f2bf_(float f)
+{
+  std::uint32_t u;
+  std::memcpy(&u, &f, 4);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return (std::uint16_t)(u >> 16);
+}
+
+float
+bf2f_(std::uint16_t b)
+{
+  const std::uint32_t u = (std::uint32_t)b << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+}  // namespace
+
+// P*V IN INT8 TOO (function constants 308 and 310): the product held in
+// int32 across key blocks, P as uint8 against the row's running max, V
+// with one scale per channel over the sequence as uint8 + 128, Q per
+// token -- beside the f16 kernel and SageAttention's int8 QK alone, each
+// with the prologue it needs, dispatched by hand from head-major buffers.
+//
+// Scored against f64 at three sharpnesses (random keys with a shared
+// bias, then queries 4x and 8x as large), and on the case the held sum's
+// headroom exists for: uniform attention (Q = 0) over 140k keys onto V
+// that is +8 for the first half and -8 for the second, whose running sum
+// passes 2^30 and has its grid stepped down -- an overrun of int32 there
+// is garbage, a grid stepped by 1/2 a bias of every later key.
+//
+// VPIPE_SAGE_BENCH=1 times the three at a video DiT's geometry (8 heads
+// x 20036 rows x 128 unless VPIPE_SAGE_HEADS / _ROWS say otherwise; _BF16
+// the bf16 kernels; _SHARP queries scaled; _REPS repeats), each against
+// the f16 kernel's output at that length.
+TEST(sage_attention, int8_pv_held)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::printf("[sage-pv8] no matrix cores -- SKIPPED\n");
+    return;
+  }
+  ComputeLibrary lib = mc->load_library("attn_steel_nax");
+  ASSERT_TRUE(lib.valid());
+  struct Quant {
+    ComputeLibrary lib;
+    ComputeFunction sum, red, block, token, vam, var, vq8;
+  };
+  auto load_quant = [&](Quant& f, const char* name) {
+    f.lib = mc->load_library(name);
+    f.sum = f.lib.function("sage_k_sum_chunk");
+    f.red = f.lib.function("sage_k_mean_reduce");
+    f.block = f.lib.function("sage_quant_block");
+    f.token = f.lib.function("sage_quant_token");
+    f.vam = f.lib.function("sage_v_absmax_chunk");
+    f.var = f.lib.function("sage_v_absmax_reduce");
+    f.vq8 = f.lib.function("sage_quant_v_channel_u8");
+  };
+  Quant qf;
+  load_quant(qf, "sage_quant");
+  ASSERT_TRUE(qf.sum.valid() && qf.red.valid() && qf.block.valid() &&
+              qf.token.valid() && qf.vam.valid() && qf.var.valid() &&
+              qf.vq8.valid());
+
+  // {name, 306 the int8 QK, 308 + 310 the int8 P*V and Q per token}.
+  struct Arm {
+    const char* name;
+    bool qk8, pv8;
+  };
+  const Arm arms[] = {{"f16", false, false},
+                      {"QK8 (Sage)", true, false},
+                      {"QK8+PV8", true, true}};
+
+  struct Bufs {
+    int H = 0, T = 0, NQ = 0, NK = 0;
+    SharedBuffer q, k, v, o, q8, k8, v8, qs, ks, vs, km, vm, part, p;
+  };
+  auto make = [&](int H, int T) {
+    Bufs b;
+    b.H = H; b.T = T;
+    b.NQ = (T + kBQ - 1) / kBQ; b.NK = (T + kBK - 1) / kBK;
+    const std::size_t n = (std::size_t)H * T * kD;
+    b.q = mc->make_shared_buffer(n * 2); b.k = mc->make_shared_buffer(n * 2);
+    b.v = mc->make_shared_buffer(n * 2); b.o = mc->make_shared_buffer(n * 2);
+    b.q8 = mc->make_shared_buffer(n); b.k8 = mc->make_shared_buffer(n);
+    b.v8 = mc->make_shared_buffer(n);
+    b.qs = mc->make_shared_buffer((std::size_t)H * T * 4);
+    b.ks = mc->make_shared_buffer((std::size_t)H * b.NK * 4);
+    b.vs = mc->make_shared_buffer((std::size_t)H * kD * 4);
+    b.km = mc->make_shared_buffer((std::size_t)H * kD * 4);
+    b.vm = mc->make_shared_buffer((std::size_t)H * kD * 4);
+    b.part = mc->make_shared_buffer((std::size_t)H * kChunks * kD * 4);
+    b.p = mc->make_shared_buffer(sizeof(AttnP));
+    if (b.p.empty()) { return b; }
+    auto* p = static_cast<AttnP*>(b.p.contents());
+    p->B = 1; p->H = H; p->D = kD; p->qL = T; p->kL = T; p->gqa = 1;
+    p->scale = 1.0f / std::sqrt((float)kD);
+    p->NQ = b.NQ; p->NK = b.NK;
+    p->NQa = T / kBQ; p->NKa = T / kBK;
+    p->qL_rem = T - p->NQa * kBQ;
+    p->kL_rem = T - p->NKa * kBK;
+    p->qL_off = 0;
+    const std::int64_t hm[3] = {(std::int64_t)H * T * kD,
+                                (std::int64_t)T * kD, kD};
+    for (int i = 0; i < 3; ++i) {
+      p->Qs[i] = hm[i]; p->Ks[i] = hm[i]; p->Vs[i] = hm[i]; p->Os[i] = hm[i];
+    }
+    return b;
+  };
+  auto fn = [&](const Arm& a, int T, bool bf16) {
+    FunctionConstants fc;
+    fc.set_bool(200, (T % kBQ) == 0).set_bool(201, (T % kBK) == 0)
+        .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+        .set_bool(303, false).set_bool(304, false).set_bool(305, false)
+        .set_bool(306, a.qk8).set_bool(308, a.pv8).set_bool(310, a.pv8);
+    return lib.function(bf16 ? "attn_steel_nax_h_bd128_bf16"
+                             : "attn_steel_nax_h_bd128", fc);
+  };
+  // The prologue an arm needs, then the arm.
+  auto encode = [&](ComputeEncoder& e, Bufs& b, const Arm& a,
+                    ComputeFunction& f, const Quant& qq) {
+    const unsigned zero = 0;
+    const unsigned H = (unsigned)b.H, D = (unsigned)kD;
+    auto mean = [&](SharedBuffer& src, SharedBuffer& out) {
+      e.set_function(qq.sum);
+      e.set_buffer(0, src); e.set_buffer(1, b.part);
+      e.set_constant(2, b.T); e.set_constant(3, kD);
+      e.set_constant(4, kD); e.set_constant(5, zero);
+      e.set_constant(6, kChunks); e.set_constant(7, b.T * kD);
+      e.dispatch({D, H, (unsigned)kChunks}, {D, 1, 1});
+      e.set_function(qq.red);
+      e.set_buffer(0, b.part); e.set_buffer(1, out);
+      e.set_constant(2, b.T); e.set_constant(3, kD);
+      e.set_constant(4, kChunks);
+      e.dispatch({D, H, 1}, {D, 1, 1});
+    };
+    if (a.qk8) {
+      mean(b.k, b.km);
+      if (a.pv8) {
+        e.set_function(qq.token);
+        e.set_buffer(0, b.q); e.set_buffer(1, b.q8); e.set_buffer(2, b.qs);
+        e.set_constant(3, b.T); e.set_constant(4, kD);
+        e.set_constant(5, kD); e.set_constant(6, zero);
+        e.set_constant(7, b.T * kD);
+        e.set_buffer(8, b.km); e.set_constant(9, 0);
+        e.dispatch({256, H, (unsigned)((b.T + 63) / 64)}, {256, 1, 1});
+      }
+      for (int w = a.pv8 ? 1 : 0; w < 2; ++w) {
+        e.set_function(qq.block);
+        e.set_buffer(0, w == 0 ? b.q : b.k); e.set_buffer(1, b.km);
+        e.set_buffer(2, w == 0 ? b.q8 : b.k8);
+        e.set_buffer(3, w == 0 ? b.qs : b.ks);
+        e.set_constant(4, b.T); e.set_constant(5, kD);
+        e.set_constant(6, kD); e.set_constant(7, zero);
+        e.set_constant(8, w == 0 ? kBQ : kBK);
+        e.set_constant(9, w == 0 ? 0 : 1);
+        e.set_constant(10, b.T * kD);
+        e.dispatch({256, H, (unsigned)(w == 0 ? b.NQ : b.NK)}, {256, 1, 1});
+      }
+    }
+    if (a.pv8) {
+      mean(b.v, b.vm);
+      e.set_function(qq.vam);
+      e.set_buffer(0, b.v); e.set_buffer(1, b.vm); e.set_buffer(2, b.part);
+      e.set_constant(3, b.T); e.set_constant(4, kD); e.set_constant(5, kD);
+      e.set_constant(6, zero); e.set_constant(7, kChunks);
+      e.set_constant(8, b.T * kD);
+      e.dispatch({D, H, (unsigned)kChunks}, {D, 1, 1});
+      e.set_function(qq.var);
+      e.set_buffer(0, b.part); e.set_buffer(1, b.vs);
+      e.set_constant(2, kD); e.set_constant(3, kChunks);
+      e.dispatch({D, H, 1}, {D, 1, 1});
+      e.set_function(qq.vq8);
+      e.set_buffer(0, b.v); e.set_buffer(1, b.vm); e.set_buffer(2, b.vs);
+      e.set_buffer(3, b.v8);
+      e.set_constant(4, b.T); e.set_constant(5, kD); e.set_constant(6, kD);
+      e.set_constant(7, zero); e.set_constant(8, b.T * kD);
+      e.dispatch({D, H, (unsigned)((b.T + 7) / 8)}, {D, 1, 1});
+    }
+    e.set_function(f);
+    e.set_buffer(0, b.q); e.set_buffer(1, b.k); e.set_buffer(2, b.v);
+    e.set_buffer(3, b.o); e.set_buffer(4, b.p);
+    if (a.qk8) {
+      e.set_buffer(15, b.q8); e.set_buffer(16, b.k8);
+      e.set_buffer(17, b.qs); e.set_buffer(18, b.ks);
+    }
+    if (a.pv8) {
+      e.set_buffer(19, b.v8); e.set_buffer(20, b.vs); e.set_buffer(21, b.vm);
+    }
+    e.dispatch({32u * (unsigned)b.NQ, 4u * H, 1}, {32, 4, 1});
+  };
+  auto run = [&](Bufs& b, const Arm& a, ComputeFunction& f, const Quant& qq) {
+    const auto t0 = std::chrono::steady_clock::now();
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      encode(e, b, a, f, qq);
+    }
+    std::string err;
+    if (!st.commit().wait_ok(&err)) { return -1.0; }
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+  };
+  // Cosine of an output against another, in the tensor dtype's values.
+  auto cos_of = [](const Bufs& b, const std::vector<float>& ref, bool bf16) {
+    const auto* o = static_cast<const std::uint16_t*>(b.o.contents());
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      const double x = bf16 ? bf2f_(o[i]) : h2f_(o[i]), y = ref[i];
+      if (!std::isfinite(x)) { return -1.0; }
+      dot += x * y; na += x * x; nb += y * y;
+    }
+    return dot / std::sqrt(std::max(1e-30, na * nb));
+  };
+
+  // ---- accuracy, against f64, at three sharpnesses
+  for (const float sharp : {1.0f, 4.0f, 8.0f}) {
+    for (const int T : {1024, 1000}) {
+      const int H = 2;
+      std::vector<Head> heads;
+      for (int h = 0; h < H; ++h) {
+        heads.push_back(make_head_(T, /*bias=*/5.0f, 0x5a6e1000u + h));
+        for (float& x : heads.back().q) { x *= sharp; }
+      }
+      const double scale = 1.0 / std::sqrt((double)kD);
+      std::vector<std::vector<double>> refs;
+      for (const auto& h : heads) { refs.push_back(attend_ref_(h, scale)); }
+      Bufs b = make(H, T);
+      ASSERT_TRUE(!b.p.empty() && !b.part.empty());
+      auto* qp = static_cast<std::uint16_t*>(b.q.contents());
+      auto* kp = static_cast<std::uint16_t*>(b.k.contents());
+      auto* vp = static_cast<std::uint16_t*>(b.v.contents());
+      for (int h = 0; h < H; ++h) {
+        for (std::size_t i = 0; i < (std::size_t)T * kD; ++i) {
+          const std::size_t o = (std::size_t)h * T * kD + i;
+          qp[o] = f2h_(heads[(std::size_t)h].q[i]);
+          kp[o] = f2h_(heads[(std::size_t)h].k[i]);
+          vp[o] = f2h_(heads[(std::size_t)h].v[i]);
+        }
+      }
+      std::printf("[sage-pv8] x%.0f T=%d:", sharp, T);
+      double c_qk8 = 0.0;
+      for (const Arm& a : arms) {
+        ComputeFunction f = fn(a, T, false);
+        ASSERT_TRUE(f.valid());
+        if (!f.valid()) { return; }
+        ASSERT_TRUE(run(b, a, f, qf) >= 0.0);
+        const auto* o = static_cast<const std::uint16_t*>(b.o.contents());
+        double c = 0.0;
+        for (int h = 0; h < H; ++h) {
+          std::vector<double> got(refs[(std::size_t)h].size());
+          for (std::size_t i = 0; i < got.size(); ++i) {
+            got[i] = (double)h2f_(o[(std::size_t)h * T * kD + i]);
+          }
+          c += cos_sim_(got, refs[(std::size_t)h]) / H;
+        }
+        std::printf("  %s cos %.6f |", a.name, c);
+        EXPECT_TRUE(c > (a.qk8 ? 0.999 : 0.99999));
+        if (a.qk8 && !a.pv8) { c_qk8 = c; }
+        // The int8 P*V costs less than the int8 QK does already.
+        if (a.pv8) { EXPECT_TRUE(c > c_qk8 - 0.0005); }
+      }
+      std::printf("\n");
+    }
+  }
+
+  // ---- the held sum's headroom: uniform attention onto a long run of
+  //      same-signed V, 140k keys
+  {
+    const int H = 1, T = 140000;
+    Bufs b = make(H, T);
+    ASSERT_TRUE(!b.p.empty() && !b.part.empty());
+    if (b.p.empty()) { return; }
+    std::mt19937 rng(11u);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const std::size_t n = (std::size_t)H * T * kD;
+    auto* qp = static_cast<std::uint16_t*>(b.q.contents());
+    auto* kp = static_cast<std::uint16_t*>(b.k.contents());
+    auto* vp = static_cast<std::uint16_t*>(b.v.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      qp[i] = f2h_(0.0f);
+      kp[i] = f2h_(nd(rng));
+      const bool first = (int)((i / kD) % (std::size_t)T) < T / 2;
+      vp[i] = f2h_(nd(rng) + (first ? 8.0f : -8.0f));
+    }
+    ComputeFunction f16 = fn(arms[0], T, false);
+    ComputeFunction pv8 = fn(arms[2], T, false);
+    ASSERT_TRUE(f16.valid() && pv8.valid());
+    ASSERT_TRUE(run(b, arms[0], f16, qf) >= 0.0);
+    std::vector<float> ref(n);
+    const auto* o = static_cast<const std::uint16_t*>(b.o.contents());
+    for (std::size_t i = 0; i < n; ++i) { ref[i] = h2f_(o[i]); }
+    ASSERT_TRUE(run(b, arms[2], pv8, qf) >= 0.0);
+    const double c = cos_of(b, ref, false);
+    std::printf("[sage-pv8] uniform over %d keys, V +-8: QK8+PV8 cos %.6f "
+                "against f16\n", T, c);
+    // V's int8 grid is what is left here (the output, V's mean, is near
+    // zero); an overrun of int32 would be noise.
+    EXPECT_TRUE(c > 0.99);
+  }
+
+  // ---- speed
+  if (std::getenv("VPIPE_SAGE_BENCH") == nullptr) { return; }
+  const bool bf16 = std::getenv("VPIPE_SAGE_BF16") != nullptr;
+  Quant qbf;
+  if (bf16) { load_quant(qbf, "sage_quant_bf16"); }
+  const Quant& qb = bf16 ? qbf : qf;
+  ASSERT_TRUE(qb.token.valid() && qb.vq8.valid());
+  int H = 8, T = 20036;
+  if (const char* e = std::getenv("VPIPE_SAGE_HEADS")) { H = std::atoi(e); }
+  if (const char* e = std::getenv("VPIPE_SAGE_ROWS")) { T = std::atoi(e); }
+  const float sharp = std::getenv("VPIPE_SAGE_SHARP")
+      ? (float)std::atof(std::getenv("VPIPE_SAGE_SHARP")) : 1.0f;
+  const int reps = std::getenv("VPIPE_SAGE_REPS")
+      ? std::max(1, std::atoi(std::getenv("VPIPE_SAGE_REPS"))) : 3;
+  Bufs b = make(H, T);
+  if (b.p.empty() || b.part.empty() || b.v8.empty()) {
+    std::printf("[sage-pv8] alloc failed -- skip\n");
+    return;
+  }
+  const std::size_t n = (std::size_t)H * T * kD;
+  {
+    std::mt19937 rng(7u);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (SharedBuffer* s : {&b.q, &b.k, &b.v}) {
+      auto* pp = static_cast<std::uint16_t*>(s->contents());
+      const float m = s == &b.q ? sharp : 1.0f;
+      for (std::size_t i = 0; i < n; ++i) {
+        const float x = nd(rng) * m;
+        pp[i] = bf16 ? f2bf_(x) : f2h_(x);
+      }
+    }
+  }
+  const double gflop = 4.0 * H * (double)T * T * kD / 1e9;
+  double base = 0.0;
+  std::vector<float> ref;
+  for (const Arm& a : arms) {
+    ComputeFunction f = fn(a, T, bf16);
+    if (!f.valid()) { continue; }
+    run(b, a, f, qb);                              // warm
+    double best = 1e30;
+    for (int i = 0; i < reps; ++i) { best = std::min(best, run(b, a, f, qb)); }
+    if (base == 0.0) { base = best; }
+    if (ref.empty()) {
+      ref.resize(n);
+      const auto* o = static_cast<const std::uint16_t*>(b.o.contents());
+      for (std::size_t i = 0; i < n; ++i) {
+        ref[i] = bf16 ? bf2f_(o[i]) : h2f_(o[i]);
+      }
+    }
+    std::printf("[sage-pv8] %d x %d x 128 %s %-11s %7.1f ms  %6.1f TF/s  "
+                "%.2fx f16  cos(f16) %.6f\n", H, T, bf16 ? "bf16" : "f16 ",
+                a.name, best, gflop / best, base / best,
+                cos_of(b, ref, bf16));
+  }
 }

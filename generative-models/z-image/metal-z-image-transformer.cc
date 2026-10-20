@@ -1233,6 +1233,8 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
       }
       m->_sage.reset();
     }
+    m->_sage_reserve =
+        std::getenv("VPIPE_Z_IMAGE_SAGE_NO_RESERVE") == nullptr;
   }
   if (const char* e = std::getenv("VPIPE_Z_IMAGE_NO_FOLD")) {
     m->_fold_mod = std::atoi(e) == 0;
@@ -1888,6 +1890,8 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     fc.set_bool(200, (R % A_BQ) == 0).set_bool(201, (R % A_BK) == 0)
         .set_bool(300, false).set_bool(301, false).set_bool(302, false)
         .set_bool(sage::kQkInt8Constant, i8);
+    MetalSageAttention::pv8_constants(
+        fc, i8 && _sage && _sage->pv8_for(_cfg.sage));
     metal_compute::ComputeFunction fn =
         nax ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
             : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
@@ -1927,9 +1931,15 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
         rows >= kSageMinSegment) {
       const MetalSageAttention::Operand qo{&qh, 0, Hd, rows * Hd};
       const MetalSageAttention::Operand ko{&kh, 0, Hd, rows * Hd};
+      const MetalSageAttention::Operand vo{&vh, 0, Hd, rows * Hd};
       std::string gerr;
       i8_ok = _sage->prepare(enc, qo, ko, NH, NH, rows, rows, Hd, A_BQ,
-                             A_BK, _cfg.sage, &gerr);
+                             A_BK, _cfg.sage, &gerr, &vo);
+      // The int8 function takes the int8 P*V's operands iff pv8_for()
+      // says so: a prologue that made none runs dense.
+      if (i8_ok && _sage->pv8_for(_cfg.sage) != _sage->pv8_ready()) {
+        i8_ok = false;
+      }
     }
     const SharedBuffer* pp = params_for(rows);
     const metal_compute::ComputeFunction* fn = attn_fn(rows, i8_ok);
@@ -2318,6 +2328,35 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
 
   const int TOTAL_BLOCKS = _cfg.n_blocks();
   int done = 0;
+
+  // SAGE'S SCRATCH, sized ONCE for the forward's largest attention. The
+  // stacks attend at three row counts -- the caption refiner over the
+  // caption, the noise refiner over the image, the main stack over both
+  // -- and a prepare() at a new count rebuilt the scratch: a private free
+  // and allocation two or three times a forward. Reserved at the largest
+  // Sage will see (the main stack's covers both refiners'), the smaller
+  // calls reuse it; a forward at the same size builds nothing.
+  if (_sage && nax && _cfg.sage.enabled && _sage_reserve) {
+    int big = 0;
+    auto take = [&](int rows) {
+      if (rows >= kSageMinSegment) { big = std::max(big, rows); }
+    };
+    // Both refiners are blocks 0 .. n_refiner - 1 to dense_layers.
+    if (_cfg.sage.dense_layers < _cfg.n_refiner) {
+      take(CAPT);
+      take(IMGT);
+    }
+    if (_cfg.sage.dense_layers < NM) { take(JT); }
+    std::string rerr;
+    if (big > 0 &&
+        !_sage->reserve(NH, NH, big, big, Hd, A_BQ, A_BK,
+                        _sage->pv8_for(_cfg.sage), &rerr) &&
+        _mc->session() != nullptr) {
+      // Not fatal: each prepare() sizes its own call, as without one.
+      _mc->session()->log_debug(fmt(
+          "z-image: sage scratch not reserved at {} rows ({})", big, rerr));
+    }
+  }
 
   // ---- context_refiner, over the caption rows alone -------------------
   //
@@ -3208,9 +3247,13 @@ MetalZImageTransformer::forward_scratch_bytes(const Config& c, int img_rows,
   // caption's normed input, the f32 rotary pair and the velocity -- all
   // live for the whole forward, the refiners using prefixes of them.
   // Held between forwards: a pack's dense stand-in, the int8 context,
-  // and Sol's / Sage's scratch, which rebuild per geometry inside a
-  // forward and on a held stack overlap the set the open command buffer
-  // still retains -- so each geometry is booked.
+  // Sol's scratch, which rebuilds per geometry inside a forward and on a
+  // held stack overlaps the set the open command buffer still retains --
+  // so each geometry is booked -- and Sage's, which forward() reserves
+  // at the largest attention it runs Sage on (the main stack's, or a
+  // refiner's when the main stack is all dense), so ONE geometry is
+  // held and the others reuse it. (VPIPE_Z_IMAGE_SAGE_NO_RESERVE, the
+  // A/B, rebuilds per geometry and holds more than this books.)
   if (img_rows <= 0) { return 0; }
   auto pad = [](std::size_t n) {
     const std::size_t m = (std::size_t)zimage::kSeqMultiple;
@@ -3241,11 +3284,13 @@ MetalZImageTransformer::forward_scratch_bytes(const Config& c, int img_rows,
     }
   }
   if (c.sage.enabled) {
+    std::size_t big = 0;
     for (std::size_t r : {JT, IT, CT}) {
-      if (r >= (std::size_t)kSageMinSegment) {
-        n += MetalSageAttention::scratch_bytes(NH, NH, (int)r, (int)r,
-                                               (int)Hd, 64, 32);
-      }
+      if (r >= (std::size_t)kSageMinSegment) { big = std::max(big, r); }
+    }
+    if (big > 0) {
+      n += MetalSageAttention::scratch_bytes(NH, NH, (int)big, (int)big,
+                                             (int)Hd, 64, 32, c.sage.pv8);
     }
   }
   return n;

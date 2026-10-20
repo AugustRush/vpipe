@@ -99,6 +99,40 @@ constant bool qk_int8_set [[function_constant(306)]];
 constant bool qk_int8 =
     is_function_constant_defined(qk_int8_set) ? qk_int8_set : false;
 
+// vpipe: Q quantized PER TOKEN (q_scale [B, H, qL], one per query row)
+// instead of per query block -- what the int8 P*V's prologue makes. A
+// score's dequant is then the row's scale by the key block's, which the
+// tile applies per row as it is anyway. MEASURED as free, and a quarter
+// less error than the block's scale.
+constant bool qk_q_token_set [[function_constant(310)]];
+constant bool qk_q_token =
+    is_function_constant_defined(qk_q_token_set) ? qk_q_token_set : false;
+
+// vpipe: P*V in INT8 too (Sage's pv8), with the int8 QK and Q per token.
+// The product is HELD in int32 across key blocks -- no f32 O tile until
+// the end: P as uint8 against the row's running max (0..255), V minus its
+// mean over tokens with one scale per channel over the whole sequence,
+// offset by 128 to uint8 as well (MPP multiplies two uint8 into int32).
+// When a row's max grows the held sum is rescaled by the online softmax's
+// own factor -- in float, rounded back: exact to 2^24, and the sum is far
+// under 2^31 -- after the offset's 128 a key is taken out with P's exact
+// integer row sum, which also happens every 64 visited blocks and at the
+// end. A row whose held sum passes 2^30 has P's grid stepped down (255,
+// 127, 63, ...) as if its max had grown -- by lvl/2 over lvl, so that a
+// P of exactly the max stays on the grid -- and int32 is never overrun.
+// V's scale and mean come back after the normalize.
+//
+// WHY HELD: dequantizing each block's product into an f32 O cost more
+// ALU than the int8 product saved -- 61 ms against SageAttention's 50 at
+// 8 heads x 20036 x 128 on the M5 Pro. Held, 43.8 (bf16: 44.6 against
+// 49.3). The price is P's grid, 8 bits against the running max: its error
+// grows on flat rows over long sequences (cosine 0.99966 against the
+// dense kernel at 20k rows of random keys, SageAttention 0.99994;
+// sage_attention.int8_pv_held).
+constant bool pv_int8_set [[function_constant(308)]];
+constant bool pv_int8 =
+    is_function_constant_defined(pv_int8_set) ? pv_int8_set : false;
+
 template <typename T>
 struct TransformScale {
   T scale;
@@ -192,11 +226,18 @@ template <
         [[buffer(14), function_constant(has_block_mask)]],
     // vpipe: the int8 QK operands and their per-block scales. Q8/K8 are
     // [B, H, qL|kL, BD] int8, tightly packed; the scales are [B, H, NQ]
-    // and [B, H, NK] fp32, one per block of the kernel's own tiling.
+    // and [B, H, NK] fp32, one per block of the kernel's own tiling (Q's
+    // [B, H, qL] with qk_q_token).
     const device int8_t* Q8 [[buffer(15), function_constant(qk_int8)]],
     const device int8_t* K8 [[buffer(16), function_constant(qk_int8)]],
     const device float* q_scale [[buffer(17), function_constant(qk_int8)]],
     const device float* k_scale [[buffer(18), function_constant(qk_int8)]],
+    // vpipe: the int8 P*V's: V8 [B, KVH, kL, BD] uint8 -- V minus its mean
+    // over tokens, quantized, plus 128 -- tightly packed; its scale and
+    // mean [B, KVH, BD] fp32.
+    const device uint8_t* V8 [[buffer(19), function_constant(pv_int8)]],
+    const device float* v_scale [[buffer(20), function_constant(pv_int8)]],
+    const device float* v_mean [[buffer(21), function_constant(pv_int8)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -245,8 +286,22 @@ template <
     const size_t kvbase = size_t(tid.z) * kvh + size_t(kv_head_idx);
     Q8b = Q8 + (hbase * size_t(params->qL) + size_t(tid.x) * BQ) * BD;
     K8b = K8 + kvbase * size_t(params->kL) * BD;
-    qsc = q_scale + hbase * size_t(params->NQ) + size_t(tid.x);
+    qsc = qk_q_token
+        ? q_scale + hbase * size_t(params->qL) + size_t(tid.x) * BQ
+        : q_scale + hbase * size_t(params->NQ) + size_t(tid.x);
     ksc = k_scale + kvbase * size_t(params->NK);
+  }
+  // vpipe: the int8 P*V's V, by the KV head as K8 is.
+  const device uint8_t* V8b = nullptr;
+  const device float* vsc = nullptr;
+  const device float* vmu = nullptr;
+  if (pv_int8) {
+    const size_t kvh =
+        size_t(params->H) / size_t(max(1, params->gqa_factor));
+    const size_t kvbase = size_t(tid.z) * kvh + size_t(kv_head_idx);
+    V8b = V8 + kvbase * size_t(params->kL) * BD;
+    vsc = v_scale + kvbase * BD;
+    vmu = v_mean + kvbase * BD;
   }
 
   if (has_mask) {
@@ -343,6 +398,52 @@ template <
     nvis = qb_off[qbi + 1] - vis_base;
   }
 
+  // vpipe: per-token Q -- this thread's rows' scales, read once.
+  metal::vec<float, kRowsPT> q_row;
+  if (qk_int8 && qk_q_token) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      const int r = tm + sm + i * otile_t::kFragRowsJump;
+      q_row[i] = (r < (is_last_q ? lim_rows_q + tm : BQ)) ? qsc[r] : 0.0f;
+    }
+  }
+
+  // vpipe: the int8 P*V's held product; P's row sums since the offset was
+  // last taken out, this thread's columns only; and the level a row's
+  // largest P lands on (255 until a row is stepped down for room).
+  NAXTile<int32_t, TQ, TD> Oacc;
+  int r_part[kRowsPT];
+  int p_lvl[kRowsPT];
+  if (pv_int8) {
+    Oacc.clear();
+  }
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kRowsPT; ++i) {
+    r_part[i] = 0;
+    p_lvl[i] = 255;
+  }
+// The offset taken out: each row's P sum across its four lanes (as
+// NAXFrag's row_reduce pairs them), 128 a key.
+#define VPIPE_PV8_FIX()                                                   \
+  {                                                                       \
+    STEEL_PRAGMA_UNROLL                                                   \
+    for (short ii = 0; ii < kRowsPT; ii++) {                              \
+      int r = r_part[ii];                                                 \
+      r += simd_shuffle_xor(r, ushort(1));                                \
+      r += simd_shuffle_xor(r, ushort(8));                                \
+      r_part[ii] = 0;                                                     \
+      const int off = 128 * r;                                            \
+      STEEL_PRAGMA_UNROLL                                                 \
+      for (short id = 0; id < TD; id++) {                                 \
+        thread auto& oi = Oacc.frag_at(0, id);                            \
+        STEEL_PRAGMA_UNROLL                                               \
+        for (short jj = 0; jj < otile_t::kFragThrCols; jj++) {            \
+          oi[ii * otile_t::kFragThrCols + jj] -= off;                     \
+        }                                                                 \
+      }                                                                   \
+    }                                                                     \
+  }
+
   // Loop over KV seq length
   for (int vi = 0; vi < nvis; vi++) {
     const int kb = has_spans ? qb_blocks[vis_base + vi] : vi;
@@ -416,10 +517,29 @@ template <
       // ONE SCALAR for the whole tile: the two block scales and the
       // softmax's log2 factor, which is what makes per-block
       // quantization the right granularity for a flash kernel.
-      const float dq = qsc[0] * ksc[kb] * float(scale2);
-      STEEL_PRAGMA_UNROLL
-      for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
-        Stile.elems()[ii] = (AccumType)((float)Si.elems()[ii] * dq);
+      if (qk_q_token) {
+        // Per token: the row's Q scale by the key block's.
+        const float kd = ksc[kb] * float(scale2);
+        STEEL_PRAGMA_UNROLL
+        for (short ik = 0; ik < TK; ik++) {
+          thread auto& si = Si.frag_at(0, ik);
+          thread auto& sf = Stile.frag_at(0, ik);
+          STEEL_PRAGMA_UNROLL
+          for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+            const float d = q_row[ii] * kd;
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+              const auto loc = ii * stile_t::kFragThrCols + jj;
+              sf[loc] = (AccumType)((float)si[loc] * d);
+            }
+          }
+        }
+      } else {
+        const float dq = qsc[0] * ksc[kb] * float(scale2);
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
+          Stile.elems()[ii] = (AccumType)((float)Si.elems()[ii] * dq);
+        }
       }
     } else {
 
@@ -700,6 +820,14 @@ template <
     // exp(Si - rowmax(Si))
     Stile.template row_bin_op<ExpSubOp>(new_max);
 
+    // vpipe: whether any row of the tile has a new max -- the int8 P*V's
+    // cue to rescale its held sum.
+    bool grew = false;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      grew = grew || (new_max[i] > max_score[i]);
+    }
+
     // Factor exp(rowmax(Si) - rowmax(Si-1))
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kRowsPT; ++i) {
@@ -716,9 +844,120 @@ template <
     Stile.template row_reduce<SumOp>(sum_score);
 
     // Update O
-    Otile.template row_bin_op<MulOp>(factor);
+    if (pv_int8) {
+      // The held sum rescaled -- the offset out first, being in the OLD
+      // units -- and a grown row's grid back to 255.
+      if (simd_any(grew)) {
+        VPIPE_PV8_FIX();
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < kRowsPT; ii++) {
+          if (factor[ii] < 1.0f) { p_lvl[ii] = 255; }
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short id = 0; id < TD; id++) {
+          thread auto& oi = Oacc.frag_at(0, id);
+          STEEL_PRAGMA_UNROLL
+          for (short ii = 0; ii < otile_t::kFragThrRows; ii++) {
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < otile_t::kFragThrCols; jj++) {
+              const auto loc = ii * otile_t::kFragThrCols + jj;
+              oi[loc] = (int32_t)metal::rint((float)oi[loc] * factor[ii]);
+            }
+          }
+        }
+      }
+    } else {
+      Otile.template row_bin_op<MulOp>(factor);
+    }
 
     simdgroup_barrier(mem_flags::mem_none);
+
+    if (pv_int8) {
+      // vpipe: Oacc += Pu @ Vu, P on 0..255, V + 128 -- uint8 both.
+      NAXTile<uint8_t, TQ, TK> Pu;
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
+        Pu.elems()[ii] = (uint8_t)metal::clamp(
+            metal::rint(Stile.elems()[ii] * 255.0f), 0.0f, 255.0f);
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        thread auto& pf = Pu.frag_at(0, ik);
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+            r_part[ii] += (int)pf[ii * stile_t::kFragThrCols + jj];
+          }
+        }
+      }
+      const device uint8_t* Vut = V8b + (size_t)kb * BK * BD;
+      STEEL_PRAGMA_UNROLL
+      for (short id = 0; id < TD; id += 2) {
+        STEEL_PRAGMA_UNROLL
+        for (short ik = 0; ik < TK; ik++) {
+          NAXTile<uint8_t, 1, 2> Vt;
+          const int voff = ik * kU * BD + id * kU;
+          if (!align_K && is_last_k) {
+            Vt.load_rows(Vut + voff, BD, lim_rows_k - ik * kU);
+          } else {
+            Vt.load(Vut + voff, BD);
+          }
+          NAXTile<int32_t, 1, 2>::NAXFrag_t::template
+              mma<int32_t, uint8_t, uint8_t>(
+              Oacc.frag_at(0, id),
+              Oacc.frag_at(0, id + 1),
+              Pu.frag_at(0, ik),
+              metal::false_type{},
+              Vt.frag_at(0, 0),
+              Vt.frag_at(0, 1),
+              metal::false_type{});
+        }
+      }
+      // Every 64 VISITED blocks (a span list jumps kb): the offset out,
+      // and a row whose held sum has passed 2^30 stepped down -- as if
+      // its max had grown: the sum, its softmax sum and its max moved
+      // together by lvl/2 over lvl (127/255, 63/127, ...), not by 1/2,
+      // which would put a P of exactly the max at 127.5 and round every
+      // later key of a uniform row the same way. The row's ACTUAL largest
+      // |sum|, not a bound. 64 blocks add at most 2^28, so 2^31 is never
+      // reached; only near-uniform attention onto a long run of
+      // same-signed V gets there.
+      if ((vi & 63) == 63) {
+        VPIPE_PV8_FIX();
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < kRowsPT; ii++) {
+          int big = 0;
+          STEEL_PRAGMA_UNROLL
+          for (short id = 0; id < TD; id++) {
+            thread auto& oi = Oacc.frag_at(0, id);
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < otile_t::kFragThrCols; jj++) {
+              big = metal::max(
+                  big, metal::abs(oi[ii * otile_t::kFragThrCols + jj]));
+            }
+          }
+          big = metal::max(big, simd_shuffle_xor(big, ushort(1)));
+          big = metal::max(big, simd_shuffle_xor(big, ushort(8)));
+          if (big > (1 << 30) && p_lvl[ii] > 1) {
+            const int nl = p_lvl[ii] >> 1;
+            const float f = (float)nl / (float)p_lvl[ii];
+            p_lvl[ii] = nl;
+            sum_score[ii] *= f;
+            max_score[ii] -= metal::precise::log2(f);
+            STEEL_PRAGMA_UNROLL
+            for (short id = 0; id < TD; id++) {
+              thread auto& oi = Oacc.frag_at(0, id);
+              STEEL_PRAGMA_UNROLL
+              for (short jj = 0; jj < otile_t::kFragThrCols; jj++) {
+                const auto loc = ii * otile_t::kFragThrCols + jj;
+                oi[loc] = (int32_t)metal::rint((float)oi[loc] * f);
+              }
+            }
+          }
+        }
+      }
+    } else {
 
     // Do O = P @ V
     STEEL_PRAGMA_UNROLL
@@ -758,6 +997,8 @@ template <
       }
     }
 
+    }   // !pv_int8
+
     // Prepare for next iteration. The sparse path steps at the TOP
     // instead, because the gap is a property of the block it is about to
     // read and not of the one it has just finished.
@@ -766,6 +1007,17 @@ template <
       V += BK * int(params->V_strides[2]);
     }
   }
+
+  // vpipe: the int8 P*V's held product into O, its offset out first.
+  if (pv_int8) {
+    VPIPE_PV8_FIX();
+    STEEL_PRAGMA_UNROLL
+    for (short ii = 0; ii < otile_t::kElemsPerTile; ii++) {
+      Otile.elems()[ii] =
+          (AccumType)Oacc.elems()[ii] * AccumType(1.0f / 255.0f);
+    }
+  }
+#undef VPIPE_PV8_FIX
 
   // vpipe: the statistics, BEFORE the normalize consumes them.
   //
@@ -817,6 +1069,27 @@ template <
   }
 
   Otile.template row_bin_op<MulOp>(rcp);
+
+  // vpipe: the int8 P*V's V scale and mean back, after the normalize, so a
+  // row that attended nothing stays zero.
+  if (pv_int8) {
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TD; id++) {
+      thread auto& of = Otile.frag_at(0, id);
+      STEEL_PRAGMA_UNROLL
+      for (short jj = 0; jj < otile_t::kFragThrCols; jj++) {
+        const float mu = vmu[id * kU + sn + jj];
+        const float vc = vsc[id * kU + sn + jj];
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < otile_t::kFragThrRows; ii++) {
+          if (rcp[ii] != AccumType(0)) {
+            const auto loc = ii * otile_t::kFragThrCols + jj;
+            of[loc] = of[loc] * (AccumType)vc + (AccumType)mu;
+          }
+        }
+      }
+    }
+  }
 
   // Store results
   O += tm * int(params->O_strides[2]);

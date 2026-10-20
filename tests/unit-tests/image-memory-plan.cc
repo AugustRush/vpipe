@@ -24,6 +24,9 @@
 // on a 33B checkpoint and skip on most boxes -- which is how the gap
 // survived in the first place.
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/flux3/metal-flux3-transformer.h"
+#include "generative-models/shared/metal-sage-attention.h"
+#include "generative-models/shared/metal-sol-attention.h"
 #include <iterator>
 #include "pipeline/resource-plan.h"
 #include "generative-models/generative-model-manager.h"
@@ -868,4 +871,72 @@ TEST(image_memory_plan, a_family_coreml_claim_follows_the_stage)
     }
   }
   fs::remove_all(root, ec);
+}
+
+// FLUX.3'S ATTENTION TIERS ARE BOOKED. Its denoise claim counted the
+// forward's planes and nothing of Sage's or Sol's own scratch -- both
+// allocate privately there, at the joint stack's rows -- because the
+// stage sized it from a config read off the checkpoint, which never
+// carried the tiers. Booked now, each at its own estimate, and
+// sage_pv8 adds V's uint8 copy and Q's per-token scales to Sage's.
+//
+// Env: VPIPE_FLUX3_TEST_MODEL_PATH (the repo root). Loads no weights.
+TEST(image_memory_plan, flux3_books_its_attention_tiers)
+{
+  const char* root = std::getenv("VPIPE_FLUX3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  namespace fs = std::filesystem;
+  genai::MetalFlux3Transformer::Config fc;
+  if (!genai::MetalFlux3Transformer::Config::read_dims(
+          (fs::path(root) / "transformer").string(), &fc)) {
+    return;
+  }
+  Session sess;
+  const int side = 1024;
+  const std::string pre = "flux3-dit:t2i|";
+  auto booked = [&](bool sage, bool pv8, bool sol) -> std::size_t {
+    FlexData cfg = FlexData::make_object();
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(root));
+    o.insert("width", FlexData::make_int(side));
+    o.insert("height", FlexData::make_int(side));
+    o.insert("sage_attn", FlexData::make_bool(sage));
+    o.insert("sage_pv8", FlexData::make_bool(pv8));
+    o.insert("sol_attn", FlexData::make_bool(sol));
+    GenerateImageStage stage(&sess, "t2i", std::vector<InEdge>{},
+                             std::move(cfg));
+    if (!stage.config_error().empty()) { return 0; }
+    for (const ResourceClaim& c : stage.declare_resources()) {
+      if (c.kind == model_memory::kScratchKind &&
+          c.key.rfind(pre, 0) == 0) {
+        return (std::size_t)std::stoull(c.key.substr(pre.size()));
+      }
+    }
+    return 0;
+  };
+  const std::size_t none = booked(false, false, false);
+  const std::size_t sage = booked(true, false, false);
+  const std::size_t pv8 = booked(true, true, false);
+  const std::size_t sol = booked(false, false, true);
+  const int rows = genai::MetalFlux3Transformer::ane_plan_seq(side, side);
+  const std::size_t want_sage = genai::MetalSageAttention::scratch_bytes(
+      fc.n_heads, fc.n_heads, rows, rows, fc.head_dim,
+      genai::MetalSageAttention::nax_query_block(),
+      genai::MetalSageAttention::nax_key_block(), false);
+  const std::size_t want_pv8 = genai::MetalSageAttention::scratch_bytes(
+      fc.n_heads, fc.n_heads, rows, rows, fc.head_dim,
+      genai::MetalSageAttention::nax_query_block(),
+      genai::MetalSageAttention::nax_key_block(), true);
+  genai::sol::Config sc;
+  const std::size_t want_sol = genai::MetalSolAttention::scratch_bytes(
+      fc.n_heads, rows, fc.head_dim, sc.key_block, /*nax=*/true);
+  std::printf("[image_memory_plan] FLUX.3 %d^2 (%d rows) denoise scratch: "
+              "%zu MB; + sage %zu, + sage_pv8 %zu, + sol %zu MB\n", side,
+              rows, none >> 20, (sage - none) >> 20, (pv8 - none) >> 20,
+              (sol - none) >> 20);
+  ASSERT_TRUE(none > 0);
+  EXPECT_TRUE(sage - none == want_sage);
+  EXPECT_TRUE(pv8 - none == want_pv8);
+  EXPECT_TRUE(want_pv8 > want_sage);
+  EXPECT_TRUE(sol - none == want_sol);
 }

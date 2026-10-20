@@ -2676,14 +2676,19 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
         const MetalSageAttention::Operand ko =
             tm ? MetalSageAttention::Operand{&kuse, 0, H, Hd}
                : MetalSageAttention::Operand{&kuse, 0, Hd, kstride * Hd};
+        const MetalSageAttention::Operand vo =
+            tm ? MetalSageAttention::Operand{&vuse, 0, H, Hd}
+               : MetalSageAttention::Operand{&vuse, 0, Hd, kstride * Hd};
         std::string gerr;
         i8_ok = _sage->prepare(enc, qo, ko, NH, NH, qL, kL, Hd, A_BQ, A_BK,
-                               _cfg.sage, &gerr);
+                               _cfg.sage, &gerr, &vo);
       }
       metal_compute::FunctionConstants fc;
       fc.set_bool(200, (qL % A_BQ) == 0).set_bool(201, (kL % A_BK) == 0)
           .set_bool(300, false).set_bool(301, sg.causal).set_bool(302, false)
           .set_bool(sage::kQkInt8Constant, i8_ok);
+      // ...and its int8 P*V, as the prologue made its operands.
+      MetalSageAttention::pv8_constants(fc, i8_ok && _sage->pv8_ready());
       // TRAINING, KEEP: the row statistics the backward's P needs.
       const bool exp_ml =
           keep != nullptr && keep->mlm != nullptr && keep->mls != nullptr;
@@ -3833,7 +3838,8 @@ MetalQwenImage21Transformer::forward_scratch_bytes(const Config& c,
   }
   if (c.sage.enabled) {
     n += MetalSageAttention::scratch_bytes(c.n_heads, c.n_heads, (int)I,
-                                           (int)J, c.head_dim, 64, 32);
+                                           (int)J, c.head_dim, 64, 32,
+                                           c.sage.pv8);
   }
   if (c.sol.enabled) {
     n += MetalSolAttention::scratch_bytes(c.n_heads, (int)J, c.head_dim,

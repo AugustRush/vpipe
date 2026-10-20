@@ -374,6 +374,8 @@ PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
   a.page_tokens = page_tokens;
 
   const auto t_all = std::chrono::steady_clock::now();
+  // One stream for every sample (autotune_time_on).
+  metal_compute::CommandStream st = mc->make_command_stream();
   std::string detail;
   for (int ri = 0; ri < kRegimes; ++ri) {
     const int n = kRegimeN[ri];
@@ -410,7 +412,8 @@ PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
     const int reps = (n <= 1024) ? 3 : 1;        // O(n^2) -> 1 rep at large n
     auto bench = [&](int i) -> double {
       const int member = cand[(std::size_t)i];
-      return autotune_time(mc, reps, [&](metal_compute::ComputeEncoder& enc) {
+      return autotune_time_on(st, reps,
+                              [&](metal_compute::ComputeEncoder& enc) {
         encode_member(enc, a, member);
       });
     };

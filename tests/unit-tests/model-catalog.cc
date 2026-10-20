@@ -236,6 +236,34 @@ TEST(model_catalog, moss_tts_pair_present) {
   }
 }
 
+// Fish Audio Drama 3: one repo carries the LM and its codec (codec.pth),
+// pinned to what the text-to-speech stage reads -- every shard the index
+// names, the tokenizer and the codec.
+TEST(model_catalog, drama3_present) {
+  const ModelCatalogEntry* e = catalog_by_path("fishaudio/drama-3");
+  EXPECT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->family == "Fish Audio");
+  EXPECT_TRUE(e->model_type == "fish-drama3");
+  EXPECT_FALSE(e->needs_tokenizer_json);
+  for (const char* f : {"config.json", "model.safetensors.index.json",
+                        "model-00001-of-00008.safetensors",
+                        "model-00008-of-00008.safetensors",
+                        "tokenizer.json", "codec.pth"}) {
+    EXPECT_TRUE(has_(e->files, f));
+  }
+  // The int4 copy: the same type, its twelve shards, no eval clips.
+  const ModelCatalogEntry* q = catalog_by_path("fishaudio/drama-3-int4");
+  EXPECT_TRUE(q != nullptr);
+  if (q == nullptr) { return; }
+  EXPECT_TRUE(q->model_type == "fish-drama3");
+  EXPECT_TRUE(has_(q->files, "model-00012-of-00012.safetensors"));
+  EXPECT_TRUE(has_(q->files, "codec.pth"));
+  for (const auto& f : q->files) {
+    EXPECT_TRUE(f.rfind("eval", 0) != 0 && f.rfind("media", 0) != 0);
+  }
+}
+
 // OptiQ 4-bit MLX variants for 2B/4B/9B; whole-repo fetch (no pin).
 TEST(model_catalog, optiq_variants_present) {
   EXPECT_TRUE(has_(catalog_variants("Qwen", "3.5", "9B"),

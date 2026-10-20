@@ -221,6 +221,7 @@ family_version_(const std::string& mt, std::string& family,
       {"moss-tts-realtime",      "MOSS",        "TTS-Realtime"},
       {"moss-codec",             "MOSS",        "Audio-Tokenizer"},
       {"moss-codec-v2",          "MOSS",        "Audio-Tokenizer"},
+      {"fish-drama3",            "Fish Audio",  "Drama 3"},
       {"yue2",                   "YuE",         "2"},
       {"yue2-vae",               "YuE",         "2-Vae"},
       {"bs-roformer",            "BS-RoFormer", "MSST"},
@@ -284,6 +285,8 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
   if (starts("moss_tts_local"))    { return "moss-tts-local"; }
   if (starts("moss_tts_realtime")) { return "moss-tts-realtime"; }
   if (starts("moss_tts"))          { return "moss-tts"; }
+  // Fish Audio Drama 3: a speech LM over a Qwen3.5 MoE backbone.
+  if (starts("fish_omni"))         { return "fish-drama3"; }
   // YuE2 names its VAE export "yue2_vae": test that first.
   if (starts("yue2_vae"))          { return "yue2-vae"; }
   if (starts("yue2"))              { return "yue2"; }

@@ -2683,6 +2683,23 @@ const STRINGS = {
       + 'SageAttention 触碰。0——默认值——表示每个 block 都量化',
       '開頭有多少個 transformer block 保持張量原本的 dtype，不被 '
       + 'SageAttention 觸碰。0——預設值——表示每個 block 都量化'],
+  'cfg.generate-image.sage_pv8': ['',
+      '配合 sage_attn：P*V 乘积也放到 INT8 上做（有损，比单开 sage_attn 更'
+      + '甚）。flash 内核把乘积以 int32 跨 key 块保持，不留 f32 输出块——P 以 '
+      + 'uint8 对照该行的当前最大值，V 每通道一个覆盖整条序列的 scale，再加 '
+      + '128 偏移——只在某行最大值增大时才重新缩放保持的和；Q 按 token 量化。'
+      + '每一步、每一行都用，包括 prompt 的行。在 M5 Pro 上实测，8 头 x 20036 '
+      + '行 x 128 bf16：44.0 毫秒，sage_attn 为 50.6。flux2、flux3、krea2、'
+      + 'moss-image、qwen-image 与 z-image 支持它；与 sage_attn 一样仅限矩阵'
+      + '核心',
+      '配合 sage_attn：P*V 乘積也放到 INT8 上做（失真，比單開 sage_attn 更'
+      + '甚）。flash 核心把乘積以 int32 跨 key 塊保持，不留 f32 輸出塊——P 以 '
+      + 'uint8 對照該列的當前最大值，V 每通道一個涵蓋整條序列的 scale，再加 '
+      + '128 偏移——只在某列最大值增大時才重新縮放保持的和；Q 按 token 量化。'
+      + '每一步、每一列都用，包括 prompt 的列。在 M5 Pro 上實測，8 頭 x 20036 '
+      + '行 x 128 bf16：44.0 毫秒，sage_attn 為 50.6。flux2、flux3、krea2、'
+      + 'moss-image、qwen-image 與 z-image 支援它；與 sage_attn 一樣僅限矩陣'
+      + '核心'],
   'cfg.generate-image.i8_gemm': ['',
       '加速模式（有损）：DiT 大块矩阵乘改用动态 int8 GEMM，速率约为 f16 的 '
       + '2 倍，精度即 int8 水平；没有 NAX matmul2d（矩阵核心 GPU + 相应内核'
@@ -3156,6 +3173,37 @@ const STRINGS = {
       + 'key，所以靠前 block 冗餘更少的殘差流是把它留著不動的理由；而 Sage 每'
       + '個 key、每個 query 都照算，只是改用 int8 算。目前沒有哪個已發布的檔位'
       + '需要在這裡留 dense 前綴；這個鍵存在，是為了讓測量結果可以據此調整'],
+  'cfg.generate-video.sage_pv8': ['',
+      '配合 sage_attn：P*V 乘积也放到 INT8 上做（有损，比单开 sage_attn 更'
+      + '甚）。flash 内核把乘积以 int32 跨 key 块保持，不留 f32 输出块——P 以 '
+      + 'uint8 对照该行的当前最大值，V 每通道一个覆盖整条序列的 scale，再加 '
+      + '128 偏移——只在某行最大值增大时才重新缩放保持的和；Q 按 token 量化。'
+      + 'prompt 与配乐的 query 行仍只用 sage_attn，除非设置 '
+      + 'sage_pv8_all_rows。在 M5 Ultra 上实测，MiniMax-H3 1344x768 x 362 帧'
+      + '（109k 行，16 步）：注意力 2.46 秒，sage_attn 为 2.90；去噪由 2110 '
+      + '秒降到 1927 秒。仅 MiniMax-H3 支持；与 sage_attn 一样仅限矩阵核心',
+      '配合 sage_attn：P*V 乘積也放到 INT8 上做（失真，比單開 sage_attn 更'
+      + '甚）。flash 核心把乘積以 int32 跨 key 塊保持，不留 f32 輸出塊——P 以 '
+      + 'uint8 對照該列的當前最大值，V 每通道一個涵蓋整條序列的 scale，再加 '
+      + '128 偏移——只在某列最大值增大時才重新縮放保持的和；Q 按 token 量化。'
+      + 'prompt 與配樂的 query 列仍只用 sage_attn，除非設定 '
+      + 'sage_pv8_all_rows。在 M5 Ultra 上實測，MiniMax-H3 1344x768 x 362 幀'
+      + '（109k 行，16 步）：注意力 2.46 秒，sage_attn 為 2.90；去噪由 2110 '
+      + '秒降到 1927 秒。僅 MiniMax-H3 支援；與 sage_attn 一樣僅限矩陣核心'],
+  'cfg.generate-video.sage_pv8_from_step': ['',
+      'sage_pv8 开始生效的第一个采样步；之前的步只用 sage_attn。-1——默认值'
+      + '——由模型族决定：MiniMax-H3 前四分之一的步不用它，这些步决定一个片段'
+      + '的布局',
+      'sage_pv8 開始生效的第一個取樣步；之前的步只用 sage_attn。-1——預設值'
+      + '——由模型族決定：MiniMax-H3 前四分之一的步不用它，這些步決定一個片段'
+      + '的佈局'],
+  'cfg.generate-video.sage_pv8_all_rows': ['',
+      '每个 query 行都用 sage_pv8。关闭——默认值——时，位于 MiniMax-H3 序列'
+      + '开头的 prompt 与配乐行（不到序列的 1%）在单独的一次 dispatch 里只用 '
+      + 'sage_attn，视频的行则用 int8',
+      '每個 query 列都用 sage_pv8。關閉——預設值——時，位於 MiniMax-H3 序列'
+      + '開頭的 prompt 與配樂列（不到序列的 1%）在單獨的一次 dispatch 裡只用 '
+      + 'sage_attn，影片的列則用 int8'],
   'cfg.generate-video.sol_attn': ['',
       '加速注意力（有损）：Sol-Attn 在在线 softmax 的过程中按整块 64 个 key 做'
       + '路由，只对代理分数保留下来的那些块做注意力，其余的则用每块 key 的质心'
@@ -3547,36 +3595,88 @@ const STRINGS = {
   // ---- Speak (generative) ----
   'stage.text-to-speech.name': ['', '语音合成', '文字轉語音'],
   'stage.text-to-speech.doc': ['',
-      '文本转语音（MOSS-TTS，metal）：把每个输入文本节拍合成为 PCM 波形并作'
-      + '为 TensorBeat 发出。具体变体由语言模型目录 config.json 中的 '
-      + 'model_type 决定："moss_tts_delay" / "moss_tts"（MOSS-TTS 8B 与 '
-      + 'MOSS-TTS-v1.5，延迟模式 -> 24 kHz 单声道）、"moss_tts_local"（'
-      + 'Local-v1.5 深度解码器 -> 48 kHz 立体声）或 "moss_tts_realtime"（'
-      + '24 kHz 单声道）。',
-      '文字轉語音（MOSS-TTS，metal）：把每個輸入文字節拍合成為 PCM 波形並作'
-      + '為 TensorBeat 發出。具體變體由語言模型目錄 config.json 中的 '
-      + 'model_type 決定："moss_tts_delay" / "moss_tts"（MOSS-TTS 8B 與 '
-      + 'MOSS-TTS-v1.5，延遲模式 -> 24 kHz 單聲道）、"moss_tts_local"（'
-      + 'Local-v1.5 深度解碼器 -> 48 kHz 立體聲）或 "moss_tts_realtime"（'
-      + '24 kHz 單聲道）。'],
+      '文本转语音（MOSS-TTS、Fish Audio Drama 3；metal）：把每个输入文本节拍'
+      + '合成为 PCM 波形并作为 TensorBeat 发出。具体变体由语言模型目录 '
+      + 'config.json 中的 model_type 决定："moss_tts_delay" / "moss_tts"（'
+      + 'MOSS-TTS 8B 与 MOSS-TTS-v1.5，延迟模式 -> 24 kHz 单声道）、'
+      + '"moss_tts_local"（Local-v1.5 深度解码器 -> 48 kHz 立体声）、'
+      + '"moss_tts_realtime"（24 kHz 单声道）或 "fish_omni"（Fish Audio '
+      + 'Drama 3：说话人标签、行内表演提示、用音频加其文字稿克隆音色 -> '
+      + '44.1 kHz 单声道）。',
+      '文字轉語音（MOSS-TTS、Fish Audio Drama 3；metal）：把每個輸入文字節拍'
+      + '合成為 PCM 波形並作為 TensorBeat 發出。具體變體由語言模型目錄 '
+      + 'config.json 中的 model_type 決定："moss_tts_delay" / "moss_tts"（'
+      + 'MOSS-TTS 8B 與 MOSS-TTS-v1.5，延遲模式 -> 24 kHz 單聲道）、'
+      + '"moss_tts_local"（Local-v1.5 深度解碼器 -> 48 kHz 立體聲）、'
+      + '"moss_tts_realtime"（24 kHz 單聲道）或 "fish_omni"（Fish Audio '
+      + 'Drama 3：說話者標籤、行內表演提示、用音訊加其文字稿複製音色 -> '
+      + '44.1 kHz 單聲道）。'],
   'cfg.text-to-speech.hf_dir': ['',
-      'MOSS-TTS 语言模型：models 数据库中的键（由 model-fetch / '
+      '语音合成语言模型：models 数据库中的键（由 model-fetch / '
       + 'model-quantize 注册）或 HF 风格的模型目录；同名时数据库键优先于路'
       + '径。延迟模式的 MOSS-TTS 8B / MOSS-TTS-v1.5（moss-tts；可直接用官方 '
       + 'bf16，或 model-quantize 量化后的目录）、Local-v1.5（moss-tts-local'
-      + '）或实时版（moss-tts-realtime）。',
-      'MOSS-TTS 語言模型：models 資料庫中的鍵（由 model-fetch / '
+      + '）、实时版（moss-tts-realtime），或 Fish Audio Drama 3（'
+      + 'fish-drama3；编解码器随模型一同提供）。',
+      '語音合成語言模型：models 資料庫中的鍵（由 model-fetch / '
       + 'model-quantize 註冊）或 HF 風格的模型目錄；同名時資料庫鍵優先於路'
       + '徑。延遲模式的 MOSS-TTS 8B / MOSS-TTS-v1.5（moss-tts；可直接用官方 '
       + 'bf16，或 model-quantize 量化後的目錄）、Local-v1.5（moss-tts-local'
-      + '）或即時版（moss-tts-realtime）。'],
+      + '）、即時版（moss-tts-realtime），或 Fish Audio Drama 3（'
+      + 'fish-drama3；編解碼器隨模型一同提供）。'],
   'cfg.text-to-speech.codec_dir': ['',
       'MOSS-Audio-Tokenizer（编解码器）模型：models 数据库中的键或文件系统'
-      + '路径；同名时数据库键优先于路径。需与语言模型变体匹配：moss-codec（'
-      + 'MOSS-TTS 8B / v1.5、实时版）或 moss-codec-v2（Local-v1.5）。',
+      + '路径；同名时数据库键优先于路径。MOSS 各变体必须设置，且需与语言模型'
+      + '匹配：moss-codec（MOSS-TTS 8B / v1.5、实时版）或 moss-codec-v2（'
+      + 'Local-v1.5）。Fish Audio Drama 3 读取其自身目录中的 codec.pth；只'
+      + '有想让它改用别处的编解码器时才需设置。',
       'MOSS-Audio-Tokenizer（編解碼器）模型：models 資料庫中的鍵或檔案系統'
-      + '路徑；同名時資料庫鍵優先於路徑。需與語言模型變體相符：moss-codec（'
-      + 'MOSS-TTS 8B / v1.5、即時版）或 moss-codec-v2（Local-v1.5）。'],
+      + '路徑；同名時資料庫鍵優先於路徑。MOSS 各變體必須設定，且需與語言模型'
+      + '相符：moss-codec（MOSS-TTS 8B / v1.5、即時版）或 moss-codec-v2（'
+      + 'Local-v1.5）。Fish Audio Drama 3 讀取其自身目錄中的 codec.pth；只'
+      + '有想讓它改用別處的編解碼器時才需設定。'],
+  'cfg.text-to-speech.reference_text': ['',
+      'Fish Audio Drama 3：audio-ref 输入端口上参考声音的文字稿——Drama 3 '
+      + '同时根据参考的音频与其说的话来克隆音色，所以没有文字稿的参考不会被'
+      + '使用。文本节拍里的 "reference_text" 字段会覆盖它。允许使用说话人标'
+      + '签（<|speaker:N|>）',
+      'Fish Audio Drama 3：audio-ref 輸入埠上參考聲音的文字稿——Drama 3 '
+      + '同時根據參考的音訊與其說的話來複製音色，所以沒有文字稿的參考不會被'
+      + '使用。文字節拍裡的 "reference_text" 欄位會覆寫它。允許使用說話者標'
+      + '籤（<|speaker:N|>）'],
+  'cfg.text-to-speech.references': ['',
+      'Fish Audio Drama 3：要克隆的声音，取自文件——由 {"audio": 文件, '
+      + '"text": 其中说的话} 对象组成的列表（FFmpeg 能读的任何格式，截到 '
+      + 'voice_ref_seconds，载入时编码一次）。文字稿开头可带说话人标签（'
+      + '<|speaker:1|> ……；没有则为说话人 0），让一场戏里每个角色各有自己的'
+      + '声音。audio-ref 输入端口上同一说话人的声音会替换这里的',
+      'Fish Audio Drama 3：要複製的聲音，取自檔案——由 {"audio": 檔案, '
+      + '"text": 其中說的話} 物件組成的清單（FFmpeg 能讀的任何格式，截到 '
+      + 'voice_ref_seconds，載入時編碼一次）。文字稿開頭可帶說話者標籤（'
+      + '<|speaker:1|> ……；沒有則為說話者 0），讓一場戲裡每個角色各有自己的'
+      + '聲音。audio-ref 輸入埠上同一說話者的聲音會取代這裡的'],
+  'cfg.text-to-speech.chunk_text': ['',
+      'Fish Audio Drama 3：长文本分段，按 Fish Audio 服务器的切法——每段约 '
+      + '300 字节、至多 3 位说话人，切在句末（其次是分句处，再其次是空格），'
+      + '绝不切在标签或 [提示] 内部——逐段朗读，并把第一段和最近一段放进上下'
+      + '文，使音色保持一致，再把各段音频拼接起来。false = 整段文本一次生成'
+      + '。max_frames 按段计',
+      'Fish Audio Drama 3：長文字分段，按 Fish Audio 伺服器的切法——每段約 '
+      + '300 位元組、至多 3 位說話者，切在句末（其次是分句處，再其次是空格）'
+      + '，絕不切在標籤或 [提示] 內部——逐段朗讀，並把第一段和最近一段放進上'
+      + '下文，使音色保持一致，再把各段音訊拼接起來。false = 整段文字一次產'
+      + '生。max_frames 按段計'],
+  'cfg.text-to-speech.context': ['',
+      'Fish Audio Drama 3：每段朗读时放在它之前的先前录音。"text"（默认）= '
+      + '同一个文本节拍的各段：它的第一段和最近一段，即参考实现的规则。"run" '
+      + '= 跨节拍沿用同一规则：本次运行的第一段录音和最近一段，使分段送入的'
+      + '朗读（每个节拍一段）保持同一音色与节奏。文本节拍的 '
+      + '"previous_takes" 在两种模式下都会再加入指定的录音',
+      'Fish Audio Drama 3：每段朗讀時放在它之前的先前錄音。"text"（預設）= '
+      + '同一個文字節拍的各段：它的第一段和最近一段，即參考實作的規則。"run" '
+      + '= 跨節拍沿用同一規則：本次執行的第一段錄音和最近一段，使分段送入的'
+      + '朗讀（每個節拍一段）保持同一音色與節奏。文字節拍的 '
+      + '"previous_takes" 在兩種模式下都會再加入指定的錄音'],
   'cfg.text-to-speech.codec_quant': ['',
       '编解码器权重精度："int8" 表示把编解码器 transformer 的 GEMM 权重存成'
       + ' int8 分组 32 的仿射量化（常驻占用约减半，音质代价很小）；默认/留'
@@ -3600,8 +3700,12 @@ const STRINGS = {
       '新文字一到就中止正在合成的這句話（先把已產生的部分沖出），然後朗讀新'
       + '文字；false = 每句話都完整念完再念下一句'],
   'cfg.text-to-speech.max_frames': ['',
-      '仅限 Local-v1.5 / 实时版：每个节拍的帧预算（每帧约 80 毫秒）；>= 1',
-      '僅限 Local-v1.5 / 即時版：每個節拍的影格預算（每格約 80 毫秒）；>= 1'],
+      '仅限 Local-v1.5 / 实时版 / Drama 3：每个节拍的帧预算（每帧约 80 毫秒'
+      + '；Drama 3 约 46 毫秒，并且在长文本中按段计——Fish Audio 服务器允许 '
+      + '600，约 28 秒）；>= 1',
+      '僅限 Local-v1.5 / 即時版 / Drama 3：每個節拍的影格預算（每格約 80 毫'
+      + '秒；Drama 3 約 46 毫秒，並且在長文字中按段計——Fish Audio 伺服器允許'
+      + ' 600，約 28 秒）；>= 1'],
   'cfg.text-to-speech.instruction': ['',
       '可选的风格指令（prompt 字段；MOSS-TTS / v1.5 与 Local-v1.5）。"None" '
       + '= 不设置',
@@ -3614,6 +3718,34 @@ const STRINGS = {
       '文字的語言，用英文名稱："English"、"Chinese"、"French"……（prompt '
       + '欄位；MOSS-TTS / v1.5 與 Local-v1.5）。設定後 MOSS-TTS-v1.5 在幾乎'
       + '所有語言上都明顯更好。"None" = 不設定'],
+  'cfg.text-to-speech.quality': ['',
+      '仅限延迟模式变体：针对整句的音质 / 风格提示（prompt 字段），例如 '
+      + '"Studio recording"、"Telephone call quality"。"None" = 不设置',
+      '僅限延遲模式變體：針對整句的音質 / 風格提示（prompt 欄位），例如 '
+      + '"Studio recording"、"Telephone call quality"。"None" = 不設定'],
+  'cfg.text-to-speech.sound_event': ['',
+      '仅限延迟模式变体：针对整句的声音事件提示（prompt 字段），例如 '
+      + '"Laughter"、"Sigh"、"Breathing"——整句都以它为条件，而不是其中某'
+      + '一处。"None" = 不设置',
+      '僅限延遲模式變體：針對整句的聲音事件提示（prompt 欄位），例如 '
+      + '"Laughter"、"Sigh"、"Breathing"——整句都以它為條件，而不是其中某'
+      + '一處。"None" = 不設定'],
+  'cfg.text-to-speech.ambient_sound': ['',
+      '仅限延迟模式变体：针对整句的环境声提示（prompt 字段），例如 "Rain"、'
+      + '"Office room tone"。在基础模型上属实验性质：效果弱，或尾音更长。'
+      + '"None" = 不设置',
+      '僅限延遲模式變體：針對整句的環境聲提示（prompt 欄位），例如 "Rain"、'
+      + '"Office room tone"。在基礎模型上屬實驗性質：效果弱，或尾音更長。'
+      + '"None" = 不設定'],
+  'cfg.text-to-speech.wait_for_reference': ['',
+      '在 audio-ref 输入端口已接线时：第一句话会先等到一个参考节拍（或该端口'
+      + '结束）再朗读。关闭时该端口被直接取空、不等待，因此在第一段文本之后才'
+      + '到达的参考（例如从文件解码、而图在启动时就发出文本的情况）不会为第一'
+      + '句克隆任何声音',
+      '在 audio-ref 輸入埠已接線時：第一句話會先等到一個參考節拍（或該埠結束'
+      + '）再朗讀。關閉時該埠被直接取空、不等待，因此在第一段文字之後才到達的'
+      + '參考（例如從檔案解碼、而圖在啟動時就發出文字的情況）不會為第一句複製'
+      + '任何聲音'],
   'cfg.text-to-speech.duration_tokens': ['',
       '仅限延迟模式变体：语音的期望长度，以音频 token 计（12.5 个约 1 秒），'
       + '即 prompt 的时长控制。0 = 由模型决定',
@@ -3638,6 +3770,17 @@ const STRINGS = {
       + '前依記憶體規劃決定），並讓機器能容納的層盡量常駐；8 位元量化包每層串流'
       + '讀取的位元組只有 bf16 checkpoint 的一半，所以在小記憶體機器上請把 '
       + 'hf_dir 指向這樣的包（model-quantize，bits 8）'],
+  'cfg.text-to-speech.i8_gemm': ['',
+      '加速模式（有损）：语言模型主干的 prefill GEMM 以动态 int8 的 '
+      + 'matmul2d 计算，每个 GEMM 约 1e-2 的误差。仅限矩阵核心——M5 的路径；'
+      + '其他机器保持稠密计算。它不处理少于 1024 行的 GEMM，所以只有长提示（'
+      + '长篇文本，或文本加一段很长的克隆声音）才会用到；生成本身每帧一行，'
+      + '永远用不到。环境变量 VPIPE_I8_GEMM 可覆盖',
+      '加速模式（有損）：語言模型主幹的 prefill GEMM 以動態 int8 的 '
+      + 'matmul2d 計算，每個 GEMM 約 1e-2 的誤差。僅限矩陣核心——M5 的路徑；'
+      + '其他機器維持稠密計算。它不處理少於 1024 列的 GEMM，所以只有長提示（'
+      + '長篇文字，或文字加一段很長的複製聲音）才會用到；產生本身每格一列，'
+      + '永遠用不到。環境變數 VPIPE_I8_GEMM 可覆寫'],
   'cfg.text-to-speech.text_normalizer': ['',
       '构建 prompt 前的文本清理："robust" = MOSS-TTS-v1.5 自带的规范化器（换'
       + '行变为句子边界、中英文之间的空格、括号、箭头、重复标点；保护网址、电'
@@ -3665,20 +3808,30 @@ const STRINGS = {
       'FlexData 字符串（或带 "text" 键的对象）：要合成的文本。对象还可以携'
       + '带 "end_of_response"（布尔）；只有当前这句话的 end_of_response 为 '
       + 'true（或缺失，默认视为 true）时，新节拍才会打断它。来自 text-chat '
-      + '流式输出端口的中途片段（false）总是被完整朗读',
+      + '流式输出端口的中途片段（false）总是被完整朗读。Drama 3 还读取 '
+      + '"reference_text"（audio-ref 声音的文字稿）和 "previous_takes"：本'
+      + '阶段在本次运行中先前读过的文本列表，它们的录音会放进上下文——以续写'
+      + '的方式编辑：用第一次的语气重读改过的句子',
       'FlexData 字串（或帶 "text" 鍵的物件）：要合成的文字。物件還可以攜帶 '
       + '"end_of_response"（布林）；只有當前這句話的 end_of_response 為 '
       + 'true（或缺少，預設視為 true）時，新節拍才會打斷它。來自 text-chat '
-      + '串流輸出埠的中途片段（false）總是被完整朗讀'],
+      + '串流輸出埠的中途片段（false）總是被完整朗讀。Drama 3 還讀取 '
+      + '"reference_text"（audio-ref 聲音的文字稿）和 "previous_takes"：本'
+      + '階段在本次執行中先前讀過的文字清單，它們的錄音會放進上下文——以續寫'
+      + '的方式編輯：用第一次的語氣重讀改過的句子'],
   'port.text-to-speech.audio-ref': ['',
       '可选的单声道 f32 PCM TensorBeat（采样率不限；sideband.sample_rate 会'
       + '被采用）：要克隆的参考声音。最新的节拍具有粘性（在被替换之前对之后'
       + '所有句子都生效）。它自成一个时钟组——它的到来独立于文本流与 PCM 输'
-      + '出，并不与它们锁定速率。',
+      + '出，并不与它们锁定速率。Drama 3 还需要它的文字稿（该节拍 sideband '
+      + '的 "reference_text"，否则取文本节拍的，再否则取配置的），并且每位说'
+      + '话人保留一个声音，由文字稿开头的 <|speaker:N|> 指定。',
       '可選的單聲道 f32 PCM TensorBeat（取樣率不限；sideband.sample_rate 會'
       + '被採用）：要複製的參考聲音。最新的節拍具有黏性（在被取代之前對之後'
       + '所有句子都生效）。它自成一個時脈組——它的到來獨立於文字串流與 PCM '
-      + '輸出，並不與它們鎖定速率。'],
+      + '輸出，並不與它們鎖定速率。Drama 3 還需要它的文字稿（該節拍 sideband'
+      + ' 的 "reference_text"，否則取文字節拍的，再否則取組態的），並且每位說'
+      + '話者保留一個聲音，由文字稿開頭的 <|speaker:N|> 指定。'],
   'port.text-to-speech.audio-sampler': ['',
       '可选的 token 采样器配置 FlexData（sampler-select），用于音频码通道；'
       + '它的 seed 同时也是音色种子。在第一个节拍时锁存。未接线则沿用 MOSS '
@@ -3696,10 +3849,12 @@ const STRINGS = {
   'port.text-to-speech.pcm': ['',
       'f32 PCM 的 TensorBeat（已设置 sideband.sample_rate）；下游可选。延迟'
       + '模式变体：秩为 1 的 [采样数] 单声道 @ 24 kHz。Local-v1.5：秩为 2 的 '
-      + '[2, 采样数] 立体声 @ 48 kHz。实时版：[1, 采样数] 单声道 @ 24 kHz。',
+      + '[2, 采样数] 立体声 @ 48 kHz。实时版：[1, 采样数] 单声道 @ 24 kHz。'
+      + 'Drama 3：秩为 1 的 [采样数] 单声道 @ 44.1 kHz。',
       'f32 PCM 的 TensorBeat（已設定 sideband.sample_rate）；下游可選。延遲'
       + '模式變體：秩為 1 的 [取樣數] 單聲道 @ 24 kHz。Local-v1.5：秩為 2 的 '
-      + '[2, 取樣數] 立體聲 @ 48 kHz。即時版：[1, 取樣數] 單聲道 @ 24 kHz。'],
+      + '[2, 取樣數] 立體聲 @ 48 kHz。即時版：[1, 取樣數] 單聲道 @ 24 kHz。'
+      + 'Drama 3：秩為 1 的 [取樣數] 單聲道 @ 44.1 kHz。'],
 
   // ---- VAE Decode (generative) ----
   'stage.vae-decode.name': ['', 'VAE 解码', 'VAE 解碼'],

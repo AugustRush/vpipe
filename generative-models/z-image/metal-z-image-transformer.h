@@ -264,6 +264,17 @@ class MetalZImageTransformer {
   int gemm_tile() const { return _gemm_tile; }
   bool uses_attn_nax() const { return _use_attn_nax; }
   bool uses_sage_attn() const { return (bool)_sage; }
+  // How many times Sage's scratch was built: once for a run whose size
+  // stays put, since each forward reserves its largest attention (the
+  // main stack's) and the refiners reuse it.
+  int sage_scratch_builds() const {
+    return _sage ? _sage->scratch_builds() : 0;
+  }
+  // ...and what it holds -- all of it its own (nothing is lent), and
+  // what forward_scratch_bytes() books for it.
+  std::size_t sage_scratch_held() const {
+    return _sage ? _sage->private_held() : 0;
+  }
   bool uses_i8_gemm() const { return (bool)_i8; }
   bool uses_sol_attn() const { return (bool)_sol; }
   // What the forwards have encoded for perf-flops, credited to the GPU
@@ -604,6 +615,9 @@ class MetalZImageTransformer {
   bool _fast = false;
   bool _fast_failed = false;
   std::unique_ptr<MetalSageAttention> _sage;
+  // Reserve Sage's scratch at the forward's largest attention (false:
+  // VPIPE_Z_IMAGE_SAGE_NO_RESERVE, the A/B -- it rebuilds per row count).
+  bool _sage_reserve = true;
   std::unique_ptr<MetalSolAttention> _sol;
   // perf-flops: GEMMs and attention counted as encoded, credited at
   // retire; Sol's exact half at the keep ratio it realizes.

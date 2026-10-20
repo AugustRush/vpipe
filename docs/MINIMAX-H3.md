@@ -65,6 +65,7 @@ arrives in **8–16 steps** instead of 30+.
     - [Get it and run it](#get-it-and-run-it)
     - [What it saves](#what-it-saves)
   - [Cheaper attention — SageAttention's int8 QK](#cheaper-attention--sageattentions-int8-qk)
+  - [Its P·V in int8 too — `sage_pv8`](#its-pv-in-int8-too--sage_pv8)
   - [Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing)
     - [What it saves](#what-it-saves-1)
     - [Against the VDN branch](#against-the-vdn-branch)
@@ -355,6 +356,7 @@ From the `generate-video` stage:
 | `seed` | 6 | Same seed + same settings ⇒ same clip. |
 | `i8_gemm` | `true` | An opt-in **lossy** accelerated mode, on in every shipped pipeline here. Only matrix-core GPUs (M5 and newer) can use it, so it does nothing on an M4 — and on an M5 turning it off is slower. It changes the picture slightly, so turn it off when you are judging output rather than speed. |
 | `sage_attn` | `false` | An opt-in **lossy** accelerated mode, independent of both `i8_gemm` and `sol_attn` and settable with either — it runs the attention's QK^T product in int8 with a per-block scale, where `sol_attn` decides which blocks are attended at all. 1.20× on the attention at video geometry, at the same cosine the f16 kernel scores. Matrix cores only. See [Cheaper attention — SageAttention's int8 QK](#cheaper-attention--sageattentions-int8-qk). |
+| `sage_pv8` | `false` | With `sage_attn`: the attention's P·V product in int8 too, held in int32 across key blocks — 2.46 s against `sage_attn`'s 2.90 on one attention of a 1344 × 768 × 362-frame clip. `sage_pv8_from_step` (default `-1`: the first quarter of the steps without) and `sage_pv8_all_rows` (default `false`: the prompt's and soundtrack's rows keep `sage_attn` alone) beside it. See [Its P·V in int8 too](#its-pv-in-int8-too--sage_pv8). |
 | `ane_ffn` / `ane_qkv` | `false` | Opt-in **lossy** modes that run part of every block on the **Apple Neural Engine** beside the GPU. Worth it on an **M4-family** Mac, normally not on an M5. See [The Neural Engine](#the-neural-engine--for-m4-family-macs). |
 | `sol_attn` | `false` | Another opt-in **lossy** accelerated mode, and an independent one — it changes how the attention between the GEMMs is computed where `i8_gemm` changes the GEMMs. 1.27× on the wall clock at 124 frames of 832 × 480, with no extra weights; see [Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing) for the knobs beside it. |
 | `motion_cache` | `false` | An opt-in **lossy** mode of a different kind: it skips whole denoising steps whose answer the last one already predicts, so it composes with every setting above. It pays on long schedules — 1.32× on the denoise at `steps: 20` — and has little to skip on an 8-step draft or a Turbo run. See [Fewer forwards — MotionCache](#fewer-forwards--motioncache). |
@@ -2557,6 +2559,45 @@ there is no published profile that needs a dense prefix.
 
 The same setting is on `generate-image`, where FLUX.2, Krea-2 and
 Qwen-Image-Edit take it.
+
+### Its P·V in int8 too — `sage_pv8`
+
+With `sage_attn` on, the flash kernel's **second** product, `P·V`, can run
+in int8 as well:
+
+```json
+"sage_attn": true, "sage_pv8": true
+```
+
+The product is **held in int32** across key blocks — the kernel keeps no
+f32 output tile until the end. `P` goes in as uint8 against the row's
+running maximum (0..255); `V`, minus its mean over tokens, gets one scale
+per channel over the whole sequence and is offset by 128 to uint8 as well.
+When a row's maximum grows, the held sum is rescaled by the online
+softmax's own factor, and a row whose sum nears int32's range has `P`'s
+grid stepped down. `Q` goes per token. Dequantizing each key block's
+product into an f32 output instead cost more than the int8 product saved.
+
+**Measured** on an M5 Ultra, 56 heads × 109k rows × head_dim 128 (a 1344 ×
+768 clip of 362 frames), bf16, one attention:
+
+| | one attention |
+|---|---|
+| f16 kernel | **4.04 s** |
+| `sage_attn` | **2.90 s** |
+| `sage_attn` + `sage_pv8` | **2.46 s** |
+
+The whole denoise of that clip at 16 steps went from 2110 s to 1927 s.
+
+**Two more keys.** `sage_pv8_from_step` is the first sampling step it runs
+at — the steps before keep `sage_attn` alone; `-1`, the default, runs the
+first quarter of the steps without, the steps that settle a clip's
+layout. `sage_pv8_all_rows` (default `false`) puts the prompt's and the
+soundtrack's rows on it too; off, those — under 1% of a clip's rows — keep
+`sage_attn` alone in a dispatch of their own.
+
+`generate-image` has `sage_pv8` too, where FLUX.2, FLUX.3, Krea-2,
+MOSS-Image, Qwen-Image and Z-Image take it on every step and row.
 
 ### Faster attention — Sol-Attn routing
 

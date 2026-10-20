@@ -1,4 +1,5 @@
 #include "stages/model-memory.h"
+#include "stages/model-memory-host.h"
 
 #include "common/host-report.h"
 #include "common/flex-data.h"
@@ -211,6 +212,27 @@ bounded(const SessionContextIntf*       session,
   const std::size_t ram = phys_ram();
   if (ram == 0) { return false; }
   return ram < weight_footprint(session, dirs) + headroom;
+}
+
+std::size_t
+moe_expert_cache(const SessionContextIntf* session, const std::string& dir,
+                 std::size_t preload, std::size_t experts,
+                 std::size_t layer_experts, std::size_t scratch,
+                 std::size_t headroom)
+{
+  const std::size_t ram = phys_ram();
+  if (ram == 0 || experts == 0) { return 0; }   // unknown: keep them all
+  // Peers and this model at its full preload, as plan_streaming counts.
+  // Before it loads, the footprint carries this directory at about its
+  // on-disk size (declared or not); what it would hold is the preload.
+  std::size_t footprint = weight_footprint(session, {dir});
+  const std::size_t disk = dir_weights_bytes(dir);
+  footprint = footprint - std::min(footprint, disk) + preload;
+  const std::size_t need = footprint + scratch + headroom;
+  if (need <= ram) { return 0; }
+  const std::size_t short_by = need - ram;
+  const std::size_t cache = experts > short_by ? experts - short_by : 0;
+  return std::max(cache, layer_experts);
 }
 
 StreamPlan

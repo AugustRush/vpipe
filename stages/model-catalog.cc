@@ -627,6 +627,63 @@ builtin_catalog_()
      .variant = "bf16 (OpenMOSS-Team)",
      .hf_path = "OpenMOSS-Team/MOSS-TTS-Realtime",
      .model_type = "moss-tts-realtime", .needs_tokenizer_json = false},
+    // ---- Fish Audio Drama 3 (text-to-speech: speech LM + its codec) ---
+    // The text-to-speech stage's hf_dir (model_type "fish-drama3"; the
+    // stage reads config.json's "fish_omni"). ONE repo: a Qwen3.5-35B-A3B
+    // backbone (routed experts block-FP8, the rest bf16; run as published,
+    // ~36 GB held -- a 64 GB box), a 13-layer codebook tower, and the
+    // 44.1 kHz modded-DAC codec as codec.pth beside them, so no codec_dir.
+    // Speaker tags <|speaker:N|> and inline cues in the text; voice cloning
+    // from a reference clip + its transcript. FISH AUDIO COMMUNITY LICENSE:
+    // research / non-commercial use, commercial only under USD 500k annual
+    // revenue, and no hosted TTS service without Fish Audio's licence.
+    // PINNED to the files the stage reads.
+    {.family = "Fish Audio", .version = "Drama 3", .param_class = "35B-A3B",
+     .variant = "FP8 experts + bf16 (fishaudio)",
+     .hf_path = "fishaudio/drama-3",
+     .model_type = "fish-drama3",
+     .files = {"config.json", "model.safetensors.index.json",
+               "model-00001-of-00008.safetensors",
+               "model-00002-of-00008.safetensors",
+               "model-00003-of-00008.safetensors",
+               "model-00004-of-00008.safetensors",
+               "model-00005-of-00008.safetensors",
+               "model-00006-of-00008.safetensors",
+               "model-00007-of-00008.safetensors",
+               "model-00008-of-00008.safetensors",
+               "tokenizer.json", "tokenizer_config.json",
+               "special_tokens_map.json", "chat_template.jinja",
+               "codec.pth", "LICENSE", "README.md"},
+     .needs_tokenizer_json = false},
+    // The same model at int4 (Fish Audio's repo, quantized by a community
+    // contributor: GPTQ format, symmetric, group 128, RTN + clip search):
+    // the routed experts and the attention / gated-DeltaNet projections
+    // int4, the rest bf16. ~22 GB held -- the one to point a 32 GB box at.
+    // The stage reads it natively: the experts become its affine w4 MoE
+    // slabs, exactly; the int4 projections are dequantized to bf16. Same
+    // licence. PINNED: the repo also carries its evaluation clips, a demo
+    // video and its quantization scripts.
+    {.family = "Fish Audio", .version = "Drama 3", .param_class = "35B-A3B",
+     .variant = "GPTQ int4 (fishaudio)",
+     .hf_path = "fishaudio/drama-3-int4",
+     .model_type = "fish-drama3",
+     .files = {"config.json", "model.safetensors.index.json",
+               "model-00001-of-00012.safetensors",
+               "model-00002-of-00012.safetensors",
+               "model-00003-of-00012.safetensors",
+               "model-00004-of-00012.safetensors",
+               "model-00005-of-00012.safetensors",
+               "model-00006-of-00012.safetensors",
+               "model-00007-of-00012.safetensors",
+               "model-00008-of-00012.safetensors",
+               "model-00009-of-00012.safetensors",
+               "model-00010-of-00012.safetensors",
+               "model-00011-of-00012.safetensors",
+               "model-00012-of-00012.safetensors",
+               "tokenizer.json", "tokenizer_config.json",
+               "special_tokens_map.json", "chat_template.jinja",
+               "codec.pth", "LICENSE", "README.md"},
+     .needs_tokenizer_json = false},
     // ---- YuE2 (text-to-music: AR-NAR LM + Oobleck VAE) ---------------
     // The generate-audio stage's hf_dir (model_type "yue2"): one 3.6B bf16
     // checkpoint that plans an ABC score, writes a semantic token per 25 Hz
@@ -2649,7 +2706,7 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     set({"text"}, {"audio"});
   } else if (mt == "moss-codec" || mt == "moss-codec-v2") {
     set({"audio"}, {"audio"});
-  } else if (mt == "yue2") {
+  } else if (mt == "yue2" || mt == "fish-drama3") {
     set({"text"}, {"audio"});
   } else if (mt == "yue2-vae") {
     set({"audio"}, {"audio"});

@@ -641,6 +641,9 @@ class MetalMiniMaxH3Transformer {
     // early, structure-deciding steps exact (HyperFlow's published Sol
     // recipe keeps the first two of eight dense) says so step by step.
     bool dense_attention = false;
+    // Sage's int8 P*V (sage::Config::pv8) off for this forward -- the
+    // int8 QK alone -- as the loop's sage_pv8_from_step says.
+    bool sage_pv8_off = false;
     // TaoMate-H3's STREAMING attention (minimax-h3-stream-kv.h). Set, and
     // every main block's attention splits in two:
     //   text rows   -> the text rows alone
@@ -1554,6 +1557,7 @@ class MetalMiniMaxH3Transformer {
   // function and nothing else about the geometry does -- so without it
   // an A/B in one process would measure the first arm twice.
   int _attn_sage_built = -1;
+  int _attn_pv8_built = -1;   // ...and its int8 P*V (sage::Config::pv8)
   int _vdn_frames = 0, _vdn_tpf = 0, _vdn_vstart = 0, _vdn_seq = 0;
   // A window wide enough to reach every frame IS the original attention,
   // and then the linear half must NOT run: it carries the window's
@@ -1996,6 +2000,14 @@ class MetalMiniMaxH3Transformer {
   metal_compute::ComputeFunction _fn_nan_trip;
   metal_compute::SharedBuffer    _nan_report;
   metal_compute::SharedBuffer _attn_p_main, _attn_p_text;
+  // Sage's int8 P*V on the VIDEO rows only, unless pv8_all_rows: the
+  // prompt's and the soundtrack's query blocks on the int8 QK alone
+  // (`_fn_attn_main_i8_qk`, Q per token as the prologue made it), the
+  // rest from `_attn_band_nb` on, with params counting blocks from there
+  // (`_attn_p_band`).
+  metal_compute::ComputeFunction _fn_attn_main_i8_qk;
+  metal_compute::SharedBuffer _attn_p_band;
+  int _attn_band_nb = 0;
   // The streaming attention's two parameter blocks (text over text, media
   // over [cache ; text ; media]) and its pipelines, one per alignment
   // pair -- qL and kL move every chunk, so they are built on demand and

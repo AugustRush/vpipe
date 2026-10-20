@@ -1567,6 +1567,8 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
         fc.set_bool(200, (JT % A_BQ) == 0).set_bool(201, (JT % A_BK) == 0)
             .set_bool(300, false).set_bool(301, false).set_bool(302, false)
             .set_bool(sage::kQkInt8Constant, i8);
+        MetalSageAttention::pv8_constants(
+            fc, i8 && _sage && _sage->pv8_for(_cfg.sage));
         return nax
             ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
             : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
@@ -1794,9 +1796,15 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
         if (_sage && fn_attn_i8.valid() && L >= _cfg.sage.dense_layers) {
           const MetalSageAttention::Operand qo{&qt, 0, Hd, JT * Hd};
           const MetalSageAttention::Operand ko{&kt, 0, Hd, JT * Hd};
+          const MetalSageAttention::Operand vo{&vt, 0, Hd, JT * Hd};
           std::string gerr;
           i8_ok = _sage->prepare(enc, qo, ko, NH, NH, JT, JT, Hd, A_BQ,
-                                 A_BK, _cfg.sage, &gerr);
+                                 A_BK, _cfg.sage, &gerr, &vo);
+          // The int8 function takes the int8 P*V's operands iff pv8_for()
+          // says so: a prologue that made none runs dense.
+          if (i8_ok && _sage->pv8_for(_cfg.sage) != _sage->pv8_ready()) {
+            i8_ok = false;
+          }
         }
         enc.set_function(i8_ok ? fn_attn_i8 : fn_attn);
         enc.set_buffer(0, qt); enc.set_buffer(1, kt); enc.set_buffer(2, vt);

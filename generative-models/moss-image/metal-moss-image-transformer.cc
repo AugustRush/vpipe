@@ -1770,6 +1770,8 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
     fc.set_bool(200, (R % A_BQ) == 0).set_bool(201, (R % A_BK) == 0)
         .set_bool(300, false).set_bool(301, false).set_bool(302, false)
         .set_bool(sage::kQkInt8Constant, i8);
+    MetalSageAttention::pv8_constants(
+        fc, i8 && _sage && _sage->pv8_for(_cfg.sage));
     metal_compute::ComputeFunction fn =
         nax ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
             : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
@@ -1790,9 +1792,15 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
         rows >= kSageMinSegment) {
       const MetalSageAttention::Operand qo{&q, qe, stride, Hd};
       const MetalSageAttention::Operand ko{&k, ke, stride, Hd};
+      const MetalSageAttention::Operand vo{&v, ve, stride, Hd};
       std::string gerr;
       i8_ok = _sage->prepare(enc, qo, ko, NH, NH, rows, rows, Hd, A_BQ,
-                             A_BK, _cfg.sage, &gerr);
+                             A_BK, _cfg.sage, &gerr, &vo);
+      // The int8 function takes the int8 P*V's operands iff pv8_for()
+      // says so: a prologue that made none runs dense.
+      if (i8_ok && _sage->pv8_for(_cfg.sage) != _sage->pv8_ready()) {
+        i8_ok = false;
+      }
     }
     const SharedBuffer* pp = params_for(rows, stride, false);
     const metal_compute::ComputeFunction* fn = attn_fn(rows, i8_ok);
@@ -1845,9 +1853,15 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
           L >= _cfg.sage.dense_layers && rows >= kSageMinSegment) {
         const MetalSageAttention::Operand qo{&qh, 0, Hd, rows * Hd};
         const MetalSageAttention::Operand ko{&kh, 0, Hd, rows * Hd};
+        const MetalSageAttention::Operand vo{&vh, 0, Hd, rows * Hd};
         std::string gerr;
         i8_ok = _sage->prepare(enc, qo, ko, NH, NH, rows, rows, Hd, A_BQ,
-                               A_BK, _cfg.sage, &gerr);
+                               A_BK, _cfg.sage, &gerr, &vo);
+        // The int8 function takes the int8 P*V's operands iff pv8_for()
+        // says so: a prologue that made none runs dense.
+        if (i8_ok && _sage->pv8_for(_cfg.sage) != _sage->pv8_ready()) {
+          i8_ok = false;
+        }
       }
       const SharedBuffer* pp = params_for(rows, Hd, true);
       const metal_compute::ComputeFunction* fn = attn_fn(rows, i8_ok);
@@ -2888,7 +2902,8 @@ MetalMossImageTransformer::forward_scratch_bytes(const Config& c, int grid_h,
     }
     if (c.sage.enabled) {
       n += MetalSageAttention::scratch_bytes(c.n_heads, c.n_heads, (int)jt,
-                                             (int)jt, c.head_dim, 64, 32);
+                                             (int)jt, c.head_dim, 64, 32,
+                                             c.sage.pv8);
     }
     if (sol) {
       n += MetalSolAttention::scratch_bytes(c.n_heads, (int)jt, c.head_dim,

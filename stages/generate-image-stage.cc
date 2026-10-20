@@ -224,6 +224,18 @@ const ConfigKey kAttrs[] = {
    .doc = "leading transformer blocks left in the tensor dtype, untouched "
           "by SageAttention. 0 -- the default -- quantizes every block",
    .def_int = 0},
+  {.key = "sage_pv8", .type = ConfigType::Bool, .required = false,
+   .doc = "with sage_attn: the P*V product in INT8 TOO (LOSSY, more so "
+          "than sage_attn alone). The flash kernel holds the product in "
+          "int32 across key blocks with no f32 output tile -- P as uint8 "
+          "against the row's running max, V with one scale per channel "
+          "over the sequence, offset by 128 -- and rescales the held sum "
+          "only when a row's max grows; Q goes per token. Every step and "
+          "every row, the prompt's included. MEASURED on an M5 Pro, 8 heads "
+          "x 20036 rows x 128 bf16: 44.0 ms against sage_attn's 50.6. "
+          "Taken by flux2, flux3, krea2, moss-image, qwen-image and "
+          "z-image; matrix cores only, as sage_attn",
+   .def_bool = false},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
           "block matmuls, ~2x their f16 rate at int8 quality; IGNORED "
@@ -841,6 +853,7 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   _keep_loaded = attr_real("keep_loaded");
   _sage.enabled      = attr_bool("sage_attn");
   _sage.dense_layers = (int)attr_int("sage_dense_layers");
+  _sage.pv8          = attr_bool("sage_pv8");
   _sol.enabled      = attr_bool("sol_attn");
   _sol.tau          = (float)attr_real("sol_tau");
   _sol.dense_layers = (int)attr_int("sol_dense_layers");
@@ -896,6 +909,7 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   genai::accel::set_flag(&_accel, genai::accel::kSageAttn, _sage.enabled);
   genai::accel::set_integer(&_accel, genai::accel::kSageDenseLayers,
                             _sage.dense_layers);
+  genai::accel::set_flag(&_accel, genai::accel::kSagePv8, _sage.pv8);
   // Written whether the tier is on or off, and with the SETTLED value:
   // `sol_key_block` here is what the check above fell back to, not what
   // the graph said, so no family has to repeat that validation or can
@@ -1109,9 +1123,19 @@ GenerateImageStage::warm_key_(const Cfg& c, bool stream,
   if constexpr (requires { c.i8_hold_w4; }) {
     k += fmt(" {}", c.i8_hold_w4 ? 1 : 0)();
   }
+  // Every sage::Config field, the int8 P*V's included: a family reads
+  // them off its own config at every forward (which flash function, which
+  // prologue), so a warm DiT under another sage_pv8 runs the other arm --
+  // and an A/B of it in one process measures the first arm twice. The
+  // P*V's only where Sage is on, and its two refinements only with it.
   if constexpr (requires { c.sage; }) {
-    k += fmt("|sage {} {} {}", c.sage.enabled ? 1 : 0, c.sage.dense_layers,
-             c.sage.smooth_k ? 1 : 0)();
+    const bool pv8 = c.sage.enabled && c.sage.pv8;
+    k += fmt("|sage {} {} {} {}", c.sage.enabled ? 1 : 0,
+             c.sage.dense_layers, c.sage.smooth_k ? 1 : 0, pv8 ? 1 : 0)();
+    if (pv8) {
+      k += fmt(" {} {}", c.sage.pv8_from_step,
+               c.sage.pv8_all_rows ? 1 : 0)();
+    }
   }
   if constexpr (requires { c.sol; }) {
     k += fmt("|sol {} {} {} {} {} {} {}", c.sol.enabled ? 1 : 0, c.sol.tau,
@@ -2350,6 +2374,9 @@ GenerateImageStage::declare_resources() const
     std::size_t bytes = model_memory::kUnknownArena;
     if (_width > 0 && _height > 0 &&
         genai::MetalFlux3Transformer::Config::read_dims(dit, &fc)) {
+      // The attention tiers allocate their own scratch beside the planes.
+      fc.sage = _sage;
+      fc.sol = _sol;
       bytes = genai::MetalFlux3Transformer::forward_scratch_bytes(
           fc, genai::MetalFlux3Transformer::ane_plan_seq(_width, _height));
     }
