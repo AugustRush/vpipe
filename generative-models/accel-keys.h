@@ -73,6 +73,12 @@ inline constexpr std::string_view kSolKeyBlock = "sol_key_block";
 inline constexpr std::string_view kSolDenseLayers = "sol_dense_layers";
 // Key blocks either side of the query's own, kept exact. Int; default 1.
 inline constexpr std::string_view kSolLocalRadius = "sol_local_radius";
+// VSA-H3's routing BUDGET, as a fraction of key blocks dropped. Real;
+// negative (the default) keeps Sol's threshold instead. A VSA-distilled
+// student was trained under a budget (FastH3-Omni: 0.9) and its
+// compression gate exists to make up what that budget dropped, so the two
+// belong together.
+inline constexpr std::string_view kSolVsaSparsity = "sol_vsa_sparsity";
 
 // ---- MotionCache ----------------------------------------------------
 //

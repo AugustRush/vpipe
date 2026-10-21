@@ -361,6 +361,19 @@ const ConfigKey kAttrs[] = {
           "is not put to the vote. -1 routes even the query's own block, "
           "which is an ablation rather than a setting",
    .def_int = 1},
+  // VSA-H3's routing BUDGET, in place of the threshold above. A VSA-distilled
+  // student (FastVideo FastH3-Omni) was trained keeping a FIXED share of key
+  // blocks -- its inference contract says vsa_sparsity 0.9, i.e. 10% kept --
+  // and its compression gate exists to make up what that budget dropped.
+  // Negative (the default) keeps the threshold, which is what a base H3
+  // checkpoint and every pack of one expects.
+  {.key = "sol_vsa_sparsity", .type = ConfigType::Real, .required = false,
+   .doc = "fraction of key blocks a VSA-distilled checkpoint DROPS: every "
+          "query block keeps ceil((1 - s) * blocks) of them, ranked by the "
+          "routing proxy (video_sparse_attn.py's compute_topk). < 0 keeps "
+          "sol_tau's threshold instead. FastH3-Omni ships 0.9; the local "
+          "band, the sink and the tail block stay exact regardless",
+   .def_real = -1.0},
   // ---- MotionCache (MAC-AutoML, arXiv:2605.01725) -------------------
   // A SAMPLING-LOOP tier rather than a transformer one: it decides per
   // step whether to run the forward at all, so it composes with every
@@ -620,6 +633,7 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _sage.pv8_all_rows = attr_bool("sage_pv8_all_rows");
   _sol.enabled      = attr_bool("sol_attn");
   _sol.tau          = (float)attr_real("sol_tau");
+  _sol.vsa_sparsity = (float)attr_real("sol_vsa_sparsity");
   _sol.dense_layers = (int)attr_int("sol_dense_layers");
   _sol.local_radius = (int)attr_int("sol_local_radius");
   _sol_dense_steps  = std::max(0, (int)attr_int("sol_dense_steps"));
@@ -691,6 +705,8 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
                             _sol.dense_layers);
   genai::accel::set_integer(&_accel, genai::accel::kSolLocalRadius,
                             _sol.local_radius);
+  genai::accel::set_real(&_accel, genai::accel::kSolVsaSparsity,
+                         (double)_sol.vsa_sparsity);
   // MotionCache, settled the way sol_key_block is above: a value that
   // would make the estimate meaningless WARNS and falls back to the
   // shipped one rather than refusing the stage, and the bag carries what

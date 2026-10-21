@@ -197,6 +197,7 @@ kernel void sol_route_mma(
     constant int&           per     [[buffer(17)]],
     constant int&           NKS     [[buffer(18)]],
     constant int&           GQA     [[buffer(19)]],
+    constant float&         vsa_sparsity [[buffer(21)]],
     uint3 tid  [[threadgroup_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]])
 {
@@ -326,6 +327,7 @@ kernel void sol_route_p_mma(
     constant int&           per     [[buffer(17)]],
     constant int&           NKS     [[buffer(18)]],
     constant int&           GQA     [[buffer(19)]],
+    constant float&         vsa_sparsity [[buffer(21)]],
     uint3 tid  [[threadgroup_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]])
 {
@@ -362,6 +364,57 @@ kernel void sol_route_p_mma(
   // walked 32 blocks at a time and the kept count is a simd sum, where
   // the fused kernel had all 32 lanes cooperate on one block's dot and
   // step one block at a time.
+  // VSA-H3'S BUDGET, when the caller asked for one (vsa_sparsity in (0,1)).
+  // Every query block keeps the ceil((1 - sparsity) * NK) best key blocks --
+  // video_sparse_attn.py's compute_topk -- with the local band, the sink and
+  // the tail still forced exact, which is the reference's `exempt` mode.
+  //
+  // One lane ranks the row: NK is at most a few hundred, and a parallel
+  // selection would have to agree with the reference's tie order to be worth
+  // the complexity. The other lanes idle for this query block.
+  if (vsa_sparsity > 0.0f && vsa_sparsity < 1.0f) {
+    if (lane == 0) {
+      float want = ceil((1.0f - vsa_sparsity) * (float)NK);
+      int k = (int)want;
+      if (k < 1) { k = 1; }
+      if (k > NK) { k = NK; }
+      for (int n = 0; n < NK; ++n) { fl[n] = (uchar)0; }
+      int chosen = 0;
+      while (chosen < k) {
+        int best = -1;
+        float bestv = -INFINITY;
+        for (int n = 0; n < NK; ++n) {
+          if (fl[n]) { continue; }
+          const float v = pr[n];
+          if (v > bestv || (v == bestv && best >= 0 && n < best)) {
+            bestv = v; best = n;
+          }
+        }
+        if (best < 0) { break; }
+        fl[best] = (uchar)1;
+        ++chosen;
+      }
+      for (int n = 0; n < NK; ++n) {
+        const bool tail  = (n == NK - 1);
+        const bool local = abs(qk - n) <= radius;
+        const bool sink  = (n >= sink_lo && n < sink_hi);
+        if (tail || local || sink) { fl[n] = (uchar)1; }
+      }
+      uint nk = 0;
+      for (int n = 0; n < NK; ++n) {
+        if (!fl[n]) { continue; }
+        const int lo = n * per;
+        const int hi = min(lo + per, NKS);
+        nk += (uint)max(0, hi - lo);
+      }
+      kept[(uint)h * NQ + qb] = nk;
+      if (counts != nullptr) {
+        atomic_fetch_add_explicit(&counts[0], nk, memory_order_relaxed);
+      }
+    }
+    return;
+  }
+
   uint n_keep = 0;
   for (int n0 = 0; n0 < NK; n0 += 32) {
     const int n = n0 + (int)lane;

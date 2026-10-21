@@ -193,6 +193,33 @@ forward(const float* q, const float* k, const float* v, const float* qc,
         exact[(std::size_t)n] =
             (char)(proxy[(std::size_t)n] > route || local || sink);
       }
+      // VSA-H3: a fixed BUDGET instead of the threshold. The scores are
+      // already in `proxy`, so this ranks them and keeps the top
+      // ceil((1 - sparsity) * nb), with the local band and the sink still
+      // forced in -- the reference's `exempt` mode does the same for the
+      // prefix, and keeping them costs nothing here because they are
+      // already marked.
+      if (cfg.vsa_sparsity > 0.0f && cfg.vsa_sparsity < 1.0f) {
+        int keep = (int)std::ceil((1.0 - (double)cfg.vsa_sparsity) * nb);
+        keep = std::max(1, std::min(keep, nb));
+        std::vector<int> order((std::size_t)nb);
+        for (int n = 0; n < nb; ++n) { order[(std::size_t)n] = n; }
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+          return proxy[(std::size_t)a] > proxy[(std::size_t)b];
+        });
+        std::vector<char> picked((std::size_t)nb, 0);
+        for (int i = 0; i < keep; ++i) { picked[(std::size_t)order[i]] = 1; }
+        for (int n = 0; n < nb; ++n) {
+          const bool local = std::abs(qb - n) <= cfg.local_radius;
+          const bool sink  = (n >= sink_lo && n < sink_hi);
+          // The tail block is always exact: its length is not a whole
+          // block, which is the one place the pooled shortcut would not
+          // hold. See sol_attn_mma.metal's header.
+          const bool tail  = (n == nb - 1);
+          exact[(std::size_t)n] =
+              (char)(picked[(std::size_t)n] || local || sink || tail);
+        }
+      }
       if (stats != nullptr) {
         for (int n = 0; n < nb; ++n) {
           if (exact[(std::size_t)n]) { ++stats->exact_blocks; }

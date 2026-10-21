@@ -40,6 +40,9 @@ constexpr std::pair<std::string_view, std::string_view> kBlock[] = {
     {"attn.to_out.0.", "attn.out_proj."},
     {"attn.norm_q.", "attn.q_norm."},
     {"attn.norm_k.", "attn.k_norm."},
+    // VSA-distilled H3 students (FastVideo FastH3-Omni) carry a learned
+    // compression gate per block; the base checkpoint zero-initialises it.
+    {"attn.to_gate_compress.", "attn.gate_compress."},
     {"ff.net.0.proj.", "mlp.fc1.ug."},
     {"ff.net.2.", "mlp.fc2."},
     {"adaln_proj.linear.", "adaln_proj.linear."},

@@ -1820,6 +1820,13 @@ MetalMiniMaxH3Transformer::refill_block_(WeightSet& ws,
   one(prefix + "attn.k_norm.weight", b.kn, /*raw=*/false);
   lin(prefix + "attn.qkv_proj", b.qkv);
   lin(prefix + "attn.out_proj", b.out);
+  // OPTIONAL, and only a VSA-distilled student has it: the compression gate
+  // the base H3 checkpoint zero-initialises. Bound when the checkpoint
+  // carries it, left empty (and the branch skipped) when it does not --
+  // `has()` rather than `lin()`, which would rebuild the block for a tensor
+  // this model is not required to have.
+  b.has_gate = ws.src().has(prefix + "attn.gate_compress.weight");
+  if (b.has_gate) { lin(prefix + "attn.gate_compress", b.gate); }
   lin(prefix + "mlp.fc1", b.fc1);
   lin(prefix + "mlp.fc2", b.fc2);
   if (with_adaln) { lin(prefix + "adaln_proj.linear", b.adaln); }
@@ -2984,6 +2991,9 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   // Steel flash-attention. The scalar sdpa_full_f16 is O(seq^2) at a few
   // percent of peak and this model's sequences are video-sized, so the
   // fallback is a correctness A/B rather than a path anyone should run.
+  // The VSA gate's kernels are loaded LAZILY, on the first block that carries
+  // a gate, because the base checkpoint has none and a model that never runs
+  // the branch should not pay for three function lookups.
   m->_lib_attn = mc->load_library("attn_steel");
   m->_attn_p_main = mc->make_shared_buffer(sizeof(float) * 64);
   m->_attn_p_text = mc->make_shared_buffer(sizeof(float) * 64);
@@ -7520,6 +7530,129 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       enc.set_constant(8, QKV_HSTRIDE);    // grouping, see below
       enc.dispatch({32, (unsigned)(rows * NH), 1}, {32, 1, 1});
     };
+    // THE VSA COMPRESSION GATE (FastVideo VSA-H3), encoded AFTER the fine
+    // attention and BEFORE the out projection -- the reference adds it to the
+    // attention output, which is what s.ob holds here.
+    //
+    // Only a VSA-distilled student carries the weights: the base H3
+    // checkpoint zero-initialises the projection and skips the branch, which
+    // is exactly what `b.has_gate == false` does here. A model that has them
+    // gets the branch whether or not sparsity is on -- the reference's
+    // condition is `gate_compress is not None`, not `sparsity > 0`.
+    auto vsa_gate = [&](const Block& b_, const SharedBuffer& x_, int rows_) {
+      // VPIPE_H3_NO_VSA_GATE: A/B the branch itself. Without it there is no
+      // way to tell "the gate is subtle" from "the gate never ran", which is
+      // the failure this whole class of bug hides in.
+      if (!b_.has_gate ||
+          std::getenv("VPIPE_H3_NO_VSA_GATE") != nullptr) { return; }
+
+      // THE TILE IS A 3-D CUBE over the (T, H, W) latent grid, cut exactly
+      // the way FastVideo's get_tile_partition_indices cuts it. A run of
+      // consecutive rows instead pools several frames of one row into one
+      // centroid, and the branch then adds a low-frequency term that reads
+      // as blur (MEASURED: visible in the picture).
+      const int tpf_ = in.video_grid_h * in.video_grid_w;
+      if (tpf_ <= 0 || in.video_grid_h <= 0 || in.video_grid_w <= 0) { return; }
+      const int frames_ = rows_ > L.video_start
+                              ? (rows_ - L.video_start) / tpf_ : 0;
+      if (frames_ <= 0) { return; }
+      const unsigned GH = (unsigned)in.video_grid_h;
+      const unsigned GW = (unsigned)in.video_grid_w;
+      const unsigned ts = (unsigned)kVsaTileT;
+      const unsigned hs = (unsigned)kVsaTileH;
+      const unsigned ws = (unsigned)kVsaTileW;
+      const unsigned nbh = (GH + hs - 1) / hs;
+      const unsigned nbw = (GW + ws - 1) / ws;
+      const unsigned nbt = ((unsigned)frames_ + ts - 1) / ts;
+      const int tiles = (int)(nbt * nbh * nbw);
+      if (tiles <= 0) { return; }
+
+      if (!_fn_vsa_pool.valid()) {
+        _lib_vsa = _mc->load_library("vsa_gate_bf16");
+        if (!_lib_vsa.valid()) { return; }
+        _fn_vsa_pool   = _lib_vsa.function("vsa_pool");
+        _fn_vsa_scores = _lib_vsa.function("vsa_scores");
+        _fn_vsa_merge  = _lib_vsa.function("vsa_merge");
+        if (!_fn_vsa_pool.valid() || !_fn_vsa_scores.valid() ||
+            !_fn_vsa_merge.valid()) {
+          if (_mc->session() != nullptr) {
+            _mc->session()->warn(fmt(
+                "minimax-h3: vsa_gate kernels missing; the compression gate "
+                "is skipped"));
+          }
+          return;
+        }
+      }
+      // Scratch is grown, never shrunk: the largest geometry of the run pays
+      // for it once.
+      if (tiles > _vsa_tiles) {
+        const std::size_t n = (std::size_t)tiles * NH * HD;
+        _vsa_qp = _mc->make_shared_buffer(n * sizeof(float));
+        _vsa_kp = _mc->make_shared_buffer(n * sizeof(float));
+        _vsa_vp = _mc->make_shared_buffer(n * sizeof(float));
+        _vsa_scores = _mc->make_shared_buffer(
+            (std::size_t)tiles * NH * tiles * sizeof(float));
+        // The projection is written over the video rows, so it needs the
+        // whole sequence's rows, not one tile's.
+        _vsa_gate = _mc->make_shared_buffer((std::size_t)rows_ * H * 2);
+        if (_vsa_qp.empty() || _vsa_kp.empty() || _vsa_vp.empty() ||
+            _vsa_scores.empty() || _vsa_gate.empty()) {
+          _vsa_tiles = 0;
+          return;
+        }
+        _vsa_tiles = tiles;
+      }
+      const float scale = 1.0f / std::sqrt((float)HD);
+      const unsigned rows_u = (unsigned)rows_, tiles_u = (unsigned)tiles;
+      const unsigned heads_u = (unsigned)NH, dim_u = (unsigned)HD;
+      const unsigned vstart_u = (unsigned)L.video_start;
+      const unsigned frames_u = (unsigned)frames_;
+
+      const std::size_t qb = (std::size_t)Q_OFF * 2;
+      const std::size_t kb = (std::size_t)K_OFF * 2;
+      const std::size_t vb = (std::size_t)V_OFF * 2;
+
+      enc.set_function(_fn_vsa_pool);
+      enc.set_buffer(0, s.qkv, qb);
+      enc.set_buffer(1, s.qkv, kb);
+      enc.set_buffer(2, s.qkv, vb);
+      enc.set_buffer(5, _vsa_qp); enc.set_buffer(6, _vsa_kp);
+      enc.set_buffer(7, _vsa_vp);
+      enc.set_constant(9, rows_u);  enc.set_constant(10, tiles_u);
+      enc.set_constant(11, heads_u); enc.set_constant(12, dim_u);
+      enc.set_constant(14, vstart_u); enc.set_constant(15, GH);
+      enc.set_constant(16, GW); enc.set_constant(17, frames_u);
+      enc.set_constant(18, ts); enc.set_constant(19, hs);
+      enc.set_constant(20, ws);
+      enc.dispatch({tiles_u, 1, 1}, {64, 1, 1});
+
+      enc.set_function(_fn_vsa_scores);
+      enc.set_buffer(5, _vsa_qp); enc.set_buffer(6, _vsa_kp);
+      enc.set_buffer(8, _vsa_scores);
+      enc.set_constant(10, tiles_u); enc.set_constant(11, heads_u);
+      enc.set_constant(12, dim_u);
+      { float sc = scale; enc.set_constant(13, sc); }
+      enc.dispatch({tiles_u, 1, 1}, {64, 1, 1});
+
+      // gate[r] = W_gate @ x[r] over the block's INPUT, which `s.nm` no
+      // longer holds here -- the attention overwrote it. So the projection is
+      // computed into its own buffer first, exactly as the reference applies
+      // to_gate_compress to hidden_states.
+      gemm_(enc, x_, 0, b_.gate, _vsa_gate, 0, rows_, H, I, nullptr);
+      enc.set_function(_fn_vsa_merge);
+      enc.set_buffer(8, _vsa_scores);
+      enc.set_buffer(7, _vsa_vp);
+      enc.set_buffer(3, _vsa_gate);
+      enc.set_buffer(4, s.ob);
+      enc.set_constant(9, rows_u);  enc.set_constant(10, tiles_u);
+      enc.set_constant(11, heads_u); enc.set_constant(12, dim_u);
+      enc.set_constant(14, vstart_u); enc.set_constant(15, GH);
+      enc.set_constant(16, GW); enc.set_constant(17, frames_u);
+      enc.set_constant(18, ts); enc.set_constant(19, hs);
+      enc.set_constant(20, ws);
+      enc.dispatch({tiles_u, 1, 1}, {64, 1, 1});
+    };
+
     // `layer` is the block index, because Sol leaves the leading
     // `dense_layers` alone: the first blocks are where the residual
     // stream is least redundant, and the published profile keeps one of
@@ -8040,6 +8173,12 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       psplit(t_prep);
       attn(rows, modulated, lora_layer);
       psplit(t_attn);
+      // The VSA compression gate rides ON the attention output, before the
+      // out projection -- the reference's `out += gate * out_c`. Skipped
+      // entirely for a checkpoint without the weights, which is every
+      // released base H3 and every quantised pack of one.
+      vsa_gate(b, s.nm, rows);
+      psplit(t_sgate);
       if (!fused_out) {
         // Head-major [H, rows, D] back to the row-major [rows, I] the
         // out projection reads. The fused path had steel store it that

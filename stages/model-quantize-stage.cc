@@ -164,7 +164,13 @@ dit_class_family_(const std::string& class_name)
   // partitions (FL2VA / Ref2VA) ship byte-identical transformer configs, so
   // the class name is all there is to go on -- and all there needs to be,
   // since the quant leaf set does not depend on the partition.
-  if (class_name == "MiniMaxH3DiTModel") { return "minimax-h3"; }
+  // Both spellings: the native one and the diffusers one. MiniMaxAI ships
+  // the released partitions under `MiniMaxH3Transformer3DModel`, and the
+  // quantizer was reading only the native name -- so a diffusers-layout
+  // checkpoint (a VSA-distilled student, say) fell through to "not a
+  // supported DiT" and was never quantized at all.
+  if (class_name == "MiniMaxH3DiTModel" ||
+      class_name == "MiniMaxH3Transformer3DModel") { return "minimax-h3"; }
   // A REGISTERED family, asked last. The chain above is a closed switch
   // over the class names this tree implements, so a family published
   // after it -- or one that lives in a plugin -- falls through

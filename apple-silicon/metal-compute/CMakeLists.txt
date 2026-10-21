@@ -75,6 +75,9 @@ add_vpipe_metal_kernel(affine_qmm
 add_vpipe_metal_kernel(rms_norm SRC ops/rms_norm.metal)
 add_vpipe_metal_kernel(rms_norm_bf16 SRC ops/rms_norm.metal
                        DEFINES VPIPE_ELT=bfloat)
+add_vpipe_metal_kernel(vsa_gate SRC ops/vsa_gate.metal)
+add_vpipe_metal_kernel(vsa_gate_bf16 SRC ops/vsa_gate.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(llm_elementwise SRC ops/llm_elementwise.metal)
 add_vpipe_metal_kernel(llm_elementwise_bf16 SRC ops/llm_elementwise.metal
                        DEFINES VPIPE_ELT=bfloat)

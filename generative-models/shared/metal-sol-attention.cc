@@ -837,6 +837,10 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
     return fail("VPIPE_SOL_NO_MASKED_APPROX is head_dim 128 only -- "
                 "sol_approx_mma's output tile is built around it");
   }
+  // VSA-H3's BUDGET is implemented on the PROXY arm only. The fused
+  // sol_route_mma ranks nothing, so a run that asked for a budget would get
+  // Sol's threshold and report itself as VSA -- the silent-different-answer
+  // failure this tree refuses elsewhere.
   if (cfg.thresh != sol::Threshold::kDiag) {
     return fail("sol_attn on metal implements the 'diag' threshold only");
   }
@@ -944,6 +948,18 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   // x 20036 rows: 2.7 ms of the routing became 0.6.
   const bool proxy_gemm = !_proxy.empty() && _fn_proxy.valid() &&
                           _fn_route_p.valid();
+  // A BUDGET needs the proxy arm: the fused sol_route_mma ranks nothing, so
+  // a run that asked for one would get Sol's threshold and report itself as
+  // VSA -- the silent-different-answer failure this tree refuses elsewhere.
+  // Asked HERE rather than in load(), because the proxy buffer is allocated
+  // by plan() and load() cannot see it.
+  if (cfg.vsa_sparsity > 0.0f && !proxy_gemm) {
+    if (err != nullptr) {
+      *err = "sol_vsa_sparsity needs the proxy routing arm and its proxy "
+             "scratch, which this build did not get";
+    }
+    return false;
+  }
   if ((skip & 4) == 0 && proxy_gemm) {
   enc.set_function(_fn_proxy);
   enc.set_buffer(0, _qc); enc.set_buffer(1, _kc); enc.set_buffer(2, _proxy);
@@ -967,6 +983,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_constant(18, nks);
   enc.set_constant(19, gqa);
   enc.set_constant(20, q_off);
+  enc.set_constant(21, cfg.vsa_sparsity);
   enc.dispatch({32, (unsigned)heads, (unsigned)nq}, {32, 1, 1});
   } else if ((skip & 4) == 0) {
   enc.set_function(_fn_route);
@@ -982,6 +999,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_constant(18, nks);
   enc.set_constant(19, gqa);
   enc.set_constant(20, q_off);
+  enc.set_constant(21, cfg.vsa_sparsity);
   enc.dispatch({32, (unsigned)heads, (unsigned)nq}, {32, 1, 1});
   }
 

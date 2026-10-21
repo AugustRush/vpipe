@@ -258,3 +258,79 @@ TEST(sol_attention, a_kv_sink_is_exact_for_every_query)
 //
 // What stays here is the METHOD: these tests need no GPU and would catch
 // the algorithm being wrong rather than the kernel being wrong.
+
+// ---- VSA-H3's BUDGET routing -------------------------------------------
+//
+// A VSA-distilled student is trained keeping a FIXED share of key blocks
+// (compute_topk: ceil((1 - sparsity) * blocks)), not however many a
+// threshold happens to admit. The two must be told apart, because both
+// produce a normalised distribution and a finite output:
+//
+//   * a budget that is wired but ignored leaves the kept fraction flat as
+//     the sparsity moves;
+//   * a budget wired to the wrong formula (round vs ceil, 1-s vs s) lands
+//     on a fraction that is close enough to look right on one input.
+//
+// So the assertions are the fraction, at two sparsities, against the
+// formula -- and that the answer differs from the threshold arm's.
+
+TEST(sol_attention, vsa_budget_keeps_the_share_it_was_asked_for)
+{
+  const Fixture f = clustered_(4, 512, 128, 6, 0.35f, 0x5eed1234u);
+  const int nb = sol::num_blocks(f.tokens);
+  std::printf("[vsa] blocks %d, sparsity -> kept\n", nb);
+  double prev_keep = 2.0;
+  bool keep_falls = true;
+  for (const float sp : {0.5f, 0.8f, 0.9f}) {
+    sol::Config c;
+    c.vsa_sparsity = sp;
+    // The local band and the tail are forced exact, so the realized share
+    // is an upper bound on the budget -- never below it, and on a short
+    // sequence a LOOSE one: 8 blocks at sparsity 0.8 ask for 2, but every
+    // query block also keeps its neighbours (+-1) and the tail is always
+    // exact, which is 4 of 8 before the budget contributes anything. The
+    // reference has the same property for the same reason (its `exempt`
+    // mode forces the prefix in), so the assertion is the direction and the
+    // floor, not an equality.
+    const auto [err, keep] = run_(f, c);
+    const double want = (double)std::max(1, (int)std::ceil((1.0 - sp) * nb)) / nb;
+    std::printf("[vsa] %.2f -> %.4f (budget %.4f, rel-L2 %.5f)\n", sp, keep, want, err);
+    EXPECT_TRUE(keep >= want - 1e-6);
+    if (!(keep <= prev_keep + 1e-6)) { keep_falls = false; }
+    prev_keep = keep;
+  }
+  EXPECT_TRUE(keep_falls);
+}
+
+TEST(sol_attention, vsa_budget_differs_from_the_threshold)
+{
+  // Same fixture, same target share: the budget arm must not be the
+  // threshold arm wearing a different name. tau = 0 keeps nearly
+  // everything, so a budget of 80% has to keep strictly less.
+  const Fixture f = clustered_(4, 512, 128, 6, 0.35f, 0x1122u);
+  sol::Config thr_cfg;
+  thr_cfg.tau = 0.0f;
+  const auto [e_thr, k_thr] = run_(f, thr_cfg);
+
+  sol::Config bud_cfg;
+  bud_cfg.vsa_sparsity = 0.8f;
+  const auto [e_bud, k_bud] = run_(f, bud_cfg);
+  std::printf("[vsa] threshold tau=0 keeps %.4f, budget 0.8 keeps %.4f\n",
+              k_thr, k_bud);
+  EXPECT_TRUE(k_bud < k_thr);
+}
+
+TEST(sol_attention, vsa_budget_tracks_dense_attention)
+{
+  // The trade has to be worth taking: at the checkpoint's own 0.8 the
+  // routing drops most blocks and still tracks dense attention. A budget
+  // wired to the WRONG blocks would keep the same count and a much worse
+  // answer, which is the failure a count-only assertion cannot see.
+  const Fixture f = clustered_(4, 512, 128, 6, 0.35f, 0xabcd0001u);
+  sol::Config c;
+  c.vsa_sparsity = 0.8f;
+  const auto [err, keep] = run_(f, c);
+  std::printf("[vsa] sparsity 0.8: kept %.4f, rel-L2 %.5f\n", keep, err);
+  EXPECT_TRUE(keep < 0.95);      // it really did drop blocks
+  EXPECT_TRUE(err < 0.5);        // and still resembles dense
+}

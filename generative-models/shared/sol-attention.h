@@ -106,6 +106,18 @@ struct Config {
   // Must be a multiple of steel's 16-key block, because the CSR the
   // exact half walks is in steel's units.
   int       key_block    = 0;
+  // VSA-H3's routing, which is a BUDGET rather than a threshold: when
+  // `vsa_sparsity` is in (0, 1) every query block keeps the
+  // ceil((1 - sparsity) * blocks) best key blocks (compute_topk in
+  // video_sparse_attn.py). < 0 keeps Sol's threshold, which is the
+  // shipped behaviour and the only one a base H3 checkpoint uses.
+  //
+  // The two are NOT interchangeable: a threshold keeps however much the
+  // activations say it should (26% of H3's blocks at tau 1.0), while a
+  // budget keeps a fixed share. A VSA-distilled student was trained under
+  // the budget, and its compression gate exists to make up what the budget
+  // dropped -- which is why the gate is only meaningful with this on.
+  float     vsa_sparsity = -1.0f;
 };
 
 // The same settings out of the acceleration BAG a generating stage
@@ -133,6 +145,8 @@ config_from_flex(const FlexData* bag)
   c.local_radius =
       (int)accel::integer(bag, accel::kSolLocalRadius, c.local_radius);
   c.key_block = (int)accel::integer(bag, accel::kSolKeyBlock, c.key_block);
+  c.vsa_sparsity =
+      (float)accel::real(bag, accel::kSolVsaSparsity, (double)c.vsa_sparsity);
   // The SINK is not in the bag and cannot be: it is where a family's own
   // sequence stops being the modality the routing is summarising, and
   // only the family knows that. H3 fills it from its packed layout; a

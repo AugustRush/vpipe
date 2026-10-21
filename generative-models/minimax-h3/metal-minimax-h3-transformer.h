@@ -1257,6 +1257,12 @@ class MetalMiniMaxH3Transformer {
     metal_compute::SharedBuffer qn, kn;   // per-head q/k RMS gammas [128]
     Linear fc1, fc2;
     Linear adaln;                         // only on the 50 main blocks
+    // VSA compression gate: a VSA-distilled student (FastVideo FastH3-Omni)
+    // carries one per block; the base checkpoint has none, so this stays
+    // empty and the branch is skipped entirely. `has_gate` is set at bind
+    // time because an empty Linear and an unbound one look the same.
+    Linear gate;
+    bool   has_gate = false;
   };
 
   // Cached entries are the ones the model KEEPS; a streamed block is read
@@ -2039,6 +2045,28 @@ class MetalMiniMaxH3Transformer {
   // the same window, which is all the ranking needs.
   static constexpr int kAttnBqMinRows   = 16384;
   static constexpr int kAttnBqProbeRows = 16384;
+  // ---- VSA compression gate (VSA-distilled students only) ----------------
+  // Loaded only when a block carried `attn.gate_compress`; the base H3
+  // checkpoint has none and every path here stays unloaded.
+  metal_compute::ComputeLibrary  _lib_vsa;
+  metal_compute::ComputeFunction _fn_vsa_pool, _fn_vsa_scores, _fn_vsa_merge;
+  metal_compute::SharedBuffer    _vsa_qp, _vsa_kp, _vsa_vp, _vsa_scores;
+  metal_compute::SharedBuffer    _vsa_gate;   // [rows, H, D] the projection
+  int  _vsa_tiles = 0;           // capacity the scratch was built for
+  // The reference's tile is a 3-D CUBE -- (4,4,8) at tile_size 128, i.e.
+  // 4 latent frames x 4 rows x 8 columns -- not a run of consecutive rows.
+  // A cube keeps the pooled value spatially coherent; a run of 128 rows
+  // spans several frames of one row and pools unrelated pixels together,
+  // which showed as a visibly softer picture. This build pools CONTIGUOUS
+  // rows of the same count as a first approximation: it is the same number
+  // of rows per tile, so the shapes line up, and the difference is which
+  // rows share a tile.
+  // The cube's shape in (T, H, W). FastVideo's VSA_H3_TILE_SHAPES pairs a
+  // token count with a shape: 64 -> (4,4,4), 128 -> (4,4,8). OmniRef's own
+  // inference contract says tile_size 64, so (4,4,4) is the one that runs.
+  static constexpr int kVsaTileT = 4;
+  static constexpr int kVsaTileH = 4;
+  static constexpr int kVsaTileW = 4;
   metal_compute::ComputeFunction _fn_attn_main_bq128;
   metal_compute::SharedBuffer _attn_p_main_bq128;
   int  _attn_bq        = 64;     // the tile in force (64 or 128)

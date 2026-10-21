@@ -186,6 +186,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         sage-attention.cc
         metal-sage-attention.cc
         sol-attention.cc
+        vsa-gate.cc
         sol-attention-h3.cc
         sol-attention-mma.cc
         motion-cache.cc
